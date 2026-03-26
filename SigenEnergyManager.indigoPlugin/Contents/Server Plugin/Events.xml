@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Events>
+
+    <Event id="emergencyImportTriggered">
+        <Name>Emergency Import Triggered</Name>
+        <TriggerLabel>Battery manager triggered emergency grid import</TriggerLabel>
+        <Description>Fires when the battery manager determines the battery will not reach dawn at the minimum SOC and initiates a grid import.</Description>
+    </Event>
+
+    <Event id="exportStarted">
+        <Name>Grid Export Started</Name>
+        <TriggerLabel>Battery export to grid started</TriggerLabel>
+        <Description>Fires when the battery manager begins exporting battery energy to the grid to prevent 100% SOC cap during solar generation.</Description>
+    </Event>
+
+    <Event id="exportStopped">
+        <Name>Grid Export Stopped</Name>
+        <TriggerLabel>Battery export to grid stopped</TriggerLabel>
+        <Description>Fires when grid export stops and the inverter returns to self-consumption mode.</Description>
+    </Event>
+
+    <Event id="vppAnnounced">
+        <Name>VPP Event Announced</Name>
+        <TriggerLabel>Axle VPP export event announced</TriggerLabel>
+        <Description>Fires when a new Axle VPP export event is scheduled (more than 30 minutes away).</Description>
+    </Event>
+
+    <Event id="vppStarted">
+        <Name>VPP Event Started</Name>
+        <TriggerLabel>Axle VPP export event is now active</TriggerLabel>
+        <Description>Fires when an Axle VPP export event becomes active. Battery manager suspends; Axle controls via Sigenergy cloud.</Description>
+    </Event>
+
+    <Event id="vppEnded">
+        <Name>VPP Event Ended</Name>
+        <TriggerLabel>Axle VPP export event completed</TriggerLabel>
+        <Description>Fires when an Axle VPP export event ends and battery manager control is restored.</Description>
+    </Event>
+
+</Events>

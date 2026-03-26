@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MenuItems>
+
+    <MenuItem id="menuRefreshAll">
+        <Name>Refresh All Data Now</Name>
+        <CallbackMethod>menuRefreshAll</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowStatus">
+        <Name>Show Manager Status</Name>
+        <CallbackMethod>menuShowStatus</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowDailyHistory">
+        <Name>Show Daily History (Last 7 Days)</Name>
+        <CallbackMethod>menuShowDailyHistory</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowTariffRates">
+        <Name>Show Current Tariff Rates</Name>
+        <CallbackMethod>menuShowTariffRates</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowVppStatus">
+        <Name>Show VPP Status</Name>
+        <CallbackMethod>menuShowVppStatus</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuToggleDebug">
+        <Name>Toggle Debug Logging</Name>
+        <CallbackMethod>menuToggleDebug</CallbackMethod>
+    </MenuItem>
+
+</MenuItems>

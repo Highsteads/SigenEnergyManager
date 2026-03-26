@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PluginConfig>
+    <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+    <Field id="separator_modbus" type="separator"/>
+    <Field id="label_modbus" type="label">
+        <Label>MODBUS CONNECTION (Sigenergy Inverter)</Label>
+    </Field>
+    <Field id="inverterIp" type="textfield" defaultValue="192.168.100.49">
+        <Label>Inverter IP address:</Label>
+    </Field>
+    <Field id="modbusPort" type="textfield" defaultValue="502">
+        <Label>Modbus TCP port:</Label>
+    </Field>
+    <Field id="plantAddress" type="textfield" defaultValue="247">
+        <Label>Plant slave address (default 247):</Label>
+    </Field>
+    <Field id="inverterSlaveId" type="textfield" defaultValue="1">
+        <Label>Inverter slave address (default 1):</Label>
+    </Field>
+    <Field id="pollInterval" type="menu" defaultValue="60">
+        <Label>Modbus poll interval:</Label>
+        <List>
+            <Option value="30">30 seconds</Option>
+            <Option value="60">60 seconds (recommended)</Option>
+            <Option value="120">120 seconds</Option>
+        </List>
+    </Field>
+
+    <Field id="separator_solcast" type="separator"/>
+    <Field id="label_solcast" type="label">
+        <Label>SOLCAST (credentials in secrets.py take priority)</Label>
+    </Field>
+    <Field id="solcastApiKey" type="textfield" defaultValue="">
+        <Label>Solcast API key (Bearer token):</Label>
+    </Field>
+    <Field id="solcastSite1Id" type="textfield" defaultValue="">
+        <Label>Site 1 resource ID (East + South arrays):</Label>
+    </Field>
+    <Field id="solcastSite2Id" type="textfield" defaultValue="">
+        <Label>Site 2 resource ID (West + Garage NE arrays):</Label>
+    </Field>
+    <Field id="solcastSite1Kwp" type="textfield" defaultValue="8.55">
+        <Label>Site 1 capacity (kWp):</Label>
+    </Field>
+    <Field id="solcastSite2Kwp" type="textfield" defaultValue="5.70">
+        <Label>Site 2 capacity (kWp):</Label>
+    </Field>
+
+    <Field id="separator_octopus" type="separator"/>
+    <Field id="label_octopus" type="label">
+        <Label>OCTOPUS ENERGY (credentials in secrets.py take priority)</Label>
+    </Field>
+    <Field id="octopusApiKey" type="textfield" defaultValue="">
+        <Label>Octopus API key (sk_live_...):</Label>
+    </Field>
+    <Field id="octopusAccount" type="textfield" defaultValue="">
+        <Label>Account number (A-XXXXXXXX):</Label>
+    </Field>
+    <Field id="octopusMpan" type="textfield" defaultValue="">
+        <Label>Electricity MPAN (13 digits):</Label>
+    </Field>
+    <Field id="octopusSerial" type="textfield" defaultValue="">
+        <Label>Electricity meter serial:</Label>
+    </Field>
+    <Field id="octopusRegion" type="menu" defaultValue="F">
+        <Label>Grid region:</Label>
+        <List>
+            <Option value="A">A - Eastern England</Option>
+            <Option value="B">B - East Midlands</Option>
+            <Option value="C">C - London</Option>
+            <Option value="D">D - Merseyside and Northern Wales</Option>
+            <Option value="E">E - West Midlands</Option>
+            <Option value="F">F - North East England</Option>
+            <Option value="G">G - North West England</Option>
+            <Option value="H">H - Southern England</Option>
+            <Option value="J">J - South East England</Option>
+            <Option value="K">K - Southern Wales</Option>
+            <Option value="L">L - South West England</Option>
+            <Option value="M">M - Yorkshire</Option>
+            <Option value="N">N - Southern Scotland</Option>
+            <Option value="P">P - Northern Scotland</Option>
+        </List>
+    </Field>
+
+    <Field id="separator_battery" type="separator"/>
+    <Field id="label_battery" type="label">
+        <Label>BATTERY MANAGER SETTINGS</Label>
+    </Field>
+    <Field id="batteryCapacityKwh" type="textfield" defaultValue="35.04">
+        <Label>Battery capacity (kWh):</Label>
+    </Field>
+    <Field id="batteryEfficiency" type="textfield" defaultValue="94">
+        <Label>Round-trip efficiency (%, default 94):</Label>
+    </Field>
+    <Field id="inverterMaxKw" type="textfield" defaultValue="8.0">
+        <Label>Inverter max charge power (kW):</Label>
+    </Field>
+    <Field id="dawnSocTarget" type="textfield" defaultValue="10">
+        <Label>Minimum SOC at dawn target (%, default 10):</Label>
+    </Field>
+    <Field id="batteryHealthCutoff" type="textfield" defaultValue="10">
+        <Label>Battery health cutoff floor (%, default 10):</Label>
+    </Field>
+
+    <Field id="separator_export" type="separator"/>
+    <Field id="label_export" type="label">
+        <Label>GRID EXPORT (enable when export MPAN is active)</Label>
+    </Field>
+    <Field id="exportEnabled" type="checkbox" defaultValue="false">
+        <Label>Enable grid export (requires active export MPAN):</Label>
+    </Field>
+    <Field id="exportTriggerSoc" type="textfield" defaultValue="90" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Export when SOC reaches (%, default 90):</Label>
+    </Field>
+    <Field id="maxExportKw" type="textfield" defaultValue="4.0" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Maximum export power (kW, DNO limit 4.0):</Label>
+    </Field>
+
+    <Field id="separator_vpp" type="separator"/>
+    <Field id="label_vpp" type="label">
+        <Label>AXLE VPP (credentials in secrets.py take priority)</Label>
+    </Field>
+    <Field id="axleEnabled" type="checkbox" defaultValue="false">
+        <Label>Enable Axle VPP monitoring:</Label>
+    </Field>
+    <Field id="axleApiKey" type="textfield" defaultValue="" visibleBindingId="axleEnabled" visibleBindingValue="true">
+        <Label>Axle API token (Bearer):</Label>
+    </Field>
+
+    <Field id="separator_debug" type="separator"/>
+    <Field id="showDebugInfo" type="checkbox" defaultValue="false">
+        <Label>Enable debug logging:</Label>
+    </Field>
+</PluginConfig>

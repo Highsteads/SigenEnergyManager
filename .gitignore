@@ -1,0 +1,8 @@
+secrets.py
+**/secrets.py
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+SigenEnergyManager.indigoPlugin/Contents/Packages/
+*.zip

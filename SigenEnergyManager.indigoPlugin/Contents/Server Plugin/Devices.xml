@@ -1,0 +1,404 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Devices>
+
+    <!-- ============================================================
+         sigenergyInverter - Real-time power flows from Modbus
+         ============================================================ -->
+    <Device type="custom" id="sigenergyInverter">
+        <Name>Sigenergy Inverter</Name>
+        <ConfigUI>
+            <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+        </ConfigUI>
+        <States>
+            <State id="batterySoc">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery SOC changed</TriggerLabel>
+                <ControlPageLabel>Battery SOC (%)</ControlPageLabel>
+            </State>
+            <State id="pvPowerWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>PV power changed</TriggerLabel>
+                <ControlPageLabel>PV Power (W)</ControlPageLabel>
+            </State>
+            <State id="gridPowerWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Grid power changed</TriggerLabel>
+                <ControlPageLabel>Grid Power (W, +import/-export)</ControlPageLabel>
+            </State>
+            <State id="batteryPowerWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery power changed</TriggerLabel>
+                <ControlPageLabel>Battery Power (W, +charge/-discharge)</ControlPageLabel>
+            </State>
+            <State id="homePowerWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Home power changed</TriggerLabel>
+                <ControlPageLabel>Home Consumption (W)</ControlPageLabel>
+            </State>
+            <State id="emsWorkMode">
+                <ValueType>String</ValueType>
+                <TriggerLabel>EMS mode changed</TriggerLabel>
+                <ControlPageLabel>EMS Work Mode</ControlPageLabel>
+            </State>
+            <State id="gridSensorConnected">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Grid sensor status changed</TriggerLabel>
+                <ControlPageLabel>Grid Sensor Connected</ControlPageLabel>
+            </State>
+            <State id="gridStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Grid status changed</TriggerLabel>
+                <ControlPageLabel>Grid Status</ControlPageLabel>
+            </State>
+            <State id="plantRunningState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Plant state changed</TriggerLabel>
+                <ControlPageLabel>Plant Running State</ControlPageLabel>
+            </State>
+            <State id="batterySoh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery health changed</TriggerLabel>
+                <ControlPageLabel>Battery SOH (%)</ControlPageLabel>
+            </State>
+            <State id="batteryTempC">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery temp changed</TriggerLabel>
+                <ControlPageLabel>Battery Temp (degC)</ControlPageLabel>
+            </State>
+            <State id="batteryCellVoltage">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Cell voltage changed</TriggerLabel>
+                <ControlPageLabel>Avg Cell Voltage (V)</ControlPageLabel>
+            </State>
+            <State id="batteryMaxTempC">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery max temp changed</TriggerLabel>
+                <ControlPageLabel>Battery Max Temp (degC)</ControlPageLabel>
+            </State>
+            <State id="batteryMinTempC">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Battery min temp changed</TriggerLabel>
+                <ControlPageLabel>Battery Min Temp (degC)</ControlPageLabel>
+            </State>
+            <State id="dischargeCutoffSoc">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Discharge cutoff changed</TriggerLabel>
+                <ControlPageLabel>Discharge Cutoff SOC (%)</ControlPageLabel>
+            </State>
+            <State id="batteryDailyChargeKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily charge changed</TriggerLabel>
+                <ControlPageLabel>Battery Daily Charge (kWh)</ControlPageLabel>
+            </State>
+            <State id="batteryDailyDischargeKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily discharge changed</TriggerLabel>
+                <ControlPageLabel>Battery Daily Discharge (kWh)</ControlPageLabel>
+            </State>
+            <State id="pvDailyKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily PV changed</TriggerLabel>
+                <ControlPageLabel>PV Daily (kWh)</ControlPageLabel>
+            </State>
+            <State id="gridDailyImportKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily import changed</TriggerLabel>
+                <ControlPageLabel>Grid Daily Import (kWh)</ControlPageLabel>
+            </State>
+            <State id="gridDailyExportKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily export changed</TriggerLabel>
+                <ControlPageLabel>Grid Daily Export (kWh)</ControlPageLabel>
+            </State>
+            <State id="homeDailyKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Daily home changed</TriggerLabel>
+                <ControlPageLabel>Home Daily (kWh)</ControlPageLabel>
+            </State>
+            <State id="modbusConnected">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Modbus connection changed</TriggerLabel>
+                <ControlPageLabel>Modbus Connected</ControlPageLabel>
+            </State>
+            <State id="lastUpdate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last update changed</TriggerLabel>
+                <ControlPageLabel>Last Update</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>batterySoc</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================
+         batteryManager - Battery management decision states
+         ============================================================ -->
+    <Device type="custom" id="batteryManager">
+        <Name>Battery Manager</Name>
+        <ConfigUI>
+            <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+        </ConfigUI>
+        <States>
+            <State id="managerStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Manager status changed</TriggerLabel>
+                <ControlPageLabel>Manager Status</ControlPageLabel>
+            </State>
+            <State id="currentAction">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Manager action changed</TriggerLabel>
+                <ControlPageLabel>Current Action</ControlPageLabel>
+            </State>
+            <State id="currentReason">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Reason changed</TriggerLabel>
+                <ControlPageLabel>Decision Reason</ControlPageLabel>
+            </State>
+            <State id="dawnViable">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Dawn viability changed</TriggerLabel>
+                <ControlPageLabel>Dawn SOC Viable</ControlPageLabel>
+            </State>
+            <State id="socAtDawn">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Projected dawn SOC changed</TriggerLabel>
+                <ControlPageLabel>Projected SOC at Dawn (kWh)</ControlPageLabel>
+            </State>
+            <State id="importActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Import state changed</TriggerLabel>
+                <ControlPageLabel>Grid Import Active</ControlPageLabel>
+            </State>
+            <State id="importScheduled">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Import schedule changed</TriggerLabel>
+                <ControlPageLabel>Import Scheduled</ControlPageLabel>
+            </State>
+            <State id="importScheduledTime">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Import time changed</TriggerLabel>
+                <ControlPageLabel>Import Scheduled Time</ControlPageLabel>
+            </State>
+            <State id="importKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Import quantity changed</TriggerLabel>
+                <ControlPageLabel>Import Quantity (kWh)</ControlPageLabel>
+            </State>
+            <State id="exportActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Export state changed</TriggerLabel>
+                <ControlPageLabel>Grid Export Active</ControlPageLabel>
+            </State>
+            <State id="exportKw">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Export power changed</TriggerLabel>
+                <ControlPageLabel>Export Power (kW)</ControlPageLabel>
+            </State>
+            <State id="tariffActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Active tariff changed</TriggerLabel>
+                <ControlPageLabel>Active Tariff</ControlPageLabel>
+            </State>
+            <State id="rateToday">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Today rate changed</TriggerLabel>
+                <ControlPageLabel>Rate Today (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="rateTomorrow">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Tomorrow rate changed</TriggerLabel>
+                <ControlPageLabel>Rate Tomorrow (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="lastUpdate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last update changed</TriggerLabel>
+                <ControlPageLabel>Last Update</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>managerStatus</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================
+         solarForecast - Solcast solar generation forecast
+         ============================================================ -->
+    <Device type="custom" id="solarForecast">
+        <Name>Solar Forecast</Name>
+        <ConfigUI>
+            <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+        </ConfigUI>
+        <States>
+            <State id="todayKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Today forecast changed</TriggerLabel>
+                <ControlPageLabel>Today P50 (kWh)</ControlPageLabel>
+            </State>
+            <State id="tomorrowKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Tomorrow forecast changed</TriggerLabel>
+                <ControlPageLabel>Tomorrow P50 (kWh)</ControlPageLabel>
+            </State>
+            <State id="correctedTodayKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Corrected today forecast changed</TriggerLabel>
+                <ControlPageLabel>Today Corrected (kWh)</ControlPageLabel>
+            </State>
+            <State id="correctedTomorrowKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Corrected tomorrow forecast changed</TriggerLabel>
+                <ControlPageLabel>Tomorrow Corrected (kWh)</ControlPageLabel>
+            </State>
+            <State id="biasFactor">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Bias factor changed</TriggerLabel>
+                <ControlPageLabel>Bias Correction Factor</ControlPageLabel>
+            </State>
+            <State id="remainingTodayKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Remaining today changed</TriggerLabel>
+                <ControlPageLabel>Remaining Today (kWh)</ControlPageLabel>
+            </State>
+            <State id="currentHourWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Current hour forecast changed</TriggerLabel>
+                <ControlPageLabel>Current Hour (Wh)</ControlPageLabel>
+            </State>
+            <State id="nextHourWatts">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Next hour forecast changed</TriggerLabel>
+                <ControlPageLabel>Next Hour (Wh)</ControlPageLabel>
+            </State>
+            <State id="forecastStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Forecast status changed</TriggerLabel>
+                <ControlPageLabel>Forecast Status</ControlPageLabel>
+            </State>
+            <State id="lastUpdate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last update changed</TriggerLabel>
+                <ControlPageLabel>Last Update</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>todayKwh</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================
+         tariffMonitor - Octopus tariff rates (Tracker, Go, Flux)
+         ============================================================ -->
+    <Device type="custom" id="tariffMonitor">
+        <Name>Tariff Monitor</Name>
+        <ConfigUI>
+            <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+        </ConfigUI>
+        <States>
+            <State id="tariffActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Active tariff changed</TriggerLabel>
+                <ControlPageLabel>Active Tariff</ControlPageLabel>
+            </State>
+            <State id="rateToday">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Today rate changed</TriggerLabel>
+                <ControlPageLabel>Rate Today (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="rateTomorrow">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Tomorrow rate changed</TriggerLabel>
+                <ControlPageLabel>Rate Tomorrow (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="trackerRateToday">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Tracker today rate changed</TriggerLabel>
+                <ControlPageLabel>Tracker Rate Today (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="trackerRateTomorrow">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Tracker tomorrow rate changed</TriggerLabel>
+                <ControlPageLabel>Tracker Rate Tomorrow (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="goOffPeakRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Go off-peak rate changed</TriggerLabel>
+                <ControlPageLabel>Go Off-Peak (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="goStandardRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Go standard rate changed</TriggerLabel>
+                <ControlPageLabel>Go Standard (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="goPeakRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Go peak rate changed</TriggerLabel>
+                <ControlPageLabel>Go Peak (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="fluxOffPeakRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flux off-peak rate changed</TriggerLabel>
+                <ControlPageLabel>Flux Off-Peak (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="fluxStandardRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flux standard rate changed</TriggerLabel>
+                <ControlPageLabel>Flux Standard (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="fluxPeakRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flux peak rate changed</TriggerLabel>
+                <ControlPageLabel>Flux Peak (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="lastUpdate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last update changed</TriggerLabel>
+                <ControlPageLabel>Last Update</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>tariffActive</UiDisplayStateId>
+    </Device>
+
+    <!-- ============================================================
+         axleVppMonitor - Axle VPP export event monitoring
+         ============================================================ -->
+    <Device type="custom" id="axleVppMonitor">
+        <Name>Axle VPP Monitor</Name>
+        <ConfigUI>
+            <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+        </ConfigUI>
+        <States>
+            <State id="vppStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>VPP status changed</TriggerLabel>
+                <ControlPageLabel>VPP Status</ControlPageLabel>
+            </State>
+            <State id="vppState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>VPP state changed</TriggerLabel>
+                <ControlPageLabel>VPP State</ControlPageLabel>
+            </State>
+            <State id="eventStartTime">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Event start time changed</TriggerLabel>
+                <ControlPageLabel>Event Start Time</ControlPageLabel>
+            </State>
+            <State id="eventEndTime">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Event end time changed</TriggerLabel>
+                <ControlPageLabel>Event End Time</ControlPageLabel>
+            </State>
+            <State id="preChargeRequired">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Pre-charge SOC changed</TriggerLabel>
+                <ControlPageLabel>Pre-Charge SOC Required (%)</ControlPageLabel>
+            </State>
+            <State id="estimatedEarnings">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Estimated earnings changed</TriggerLabel>
+                <ControlPageLabel>Estimated Earnings (GBP)</ControlPageLabel>
+            </State>
+            <State id="lastUpdate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last update changed</TriggerLabel>
+                <ControlPageLabel>Last Update</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>vppStatus</UiDisplayStateId>
+    </Device>
+
+</Devices>

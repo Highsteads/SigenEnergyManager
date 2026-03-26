@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Actions>
+
+    <Action id="forceGridImport" deviceFilter="self.sigenergyInverter">
+        <Name>Force Grid Import</Name>
+        <CallbackMethod>actionForceGridImport</CallbackMethod>
+        <ConfigUI>
+            <Field id="powerKw" type="textfield" defaultValue="8.0">
+                <Label>Charge power (kW, max 8.0):</Label>
+            </Field>
+            <Field id="targetSocPct" type="textfield" defaultValue="80">
+                <Label>Target SOC (%, 10-100):</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="forceExport" deviceFilter="self.sigenergyInverter">
+        <Name>Force Grid Export</Name>
+        <CallbackMethod>actionForceExport</CallbackMethod>
+        <ConfigUI>
+            <Field id="powerKw" type="textfield" defaultValue="4.0">
+                <Label>Export power (kW, max 4.0 DNO limit):</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setSelfConsumption" deviceFilter="self.sigenergyInverter">
+        <Name>Set Self-Consumption Mode</Name>
+        <CallbackMethod>actionSetSelfConsumption</CallbackMethod>
+    </Action>
+
+    <Action id="returnToLocalEms" deviceFilter="self.sigenergyInverter">
+        <Name>Return to Local EMS Control</Name>
+        <CallbackMethod>actionReturnToLocalEms</CallbackMethod>
+    </Action>
+
+    <Action id="pauseManager" deviceFilter="self.batteryManager">
+        <Name>Pause Battery Manager</Name>
+        <CallbackMethod>actionPauseManager</CallbackMethod>
+    </Action>
+
+    <Action id="resumeManager" deviceFilter="self.batteryManager">
+        <Name>Resume Battery Manager</Name>
+        <CallbackMethod>actionResumeManager</CallbackMethod>
+    </Action>
+
+    <Action id="refreshSolcast" deviceFilter="self.solarForecast">
+        <Name>Refresh Solar Forecast</Name>
+        <CallbackMethod>actionRefreshSolcast</CallbackMethod>
+    </Action>
+
+    <Action id="refreshOctopus" deviceFilter="self.tariffMonitor">
+        <Name>Refresh Octopus Rates</Name>
+        <CallbackMethod>actionRefreshOctopus</CallbackMethod>
+    </Action>
+
+</Actions>
