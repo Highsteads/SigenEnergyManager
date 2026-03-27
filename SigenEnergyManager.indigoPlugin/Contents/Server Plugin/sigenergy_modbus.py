@@ -642,7 +642,7 @@ class SigenergyModbus:
     # Convenience Methods
     # ================================================================
 
-    def force_charge(self, power_watts=8000):
+    def force_charge(self, power_watts=10000):
         """Force charge battery from grid at specified power.
 
         Enables Remote EMS, sets Charge Grid First mode, sets power limit.

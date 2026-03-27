@@ -4,8 +4,8 @@
 # Description: Unit tests for battery_manager.py decision engine
 #              Runs without Indigo installed
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 21:48 GMT
-# Version:     1.1
+# Date:        27-03-2026 22:11 GMT
+# Version:     1.2
 
 import sys
 import unittest

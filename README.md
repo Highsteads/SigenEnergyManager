@@ -187,7 +187,7 @@ without Indigo installed.
 
 Developed and tested on:
 - 11.4 kWp solar (30 panels, 4 arrays)
-- Sigenergy 8 kW hybrid inverter
+- Sigenergy 10 kW hybrid inverter
 - 35.04 kWh battery (4 × 8.76 kWh SigenStor)
 - DNO export cap: 4 kW
 - Tariff: Octopus Tracker

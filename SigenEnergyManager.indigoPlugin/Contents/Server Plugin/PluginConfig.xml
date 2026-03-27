@@ -92,7 +92,7 @@
     <Field id="batteryEfficiency" type="textfield" defaultValue="94">
         <Label>Round-trip efficiency (%, default 94):</Label>
     </Field>
-    <Field id="inverterMaxKw" type="textfield" defaultValue="8.0">
+    <Field id="inverterMaxKw" type="textfield" defaultValue="10.0">
         <Label>Inverter max charge power (kW):</Label>
     </Field>
     <Field id="dawnSocTarget" type="textfield" defaultValue="10">

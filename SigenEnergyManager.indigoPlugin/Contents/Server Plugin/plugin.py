@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 21:48 GMT
-# Version:     1.1
+# Date:        27-03-2026 22:11 GMT
+# Version:     1.2
 
 import indigo
 import json
@@ -515,8 +515,8 @@ class Plugin(indigo.PluginBase):
         if action == ACTION_START_IMPORT:
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
-                power_w = min(decision.power_watts or 8000,
-                              int(float(self.pluginPrefs.get("inverterMaxKw", 8.0)) * 1000))
+                power_w = min(decision.power_watts or 10000,
+                              int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000))
                 if self.modbus.force_charge(power_w):
                     self.store["import_active"]       = True
                     self.store["import_target_soc"]   = decision.target_soc_pct
@@ -605,7 +605,7 @@ class Plugin(indigo.PluginBase):
         if now_utc >= scheduled:
             log(f"[Manager] Scheduled import window reached - starting import")
             target_soc = self.store.get("import_target_soc", 12.0)
-            if self.modbus and self.modbus.force_charge(8000):
+            if self.modbus and self.modbus.force_charge(10000):
                 self.store["import_active"]      = True
                 self.store["import_target_soc"]  = target_soc
                 self.store["import_scheduled_time"] = None
@@ -947,7 +947,7 @@ class Plugin(indigo.PluginBase):
                 f"shortfall: {shortfall:.1f} kWh)"
             )
             if self.modbus:
-                self.modbus.force_charge(8000)
+                self.modbus.force_charge(10000)
 
         self._vpp_transition(VPP_PRE_CHARGING)
 
@@ -1228,7 +1228,7 @@ class Plugin(indigo.PluginBase):
     def actionForceGridImport(self, action):
         """Action: Force immediate grid import."""
         props     = action.props
-        power_kw  = float(props.get("powerKw", 8.0))
+        power_kw  = float(props.get("powerKw", 10.0))
         target_soc = float(props.get("targetSocPct", 80.0))
         log(f"[Action] Force grid import: {power_kw}kW to {target_soc:.0f}% SOC")
         if self.modbus and self.modbus.force_charge(int(power_kw * 1000)):

@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 21:48 GMT
-# Version:     1.1
+# Date:        27-03-2026 22:11 GMT
+# Version:     1.2
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -338,7 +338,7 @@ class BatteryManager:
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = f"Dawn viability at risk ({viability.soc_at_dawn_kwh:.1f} kWh at dawn, need {viability.dawn_target_kwh:.1f}). Unknown tariff - importing now.",
-            power_watts    = int(min(8000, snapshot.capacity_kwh * 1000 / 2)),
+            power_watts    = int(min(10000, snapshot.capacity_kwh * 1000 / 2)),
             target_soc_pct = target_soc,
         )
 
@@ -360,7 +360,7 @@ class BatteryManager:
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = f"Dawn risk - Go/Flux cheap window unavailable, importing now",
-                power_watts    = 8000,
+                power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
 
@@ -370,7 +370,7 @@ class BatteryManager:
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = f"Dawn risk - in cheap window ({cheap_start}-{cheap_end}), importing now",
-                power_watts    = 8000,
+                power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
 
@@ -395,7 +395,7 @@ class BatteryManager:
                 return Decision(
                     action           = ACTION_SCHEDULE_IMPORT,
                     reason           = f"Dawn risk - waiting for cheap window at {cheap_start}",
-                    power_watts      = 8000,
+                    power_watts      = 10000,
                     target_soc_pct   = target_soc,
                     scheduled_time   = next_window_dt,
                 )
@@ -404,7 +404,7 @@ class BatteryManager:
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = f"Dawn risk - cannot wait for cheap window (battery too low), importing now",
-            power_watts    = 8000,
+            power_watts    = 10000,
             target_soc_pct = target_soc,
         )
 
@@ -454,7 +454,7 @@ class BatteryManager:
                         f"{saving_p:.2f}p/kWh cheaper than today {today_rate:.2f}p. "
                         f"Deferring to 00:05"
                     ),
-                    power_watts      = 8000,
+                    power_watts      = 10000,
                     target_soc_pct   = target_soc,
                     scheduled_time   = import_time,
                 )
@@ -464,7 +464,7 @@ class BatteryManager:
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = f"Dawn risk ({viability.soc_at_dawn_kwh:.1f} kWh at dawn, need {viability.dawn_target_kwh:.1f}). Importing now at Tracker {rate_str}",
-            power_watts    = 8000,
+            power_watts    = 10000,
             target_soc_pct = target_soc,
         )
 
@@ -481,7 +481,7 @@ class BatteryManager:
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = "Dawn risk - no Agile rates available, importing now",
-                power_watts    = 8000,
+                power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
 
@@ -498,7 +498,7 @@ class BatteryManager:
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = "Dawn risk - no future Agile slots before dawn, importing now",
-                power_watts    = 8000,
+                power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
 
@@ -517,13 +517,13 @@ class BatteryManager:
                 return Decision(
                     action         = ACTION_START_IMPORT,
                     reason         = f"Dawn risk - cheapest Agile slot now ({rate:.2f}p/kWh), importing",
-                    power_watts    = 8000,
+                    power_watts    = 10000,
                     target_soc_pct = target_soc,
                 )
             return Decision(
                 action           = ACTION_SCHEDULE_IMPORT,
                 reason           = f"Dawn risk - scheduled import at {slot_dt.strftime('%H:%M')} ({rate:.2f}p/kWh Agile)",
-                power_watts      = 8000,
+                power_watts      = 10000,
                 target_soc_pct   = target_soc,
                 scheduled_time   = slot_dt,
             )
@@ -532,7 +532,7 @@ class BatteryManager:
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = "Dawn risk - no viable Agile slot available, importing now",
-            power_watts    = 8000,
+            power_watts    = 10000,
             target_soc_pct = target_soc,
         )
 

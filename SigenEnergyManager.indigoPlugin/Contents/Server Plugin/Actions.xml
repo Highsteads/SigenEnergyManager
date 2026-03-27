@@ -5,8 +5,8 @@
         <Name>Force Grid Import</Name>
         <CallbackMethod>actionForceGridImport</CallbackMethod>
         <ConfigUI>
-            <Field id="powerKw" type="textfield" defaultValue="8.0">
-                <Label>Charge power (kW, max 8.0):</Label>
+            <Field id="powerKw" type="textfield" defaultValue="10.0">
+                <Label>Charge power (kW, max 10.0):</Label>
             </Field>
             <Field id="targetSocPct" type="textfield" defaultValue="80">
                 <Label>Target SOC (%, 10-100):</Label>
