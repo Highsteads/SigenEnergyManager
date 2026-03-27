@@ -8,6 +8,9 @@
         <Name>Sigenergy Inverter</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+            <Field id="info" type="label">
+                <Label>Displays real-time power flows from the Sigenergy inverter via Modbus. No configuration required — managed automatically by the plugin.</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="batterySoc">
@@ -136,6 +139,9 @@
         <Name>Battery Manager</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+            <Field id="info" type="label">
+                <Label>Shows battery management decisions — dawn viability, import scheduling, and export control. No configuration required — managed automatically by the plugin.</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="managerStatus">
@@ -224,6 +230,9 @@
         <Name>Solar Forecast</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+            <Field id="info" type="label">
+                <Label>Shows Solcast solar generation forecasts for today and tomorrow, with bias correction. No configuration required — managed automatically by the plugin.</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="todayKwh">
@@ -287,6 +296,9 @@
         <Name>Tariff Monitor</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+            <Field id="info" type="label">
+                <Label>Shows Octopus Energy tariff rates for Tracker, Go, and Flux tariffs. No configuration required — managed automatically by the plugin.</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="tariffActive">
@@ -360,6 +372,9 @@
         <Name>Axle VPP Monitor</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
+            <Field id="info" type="label">
+                <Label>Shows Axle VPP export event status and state machine. No configuration required — managed automatically by the plugin.</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="vppStatus">
@@ -391,6 +406,11 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Estimated earnings changed</TriggerLabel>
                 <ControlPageLabel>Estimated Earnings (GBP)</ControlPageLabel>
+            </State>
+            <State id="vppLastExportKwh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>VPP export changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Export (kWh)</ControlPageLabel>
             </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>

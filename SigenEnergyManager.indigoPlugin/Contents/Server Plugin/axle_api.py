@@ -3,7 +3,7 @@
 # Filename:    axle_api.py
 # Description: Axle VPP REST API client - polls for export event schedule
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026
+# Date:        26-03-2026 15:30 GMT
 # Version:     1.0
 #
 # Adapted from SigenergySolar v3.1 axle_api.py

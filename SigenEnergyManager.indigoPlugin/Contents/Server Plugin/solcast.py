@@ -4,7 +4,7 @@
 # Description: Solcast solar forecast API client - direct calls with disk cache
 #              and daily bias correction
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026
+# Date:        26-03-2026 15:30 GMT
 # Version:     1.0
 #
 # Solcast Hobbyist plan: 10 API calls/day/site (max)
@@ -249,9 +249,14 @@ class SolcastForecast:
             response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
 
             if response.status_code == 429:
-                self.logger.warning(f"Solcast rate limit hit for site {site_id[:8]}...")
                 if cached:
+                    self.logger.debug(
+                        f"Solcast rate limit hit for site {site_id[:8]}... - using cached data"
+                    )
                     return cached.get("forecasts", [])
+                self.logger.warning(
+                    f"Solcast rate limit hit for site {site_id[:8]}... and no cached data available"
+                )
                 return None
 
             if response.status_code == 401:
@@ -370,11 +375,13 @@ class SolcastForecast:
                     dawn_times[date_str] = period_start
 
         # Remaining today (future hours only)
+        # Use naive datetime for comparison — keys are local-time strings (no tzinfo)
         now_hour = now_local.replace(minute=0, second=0, microsecond=0)
+        now_hour_naive = now_hour.replace(tzinfo=None)
         remaining_today_kwh = sum(
             wh / 1000.0
             for key, wh in hourly_p50_today.items()
-            if datetime.strptime(key, "%Y-%m-%d %H:%M:%S") >= now_hour
+            if datetime.strptime(key, "%Y-%m-%d %H:%M:%S") >= now_hour_naive
         )
 
         # Current and next hour watts

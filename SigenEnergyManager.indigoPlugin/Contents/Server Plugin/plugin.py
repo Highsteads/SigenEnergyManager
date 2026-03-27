@@ -6,13 +6,14 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026
-# Version:     1.0
+# Date:        27-03-2026 21:48 GMT
+# Version:     1.1
 
 import indigo
 import json
 import logging
 import os
+import platform
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -21,12 +22,13 @@ from datetime import datetime, timedelta, timezone
 # Secrets (from master secrets.py - never committed to git)
 # ============================================================
 
+sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "/Library/Application Support/Perceptive Automation")
 try:
     from secrets import (
         OCTOPUS_API_KEY, OCTOPUS_ACCOUNT, OCTOPUS_MPAN, OCTOPUS_SERIAL,
         SOLCAST_API_KEY, SOLCAST_SITE_1_ID, SOLCAST_SITE_2_ID,
-        AXLE_API_KEY, AXLE_CLIENT_ID,
+        AXLE_API_KEY,
     )
 except ImportError:
     OCTOPUS_API_KEY   = ""
@@ -37,7 +39,11 @@ except ImportError:
     SOLCAST_SITE_1_ID = ""
     SOLCAST_SITE_2_ID = ""
     AXLE_API_KEY      = ""
-    AXLE_CLIENT_ID    = ""
+
+try:
+    from plugin_utils import log_startup_banner
+except ImportError:
+    log_startup_banner = None
 
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
@@ -105,11 +111,10 @@ class Plugin(indigo.PluginBase):
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs):
         super().__init__(plugin_id, plugin_display_name, plugin_version, plugin_prefs)
 
-        # Log startup banner inside __init__ (params available here, not in startup())
-        indigo.server.log(
-            f"[{datetime.now().strftime('%H:%M:%S')}] "
-            f"{PLUGIN_NAME} v{PLUGIN_VERSION} initialising"
-        )
+        if log_startup_banner:
+            log_startup_banner(plugin_id, plugin_display_name, plugin_version)
+        else:
+            indigo.server.log(f"{plugin_display_name} v{plugin_version} starting")
 
         self.debug = plugin_prefs.get("showDebugInfo", False)
 
@@ -141,19 +146,27 @@ class Plugin(indigo.PluginBase):
         self.store["last_soc"]       = 0.0  # for SOC delta trigger
 
         # Daily energy accumulators (kWh, reset at midnight)
-        self.store["pv_daily_kwh"]          = 0.0
-        self.store["grid_import_daily_kwh"] = 0.0
-        self.store["grid_export_daily_kwh"] = 0.0
-        self.store["home_daily_kwh"]        = 0.0
-        self.store["peak_soc"]              = 0.0
-        self.store["min_soc"]               = 100.0
-        self.store["today_date"]            = datetime.now().strftime("%Y-%m-%d")
+        self.store["pv_daily_kwh"]              = 0.0
+        self.store["grid_import_daily_kwh"]     = 0.0
+        self.store["grid_export_daily_kwh"]     = 0.0
+        self.store["home_daily_kwh"]            = 0.0
+        self.store["peak_soc"]                  = 0.0
+        self.store["min_soc"]                   = 100.0
+        self.store["today_date"]                = datetime.now().strftime("%Y-%m-%d")
+        # Lifetime total anchors for daily delta computation (set on first Modbus read)
+        self.store["pv_lifetime_start_kwh"]     = None
+        self.store["import_lifetime_start_kwh"] = None
+        self.store["export_lifetime_start_kwh"] = None
 
         # VPP state machine
-        self.store["vpp_state"]          = VPP_IDLE
-        self.store["vpp_active"]         = False
-        self.store["vpp_event"]          = None
-        self.store["vpp_pre_charge_soc"] = 0.0
+        self.store["vpp_state"]            = VPP_IDLE
+        self.store["vpp_active"]           = False
+        self.store["vpp_event"]            = None
+        self.store["vpp_pre_charge_soc"]   = 0.0
+        self.store["vpp_export_start_kwh"]  = 0.0   # grid_export_daily_kwh at event start
+        self.store["vpp_last_export_kwh"]   = 0.0   # export kWh during last completed event
+        self.store["vpp_cooling_start"]     = 0.0   # time.time() when COOLING_OFF entered
+        self.store["vpp_release_alerted"]   = False # True once 45-min alert has been sent
 
         # Scheduled import state
         self.store["import_active"]          = False
@@ -162,6 +175,8 @@ class Plugin(indigo.PluginBase):
 
         # Export state
         self.store["export_active"]   = False
+        self.store["export_tier"]     = 0      # 0=off, 1=stage1, 2=stage2
+        self.store["export_power_w"]  = 0      # last Modbus-written export power (W)
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
@@ -172,6 +187,10 @@ class Plugin(indigo.PluginBase):
         log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} starting")
         self._init_modules()
         self.solcast.load_correction_factor()
+        # Set initial state images for all devices that already exist
+        # (deviceStartComm handles newly created devices; this handles existing ones on reload)
+        for dev in indigo.devices.iter("self"):
+            self._set_device_initial_state(dev)
         log(f"{PLUGIN_NAME} ready")
 
     def shutdown(self):
@@ -187,9 +206,67 @@ class Plugin(indigo.PluginBase):
 
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
+        try:
+            self._set_device_initial_state(dev)
+        except Exception as e:
+            self.logger.error(f"deviceStartComm error for {dev.name}: {e}")
 
     def deviceStopComm(self, dev):
         pass
+
+    def _set_device_initial_state(self, dev):
+        """Write placeholder states and state image for a device on startup."""
+        type_id = dev.deviceTypeId
+
+        if type_id == "sigenergyInverter":
+            dev.updateStatesOnServer([
+                {"key": "batterySoc",        "value": "0.0"},
+                {"key": "pvPowerWatts",      "value": "0"},
+                {"key": "gridPowerWatts",    "value": "0"},
+                {"key": "batteryPowerWatts", "value": "0"},
+                {"key": "homePowerWatts",    "value": "0"},
+                {"key": "modbusConnected",   "value": "False"},
+                {"key": "lastUpdate",        "value": "Initialising..."},
+            ])
+            dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOff)
+
+        elif type_id == "batteryManager":
+            dev.updateStatesOnServer([
+                {"key": "managerStatus", "value": "Initialising"},
+                {"key": "currentAction", "value": "self_consumption"},
+                {"key": "currentReason", "value": "Starting up"},
+                {"key": "dawnViable",    "value": ""},
+                {"key": "socAtDawn",     "value": ""},
+                {"key": "lastUpdate",    "value": "Initialising..."},
+            ])
+            dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
+
+        elif type_id == "solarForecast":
+            dev.updateStatesOnServer([
+                {"key": "todayKwh",       "value": "0.0"},
+                {"key": "tomorrowKwh",    "value": "0.0"},
+                {"key": "forecastStatus", "value": "Initialising"},
+                {"key": "lastUpdate",     "value": "Initialising..."},
+            ])
+            dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
+
+        elif type_id == "tariffMonitor":
+            dev.updateStatesOnServer([
+                {"key": "tariffActive", "value": "Initialising"},
+                {"key": "rateToday",    "value": ""},
+                {"key": "rateTomorrow", "value": ""},
+                {"key": "lastUpdate",   "value": "Initialising..."},
+            ])
+            dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
+
+        elif type_id == "axleVppMonitor":
+            dev.updateStatesOnServer([
+                {"key": "vppStatus",        "value": "Standby"},
+                {"key": "vppState",         "value": "idle"},
+                {"key": "vppLastExportKwh", "value": "0.00"},
+                {"key": "lastUpdate",       "value": "Initialising..."},
+            ])
+            dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 
     def runConcurrentThread(self):
         """Main 10-second polling loop."""
@@ -276,18 +353,73 @@ class Plugin(indigo.PluginBase):
         self._update_inverter_device(data)
 
     def _accumulate_daily_energy(self, data):
-        """Integrate instantaneous power readings into daily kWh totals."""
-        interval_h = MODBUS_POLL_INTERVAL / 3600.0  # hours per poll
+        """Compute daily energy totals from Modbus registers where available.
 
-        pv_w   = data.get("pvPowerWatts", 0)
-        grid_w = data.get("gridPowerWatts", 0)
-        home_w = data.get("homePowerWatts", 0)
+        Home consumption: register 30092 resets at midnight on the inverter —
+        read directly; always accurate regardless of when the plugin started.
 
-        self.store["pv_daily_kwh"]          += max(0, pv_w)   * interval_h / 1000.0
-        self.store["home_daily_kwh"]        += max(0, home_w) * interval_h / 1000.0
-        self.store["grid_import_daily_kwh"] += max(0, grid_w) * interval_h / 1000.0
-        self.store["grid_export_daily_kwh"] += max(0, -grid_w) * interval_h / 1000.0
+        PV / grid import / grid export: only lifetime totals exist in the protocol
+        (30088, 30216, 30220).  We snapshot the lifetime value at midnight (or at
+        first read after plugin startup) and compute daily = current - snapshot.
+        This is accurate for any full day even if the plugin restarts mid-day.
 
+        If a register read fails the fallback is watt-integration (original method).
+        """
+        interval_h = MODBUS_POLL_INTERVAL / 3600.0   # fallback: hours per poll
+
+        # --- Home daily: read directly from 30092 (resets at midnight) ---
+        home_direct = data.get("homeDailyDirectKwh")
+        if home_direct is not None:
+            self.store["home_daily_kwh"] = home_direct
+        else:
+            self.store["home_daily_kwh"] += (
+                max(0, data.get("homePowerWatts", 0)) * interval_h / 1000.0
+            )
+
+        # --- PV daily: delta from lifetime total (30088) ---
+        pv_lifetime = data.get("pvLifetimeKwh")
+        if pv_lifetime is not None:
+            if self.store["pv_lifetime_start_kwh"] is None:
+                self.store["pv_lifetime_start_kwh"] = pv_lifetime
+                self.logger.info(
+                    f"[Energy] PV lifetime anchor: {pv_lifetime:.2f} kWh "
+                    f"(daily PV starts from this point)"
+                )
+            self.store["pv_daily_kwh"] = max(
+                0.0, pv_lifetime - self.store["pv_lifetime_start_kwh"]
+            )
+        else:
+            self.store["pv_daily_kwh"] += (
+                max(0, data.get("pvPowerWatts", 0)) * interval_h / 1000.0
+            )
+
+        # --- Grid import daily: delta from lifetime total (30216) ---
+        imp_lifetime = data.get("gridImportLifetimeKwh")
+        if imp_lifetime is not None:
+            if self.store["import_lifetime_start_kwh"] is None:
+                self.store["import_lifetime_start_kwh"] = imp_lifetime
+            self.store["grid_import_daily_kwh"] = max(
+                0.0, imp_lifetime - self.store["import_lifetime_start_kwh"]
+            )
+        else:
+            self.store["grid_import_daily_kwh"] += (
+                max(0, data.get("gridPowerWatts", 0)) * interval_h / 1000.0
+            )
+
+        # --- Grid export daily: delta from lifetime total (30220) ---
+        exp_lifetime = data.get("gridExportLifetimeKwh")
+        if exp_lifetime is not None:
+            if self.store["export_lifetime_start_kwh"] is None:
+                self.store["export_lifetime_start_kwh"] = exp_lifetime
+            self.store["grid_export_daily_kwh"] = max(
+                0.0, exp_lifetime - self.store["export_lifetime_start_kwh"]
+            )
+        else:
+            self.store["grid_export_daily_kwh"] += (
+                max(0, -data.get("gridPowerWatts", 0)) * interval_h / 1000.0
+            )
+
+        # --- SOC peak/low tracking ---
         soc = data.get("batterySoc", 0.0)
         if soc > self.store["peak_soc"]:
             self.store["peak_soc"] = soc
@@ -316,9 +448,12 @@ class Plugin(indigo.PluginBase):
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
             dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 10)),
-            export_enabled     = prefs.get("exportEnabled", False),
-            export_trigger_pct = float(prefs.get("exportTriggerSoc", 90)),
-            max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
+            export_enabled        = prefs.get("exportEnabled", False),
+            export_stage1_soc_pct = float(prefs.get("exportStage1Soc", 80)),
+            export_stage1_kw      = float(prefs.get("exportStage1Kw", 2.0)),
+            export_stage2_soc_pct = float(prefs.get("exportStage2Soc", 90)),
+            export_stage2_kw      = float(prefs.get("exportStage2Kw", 4.0)),
+            current_export_tier   = self.store.get("export_tier", 0),
             tariff             = tariff_data,
             forecast_p50       = self.latest_forecast_data.get("_hourly_p50_today", {}),
             forecast_p10       = self.latest_forecast_data.get("_hourly_p10_today", {}),
@@ -365,6 +500,18 @@ class Plugin(indigo.PluginBase):
         prev_import = self.store["import_active"]
         prev_export = self.store["export_active"]
 
+        # ── DNO cap for export-limit writes ─────────────────────────────────────
+        # When export is active:  limit = tier power (2kW or 4kW)
+        # When export is stopped: NEVER write 0W — Sigenergy interprets 0W as a
+        # global output constraint and throttles battery discharge to prevent any
+        # accidental export, causing grid import even at high SOC at night.
+        # Instead use the DNO cap at night (no PV) or 0W only if PV is generating.
+        pv_watts   = self.latest_inverter_data.get("pvPowerWatts", 0)
+        dno_cap_w  = int(float(self.pluginPrefs.get("exportStage2Kw", 4.0)) * 1000)
+        # 0W only when solar is actively generating (prevents accidental PV export
+        # below the export tier threshold); otherwise DNO cap allows free discharge.
+        idle_limit = 0 if pv_watts > 500 else dno_cap_w
+
         if action == ACTION_START_IMPORT:
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
@@ -391,20 +538,33 @@ class Plugin(indigo.PluginBase):
                 self.store["import_scheduled_logged"] = str(decision.scheduled_time)
 
         elif action == ACTION_START_EXPORT:
-            if not prev_export and not self.store["import_active"]:
-                log(f"[Manager] Starting export: {decision.reason}")
-                export_w = decision.power_watts or int(
-                    float(self.pluginPrefs.get("maxExportKw", 4.0)) * 1000
-                )
-                if self.modbus.force_discharge(export_w):
-                    self.store["export_active"] = True
-                    self._trigger_event("exportStarted")
+            new_power_w    = decision.power_watts or dno_cap_w
+            current_power_w = self.store.get("export_power_w", 0)
+            power_changed   = prev_export and (current_power_w != new_power_w)
+
+            if not self.store["import_active"] and (not prev_export or power_changed):
+                verb = "Updating" if power_changed else "Starting"
+                log(f"[Manager] {verb} export (tier {decision.export_tier}, "
+                    f"{new_power_w}W): {decision.reason}")
+                # Set the export limit register — surplus solar exports naturally in
+                # Self-Consumption mode without curtailing PV (do NOT use force_discharge
+                # which sets mode 0x06 and cuts PV generation entirely)
+                if self.modbus.set_export_limit(new_power_w):
+                    self.modbus.set_self_consumption()   # ensure Remote EMS mode 0x02
+                    self.store["export_active"]  = True
+                    self.store["export_power_w"] = new_power_w
+                    self.store["export_tier"]    = decision.export_tier
+                    if not prev_export:
+                        self._trigger_event("exportStarted")
 
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
-                log("[Manager] Stopping export - returning to self-consumption")
-                self.modbus.set_self_consumption()
-                self.store["export_active"] = False
+                log(f"[Manager] Stopping export - setting idle limit to {idle_limit}W "
+                    f"(PV={pv_watts}W)")
+                self.modbus.set_export_limit(idle_limit)
+                self.store["export_active"]  = False
+                self.store["export_power_w"] = 0
+                self.store["export_tier"]    = 0
                 self._trigger_event("exportStopped")
 
         elif action == ACTION_SELF_CONSUMPTION:
@@ -413,9 +573,12 @@ class Plugin(indigo.PluginBase):
                 log("[Manager] Returning to self-consumption")
                 self.modbus.set_self_consumption()
                 if prev_export:
+                    self.modbus.set_export_limit(idle_limit)
                     self._trigger_event("exportStopped")
-                self.store["import_active"] = False
-                self.store["export_active"] = False
+                self.store["import_active"]  = False
+                self.store["export_active"]  = False
+                self.store["export_power_w"] = 0
+                self.store["export_tier"]    = 0
 
         # Check if active import has reached target SOC
         if self.store["import_active"]:
@@ -539,40 +702,40 @@ class Plugin(indigo.PluginBase):
         if not self.axle or not self.pluginPrefs.get("axleEnabled", False):
             return
 
-        event = self.axle.get_next_event()
-        now   = datetime.now(timezone.utc)
-
+        event         = self.axle.get_next_event()
+        now           = datetime.now(timezone.utc)
         current_state = self.store["vpp_state"]
 
-        # Check if Axle has taken Sigen Cloud control (EMS mode = Remote EMS
-        # but NOT because WE set it)
-        ems_mode_str = self.latest_inverter_data.get("emsWorkMode", "")
-        axle_in_control = (
-            "Remote EMS" in ems_mode_str
-            and not self.store["import_active"]
-            and not self.store["export_active"]
-            and current_state in (VPP_ACTIVE, VPP_PRE_CHARGING)
-        )
-
         if event is None:
-            # No upcoming event
+            # Axle API returns None when no event is scheduled or the event has ended
+
             if current_state == VPP_ACTIVE:
-                # Check if Axle has released control
-                if not axle_in_control:
-                    self._vpp_transition(VPP_COOLING_OFF)
-                    self.store["vpp_active"] = False
+                # Event ended (API stopped returning it)
+                vpp_export = (self.store["grid_export_daily_kwh"]
+                              - self.store.get("vpp_export_start_kwh", 0.0))
+                self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
+                self.store["vpp_cooling_start"]   = time.time()
+                self._vpp_transition(VPP_COOLING_OFF)
+                self.store["vpp_active"] = False
+                self._trigger_event("vppEnded")
+                log(
+                    f"[VPP] Event complete. Estimated VPP export: {vpp_export:.2f} kWh. "
+                    f"Waiting for Axle to release inverter..."
+                )
+
             elif current_state == VPP_COOLING_OFF:
-                # Short cool-off period then return to idle
-                self._vpp_transition(VPP_IDLE)
-                self._restore_discharge_cutoff()
+                self._vpp_check_axle_release()
+
             elif current_state != VPP_IDLE:
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
+
+            self._update_vpp_device()
             return
 
         # Event is scheduled
-        start_time   = event["start_time"]
-        end_time     = event["end_time"]
+        start_time     = event["start_time"]
+        end_time       = event["end_time"]
         hours_to_start = (start_time - now).total_seconds() / 3600.0
 
         if current_state == VPP_IDLE and hours_to_start > 0:
@@ -586,11 +749,8 @@ class Plugin(indigo.PluginBase):
 
         elif current_state == VPP_ANNOUNCED:
             if hours_to_start <= 1.0:
-                # 1-hour warning
-                log(f"[VPP] Event in {hours_to_start:.1f}h - preparing pre-charge")
-
+                log(f"[VPP] Event in {hours_to_start * 60:.0f} min - preparing")
             if hours_to_start <= 0.5:
-                # Enter pre-charge
                 self._start_vpp_precharge(event)
 
         elif current_state == VPP_PRE_CHARGING:
@@ -598,53 +758,195 @@ class Plugin(indigo.PluginBase):
             current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
 
             if current_soc >= required_soc or hours_to_start <= 0:
-                # Pre-charge complete or event starting
                 if self.modbus:
                     self.modbus.set_self_consumption()
-                log(f"[VPP] Pre-charge complete. SOC: {current_soc:.0f}%")
+                log(f"[VPP] Ready for event. SOC: {current_soc:.0f}%")
 
             if hours_to_start <= 0:
+                # Record export baseline when Axle takes over
+                self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
                 log(f"[VPP] Event ACTIVE - Axle has control")
 
         elif current_state == VPP_ACTIVE:
-            # Check for event end
             if now >= end_time:
+                # Time-based end — record export and begin waiting for Axle release
+                vpp_export = (self.store["grid_export_daily_kwh"]
+                              - self.store.get("vpp_export_start_kwh", 0.0))
+                self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
+                self.store["vpp_cooling_start"]   = time.time()
                 self._vpp_transition(VPP_COOLING_OFF)
                 self.store["vpp_active"] = False
                 self._trigger_event("vppEnded")
-                log(f"[VPP] Event ended - restoring battery manager control")
+                log(
+                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
+                    f"Waiting for Axle to release inverter..."
+                )
+
+        elif current_state == VPP_COOLING_OFF:
+            # Axle API may still return the event briefly after it ends
+            self._vpp_check_axle_release()
 
         self._update_vpp_device()
 
+    def _vpp_check_axle_release(self):
+        """Check if Axle has released the inverter and reinstate Remote EMS.
+
+        Axle always reverts the inverter to 'Max Self Consumption' (local mode,
+        register 30003 = 0) when an event ends.  We watch emsWorkMode for that
+        string — the moment we see it we know Axle has handed back control and
+        we can switch to Remote EMS (set_self_consumption() enables 40029=1 +
+        mode 0x02 in 40031, which puts 30003 back to 7 "Remote EMS").
+
+        Alert thresholds after VPP_COOLING_OFF was entered (vpp_cooling_start):
+          45 min  — Pushover + email to axle@strudwick.co.uk
+          60 min  — Force reinstatement regardless of EMS mode
+        """
+        ems_mode      = self.latest_inverter_data.get("emsWorkMode", "")
+        axle_released = "Self" in ems_mode   # Axle releases to "Self-Consumption" (mode 0)
+
+        cooling_start    = self.store.get("vpp_cooling_start", 0)
+        elapsed_secs     = time.time() - cooling_start
+        alerted          = self.store.get("vpp_release_alerted", False)
+        ALERT_SECS       = 2700   # 45 minutes
+        FORCE_SECS       = 3600   # 60 minutes
+
+        # Send alert at 45 min if not yet released
+        if elapsed_secs >= ALERT_SECS and not alerted and not axle_released:
+            self.store["vpp_release_alerted"] = True
+            elapsed_min = int(elapsed_secs / 60)
+            log(
+                f"[VPP] WARNING: Axle has not released inverter after {elapsed_min} min "
+                f"(EMS mode: '{ems_mode}'). Sending alert.",
+                level="WARNING"
+            )
+            self._send_vpp_release_alert(elapsed_min, ems_mode)
+
+        # Still waiting and not yet at force timeout
+        if not (axle_released or elapsed_secs >= FORCE_SECS):
+            if self.debug:
+                log(f"[VPP] Waiting for Axle release "
+                    f"(EMS='{ems_mode}', {int(elapsed_secs)}s elapsed)")
+            return
+
+        # Either released naturally or force timeout reached
+        if not axle_released:
+            log(
+                f"[VPP] 60-min timeout - forcing Remote EMS reinstatement "
+                f"(EMS still: '{ems_mode}')",
+                level="WARNING"
+            )
+        else:
+            log(
+                f"[VPP] Axle released inverter (EMS now: '{ems_mode}') - "
+                f"reinstating Remote EMS (Max Self Consumption)"
+            )
+
+        if self.modbus:
+            self.modbus.set_self_consumption()
+
+        self._restore_discharge_cutoff()
+        self._vpp_transition(VPP_IDLE)
+        self.store["vpp_event"]           = None
+        self.store["vpp_release_alerted"] = False   # reset for next event
+        self.store["had_vpp_today"]       = True
+
+    def _send_vpp_release_alert(self, elapsed_min, ems_mode):
+        """Send Pushover + email when Axle has not released the inverter on time."""
+        subject = f"Axle VPP - Inverter not released after {elapsed_min} min"
+        plain   = (
+            f"The Axle VPP event ended {elapsed_min} minutes ago but the "
+            f"Sigenergy inverter has not returned to Self Consumption mode.\n\n"
+            f"Current EMS mode: {ems_mode}\n"
+            f"Expected: Max Self Consumption\n\n"
+            f"Remote EMS will be force-reinstated at 60 minutes if Axle has "
+            f"still not released.\n\nPlease check the Axle app and Sigenergy portal."
+        )
+        html    = (
+            f"<html><body>"
+            f"<p>The Axle VPP event ended <strong>{elapsed_min} minutes ago</strong> "
+            f"but the Sigenergy inverter has not returned to Self Consumption mode.</p>"
+            f"<p><strong>Current EMS mode:</strong> {ems_mode}<br>"
+            f"<strong>Expected:</strong> Max Self Consumption</p>"
+            f"<p>Remote EMS will be force-reinstated at 60 minutes if Axle has "
+            f"still not released.</p>"
+            f"<p>Please check the Axle app and Sigenergy portal.</p>"
+            f"</body></html>"
+        )
+
+        # Pushover alert
+        try:
+            pushover = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
+            if pushover and pushover.isEnabled():
+                pushover.executeAction("sendPushover", props={
+                    "title":    subject,
+                    "message":  plain,
+                    "priority": "1",   # high priority
+                })
+                log("[VPP] Pushover alert sent")
+        except Exception as e:
+            log(f"[VPP] Pushover alert failed: {e}", level="WARNING")
+
+        # Email to Axle support
+        try:
+            email_plugin = indigo.server.getPlugin("com.indigodomo.email")
+            if email_plugin and email_plugin.isEnabled():
+                email_plugin.executeAction("sendEmail", deviceId=1192809466,
+                    props={
+                        "emailTo":      "axle@strudwick.co.uk",
+                        "emailSubject": subject,
+                        "emailBody":    html,
+                    }
+                )
+                log("[VPP] Email alert sent to axle@strudwick.co.uk")
+        except Exception as e:
+            log(f"[VPP] Email alert failed: {e}", level="WARNING")
+
     def _start_vpp_precharge(self, event):
-        """Calculate and start pre-charge for VPP export event."""
-        duration_hrs = event.get("duration_hrs", 1.0)
-        cap_kwh      = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
-        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        """Calculate required SOC for VPP event; pre-charge only if needed.
 
-        # Energy to export + reserve
-        export_kwh     = max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
-        required_kwh   = export_kwh + VPP_RESERVE_KWH
-        required_soc   = min(100.0, (required_kwh / cap_kwh) * 100.0)
-        required_soc   = max(required_soc, float(self.pluginPrefs.get("dawnSocTarget", 10)))
+        Pre-charge is skipped if the current SOC already covers the event
+        export plus the configured dawn SOC target.  The discharge cutoff
+        register is always set to the dawn target for reserve protection.
+        """
+        duration_hrs    = event.get("duration_hrs", 1.0)
+        cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
+        max_export_kw   = float(self.pluginPrefs.get("exportStage2Kw", 4.0))
+        dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
 
-        reserve_soc    = (VPP_RESERVE_KWH / cap_kwh) * 100.0
+        # Energy Axle will export + dawn reserve (replaces hard-coded 12 kWh)
+        export_kwh    = max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
+        dawn_kwh      = cap_kwh * dawn_target_pct / 100.0
+        required_kwh  = export_kwh + dawn_kwh
+        required_soc  = min(100.0, (required_kwh / cap_kwh) * 100.0)
+        required_soc  = max(required_soc, dawn_target_pct)
+
+        # Current battery level
+        current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
+        current_kwh  = cap_kwh * current_soc / 100.0
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        log(
-            f"[VPP] Pre-charging to {required_soc:.0f}% for {duration_hrs:.1f}h event "
-            f"({export_kwh:.1f} kWh export + {VPP_RESERVE_KWH} kWh reserve)"
-        )
-
-        # Set discharge cutoff register for reserve protection
+        # Always set discharge cutoff to dawn target for reserve protection
         if self.modbus:
-            self.modbus.set_discharge_cutoff(reserve_soc)
-            current_soc = self.latest_inverter_data.get("batterySoc", 0.0)
-            if current_soc < required_soc:
+            self.modbus.set_discharge_cutoff(dawn_target_pct)
+
+        if current_kwh >= required_kwh:
+            log(
+                f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
+                f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) + dawn reserve "
+                f"({dawn_kwh:.1f} kWh) - no pre-charge needed"
+            )
+        else:
+            shortfall = required_kwh - current_kwh
+            log(
+                f"[VPP] Pre-charging to {required_soc:.0f}% for {duration_hrs:.1f}h event "
+                f"({export_kwh:.1f} kWh export + {dawn_kwh:.1f} kWh dawn reserve, "
+                f"shortfall: {shortfall:.1f} kWh)"
+            )
+            if self.modbus:
                 self.modbus.force_charge(8000)
 
         self._vpp_transition(VPP_PRE_CHARGING)
@@ -687,13 +989,17 @@ class Plugin(indigo.PluginBase):
         self._write_daily_history(yesterday)
 
         # Reset accumulators
-        self.store["pv_daily_kwh"]          = 0.0
-        self.store["grid_import_daily_kwh"] = 0.0
-        self.store["grid_export_daily_kwh"] = 0.0
-        self.store["home_daily_kwh"]        = 0.0
-        self.store["peak_soc"]              = 0.0
-        self.store["min_soc"]               = 100.0
-        self.store["today_date"]            = today
+        self.store["pv_daily_kwh"]              = 0.0
+        self.store["grid_import_daily_kwh"]     = 0.0
+        self.store["grid_export_daily_kwh"]     = 0.0
+        self.store["home_daily_kwh"]            = 0.0
+        self.store["peak_soc"]                  = 0.0
+        self.store["min_soc"]                   = 100.0
+        self.store["today_date"]                = today
+        # Clear lifetime anchors — next poll will re-snapshot at the new day's baseline
+        self.store["pv_lifetime_start_kwh"]     = None
+        self.store["import_lifetime_start_kwh"] = None
+        self.store["export_lifetime_start_kwh"] = None
 
         self._save_accumulators()
 
@@ -900,17 +1206,18 @@ class Plugin(indigo.PluginBase):
             end_str      = event["end_time"].strftime("%H:%M")
             duration_hrs = event.get("duration_hrs", 0.0)
 
-        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        max_export_kw = float(self.pluginPrefs.get("exportStage2Kw", 4.0))
         earnings_est  = round(max_export_kw * duration_hrs * 1.00, 2)  # GBP1/kWh Axle rate
 
         states = [
-            {"key": "vppStatus",      "value": "Active" if self.store["vpp_active"] else "Standby"},
-            {"key": "vppState",       "value": self.store["vpp_state"]},
-            {"key": "eventStartTime", "value": start_str},
-            {"key": "eventEndTime",   "value": end_str},
+            {"key": "vppStatus",         "value": "Active" if self.store["vpp_active"] else "Standby"},
+            {"key": "vppState",          "value": self.store["vpp_state"]},
+            {"key": "eventStartTime",    "value": start_str},
+            {"key": "eventEndTime",      "value": end_str},
             {"key": "preChargeRequired", "value": str(self.store["vpp_pre_charge_soc"])},
             {"key": "estimatedEarnings", "value": str(earnings_est)},
-            {"key": "lastUpdate",     "value": datetime.now().strftime("%H:%M:%S")},
+            {"key": "vppLastExportKwh",  "value": str(round(self.store.get("vpp_last_export_kwh", 0.0), 2))},
+            {"key": "lastUpdate",        "value": datetime.now().strftime("%H:%M:%S")},
         ]
         dev.updateStatesOnServer(states)
 
@@ -986,7 +1293,7 @@ class Plugin(indigo.PluginBase):
     # Indigo Menu Callbacks
     # ================================================================
 
-    def menuRefreshAll(self, values_dict, menu_item_id):
+    def menuRefreshAll(self):
         """Menu: Force refresh Solcast + Octopus + re-evaluate manager."""
         log("[Menu] Refresh All: fetching Solcast, Octopus and re-evaluating...")
         self._refresh_solcast(force=True)
@@ -998,37 +1305,87 @@ class Plugin(indigo.PluginBase):
         log("[Menu] Refresh All complete")
         return True
 
-    def menuShowStatus(self, values_dict, menu_item_id):
+    def menuShowStatus(self):
         """Menu: Log current manager status to event log."""
-        dev = self._find_device("batteryManager")
-        if dev:
-            action  = dev.states.get("currentAction", "unknown")
-            reason  = dev.states.get("currentReason", "")
-            soc_str = dev.states.get("socAtDawn", "")
-            viable  = dev.states.get("dawnViable", "")
-            sched   = dev.states.get("importScheduledTime", "")
-            log(
-                f"[Status] Action={action} | Reason={reason} | "
-                f"DawnViable={viable} | SocAtDawn={soc_str}kWh"
-                + (f" | ImportAt={sched}" if sched else "")
-            )
-        else:
-            log("[Status] No batteryManager device found", level="WARNING")
+        from datetime import datetime as _dt
+        now_str  = _dt.now().strftime("%H:%M:%S")
+        capacity = float(self.pluginPrefs.get("batteryCapacityKwh", 35.04))
 
-        inv = self._find_device("sigenergyInverter")
+        inv   = self._find_device("sigenergyInverter")
+        mgr   = self._find_device("batteryManager")
+        fcast = self._find_device("solarForecast")
+        tarif = self._find_device("tariffMonitor")
+
+        log("[Status] ======= Live Status: " + now_str + " =======")
+
+        # --- Battery ---
         if inv:
-            soc     = inv.states.get("batterySoc", "?")
-            pv      = inv.states.get("pvPowerWatts", "?")
-            grid    = inv.states.get("gridPowerWatts", "?")
-            modbus  = inv.states.get("modbusConnected", "False")
-            updated = inv.states.get("lastUpdate", "")
-            log(
-                f"[Status] SOC={soc}% | PV={pv}W | Grid={grid}W | "
-                f"Modbus={'OK' if modbus == 'True' else 'OFFLINE'} | Updated={updated}"
-            )
+            soc_pct  = float(inv.states.get("batterySoc", 0))
+            soc_kwh  = soc_pct / 100.0 * capacity
+            batt_w   = int(inv.states.get("batteryPowerWatts", 0))
+            modbus   = inv.states.get("modbusConnected", "False")
+            if batt_w > 50:
+                batt_str = f"Charging {batt_w}W"
+            elif batt_w < -50:
+                batt_str = f"Discharging {abs(batt_w)}W"
+            else:
+                batt_str = "Idle"
+            log(f"[Status] Battery:  {soc_pct:.1f}% SOC  |  {soc_kwh:.1f} kWh stored  |  {batt_str}"
+                f"  |  Modbus: {'OK' if modbus == 'True' else 'OFFLINE'}")
+        else:
+            log("[Status] Battery:  No inverter device found", level="WARNING")
+
+        # --- Solar & Grid & Home ---
+        if inv:
+            pv_w    = int(inv.states.get("pvPowerWatts", 0))
+            grid_w  = int(inv.states.get("gridPowerWatts", 0))
+            home_w  = int(inv.states.get("homePowerWatts", 0))
+            ems     = inv.states.get("emsWorkMode", "Unknown")
+            grid_str = f"Exporting {abs(grid_w)}W" if grid_w < -50 else (
+                       f"Importing {grid_w}W" if grid_w > 50 else "Idle (grid)")
+            pv_today   = self.store.get("pv_daily_kwh", 0.0)
+            imp_today  = self.store.get("grid_import_daily_kwh", 0.0)
+            exp_today  = self.store.get("grid_export_daily_kwh", 0.0)
+            home_today = self.store.get("home_daily_kwh", 0.0)
+            fcst_remain  = fcast.states.get("correctedTodayKwh", "?") if fcast else "?"
+            fcst_tmrw    = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
+            try:
+                fcst_expected_total = round(pv_today + float(fcst_remain), 1)
+            except (ValueError, TypeError):
+                fcst_expected_total = "?"
+            log(f"[Status] Solar:    {pv_w}W now  |  {pv_today:.2f} kWh today"
+                f"  |  {fcst_remain} kWh forecast remaining  |  {fcst_expected_total} kWh expected total")
+            log(f"[Status] Grid:     {grid_str}  |  Import today {imp_today:.2f} kWh"
+                f"  |  Export today {exp_today:.2f} kWh")
+            log(f"[Status] Home:     {home_w}W now  |  {home_today:.2f} kWh today"
+                f"  |  EMS mode: {ems}")
+
+        # --- Tariff ---
+        if tarif:
+            t_name = tarif.states.get("tariffActive", "?")
+            t_rate = tarif.states.get("rateToday", "?")
+            t_tmrw = tarif.states.get("rateTomorrow", "?")
+            log(f"[Status] Tariff:   {t_name}  |  Today {t_rate}p/kWh  |  Tomorrow {t_tmrw}p/kWh")
+
+        # --- Manager decision ---
+        if mgr:
+            action   = mgr.states.get("currentAction", "unknown")
+            reason   = mgr.states.get("currentReason", "")
+            viable   = mgr.states.get("dawnViable", "?")
+            soc_dawn = mgr.states.get("socAtDawn", "?")
+            sched    = mgr.states.get("importScheduledTime", "")
+            log(f"[Status] Manager:  {action}  |  {reason}")
+            log(f"[Status] Dawn:     Viable={viable}  |  SOC at dawn {soc_dawn} kWh"
+                + (f"  |  Import scheduled {sched}" if sched else ""))
+
+        # --- Tomorrow ---
+        if fcast:
+            log(f"[Status] Tomorrow: {fcst_tmrw} kWh solar forecast")
+
+        log("[Status] =============================================")
         return True
 
-    def menuShowDailyHistory(self, values_dict, menu_item_id):
+    def menuShowDailyHistory(self):
         """Menu: Log last 7 days from daily_history.json."""
         path = os.path.join(self.data_dir, "daily_history.json")
         if not os.path.exists(path):
@@ -1059,7 +1416,7 @@ class Plugin(indigo.PluginBase):
             )
         return True
 
-    def menuShowTariffRates(self, values_dict, menu_item_id):
+    def menuShowTariffRates(self):
         """Menu: Log current Tracker/Go/Flux rates from cached Octopus data."""
         rates = self.latest_rates_data
         if not rates:
@@ -1094,7 +1451,7 @@ class Plugin(indigo.PluginBase):
                 f"standard={flux.get('standard_p', '?')}p")
         return True
 
-    def menuShowVppStatus(self, values_dict, menu_item_id):
+    def menuShowVppStatus(self):
         """Menu: Log current VPP state and next event details."""
         state   = self.store.get("vpp_state", "idle")
         active  = self.store.get("vpp_active", False)
@@ -1112,7 +1469,115 @@ class Plugin(indigo.PluginBase):
             log("[VPP] Axle API not configured", level="WARNING")
         return True
 
-    def menuToggleDebug(self, values_dict, menu_item_id):
+    def menuShowVppExport(self):
+        """Menu: Log VPP export summary for today."""
+        axle_enabled = self.pluginPrefs.get("axleEnabled", False)
+        state        = self.store.get("vpp_state", "idle")
+        active       = self.store.get("vpp_active", False)
+        last_export  = self.store.get("vpp_last_export_kwh", 0.0)
+        had_vpp      = self.store.get("had_vpp_today", False) or active
+
+        log("[VPP] ============ VPP Export Summary ============")
+        log(f"[VPP] Axle enabled:        {'YES' if axle_enabled else 'NO'}")
+        log(f"[VPP] Axle token:          {'configured' if self.axle else 'not set'}")
+        log(f"[VPP] Current state:       {state}")
+        log(f"[VPP] Event active:        {'YES - Axle in control' if active else 'No'}")
+
+        if active:
+            ongoing = (self.store["grid_export_daily_kwh"]
+                       - self.store.get("vpp_export_start_kwh", 0.0))
+            log(f"[VPP] Export so far:       {ongoing:.2f} kWh  (event in progress)")
+        elif had_vpp:
+            log(f"[VPP] Last event export:   {last_export:.2f} kWh")
+        else:
+            log("[VPP] Last event export:   No VPP event recorded today")
+
+        dev = self._find_device("axleVppMonitor")
+        if dev:
+            start = dev.states.get("eventStartTime", "")
+            end   = dev.states.get("eventEndTime", "")
+            earn  = dev.states.get("estimatedEarnings", "")
+            chg   = dev.states.get("preChargeRequired", "0")
+            if start:
+                log(f"[VPP] Event window:        {start} - {end}")
+                log(f"[VPP] Est. earnings:       GBP {earn}")
+                if float(chg) > 0:
+                    log(f"[VPP] Pre-charge target:   {chg}% SOC")
+                else:
+                    log(f"[VPP] Pre-charge:          Not needed (SOC sufficient)")
+
+        log("[VPP] =============================================")
+        return True
+
+    def menuShowTodaySummary(self):
+        """Menu: Log a human-readable summary of today's energy data."""
+        today   = datetime.now().strftime("%d-%b-%Y")
+        pv      = self.store.get("pv_daily_kwh", 0.0)
+        imp     = self.store.get("grid_import_daily_kwh", 0.0)
+        exp     = self.store.get("grid_export_daily_kwh", 0.0)
+        home    = self.store.get("home_daily_kwh", 0.0)
+        peak    = self.store.get("peak_soc", 0.0)
+        low     = self.store.get("min_soc", 100.0)
+        vpp_exp = self.store.get("vpp_last_export_kwh", 0.0)
+        had_vpp = self.store.get("had_vpp_today", False) or self.store.get("vpp_active", False)
+
+        inv         = self._find_device("sigenergyInverter")
+        current_soc = float(inv.states.get("batterySoc", 0)) if inv else 0.0
+        ems_mode    = inv.states.get("emsWorkMode", "Unknown") if inv else "Unknown"
+        pv_now      = inv.states.get("pvPowerWatts", "0") if inv else "0"
+        grid_now    = inv.states.get("gridPowerWatts", "0") if inv else "0"
+
+        mgr      = self._find_device("batteryManager")
+        action   = mgr.states.get("currentAction", "Unknown") if mgr else "Unknown"
+        reason   = mgr.states.get("currentReason", "") if mgr else ""
+        viable   = mgr.states.get("dawnViable", "?") if mgr else "?"
+        soc_dawn = mgr.states.get("socAtDawn", "?") if mgr else "?"
+
+        fcast       = self._find_device("solarForecast")
+        fcst_today  = fcast.states.get("correctedTodayKwh", "?") if fcast else "?"
+        fcst_tmrw   = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
+
+        tariff  = self._find_device("tariffMonitor")
+        t_name  = tariff.states.get("tariffActive", "?") if tariff else "?"
+        t_rate  = tariff.states.get("rateToday", "") if tariff else ""
+        t_tmrw  = tariff.states.get("rateTomorrow", "") if tariff else ""
+
+        import_note = "  (self-sufficient - no grid draw)" if imp < 0.05 else ""
+        export_note = f"  (VPP contribution: {vpp_exp:.2f} kWh)" if had_vpp and vpp_exp > 0 else ""
+        rate_str    = (f" at {t_rate}p/kWh" if t_rate else "")
+        tmrw_str    = (f"  |  tomorrow: {t_tmrw}p" if t_tmrw else "  |  tomorrow: TBD")
+
+        log(f"[Today] ======= Energy Summary: {today} =======")
+        try:
+            expected_total = round(pv + float(fcst_today), 1)
+        except (ValueError, TypeError):
+            expected_total = "?"
+        log(f"[Today] Solar generation:    {pv:.2f} kWh  (+{fcst_today} kWh remaining = {expected_total} kWh expected total)")
+        log(f"[Today] Home consumption:    {home:.2f} kWh")
+        log(f"[Today] Grid import:         {imp:.2f} kWh{import_note}")
+        log(f"[Today] Grid export:         {exp:.2f} kWh{export_note}")
+        log(f"[Today] Battery SOC now:     {current_soc:.0f}%  "
+            f"(peak {peak:.0f}%,  low {low:.0f}%)")
+        log(f"[Today] EMS mode:            {ems_mode}")
+        log(f"[Today] Manager action:      {action}")
+        if reason:
+            log(f"[Today] Reason:              {reason}")
+        log(f"[Today] Dawn viability:      {viable}  |  SOC at dawn: {soc_dawn} kWh")
+        log(f"[Today] Tariff:              {t_name}{rate_str}{tmrw_str}")
+        log(f"[Today] Tomorrow forecast:   {fcst_tmrw} kWh solar expected")
+        log(f"[Today] Live:                PV {pv_now} W  |  Grid {grid_now} W")
+        if had_vpp:
+            vpp_state = self.store.get("vpp_state", "idle")
+            if self.store.get("vpp_active"):
+                ongoing = exp - self.store.get("vpp_export_start_kwh", 0.0)
+                log(f"[Today] VPP:                 ACTIVE ({ongoing:.2f} kWh exported so far)")
+            else:
+                log(f"[Today] VPP:                 Completed  ({vpp_exp:.2f} kWh exported)  "
+                    f"state: {vpp_state}")
+        log(f"[Today] =============================================")
+        return True
+
+    def menuToggleDebug(self):
         """Menu: Toggle debug logging on/off."""
         self.debug = not self.debug
         self.pluginPrefs["showDebugInfo"] = self.debug
@@ -1165,11 +1630,14 @@ class Plugin(indigo.PluginBase):
             plant_address=plant_addr, inverter_address=inv_addr,
             logger=self.logger,
         )
-        # Set export limit on inverter (register 40038)
+        # Initialise export limit to DNO cap at startup — never 0W, because 0W causes
+        # Sigenergy to throttle battery discharge and import from grid even at high SOC.
+        # The decision engine will set the correct tier limit once PV is generating and
+        # SOC thresholds are crossed.  0W is set only during solar hours if needed.
         if prefs.get("exportEnabled", False):
-            max_export_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
             if self.modbus.connect():
-                self.modbus.set_export_limit(max_export_w)
+                dno_startup_w = int(float(prefs.get("exportStage2Kw", 4.0)) * 1000)
+                self.modbus.set_export_limit(dno_startup_w)
 
         # Solcast
         self.solcast = SolcastForecast(
@@ -1225,13 +1693,16 @@ class Plugin(indigo.PluginBase):
         """Save daily accumulators to disk (survives plugin reload)."""
         path = os.path.join(self.data_dir, "accumulators.json")
         data = {
-            "pv_daily_kwh":          self.store["pv_daily_kwh"],
-            "grid_import_daily_kwh": self.store["grid_import_daily_kwh"],
-            "grid_export_daily_kwh": self.store["grid_export_daily_kwh"],
-            "home_daily_kwh":        self.store["home_daily_kwh"],
-            "peak_soc":              self.store["peak_soc"],
-            "min_soc":               self.store["min_soc"],
-            "today_date":            self.store["today_date"],
+            "pv_daily_kwh":              self.store["pv_daily_kwh"],
+            "grid_import_daily_kwh":     self.store["grid_import_daily_kwh"],
+            "grid_export_daily_kwh":     self.store["grid_export_daily_kwh"],
+            "home_daily_kwh":            self.store["home_daily_kwh"],
+            "peak_soc":                  self.store["peak_soc"],
+            "min_soc":                   self.store["min_soc"],
+            "today_date":                self.store["today_date"],
+            "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
+            "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
+            "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1249,14 +1720,28 @@ class Plugin(indigo.PluginBase):
                 data = json.load(f)
             today = datetime.now().strftime("%Y-%m-%d")
             if data.get("today_date") == today:
-                # Same day - restore accumulators
-                self.store["pv_daily_kwh"]          = data.get("pv_daily_kwh", 0.0)
-                self.store["grid_import_daily_kwh"] = data.get("grid_import_daily_kwh", 0.0)
-                self.store["grid_export_daily_kwh"] = data.get("grid_export_daily_kwh", 0.0)
-                self.store["home_daily_kwh"]        = data.get("home_daily_kwh", 0.0)
-                self.store["peak_soc"]              = data.get("peak_soc", 0.0)
-                self.store["min_soc"]               = data.get("min_soc", 100.0)
-                self.store["today_date"]            = today
+                # Same day — restore accumulators and lifetime anchors
+                self.store["pv_daily_kwh"]              = data.get("pv_daily_kwh", 0.0)
+                self.store["grid_import_daily_kwh"]     = data.get("grid_import_daily_kwh", 0.0)
+                self.store["grid_export_daily_kwh"]     = data.get("grid_export_daily_kwh", 0.0)
+                self.store["home_daily_kwh"]            = data.get("home_daily_kwh", 0.0)
+                self.store["peak_soc"]                  = data.get("peak_soc", 0.0)
+                self.store["min_soc"]                   = data.get("min_soc", 100.0)
+                self.store["today_date"]                = today
+                # Restore lifetime anchors so delta computation continues correctly
+                self.store["pv_lifetime_start_kwh"]     = data.get("pv_lifetime_start_kwh")
+                self.store["import_lifetime_start_kwh"] = data.get("import_lifetime_start_kwh")
+                self.store["export_lifetime_start_kwh"] = data.get("export_lifetime_start_kwh")
                 self.logger.debug("Restored daily accumulators from disk")
         except Exception as e:
             self.logger.warning(f"Cannot load accumulators: {e}")
+
+    # -------------------------------------------------------------------------
+    # Menu handlers
+    # -------------------------------------------------------------------------
+
+    def showPluginInfo(self, valuesDict=None, typeId=None):
+        if log_startup_banner:
+            log_startup_banner(self.pluginId, self.pluginDisplayName, self.pluginVersion)
+        else:
+            indigo.server.log(f"{self.pluginDisplayName} v{self.pluginVersion}")

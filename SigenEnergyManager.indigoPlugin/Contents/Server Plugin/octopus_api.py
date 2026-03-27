@@ -4,7 +4,7 @@
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026
+# Date:        26-03-2026 15:30 GMT
 # Version:     1.0
 #
 # Octopus REST v1 API: https://docs.octopus.energy/rest/guides/endpoints/
@@ -143,6 +143,9 @@ class OctopusAPI:
             return self._tariff_cache
 
         tariff_info = self._detect_tariff_from_account()
+        if not tariff_info:
+            # REST account endpoint failed — try Kraken GraphQL as fallback
+            tariff_info = self._detect_tariff_from_kraken()
         if not tariff_info:
             tariff_info = {
                 "tariff_key":   TARIFF_UNKNOWN,
@@ -377,11 +380,11 @@ class OctopusAPI:
         For others: tries known product code patterns via public products API.
         """
         if tariff_key == TARIFF_TRACKER:
-            # Tracker only available via account endpoint or probe
-            info = self._detect_tariff_from_account()
+            # Use get_current_tariff() so the Kraken fallback and cache are honoured
+            info = self.get_current_tariff()
             if info and info.get("tariff_key") == TARIFF_TRACKER:
                 return info.get("product_code", "")
-            # Try probing known Tracker product codes
+            # Last resort: probe known Tracker product codes via public API
             return self._probe_tracker_product_code()
 
         if tariff_key in (TARIFF_GO, TARIFF_IGO):
@@ -455,7 +458,7 @@ class OctopusAPI:
         if not self.api_key or not self.account_id:
             return None
 
-        url = f"{OCTOPUS_API_BASE}/accounts/{self.account_id}/"
+        url = f"{OCTOPUS_API_BASE}/accounts/{self.account_id}"
         try:
             data = self._api_get(url, authenticated=True)
             if not data:
@@ -474,6 +477,105 @@ class OctopusAPI:
             self.logger.warning(f"Account endpoint failed: {e}")
         except Exception as e:
             self.logger.warning(f"Account detection error: {e}")
+
+        return None
+
+    def _get_kraken_token(self):
+        """Obtain (or return cached) a Kraken JWT for GraphQL authentication.
+
+        The Kraken token is obtained via GraphQL mutation using the API key.
+        Cached for 55 minutes (Octopus tokens are typically valid for 60 min).
+        Returns the token string or None on failure.
+        """
+        now = time.time()
+        if self._kraken_token and now - self._kraken_token_at < 3300:
+            return self._kraken_token
+
+        if not self.api_key:
+            return None
+
+        mutation = json.dumps({
+            "query": f'mutation {{ obtainKrakenToken(input: {{ APIKey: "{self.api_key}" }}) {{ token }} }}'
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL,
+                data=mutation.encode(),
+                headers={"Content-Type": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if not response.ok:
+                self.logger.debug(f"Kraken token request failed: HTTP {response.status_code}")
+                return None
+            token = response.json().get("data", {}).get("obtainKrakenToken", {}).get("token")
+            if token:
+                self._kraken_token    = token
+                self._kraken_token_at = now
+                self.logger.debug("Kraken token obtained")
+            return token
+        except Exception as e:
+            self.logger.debug(f"Kraken token error: {e}")
+            return None
+
+    def _detect_tariff_from_kraken(self):
+        """Fetch active electricity tariff via Kraken GraphQL API.
+
+        Used as fallback when the REST v1/accounts/ endpoint returns 500.
+        Queries the active electricity agreement for the configured account
+        and returns the same tariff_info dict as _detect_tariff_from_account().
+        """
+        if not self.api_key or not self.account_id:
+            return None
+
+        token = self._get_kraken_token()
+        if not token:
+            return None
+
+        query = json.dumps({
+            "query": (
+                f'{{ account(accountNumber: "{self.account_id}") {{'
+                f"  electricityAgreements(active: true) {{"
+                f"    tariff {{"
+                f"      ...on TariffType       {{ displayName productCode tariffCode }}"
+                f"      ...on HalfHourlyTariff {{ displayName productCode tariffCode }}"
+                f"    }}"
+                f"  }}"
+                f"}}}}"
+            )
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL,
+                data=query.encode(),
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"JWT {token}",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if not response.ok:
+                self.logger.debug(f"Kraken tariff query failed: HTTP {response.status_code}")
+                return None
+
+            agreements = (
+                response.json()
+                .get("data", {})
+                .get("account", {})
+                .get("electricityAgreements", [])
+            )
+            for agr in agreements:
+                tariff_node   = agr.get("tariff", {}) or {}
+                tariff_code   = tariff_node.get("tariffCode", "")
+                if tariff_code:
+                    result = self._classify_tariff_code(tariff_code)
+                    self.logger.info(
+                        f"[Kraken] Active tariff: {result.get('display_name')} "
+                        f"({tariff_code})"
+                    )
+                    return result
+
+        except Exception as e:
+            self.logger.debug(f"Kraken tariff detection error: {e}")
 
         return None
 
@@ -739,8 +841,10 @@ class OctopusAPI:
         if response.status_code == 404:
             return None
         if not response.ok:
+            body = response.text[:200].strip()
+            detail = f" ({body})" if body else ""
             raise OctopusApiError(
-                f"HTTP {response.status_code}: {url}: {response.text[:200]}"
+                f"HTTP {response.status_code}{detail}: {url}"
             )
 
         try:

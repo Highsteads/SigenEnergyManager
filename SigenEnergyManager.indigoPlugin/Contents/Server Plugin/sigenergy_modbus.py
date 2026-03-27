@@ -4,7 +4,7 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026
+# Date:        26-03-2026 15:30 GMT
 # Version:     1.0
 #
 # Register map verified against Sigenergy Modbus Protocol V2.8 (2025-11-28)
@@ -43,6 +43,10 @@ PLANT_ESS_POWER            = 30037    # S32 (2 regs), gain 1000, kW. >0=charge, 
 PLANT_RUNNING_STATE        = 30051    # U16: 0=Standby, 1=Running, 2=Fault, 3=Shutdown
 PLANT_ESS_DISCHARGE_CUTOFF = 30086    # U16, gain 10, %
 PLANT_ESS_SOH              = 30087    # U16, gain 10, % (weighted average)
+PLANT_PV_TOTAL_KWH         = 30088    # U64 (4 regs), gain 100, kWh — LIFETIME PV generation
+PLANT_LOAD_DAILY_KWH       = 30092    # U32 (2 regs), gain 100, kWh — daily reset at midnight
+PLANT_TOTAL_IMPORT_KWH     = 30216    # U64 (4 regs), gain 100, kWh — LIFETIME grid import
+PLANT_TOTAL_EXPORT_KWH     = 30220    # U64 (4 regs), gain 100, kWh — LIFETIME grid export
 
 # --- Inverter registers (slave address 1-246, read-only, function 0x03) ---
 
@@ -279,6 +283,34 @@ class SigenergyModbus:
             self.logger.error(f"Unexpected read error regs {register}-{register+1} (slave {slave}): {e}")
             return None
 
+    def _read_uint64(self, register, slave=None):
+        """Read an unsigned 64-bit value from four consecutive registers (big-endian)."""
+        if slave is None:
+            slave = self.plant_address
+        self._throttle()
+        try:
+            result = self.client.read_holding_registers(
+                address=register, count=4, device_id=slave
+            )
+            if result.isError():
+                self.logger.debug(
+                    f"Error reading regs {register}-{register+3} (slave {slave}): {result}"
+                )
+                return None
+            r = result.registers
+            return (r[0] << 48) | (r[1] << 32) | (r[2] << 16) | r[3]
+        except (ModbusException, ConnectionException) as e:
+            self.logger.error(
+                f"Modbus read error regs {register}-{register+3} (slave {slave}): {e}"
+            )
+            self._connected = False
+            return None
+        except Exception as e:
+            self.logger.error(
+                f"Unexpected read error regs {register}-{register+3} (slave {slave}): {e}"
+            )
+            return None
+
     def _read_uint32(self, register, slave=None):
         """Read an unsigned 32-bit value from two consecutive registers."""
         if slave is None:
@@ -437,6 +469,35 @@ class SigenergyModbus:
         grid_w = data.get("gridPowerWatts", 0)
         batt_w = data.get("batteryPowerWatts", 0)
         data["homePowerWatts"] = max(0, pv_w + grid_w - batt_w)
+
+        # --- Phase D: Plant daily/lifetime energy registers ---
+        # pvLifetimeKwh / gridImportLifetimeKwh / gridExportLifetimeKwh are LIFETIME
+        # totals; plugin.py computes daily values as (current - start-of-day snapshot).
+        # homeDailyDirectKwh (30092) resets at midnight on the inverter — read directly.
+
+        pv_total = self._read_uint64(PLANT_PV_TOTAL_KWH)
+        if pv_total is not None:
+            data["pvLifetimeKwh"] = round(pv_total / 100.0, 2)
+        else:
+            plant_errors += 1
+
+        load_daily = self._read_uint32(PLANT_LOAD_DAILY_KWH)
+        if load_daily is not None:
+            data["homeDailyDirectKwh"] = round(load_daily / 100.0, 2)
+        else:
+            plant_errors += 1
+
+        import_total = self._read_uint64(PLANT_TOTAL_IMPORT_KWH)
+        if import_total is not None:
+            data["gridImportLifetimeKwh"] = round(import_total / 100.0, 2)
+        else:
+            plant_errors += 1
+
+        export_total = self._read_uint64(PLANT_TOTAL_EXPORT_KWH)
+        if export_total is not None:
+            data["gridExportLifetimeKwh"] = round(export_total / 100.0, 2)
+        else:
+            plant_errors += 1
 
         # --- Connection quality check ---
 

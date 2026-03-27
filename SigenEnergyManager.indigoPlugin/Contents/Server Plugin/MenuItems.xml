@@ -26,9 +26,26 @@
         <CallbackMethod>menuShowVppStatus</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuShowVppExport">
+        <Name>Show VPP Export Summary</Name>
+        <CallbackMethod>menuShowVppExport</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowTodaySummary">
+        <Name>Show Today's Energy Summary</Name>
+        <CallbackMethod>menuShowTodaySummary</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuToggleDebug">
         <Name>Toggle Debug Logging</Name>
         <CallbackMethod>menuToggleDebug</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuSeparator1" isSeparator="true"/>
+
+    <MenuItem id="showPluginInfo">
+        <Name>Show Plugin Info</Name>
+        <CallbackMethod>showPluginInfo</CallbackMethod>
     </MenuItem>
 
 </MenuItems>

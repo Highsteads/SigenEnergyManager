@@ -109,11 +109,17 @@
     <Field id="exportEnabled" type="checkbox" defaultValue="false">
         <Label>Enable grid export (requires active export MPAN):</Label>
     </Field>
-    <Field id="exportTriggerSoc" type="textfield" defaultValue="90" visibleBindingId="exportEnabled" visibleBindingValue="true">
-        <Label>Export when SOC reaches (%, default 90):</Label>
+    <Field id="exportStage1Soc" type="textfield" defaultValue="80" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Stage 1: start exporting when SOC reaches (%, default 80):</Label>
     </Field>
-    <Field id="maxExportKw" type="textfield" defaultValue="4.0" visibleBindingId="exportEnabled" visibleBindingValue="true">
-        <Label>Maximum export power (kW, DNO limit 4.0):</Label>
+    <Field id="exportStage1Kw" type="textfield" defaultValue="2.0" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Stage 1: export power (kW, default 2.0):</Label>
+    </Field>
+    <Field id="exportStage2Soc" type="textfield" defaultValue="90" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Stage 2: increase export when SOC reaches (%, default 90):</Label>
+    </Field>
+    <Field id="exportStage2Kw" type="textfield" defaultValue="4.0" visibleBindingId="exportEnabled" visibleBindingValue="true">
+        <Label>Stage 2: export power (kW, DNO limit 4.0):</Label>
     </Field>
 
     <Field id="separator_vpp" type="separator"/>
