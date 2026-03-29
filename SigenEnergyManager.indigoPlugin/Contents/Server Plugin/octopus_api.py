@@ -391,16 +391,17 @@ class OctopusAPI:
         return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
     def _probe_product_by_prefix(self, prefixes):
-        """Search public products listing for a product matching given prefixes."""
+        """Search public products listing for a product matching given prefixes.
+
+        No is_variable filter: Tracker (SILVER-*) is a daily-changing flat
+        rate that Octopus does not flag as is_variable in their products API,
+        so filtering on that flag silently excludes it.
+        """
         if not prefixes:
             return None
 
         url = f"{OCTOPUS_API_BASE}/products/"
-        params = {
-            "is_variable": True,
-            "is_green":    False,
-            "page_size":   100,
-        }
+        params = {"page_size": 100}
 
         try:
             response = self._api_get(url, params=params, authenticated=False)
@@ -429,7 +430,12 @@ class OctopusAPI:
     # ================================================================
 
     def _detect_tariff_from_account(self):
-        """Fetch account endpoint to discover the active electricity tariff."""
+        """Fetch account endpoint to discover the active electricity tariff.
+
+        If self.mpan is configured, only the matching meter point is checked —
+        this prevents the export MPAN (OUTGOING tariff) from being returned
+        first and mis-classified as TARIFF_UNKNOWN.
+        """
         if not self.api_key or not self.account_id:
             return None
 
@@ -442,11 +448,16 @@ class OctopusAPI:
             # Walk properties -> electricity_meter_points -> agreements
             for prop in data.get("properties", []):
                 for point in prop.get("electricity_meter_points", []):
+                    # Skip non-import MPANs when we know our import MPAN
+                    if self.mpan and point.get("mpan") != self.mpan:
+                        continue
                     agreements = point.get("agreements", [])
                     active     = self._active_agreement(agreements)
                     if active:
                         tariff_code = active.get("tariff_code", "")
-                        return self._classify_tariff_code(tariff_code)
+                        result = self._classify_tariff_code(tariff_code)
+                        if result.get("tariff_key") != TARIFF_UNKNOWN:
+                            return result
 
         except OctopusApiError as e:
             self.logger.warning(f"Account endpoint failed: {e}")
