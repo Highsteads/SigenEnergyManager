@@ -51,8 +51,8 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 keys below to it. The plugin will pick them up automatically at startup.
 
 **If you do not have a `secrets.py`** you can either:
-- Copy `secrets_example.py` (included in the plugin bundle) to
-  `/Library/Application Support/Perceptive Automation/secrets.py` and fill in
+- Rename `secrets_example.py` (included in the plugin bundle) to `secrets.py`,
+  move it to `/Library/Application Support/Perceptive Automation/` and fill in
   your credentials, **or**
 - Enter your credentials directly in the plugin's configuration dialog
   (Indigo menu → Plugins → Sigenergy Energy Manager → Configure)
