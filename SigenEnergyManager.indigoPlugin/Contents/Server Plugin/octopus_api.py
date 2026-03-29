@@ -376,44 +376,19 @@ class OctopusAPI:
     def _find_product_code(self, tariff_key):
         """Find the current product code for a given tariff key.
 
-        For Tracker: tries account endpoint (Tracker is only discoverable there).
-        For others: tries known product code patterns via public products API.
+        All tariffs: tries public products listing via _probe_product_by_prefix().
+        Tracker additionally checks the account endpoint first (when credentials
+        are configured) so the exact active product code is used.
         """
         if tariff_key == TARIFF_TRACKER:
-            # Use get_current_tariff() so the Kraken fallback and cache are honoured
+            # Prefer account endpoint when credentials are available
             info = self.get_current_tariff()
             if info and info.get("tariff_key") == TARIFF_TRACKER:
                 return info.get("product_code", "")
-            # Last resort: probe known Tracker product codes via public API
-            return self._probe_tracker_product_code()
-
-        if tariff_key in (TARIFF_GO, TARIFF_IGO):
+            # Fall back to public products listing (SILVER-* or TRACKER-VAR-* prefixes)
             return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
-        if tariff_key in (TARIFF_FLUX, TARIFF_IFLUX):
-            return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
-
-        if tariff_key == TARIFF_AGILE:
-            return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
-
-        return None
-
-    def _probe_tracker_product_code(self):
-        """Probe recent Tracker product codes to find a current one."""
-        # Tracker product codes follow pattern: TRACKER-VAR-YY-MM-DD
-        # Try recent months working backwards
-        now = datetime.now(timezone.utc)
-        for months_back in range(0, 24):
-            probe_date = now - timedelta(days=months_back * 30)
-            code       = f"TRACKER-VAR-{probe_date.strftime('%y-%m-%d')}"
-            url        = f"{OCTOPUS_API_BASE}/products/{code}/"
-            try:
-                resp = self._get(url, authenticated=False)
-                if resp and resp.get("code") == code:
-                    return code
-            except Exception:
-                pass
-        return None
+        return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
     def _probe_product_by_prefix(self, prefixes):
         """Search public products listing for a product matching given prefixes."""
