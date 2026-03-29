@@ -74,20 +74,22 @@ AXLE_PASSWORD        = "..."
 
 | Setting | Description |
 |---------|-------------|
-| Inverter IP | Sigenergy inverter LAN address |
+| Inverter IP | Sigenergy inverter LAN address (default 192.168.100.49) |
+| Modbus port | Inverter Modbus TCP port (default 502) |
 | Plant slave address | Modbus slave address for plant data (default 247) |
 | Inverter slave address | Modbus slave address for inverter data (default 1) |
-| Battery capacity (kWh) | Total usable capacity (default 35.04) |
+| Poll interval | Inverter data poll frequency in seconds (default 60) |
+| Battery capacity (kWh) | Total usable battery capacity (default 35.04) |
 | Battery efficiency | Round-trip efficiency 0-100% (default 94) |
+| Inverter max kW | Inverter rated output power -- sets battery discharge ceiling (default 10) |
 | Dawn SOC target (%) | Minimum SOC required at next solar dawn (default 10%) |
 | Battery health cutoff (%) | Hardware discharge floor (default 10%) |
-| Export enabled | Enable staged grid export when SOC is high |
-| Export stage 1 SOC (%) | SOC threshold to start stage 1 export (default 80%) |
-| Export stage 1 kW | Export power at stage 1 (default 2 kW) |
-| Export stage 2 SOC (%) | SOC threshold to increase to stage 2 export (default 90%) |
-| Export stage 2 kW | Export power at stage 2 / DNO cap (default 4 kW) |
-| Max export kW | DNO export cap -- used for night export power (default 4 kW) |
-| Tariff | Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) |
+| Export enabled | Enable night export and daytime surplus export to grid |
+| Max export kW | DNO grid export cap for night export (default 4 kW) |
+| VPP (Axle) enabled | Enable Axle Virtual Power Plant integration |
+
+Note: Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) is detected
+automatically from your Octopus account -- no manual selection required.
 
 ---
 
