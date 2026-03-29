@@ -660,6 +660,11 @@ class SigenergyModbus:
     def force_discharge(self, power_watts=4000):
         """Force discharge battery to grid at specified power.
 
+        Caps TOTAL battery output at power_watts (house load + grid combined).
+        Used for VPP and other operations where total battery output must be limited.
+        For night export (where grid should receive the full export_watts regardless
+        of house load), use night_export() instead.
+
         Enables Remote EMS, sets Discharge ESS First mode, sets power limit.
         """
         self.logger.info(f"Force discharging to grid at {power_watts}W")
@@ -670,6 +675,35 @@ class SigenergyModbus:
         if not self.set_discharge_limit(power_watts):
             return False
         self.logger.info(f"Force discharge active: {power_watts}W to grid")
+        return True
+
+    def night_export(self, export_watts=4000, inverter_max_w=10000):
+        """Discharge battery surplus to grid at up to export_watts, while also supplying house load.
+
+        Unlike force_discharge() which caps TOTAL battery output (leaving house load
+        to eat into the grid export budget), this method:
+          1. Sets HOLD_ESS_MAX_DISCHARGE = inverter_max_w  (battery free to supply house + grid)
+          2. Sets HOLD_GRID_MAX_EXPORT_LIMIT = export_watts (DNO cap — limits only grid export)
+
+        Result: battery discharges at (house_load + export_watts), up to inverter max.
+        Grid always receives the full export_watts regardless of home consumption.
+        """
+        self.logger.info(
+            f"Night export: {export_watts}W to grid, inverter max {inverter_max_w}W "
+            f"(battery will supply house load on top)"
+        )
+        if not self.enable_remote_ems():
+            return False
+        if not self.set_remote_ems_mode(0x06):
+            return False
+        if not self.set_discharge_limit(inverter_max_w):   # battery free up to inverter max
+            return False
+        if not self.set_export_limit(export_watts):         # grid capped at DNO limit
+            return False
+        self.logger.info(
+            f"Night export active: {export_watts}W grid cap, "
+            f"battery supplying house load + export"
+        )
         return True
 
     def set_self_consumption(self):

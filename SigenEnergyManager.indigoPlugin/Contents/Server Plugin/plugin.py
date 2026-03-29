@@ -531,10 +531,11 @@ class Plugin(indigo.PluginBase):
                 self.store["import_scheduled_logged"] = str(decision.scheduled_time)
 
         elif action == ACTION_START_EXPORT:
-            # Idempotent: only call force_discharge if not already exporting
+            # Idempotent: only call night_export if not already exporting
             if not prev_import and not prev_export:
                 log(f"[Manager] Starting night export: {decision.reason}")
-                if self.modbus.force_discharge(decision.power_watts):
+                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+                if self.modbus.night_export(decision.power_watts, inv_max_w):
                     self.store["export_active"] = True
                     self._trigger_event("exportStarted")
 
@@ -575,7 +576,9 @@ class Plugin(indigo.PluginBase):
         evaluation cycle (~15 min) as a self-healing guard.
 
         Expected values:
-          - export_active: discharge limit = maxExportKw, charge limit = inverter max
+          - export_active: discharge limit = inverter max (night_export uses export limit register,
+                           not discharge register, to cap grid flow; battery must be free to supply
+                           house load + grid simultaneously)
           - import_active: charge limit = inverter max (full import power), discharge = inverter max
           - otherwise:     both limits = inverter max (unrestricted self-consumption)
         """
@@ -584,10 +587,9 @@ class Plugin(indigo.PluginBase):
 
         inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
 
-        if self.store["export_active"]:
-            expected_discharge_w = int(float(self.pluginPrefs.get("maxExportKw", 4.0)) * 1000)
-        else:
-            expected_discharge_w = inv_max_w
+        # Always expect inverter max — night_export() uses HOLD_GRID_MAX_EXPORT_LIMIT
+        # (not the discharge register) to constrain grid flow.
+        expected_discharge_w = inv_max_w
 
         expected_charge_w = inv_max_w   # always unrestricted outside of VPP pre-charge
 
@@ -1261,10 +1263,11 @@ class Plugin(indigo.PluginBase):
 
     def actionForceExport(self, action):
         """Action: Force immediate grid export."""
-        props    = action.props
-        power_kw = float(props.get("powerKw", 4.0))
+        props     = action.props
+        power_kw  = float(props.get("powerKw", 4.0))
+        inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
         log(f"[Action] Force export: {power_kw}kW")
-        if self.modbus and self.modbus.force_discharge(int(power_kw * 1000)):
+        if self.modbus and self.modbus.night_export(int(power_kw * 1000), inv_max_w):
             self.store["export_active"]  = True
             self.store["import_active"]  = False
 
