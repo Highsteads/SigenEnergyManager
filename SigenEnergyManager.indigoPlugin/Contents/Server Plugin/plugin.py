@@ -173,8 +173,10 @@ class Plugin(indigo.PluginBase):
         self.store["import_scheduled_time"]  = None
         self.store["import_target_soc"]      = 0.0
 
-        # Export state (export limit is set once at startup; no dynamic tracking needed)
+        # Export state
         self.store["export_active"]   = False
+        self.store["export_tier"]     = 0      # 0=off/night, 1=stage1, 2=stage2
+        self.store["export_power_w"]  = 0      # last export limit written (W)
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
@@ -446,8 +448,12 @@ class Plugin(indigo.PluginBase):
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
             dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 10)),
-            export_enabled     = prefs.get("exportEnabled", False),
-            max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
+            export_enabled         = prefs.get("exportEnabled", False),
+            export_stage1_soc_pct  = float(prefs.get("exportStage1Soc", 80)),
+            export_stage1_kw       = float(prefs.get("exportStage1Kw", 2.0)),
+            export_stage2_soc_pct  = float(prefs.get("exportStage2Soc", 90)),
+            export_stage2_kw       = float(prefs.get("exportStage2Kw", 4.0)),
+            current_export_tier    = self.store.get("export_tier", 0),
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             export_active           = self.store["export_active"],
             corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
@@ -531,19 +537,49 @@ class Plugin(indigo.PluginBase):
                 self.store["import_scheduled_logged"] = str(decision.scheduled_time)
 
         elif action == ACTION_START_EXPORT:
-            # Idempotent: only call night_export if not already exporting
-            if not prev_import and not prev_export:
-                log(f"[Manager] Starting night export: {decision.reason}")
-                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-                if self.modbus.night_export(inv_max_w):
-                    self.store["export_active"] = True
-                    self._trigger_event("exportStarted")
+            new_tier    = decision.export_tier
+            new_power_w = decision.power_watts
+            cur_power_w = self.store.get("export_power_w", 0)
+            power_changed = prev_export and (cur_power_w != new_power_w)
+
+            if new_tier > 0:
+                # Daytime staged export: stay in Self Consumption, set export limit register
+                if not self.store["import_active"] and (not prev_export or power_changed):
+                    tier_label = "Updating" if power_changed else "Starting"
+                    log(f"[Manager] {tier_label} daytime export "
+                        f"(tier {new_tier}, {new_power_w}W): {decision.reason}")
+                    if self.modbus.set_export_limit(new_power_w):
+                        self.store["export_active"]  = True
+                        self.store["export_power_w"] = new_power_w
+                        self.store["export_tier"]    = new_tier
+                        if not prev_export:
+                            self._trigger_event("exportStarted")
+            else:
+                # Night export: active battery discharge via Discharge ESS First mode
+                if not self.store["import_active"] and not prev_export:
+                    log(f"[Manager] Starting night export: {decision.reason}")
+                    inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+                    if self.modbus.night_export(inv_max_w):
+                        self.store["export_active"]  = True
+                        self.store["export_power_w"] = inv_max_w
+                        self.store["export_tier"]    = 0
+                        self._trigger_event("exportStarted")
 
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
-                log("[Manager] Stopping night export - returning to self-consumption")
-                self.modbus.set_self_consumption()
-                self.store["export_active"] = False
+                prev_tier = self.store.get("export_tier", 0)
+                if prev_tier > 0:
+                    # Stopping daytime export: restore DNO cap so battery behaves normally
+                    dno_cap_w = int(float(self.pluginPrefs.get("exportStage2Kw", 4.0)) * 1000)
+                    log(f"[Manager] Stopping daytime export (tier {prev_tier}): {decision.reason}")
+                    self.modbus.set_export_limit(dno_cap_w)
+                else:
+                    # Stopping night export: return fully to self-consumption
+                    log("[Manager] Stopping night export - returning to self-consumption")
+                    self.modbus.set_self_consumption()
+                self.store["export_active"]  = False
+                self.store["export_power_w"] = 0
+                self.store["export_tier"]    = 0
                 self._trigger_event("exportStopped")
 
         elif action == ACTION_SELF_CONSUMPTION:
@@ -555,7 +591,9 @@ class Plugin(indigo.PluginBase):
                 # export_enabled was disabled while exporting - clean up
                 log("[Manager] Export disabled - returning to self-consumption")
                 self.modbus.set_self_consumption()
-                self.store["export_active"] = False
+                self.store["export_active"]  = False
+                self.store["export_power_w"] = 0
+                self.store["export_tier"]    = 0
 
         # Check if active import has reached target SOC
         if self.store["import_active"]:
@@ -576,9 +614,10 @@ class Plugin(indigo.PluginBase):
         evaluation cycle (~15 min) as a self-healing guard.
 
         Expected values:
-          - export_active: discharge limit = inverter max (night_export uses export limit register,
-                           not discharge register, to cap grid flow; battery must be free to supply
-                           house load + grid simultaneously)
+          - night export active: discharge limit = inverter max (night_export uses export limit
+                           register, not discharge register, to cap grid flow)
+          - daytime export active: discharge limit = inverter max (Self Consumption mode;
+                           export limit register gates grid flow, discharge register is unused)
           - import_active: charge limit = inverter max (full import power), discharge = inverter max
           - otherwise:     both limits = inverter max (unrestricted self-consumption)
         """
@@ -1147,7 +1186,11 @@ class Plugin(indigo.PluginBase):
             ACTION_START_IMPORT:     "Grid Import Active",
             ACTION_STOP_IMPORT:      "Import Stopping",
             ACTION_SCHEDULE_IMPORT:  "Import Scheduled",
-            ACTION_START_EXPORT:     "Night Export Active",
+            ACTION_START_EXPORT:     (
+                f"Daytime Export Tier {self.store.get('export_tier', 0)}"
+                if self.store.get("export_tier", 0) > 0
+                else "Night Export Active"
+            ),
             ACTION_STOP_EXPORT:      "Export Stopping",
         }.get(decision.action, decision.action)
 
@@ -1162,6 +1205,7 @@ class Plugin(indigo.PluginBase):
             {"key": "importScheduledTime", "value": scheduled_str},
             {"key": "importKwh",           "value": str(round(decision.import_kwh, 2))},
             {"key": "exportActive",        "value": str(self.store["export_active"])},
+            {"key": "exportTier",          "value": str(self.store.get("export_tier", 0))},
             {"key": "exportKw",            "value": str(round(decision.export_kw, 1))},
             {"key": "tariffActive",        "value": snapshot.tariff.tariff_key},
             {"key": "rateToday",           "value": str(snapshot.tariff.today_rate_p or "")},
@@ -1231,7 +1275,7 @@ class Plugin(indigo.PluginBase):
             end_str      = event["end_time"].strftime("%H:%M")
             duration_hrs = event.get("duration_hrs", 0.0)
 
-        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        max_export_kw = float(self.pluginPrefs.get("exportStage2Kw", 4.0))
         earnings_est  = round(max_export_kw * duration_hrs * 1.00, 2)  # GBP1/kWh Axle rate
 
         states = [
@@ -1267,6 +1311,8 @@ class Plugin(indigo.PluginBase):
         log("[Action] Force export: night_export mode")
         if self.modbus and self.modbus.night_export(inv_max_w):
             self.store["export_active"]  = True
+            self.store["export_tier"]    = 0
+            self.store["export_power_w"] = inv_max_w
             self.store["import_active"]  = False
 
     def actionSetSelfConsumption(self, action):
@@ -1274,8 +1320,10 @@ class Plugin(indigo.PluginBase):
         log("[Action] Set self-consumption mode")
         if self.modbus:
             self.modbus.set_self_consumption()
-            self.store["import_active"] = False
-            self.store["export_active"] = False
+            self.store["import_active"]  = False
+            self.store["export_active"]  = False
+            self.store["export_tier"]    = 0
+            self.store["export_power_w"] = 0
 
     def actionReturnToLocalEms(self, action):
         """Action: Disable Remote EMS and return to local inverter control."""
@@ -1664,7 +1712,7 @@ class Plugin(indigo.PluginBase):
             self.modbus.set_charge_limit(inverter_max_w)      # clear any stale charge cap
             self.modbus.set_charge_cutoff(100.0)              # ensure unrestricted charging
             if prefs.get("exportEnabled", False):
-                dno_startup_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
+                dno_startup_w = int(float(prefs.get("exportStage2Kw", 4.0)) * 1000)
                 self.modbus.set_export_limit(dno_startup_w)
 
         # Solcast

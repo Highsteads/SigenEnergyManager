@@ -4,8 +4,8 @@
 # Description: Unit tests for battery_manager.py decision engine
 #              Runs without Indigo installed
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 22:11 GMT
-# Version:     1.2
+# Date:        29-03-2026 17:00 GMT
+# Version:     1.3
 
 import sys
 import unittest
@@ -32,6 +32,8 @@ from battery_manager import (
     NIGHT_EXPORT_BUFFER_KWH,
     MIN_NIGHT_EXPORT_KWH,
     DAYTIME_WINDOW_HOURS,
+    EXPORT_HYSTERESIS_PCT,
+    EXPORT_HEADROOM_BUFFER_KWH,
 )
 
 
@@ -71,7 +73,11 @@ def _make_snapshot(
     dawn_times=None,
     pv_watts=0,
     export_active=False,
-    max_export_kw=4.0,
+    export_stage1_soc_pct=80.0,
+    export_stage1_kw=2.0,
+    export_stage2_soc_pct=90.0,
+    export_stage2_kw=4.0,
+    current_export_tier=0,
     corrected_tomorrow_kwh=0.0,
 ):
     """Build a ManagerSnapshot for testing."""
@@ -100,7 +106,11 @@ def _make_snapshot(
         dawn_target_pct        = DAWN_TARGET,
         health_cutoff_pct      = HEALTH_FLOOR,
         export_enabled         = export_enabled,
-        max_export_kw          = max_export_kw,
+        export_stage1_soc_pct  = export_stage1_soc_pct,
+        export_stage1_kw       = export_stage1_kw,
+        export_stage2_soc_pct  = export_stage2_soc_pct,
+        export_stage2_kw       = export_stage2_kw,
+        current_export_tier    = current_export_tier,
         pv_watts               = pv_watts,
         export_active          = export_active,
         corrected_tomorrow_kwh = corrected_tomorrow_kwh,
@@ -452,18 +462,19 @@ class TestNightExport(unittest.TestCase):
         self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
 
     def test_night_export_blocked_after_sunrise(self):
-        """After today's sunrise export is blocked — dawn_times used, not PV watts.
+        """After today's sunrise night export is blocked — dawn_times used, not PV watts.
 
         In Discharge ESS First mode the inverter reads PV as 0W, so PV cannot
         be used as a daylight indicator. Sunrise is detected via dawn_times.
         now=08:00, today dawn=07:00 (1h ago, within DAYTIME_WINDOW_HOURS) → daytime.
+        SOC=70% (below stage1 80%) so daytime export also does not trigger.
         """
         today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
         tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
         snapshot = _make_snapshot(
-            soc_pct                = 80.0,
+            soc_pct                = 70.0,   # below stage1 threshold (80%) → no daytime export
             export_enabled         = True,
-            pv_watts               = 0,     # reads 0W in force-discharge mode — irrelevant
+            pv_watts               = 0,      # reads 0W in force-discharge mode — irrelevant
             corrected_tomorrow_kwh = self._good_tomorrow_kwh,
             now_hour               = 8,
             dawn_times             = {
@@ -548,13 +559,13 @@ class TestNightExport(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_STOP_EXPORT)
 
-    def test_night_export_respects_max_export_kw(self):
-        """power_watts matches max_export_kw setting."""
+    def test_night_export_uses_stage2_kw(self):
+        """Night export power_watts matches export_stage2_kw (DNO cap)."""
         snapshot = _make_snapshot(
             soc_pct                = 80.0,
             export_enabled         = True,
             pv_watts               = 0,
-            max_export_kw          = 3.5,
+            export_stage2_kw       = 3.5,
             corrected_tomorrow_kwh = self._good_tomorrow_kwh,
             now_hour               = 2,
         )
@@ -595,6 +606,176 @@ class TestNightExport(unittest.TestCase):
         result = BatteryManager._sum_tomorrow_forecast(p10, datetime.now(timezone.utc))
         # 3000 + 4000 = 7000 Wh = 7.0 kWh
         self.assertAlmostEqual(result, 7.0, places=1)
+
+
+class TestDaytimeStagedExport(unittest.TestCase):
+    """Tests for daytime staged export via HOLD_GRID_MAX_EXPORT_LIMIT.
+
+    Daytime export stays in Self Consumption mode, opens the export limit register.
+    Two tiers with 5% hysteresis:
+      Stage 1 starts: SOC >= stage1_soc (default 80%)
+      Stage 2 starts: SOC >= stage2_soc (default 90%)
+      Stage 2 → Stage 1: SOC < stage2_soc - 5% (i.e. < 85%)
+      Stage 1 → off: SOC < stage1_soc - 5% (i.e. < 75%)
+    Default consumption profile: [0.30]*48 = 14.4 kWh/day.
+    Dawn target: 10% of 35.04 = 3.504 kWh.
+    Headroom buffer: 1.0 kWh → dawn floor = 4.504 kWh.
+    """
+
+    def setUp(self):
+        self.bm = BatteryManager()
+        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Daytime: now=10:00, dawn=07:00 (3h ago, within 14h window)
+        self._daytime_dawn = {
+            today_str:    _now(hour=7),
+            tomorrow_str: _tomorrow_dawn(hour=7),
+        }
+
+    def test_stage1_starts_at_threshold(self):
+        """SOC=82% (above 80% stage1) → ACTION_START_EXPORT tier=1 at stage1_kw."""
+        snapshot = _make_snapshot(
+            soc_pct              = 82.0,
+            export_enabled       = True,
+            current_export_tier  = 0,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.export_tier, 1)
+        self.assertEqual(decision.power_watts, 2000)
+
+    def test_stage2_starts_at_threshold(self):
+        """SOC=92% (above 90% stage2) → ACTION_START_EXPORT tier=2 at stage2_kw."""
+        snapshot = _make_snapshot(
+            soc_pct              = 92.0,
+            export_enabled       = True,
+            current_export_tier  = 0,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.export_tier, 2)
+        self.assertEqual(decision.power_watts, 4000)
+
+    def test_stage1_upgrades_to_stage2(self):
+        """Tier 1 active, SOC crosses stage2 → upgrade to tier 2."""
+        snapshot = _make_snapshot(
+            soc_pct              = 92.0,
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 1,     # currently at stage 1
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.export_tier, 2)
+        self.assertEqual(decision.power_watts, 4000)
+
+    def test_hysteresis_holds_stage1(self):
+        """Tier 1 active, SOC=76% (above 80-5=75% floor) → no change (None returned)."""
+        snapshot = _make_snapshot(
+            soc_pct              = 76.0,
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 1,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        # Should NOT stop or change — SOC still above hysteresis floor
+        self.assertNotEqual(decision.action, ACTION_STOP_EXPORT)
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+
+    def test_hysteresis_drops_stage1_to_off(self):
+        """Tier 1 active, SOC=74% (below 80-5=75%) → ACTION_STOP_EXPORT."""
+        snapshot = _make_snapshot(
+            soc_pct              = 74.0,
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 1,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
+
+    def test_stage2_downgrades_to_stage1(self):
+        """Tier 2 active, SOC=83% (below 90-5=85%) → tier 1 at stage1_kw."""
+        snapshot = _make_snapshot(
+            soc_pct              = 83.0,
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 2,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.export_tier, 1)
+        self.assertEqual(decision.power_watts, 2000)
+
+    def test_dawn_viability_blocks_daytime_export(self):
+        """Viability guard: current kWh <= dawn_target + headroom → stop export.
+
+        Tests _check_export() directly to bypass the import-priority path.
+        Artificial DawnViability with high dawn_target_kwh makes the guard fire.
+        current = 70% * 35.04 = 24.5 kWh; floor = 25.0 + 1.0 = 26.0 → guard fires.
+        """
+        from battery_manager import DawnViability
+        snapshot = _make_snapshot(
+            soc_pct              = 70.0,   # 70% * 35.04 = 24.5 kWh
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 1,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        viability = DawnViability(
+            viable          = True,
+            soc_at_dawn_kwh = 20.0,
+            dawn_target_kwh = 25.0,   # floor = 26.0; 24.5 <= 26.0 → guard fires
+        )
+        decision = self.bm._check_export(snapshot, viability)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
+
+    def test_no_daytime_export_when_disabled(self):
+        """export_enabled=False → no daytime export regardless of SOC."""
+        snapshot = _make_snapshot(
+            soc_pct              = 92.0,
+            export_enabled       = False,
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+
+    def test_daytime_export_no_change_same_tier(self):
+        """Tier 1 already active, SOC=82% (still tier 1) → no decision (None → self-consumption)."""
+        snapshot = _make_snapshot(
+            soc_pct              = 82.0,
+            export_enabled       = True,
+            export_active        = True,
+            current_export_tier  = 1,     # already at correct tier
+            dawn_times           = self._daytime_dawn,
+            now_hour             = 10,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        # _check_export returns None when tier unchanged → falls through to self-consumption
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
 
 
 if __name__ == "__main__":

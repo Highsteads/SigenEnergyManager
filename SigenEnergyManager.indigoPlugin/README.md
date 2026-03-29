@@ -1,45 +1,341 @@
-# SigenEnergyManager v1.1
+# SigenEnergyManager
 
-Self-sufficiency-first battery management plugin for Sigenergy solar/battery systems
-running under Indigo 2025.1.
+**Indigo home automation plugin for Sigenergy solar/battery systems.**
 
-## Quick start
+Self-sufficiency-first battery management: never import from grid unless the battery
+cannot reach the next solar generation window at the configured minimum SOC. Exports
+surplus to grid to prevent the battery from hitting 100% and curtailing PV generation.
+At night, exports battery surplus to grid when the battery has more energy than needed
+to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
-1. Install the plugin by double-clicking `SigenEnergyManager.indigoPlugin`
-2. Copy `secrets_example.py` to `/Library/Application Support/Perceptive Automation/secrets.py`
-   and fill in your API keys
-3. Configure the plugin via Plugins → SigenEnergyManager → Configure
-4. Create a **Battery Manager** device — the plugin starts managing immediately
-
-## What it does
-
-- Reads inverter data every 60 s via Modbus TCP
-- Projects battery SOC at next dawn (P10 Solcast forecast + consumption profile)
-- Imports from grid only if the battery cannot reach dawn at the configured minimum SOC
-- Exports surplus solar in two stages (2 kW / 4 kW) to prevent 100% SOC PV curtailment
-- Schedules imports at cheapest available rate (Tracker/Go/Flux/Agile aware)
-- Manages Axle VPP events with pre-charge and post-event reserve protection
+---
 
 ## Version history
 
-| Version | Notes |
-|---------|-------|
-| 1.1 | Fix nighttime grid import caused by export_limit=0W throttling battery discharge. Symmetric 10% export hysteresis deadband. 48 unit tests. |
-| 1.0 | Initial release. |
+| Version | Date | Notes |
+|---------|------|-------|
+| 1.5 | 29-Mar-2026 | New: 2-tier daytime staged export via HOLD_GRID_MAX_EXPORT_LIMIT register. Stage 1 (default 80% SOC → 2 kW) and Stage 2 (default 90% SOC → 4 kW) with 5% hysteresis deadband. Stays in Self Consumption mode; surplus PV flows to grid naturally without suppressing solar generation. Night export unchanged. 63 unit tests, all pass. |
+| 1.4 | 29-Mar-2026 | Fix: night export stop condition replaced -- PV watts reads 0W in Discharge ESS First mode so solar could never trigger a stop. Export now stops at Solcast-predicted sunrise (dawn_times) instead. Fix: night_export() sets HOLD_ESS_MAX_DISCHARGE=10000W and relies on the inverter's own DNO cap for grid limiting -- battery now supplies house load + 4kW to grid simultaneously. 54 unit tests, all pass. |
+| 1.3 | 29-Mar-2026 | Night export feature: force-discharge surplus to grid at night when SOC is high and tomorrow's forecast is good. Fix: persistent Modbus register (HOLD_ESS_MAX_DISCHARGE / HOLD_ESS_MAX_CHARGE) left at reduced value after force-discharge, capping battery output in self-consumption mode. Fix: tomorrow viability check now uses bias-corrected P50 (correctedTomorrowKwh x 60%) instead of P10. New: test_sigenergy_modbus.py (16 Modbus register tests). 49 unit tests total, all pass. |
+| 1.2 | 27-Mar-2026 | Fix: inverter capacity corrected to 10 kW. |
+| 1.1 | 27-Mar-2026 | Fix: nighttime grid import caused by export limit register set to 0W when export stops. Fix: symmetric hysteresis on export restart (10% deadband). 48 unit tests all pass. |
+| 1.0 | 26-Mar-2026 | Initial release. Replaces SigenergySolar v3.1. |
 
-## Files
+---
 
-| File | Purpose |
+## Requirements
+
+- Indigo 2025.1 or later
+- Sigenergy inverter with Modbus TCP enabled (port 502)
+- Python package: `pymodbus` (installed via Indigo's package manager)
+- Optional: Solcast API key (solar forecast)
+- Optional: Octopus Energy API key (tariff-aware import scheduling)
+- Optional: Axle VPP account credentials
+
+---
+
+## Installation
+
+1. Go to the [Releases](https://github.com/Highsteads/SigenEnergyManager/releases) page
+   and download `SigenEnergyManager.indigoPlugin.zip`
+2. Unzip the downloaded file -- you will get `SigenEnergyManager.indigoPlugin`
+3. Double-click `SigenEnergyManager.indigoPlugin` -- Indigo will install it automatically
+
+---
+
+## Configuration
+
+### Credentials
+
+**If you already have a `secrets.py`** in
+`/Library/Application Support/Perceptive Automation/` add the keys below to it.
+The plugin will pick them up automatically at startup.
+
+**If you do not have a `secrets.py`** you can either:
+- Rename `secrets_example.py` (included in the plugin bundle) to `secrets.py`,
+  move it to `/Library/Application Support/Perceptive Automation/` and fill in
+  your credentials, **or**
+- Enter your credentials directly in the plugin's configuration dialog
+  (Indigo menu → Plugins → Sigenergy Energy Manager → Configure)
+
+All credential fields fall back to the plugin configuration dialog if
+`secrets.py` is absent or a key is missing.
+
+```python
+OCTOPUS_API_KEY      = "sk_live_..."
+OCTOPUS_ACCOUNT_NUM  = "A-XXXXXXXX"
+SOLCAST_SITE_1_ID    = "xxxx-xxxx-xxxx-xxxx"
+SOLCAST_SITE_2_ID    = "xxxx-xxxx-xxxx-xxxx"
+SOLCAST_API_KEY      = "..."
+AXLE_USERNAME        = "..."
+AXLE_PASSWORD        = "..."
+```
+
+### Plugin preferences
+
+| Setting | Description |
+|---------|-------------|
+| Inverter IP | Sigenergy inverter LAN address (default 192.168.100.49) |
+| Modbus port | Inverter Modbus TCP port (default 502) |
+| Plant slave address | Modbus slave address for plant data (default 247) |
+| Inverter slave address | Modbus slave address for inverter data (default 1) |
+| Poll interval | Inverter data poll frequency in seconds (default 60) |
+| Battery capacity (kWh) | Total usable battery capacity (default 35.04) |
+| Battery efficiency | Round-trip efficiency 0-100% (default 94) |
+| Inverter max kW | Inverter rated output power -- sets battery discharge ceiling (default 10) |
+| Dawn SOC target (%) | Minimum SOC required at next solar dawn (default 10%) |
+| Battery health cutoff (%) | Hardware discharge floor (default 10%) |
+| Export enabled | Enable daytime staged export and night export to grid |
+| Stage 1 SOC (%) | SOC at which stage 1 export starts (default 80%) |
+| Stage 1 power (kW) | Export limit at stage 1 (default 2 kW) |
+| Stage 2 SOC (%) | SOC at which export increases to stage 2 (default 90%) |
+| Stage 2 power (kW) | Export limit at stage 2 -- set to DNO cap (default 4 kW) |
+| VPP (Axle) enabled | Enable Axle Virtual Power Plant integration |
+
+Note: Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) is detected
+automatically from your Octopus account -- no manual selection required.
+
+---
+
+## Core logic
+
+### Self-sufficiency first
+
+Every 60 seconds the plugin:
+
+1. Reads live data from the inverter via Modbus TCP
+2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
+   and a 48-slot half-hourly consumption profile
+3. If projected SOC at dawn < dawn target: schedules or starts a grid import
+4. If SOC is above the export stage 1 threshold: opens the export limit register to
+   allow surplus solar to flow to grid (staged, 2 kW then 4 kW)
+5. If it is night (PV < 500W) and battery has surplus above the dawn floor: force-discharges
+   to grid, provided tomorrow's solar forecast is good enough to recharge (see below)
+6. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+
+### Night export
+
+When there is no solar generation (PV < 500W), the plugin can export battery surplus
+directly to grid at the configured max export rate (typically 4 kW). Three conditions
+must all be true:
+
+| Condition | Detail |
+|-----------|--------|
+| **Night** | Current time is outside the daytime window (before today's Solcast dawn, or more than 14h after it) |
+| **Surplus** | Projected SOC at dawn > dawn target + 1 kWh safety buffer |
+| **Tomorrow viable** | `correctedTomorrowKwh x 0.6 >= daily_consumption_kWh` |
+
+The tomorrow viability check uses Solcast's **bias-corrected P50** estimate
+(`correctedTomorrowKwh`) at 60% confidence -- meaning "even if tomorrow comes in
+40% below our best estimate, the battery will still be recharged". This is far less
+conservative than P10 (10th percentile), which would block export even on nights
+before clearly sunny days.
+
+**Why PV watts is not used as the night/day indicator:** In Discharge ESS First mode
+(0x06) the Sigenergy inverter suppresses PV generation to 0W, so `pvPowerWatts`
+reads zero regardless of actual solar. A PV threshold check would never fire while
+exporting. Sunrise is instead detected from the Solcast-predicted `dawn_times`.
+
+**Daytime window:** Export is blocked for 14 hours after today's dawn time (e.g.
+dawn 07:00 -> blocked until 21:00, then nighttime resumes and export can start again).
+
+Night export stops automatically when:
+- Today's Solcast dawn time is reached (sunrise)
+- Battery surplus drops below the minimum threshold
+- Tomorrow's forecast deteriorates below the viability check
+
+Example log message:
+
+```
+[Manager] Night export: 15.3 kWh surplus above dawn floor.
+          Tomorrow forecast 25.1 kWh (60% = 15.1) >= daily 14.4 kWh.
+          Exporting 4.0 kW
+```
+
+### Export staging (daytime)
+
+Daytime export is controlled via `HOLD_GRID_MAX_EXPORT_LIMIT` (Modbus register 40038) in
+Remote EMS Max Self Consumption mode. The inverter stays in Self Consumption mode; the
+export limit register is opened to allow surplus PV to flow to grid naturally without
+suppressing solar generation.
+
+**Two tiers with 5% hysteresis deadband (default thresholds):**
+
+| State | Condition |
+|-------|-----------|
+| Stage 1 starts | SOC >= 80% (first entry, no hysteresis on initial trigger) |
+| Stage 2 starts | SOC >= 90% |
+| Stage 2 to Stage 1 | SOC < 90 - 5 = 85% |
+| Stage 1 to off | SOC < 80 - 5 = 75% |
+
+Stage 1 sets the export limit to 2 kW; stage 2 sets it to 4 kW (the DNO cap). The
+5% deadband prevents rapid on/off cycling when SOC oscillates around a threshold.
+
+When stopping daytime export, the export limit is restored to the stage 2 value (DNO
+cap) rather than 0W, which would cause the inverter to target a small grid import to
+guarantee it never crosses zero.
+
+Example log messages:
+
+```
+[Manager] Starting daytime export (tier 1, 2000W): Daytime export Stage 1: SOC 82% >= 80% threshold.
+          Setting export limit to 2.0 kW to prevent 100% SOC cap
+[Manager] Updating daytime export (tier 2, 4000W): Daytime export Stage 2: SOC 91% >= 90% threshold.
+          Setting export limit to 4.0 kW to prevent 100% SOC cap
+```
+
+### Persistent Modbus register protection
+
+The Sigenergy inverter retains certain registers across mode changes. Specifically,
+`HOLD_ESS_MAX_DISCHARGE` (40034) and `HOLD_ESS_MAX_CHARGE` (40032) set during a
+`force_discharge` or `force_charge` call persist as power caps even after returning
+to Self Consumption mode.
+
+The plugin guards against register drift at three layers:
+
+1. **On every mode change** -- `set_self_consumption()` always resets both registers to
+   10000W (inverter maximum) before setting the mode
+2. **On startup** -- both registers are explicitly written to 10000W before any other
+   Modbus operation
+3. **Every 15 minutes** -- `_verify_ems_registers()` reads back both registers; if
+   either has drifted it is corrected and logged with a warning
+
+### Tariff-aware import scheduling
+
+| Tariff | Import strategy |
+|--------|----------------|
+| Tracker | Import now, or defer to midnight if tomorrow is 10%+ cheaper |
+| Go / iGo | Defer to cheap window (00:30-05:30) if battery can reach it |
+| Flux / iFlux | Defer to cheap window (02:00-05:00) |
+| Agile | Find cheapest 30-min slot before dawn |
+
+### VPP (Axle) integration
+
+Full 5-state machine: IDLE -> SCHEDULED -> PRE_CHARGING -> ACTIVE -> COOLING_OFF.
+The plugin pre-charges the battery to cover the event export plus the configured dawn
+reserve. After the event, the discharge cutoff register is restored to the health floor.
+
+---
+
+## Bug fixes (v1.1 - v1.4)
+
+### v1.4 -- Night export stop condition permanently blind (critical)
+
+**Symptom:** Night export ran through sunrise and into the morning without stopping.
+
+**Root cause:** The stop condition checked `pvPowerWatts >= 500W`. In Discharge ESS
+First mode (0x06) the inverter suppresses PV output to 0W regardless of actual solar
+generation, so this condition could never fire while export was active.
+
+**Fix:** PV watts check replaced with a dawn_times check. The Solcast-predicted
+sunrise time for today is stored in `snapshot.dawn_times`. Export is stopped (and
+blocked from starting) for 14 hours after today's dawn time. At dawn + 14h
+(typically 21:00) the nighttime window reopens and export can start again.
+
+### v1.4 -- Night export limited to 4kW total instead of 4kW to grid
+
+**Symptom:** With house consuming 0.9kW and export set to 4kW, only ~3.1kW reached
+the grid. Battery was discharging at exactly 4kW total.
+
+**Root cause:** `force_discharge(4000)` wrote `HOLD_ESS_MAX_DISCHARGE = 4000W`,
+capping total battery output. House load consumed ~0.9kW of that, leaving 3.1kW
+for the grid.
+
+**Fix:** New `night_export(inverter_max_w)` method sets `HOLD_ESS_MAX_DISCHARGE =
+10000W` (inverter maximum) and relies on the inverter's own DNO export cap (set
+during commissioning) to limit grid flow to 4kW. Battery now discharges at
+`house_load + 4kW`, so the grid always receives the full 4kW regardless of
+home consumption.
+
+### v1.3 -- Persistent register caps battery output (critical)
+
+**Symptom:** Battery limited to 1.8 kW output in Self Consumption mode; inverter
+importing 1.3 kW from grid even with 78% SOC.
+
+**Root cause:** `HOLD_ESS_MAX_DISCHARGE` (Modbus 40034) is a persistent register that
+survives Remote EMS mode changes. A `force_discharge(2000)` call during staged export
+testing left 2000W in this register. When the plugin returned to Self Consumption mode
+it only changed the mode register, never resetting the discharge cap.
+
+**Fix:** `set_self_consumption()` now always resets both `HOLD_ESS_MAX_DISCHARGE` and
+`HOLD_ESS_MAX_CHARGE` to 10000W before engaging the mode. Startup performs the same
+reset. A 15-minute verification loop detects and corrects any future drift.
+
+### v1.3 -- Night export never triggered (tomorrow viability check)
+
+**Symptom:** Night export never started despite adequate SOC and good solar forecast.
+
+**Root cause:** The tomorrow viability check used `_hourly_p10_tomorrow` (hourly P10
+data by date string), but the Solcast module only populated `_hourly_p10_today`. The
+`_sum_tomorrow_forecast()` helper searched for tomorrow's date in today's dict, found
+nothing, returned 0 kWh, and the check `0 < 14.4` blocked export every night.
+
+**Fix:** Solcast module now populates `_hourly_p10_tomorrow`. The viability check was
+also switched from P10 to the bias-corrected P50 (`correctedTomorrowKwh x 0.6`), which
+is far more appropriate for this decision -- see Night export above.
+
+### v1.1 -- Nighttime grid import at high SOC
+
+**Symptom:** Battery at 78% SOC importing 1.3 kW from grid at night while discharging
+at only 1.8 kW (home load 3.1 kW).
+
+**Root cause:** When export stops, the old code wrote `HOLD_GRID_MAX_EXPORT_LIMIT = 0W`
+to Modbus register 40038. Sigenergy interprets 0W as a hard constraint meaning "never
+let net power cross zero into export territory". To guarantee compliance, the inverter
+deliberately targets a small positive grid import rather than fully covering the home
+load from battery.
+
+**Fix:** When stopping export at night (PV <= 500W), the export limit register is now
+set to the DNO cap (4000W) rather than 0W.
+
+### v1.1 -- Export cycling
+
+**Symptom:** Export starting and stopping every 15 minutes in the evening as SOC
+oscillated around 80%.
+
+**Fix:** Restart from tier 0 now requires SOC >= stage1 + 5% (symmetric 10% deadband).
+
+---
+
+## Device types
+
+| Type | Purpose |
 |------|---------|
-| `plugin.py` | Indigo plugin lifecycle, Modbus polling, decision dispatch |
-| `battery_manager.py` | Stateless decision engine (testable without Indigo) |
-| `sigenergy_modbus.py` | Modbus TCP client, register map, control methods |
-| `solcast.py` | Solcast API — P10/P50 forecast with bias correction |
-| `octopus_api.py` | Octopus Energy API — rates, tariff detection |
-| `axle_api.py` | Axle VPP — event polling and 5-state machine |
-| `test_battery_manager.py` | 48 unit tests — run with `python3 test_battery_manager.py` |
-| `plugin_utils.py` | Shared startup banner utility |
+| Battery Manager | Main control device -- one per system |
+| Inverter Monitor | Real-time PV, battery, grid, home power readings |
+| Solcast Forecast | Today/tomorrow solar forecast (P10/P50) |
+| Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
+| Axle VPP | VPP event state machine and SOC management |
+
+---
+
+## Unit tests
+
+```bash
+cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
+python3 -m unittest test_battery_manager test_sigenergy_modbus -v
+```
+
+**63 tests** across two test files, all passing without Indigo installed:
+
+| File | Tests | Coverage |
+|------|-------|---------|
+| `test_battery_manager.py` | 47 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), daytime staged export (9 cases: tier start/upgrade/downgrade/hysteresis/disable), night export (10 cases), VPP suppression |
+| `test_sigenergy_modbus.py` | 16 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation |
+
+---
+
+## Hardware reference
+
+Developed and tested on:
+- 14.25 kWp solar (30 panels, 4 arrays)
+- Sigenergy 10 kW hybrid inverter
+- 35.04 kWh battery (4 x 8.76 kWh SigenStor)
+- DNO export cap: 4 kW
+- Tariff: Octopus Tracker
+
+---
 
 ## Author
 
-CliveS & Claude Sonnet 4.6
+CliveS & Claude Sonnet 4.6 -- Medomsley, County Durham, England
