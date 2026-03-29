@@ -752,6 +752,8 @@ class Plugin(indigo.PluginBase):
                 self._vpp_check_axle_release()
 
             elif current_state != VPP_IDLE:
+                log("[VPP] Event cancelled/disappeared - restoring discharge cutoff")
+                self._restore_discharge_cutoff()
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
 
@@ -765,6 +767,7 @@ class Plugin(indigo.PluginBase):
 
         if current_state == VPP_IDLE and hours_to_start > 0:
             self.store["vpp_event"] = event
+            self._set_vpp_discharge_cutoff(event)
             self._vpp_transition(VPP_ANNOUNCED)
             self._trigger_event("vppAnnounced")
             log(
@@ -954,9 +957,7 @@ class Plugin(indigo.PluginBase):
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        # Always set discharge cutoff to dawn target for reserve protection
-        if self.modbus:
-            self.modbus.set_discharge_cutoff(dawn_target_pct)
+        # Discharge cutoff was raised to VPP-aware floor at VPP_ANNOUNCED; no change needed here
 
         if current_kwh >= required_kwh:
             log(
@@ -975,6 +976,28 @@ class Plugin(indigo.PluginBase):
                 self.modbus.force_charge(10000)
 
         self._vpp_transition(VPP_PRE_CHARGING)
+
+    def _set_vpp_discharge_cutoff(self, event):
+        """Raise discharge cutoff at VPP_ANNOUNCED to protect event energy reserve.
+
+        Floor = dawn target kWh + full event export energy (conservative).
+        The inverter enforces this floor regardless of night export or self-consumption.
+        """
+        import math
+        duration_hrs    = event.get("duration_hrs", 1.0)
+        cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
+        max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
+        dawn_kwh        = cap_kwh * dawn_target_pct / 100.0
+        event_kwh       = duration_hrs * max_export_kw / VPP_DISCHARGE_EFFICIENCY
+        floor_pct       = math.ceil((dawn_kwh + event_kwh) / cap_kwh * 100.0)
+        floor_pct       = max(floor_pct, dawn_target_pct)
+        if self.modbus:
+            self.modbus.set_discharge_cutoff(floor_pct)
+            log(
+                f"[VPP] Discharge cutoff raised to {floor_pct:.0f}% "
+                f"(dawn {dawn_target_pct:.0f}% + event {event_kwh:.1f} kWh)"
+            )
 
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""

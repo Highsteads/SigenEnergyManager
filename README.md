@@ -14,6 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 1.5 | 29-Mar-2026 | VPP: discharge cutoff register (40048) raised at VPP_ANNOUNCED rather than PRE_CHARGING. Floor = dawn target + full event export energy, so the battery reserve is protected from the moment an Axle event is announced. Cutoff restored on cancellation (event disappears while ANNOUNCED/PRE_CHARGING) as well as on COOLING_OFF completion. |
 | 1.4 | 29-Mar-2026 | Fix: night export stop condition replaced -- PV watts reads 0W in Discharge ESS First mode so solar could never trigger a stop. Export now stops at Solcast-predicted sunrise (dawn_times) instead. Fix: night_export() sets HOLD_ESS_MAX_DISCHARGE=10000W and relies on the inverter's own DNO cap for grid limiting -- battery now supplies house load + 4kW to grid simultaneously. 54 unit tests, all pass. |
 | 1.3 | 29-Mar-2026 | Night export feature: force-discharge surplus to grid at night when SOC is high and tomorrow's forecast is good. Fix: persistent Modbus register (HOLD_ESS_MAX_DISCHARGE / HOLD_ESS_MAX_CHARGE) left at reduced value after force-discharge, capping battery output in self-consumption mode. Fix: tomorrow viability check now uses bias-corrected P50 (correctedTomorrowKwh x 60%) instead of P10. New: test_sigenergy_modbus.py (16 Modbus register tests). 49 unit tests total, all pass. |
 | 1.2 | 27-Mar-2026 | Fix: inverter capacity corrected to 10 kW. |
