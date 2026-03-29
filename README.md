@@ -46,9 +46,9 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ### Credentials
 
-**If you already have a `secrets.py`** in your Indigo root folder
-(`/Library/Application Support/Perceptive Automation/Indigo 202x.x/`) add the
-keys below to it. The plugin will pick them up automatically at startup.
+**If you already have a `secrets.py`** in
+`/Library/Application Support/Perceptive Automation/` add the keys below to it.
+The plugin will pick them up automatically at startup.
 
 **If you do not have a `secrets.py`** you can either:
 - Rename `secrets_example.py` (included in the plugin bundle) to `secrets.py`,
