@@ -100,7 +100,7 @@ automatically from your Octopus account -- no manual selection required.
 Every 60 seconds the plugin:
 
 1. Reads live data from the inverter via Modbus TCP
-2. Projects battery SOC at the next dawn using the P10 (conservative) Solcast forecast
+2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
    and a 48-slot half-hourly consumption profile
 3. If projected SOC at dawn < dawn target: schedules or starts a grid import
 4. If SOC is above the export stage 1 threshold: opens the export limit register to

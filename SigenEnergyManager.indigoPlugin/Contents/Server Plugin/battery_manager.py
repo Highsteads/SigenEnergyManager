@@ -99,7 +99,8 @@ class ManagerSnapshot:
     tariff: TariffData = field(default_factory=TariffData)
 
     # Forecast: hourly Wh dicts {"YYYY-MM-DD HH:00:00": wh_int}
-    # P50 for display; P10 (conservative) for dawn viability planning
+    # P50 used for display and next-hour lookahead.
+    # P10 retained in snapshot for diagnostics; not used in decision logic.
     forecast_p50: Dict[str, int] = field(default_factory=dict)
     forecast_p10: Dict[str, int] = field(default_factory=dict)
 
@@ -206,8 +207,9 @@ class BatteryManager:
     def _check_dawn_viability(self, snapshot: ManagerSnapshot) -> DawnViability:
         """Calculate projected SOC at the next solar generation window.
 
-        Uses P10 (conservative) forecast to determine when PV starts.
-        Uses consumption profile to estimate overnight drain.
+        Dawn time comes from snapshot.dawn_times, which is the first half-hourly
+        slot with P50 forecast > PV_GENERATION_THRESHOLD_W. Overnight drain is
+        estimated from the 48-slot half-hourly consumption profile.
         """
         cap_kwh          = snapshot.capacity_kwh
         current_soc_kwh  = snapshot.current_soc_pct / 100.0 * cap_kwh
