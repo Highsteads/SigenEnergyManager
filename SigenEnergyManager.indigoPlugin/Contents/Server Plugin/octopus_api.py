@@ -65,8 +65,8 @@ TARIFF_PRODUCT_PREFIXES = {
 TARIFF_WINDOWS = {
     TARIFF_GO:    {"cheap_start": "00:30", "cheap_end": "05:30"},
     TARIFF_FLUX:  {"cheap_start": "02:00", "cheap_end": "05:00"},
-    TARIFF_IGO:   {"cheap_start": "00:30", "cheap_end": "05:30"},
-    TARIFF_IFLUX: {"cheap_start": "02:00", "cheap_end": "05:00"},
+    TARIFF_IGO:   {"cheap_start": "23:30", "cheap_end": "05:30"},  # 23:30-05:30 (6h)
+    TARIFF_IFLUX: {"cheap_start": "19:00", "cheap_end": "16:00"},  # 21h non-peak window (avoids 16:00-19:00 peak)
 }
 
 

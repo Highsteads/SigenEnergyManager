@@ -30,8 +30,8 @@ except ImportError:
     TARIFF_WINDOWS = {
         "go":    {"cheap_start": "00:30", "cheap_end": "05:30"},
         "flux":  {"cheap_start": "02:00", "cheap_end": "05:00"},
-        "igo":   {"cheap_start": "00:30", "cheap_end": "05:30"},
-        "iflux": {"cheap_start": "02:00", "cheap_end": "05:00"},
+        "igo":   {"cheap_start": "23:30", "cheap_end": "05:30"},  # 23:30-05:30 (6h)
+        "iflux": {"cheap_start": "19:00", "cheap_end": "16:00"},  # 21h non-peak window (avoids 16:00-19:00 peak)
     }
 
 
