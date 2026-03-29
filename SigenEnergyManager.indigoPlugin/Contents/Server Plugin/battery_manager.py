@@ -53,11 +53,15 @@ TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper
 MIN_IMPORT_KWH = 0.5
 
 # Night export constants
-NIGHT_PV_THRESHOLD_W              = 500   # below this = no solar (night)
+# Note: pvPowerWatts reads 0W in Discharge ESS First mode (0x06) — the inverter
+# suppresses PV. A PV-based night/day check is therefore permanently blind while
+# exporting. Sunrise is detected via today's Solcast dawn_time instead.
 NIGHT_EXPORT_BUFFER_KWH           = 1.0   # safety margin above dawn target before exporting
 MIN_NIGHT_EXPORT_KWH              = 0.5   # minimum surplus to bother starting export
 NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cover daily load
                                           # (P50 bias-corrected; 0.6 tolerates 40% shortfall)
+DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export is blocked
+                                          # dawn 07:00 + 14h = 21:00 → nighttime resumes
 
 
 @dataclass
@@ -540,18 +544,38 @@ class BatteryManager:
         """Check if conditions are right for night export via force-discharge.
 
         All three conditions must hold:
-        1. No solar (pv_watts < NIGHT_PV_THRESHOLD_W) - safe to force-discharge
+        1. Before sunrise — checked against today's Solcast dawn time.
+           pvPowerWatts cannot be used: in Discharge ESS First mode (0x06)
+           the inverter suppresses PV to 0W regardless of actual solar.
         2. Battery surplus above dawn floor + safety buffer
-        3. Tomorrow P10 solar >= expected daily consumption (we'll recharge)
+        3. Tomorrow P50 solar (at 60% confidence) >= expected daily consumption
 
         Returns a Decision or None if conditions not met.
         """
-        # Condition 1: Night only - force_discharge suppresses PV, unsafe in daylight
-        if snapshot.pv_watts >= NIGHT_PV_THRESHOLD_W:
+        # Condition 1: Night only — stop/block export once sunrise is reached.
+        # Dawn time for today comes from the Solcast forecast in snapshot.dawn_times.
+        # Export is blocked for DAYTIME_WINDOW_HOURS after dawn (covers full daylight).
+        try:
+            import pytz
+            _tz = pytz.timezone("Europe/London")
+            _local_now = snapshot.now.astimezone(_tz)
+        except (ImportError, Exception):
+            _local_now = snapshot.now
+
+        _today_str     = _local_now.date().strftime("%Y-%m-%d")
+        _today_dawn_dt = snapshot.dawn_times.get(_today_str)
+        _is_daytime    = (
+            _today_dawn_dt is not None
+            and snapshot.now >= _today_dawn_dt
+            and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
+        )
+
+        if _is_daytime:
             if snapshot.export_active:
+                _dawn_str = _today_dawn_dt.astimezone(_tz).strftime("%H:%M")
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
-                    reason          = f"Solar detected ({snapshot.pv_watts}W) - stopping night export",
+                    reason          = f"Sunrise reached ({_dawn_str}) - stopping night export",
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
                 )

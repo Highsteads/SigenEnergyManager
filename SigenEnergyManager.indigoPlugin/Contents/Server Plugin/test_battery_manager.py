@@ -31,6 +31,7 @@ from battery_manager import (
     TRACKER_DEFER_THRESHOLD,
     NIGHT_EXPORT_BUFFER_KWH,
     MIN_NIGHT_EXPORT_KWH,
+    DAYTIME_WINDOW_HOURS,
 )
 
 
@@ -450,28 +451,48 @@ class TestNightExport(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
 
-    def test_night_export_blocked_when_solar_present(self):
-        """Solar above threshold → no export (force_discharge would suppress PV)."""
+    def test_night_export_blocked_after_sunrise(self):
+        """After today's sunrise export is blocked — dawn_times used, not PV watts.
+
+        In Discharge ESS First mode the inverter reads PV as 0W, so PV cannot
+        be used as a daylight indicator. Sunrise is detected via dawn_times.
+        now=08:00, today dawn=07:00 (1h ago, within DAYTIME_WINDOW_HOURS) → daytime.
+        """
+        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
         snapshot = _make_snapshot(
             soc_pct                = 80.0,
             export_enabled         = True,
-            pv_watts               = 600,   # above NIGHT_PV_THRESHOLD_W
+            pv_watts               = 0,     # reads 0W in force-discharge mode — irrelevant
             corrected_tomorrow_kwh = self._good_tomorrow_kwh,
             now_hour               = 8,
+            dawn_times             = {
+                today_str:    _now(hour=7),            # today dawn at 07:00 (1h ago)
+                tomorrow_str: _tomorrow_dawn(hour=7),
+            },
         )
         decision = self.bm.evaluate(snapshot)
 
         self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
-    def test_night_export_stops_when_solar_returns(self):
-        """Solar detected while export active → stop export."""
+    def test_night_export_stops_at_sunrise(self):
+        """Export active → stops when today's dawn time is reached.
+
+        now=08:00, today dawn=07:00 (1h ago, within DAYTIME_WINDOW_HOURS) → stop.
+        """
+        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
         snapshot = _make_snapshot(
             soc_pct                = 75.0,
             export_enabled         = True,
-            pv_watts               = 600,   # sunrise
+            pv_watts               = 0,     # 0W in force-discharge — irrelevant
             export_active          = True,
             corrected_tomorrow_kwh = self._good_tomorrow_kwh,
-            now_hour               = 7,
+            now_hour               = 8,
+            dawn_times             = {
+                today_str:    _now(hour=7),            # today dawn at 07:00 (1h ago)
+                tomorrow_str: _tomorrow_dawn(hour=7),
+            },
         )
         decision = self.bm.evaluate(snapshot)
 
