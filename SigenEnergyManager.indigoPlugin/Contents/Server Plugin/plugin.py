@@ -650,11 +650,18 @@ class Plugin(indigo.PluginBase):
 
         self._update_forecast_device(data)
 
-        if self.debug:
+        status   = data.get("forecastStatus", "")
+        tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
+
+        if "No data" in status:
+            log(f"[Solcast] WARNING: forecast unavailable ({status}) — night export condition 3 will block", level="WARNING")
+        elif tmrw_kwh == 0.0:
+            log(f"[Solcast] WARNING: tomorrow forecast is 0.0 kWh (status: {status!r}) — night export condition 3 will block", level="WARNING")
+        else:
             log(
                 f"[Solcast] Today: {data.get('correctedTodayKwh', 0):.1f} kWh "
                 f"(raw {data.get('todayKwh', 0):.1f}, bias {data.get('biasFactor', 1):.3f}), "
-                f"Tomorrow: {data.get('correctedTomorrowKwh', 0):.1f} kWh"
+                f"Tomorrow: {tmrw_kwh:.1f} kWh"
             )
 
     # ================================================================

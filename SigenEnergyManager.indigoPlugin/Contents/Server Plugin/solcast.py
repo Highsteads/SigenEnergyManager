@@ -81,6 +81,9 @@ class SolcastForecast:
         self._morning_forecast_kwh = 0.0  # captured at 00:05
         self._correction_factor    = 1.0  # current seasonal factor
 
+        # Pre-warm in-memory cache from disk so restarts don't lose forecast data
+        self._load_combined_cache()
+
     # ================================================================
     # Public API
     # ================================================================
@@ -542,11 +545,42 @@ class SolcastForecast:
         except Exception as e:
             self.logger.error(f"Cannot write accuracy records: {e}")
 
+    def _load_combined_cache(self):
+        """Pre-warm in-memory cache from disk on startup.
+
+        Reads solcast_combined_cache.json written by _save_cache().
+        This prevents post-restart forecast blackouts while waiting for
+        the next API call window (up to 2.4h).  _dawn_times is not
+        stored on disk (datetime objects), so it will be absent until
+        the next live fetch — the night-export daytime check tolerates this.
+        """
+        path = os.path.join(self.data_dir, "solcast_combined_cache.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cached_time = data.pop("_cached_time", 0.0)
+            self._cached_forecast = data
+            self._cached_time     = cached_time
+            age_h = (time.time() - cached_time) / 3600.0
+            if age_h > (CACHE_TTL / 3600.0) * 3:   # stale if > 7.2h
+                self.logger.warning(
+                    f"[Solcast] Loaded stale combined cache from disk "
+                    f"(age {age_h:.1f}h) — forecast data may be outdated"
+                )
+            else:
+                self.logger.info(
+                    f"[Solcast] Pre-warmed from disk cache (age {age_h:.1f}h)"
+                )
+        except Exception as e:
+            self.logger.warning(f"[Solcast] Cannot load combined cache from disk: {e}")
+
     def _save_cache(self, combined):
         """Save combined forecast to a single composite cache file."""
         path = os.path.join(self.data_dir, "solcast_combined_cache.json")
         try:
-            # Strip non-serialisable items (hourly dicts are fine)
+            # Strip non-serialisable items (hourly dicts are fine, _dawn datetimes are not)
             saveable = {k: v for k, v in combined.items() if not k.startswith("_dawn")}
             saveable["_cached_time"] = time.time()
             with open(path, "w", encoding="utf-8") as f:
