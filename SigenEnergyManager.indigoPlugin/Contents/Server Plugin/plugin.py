@@ -185,6 +185,11 @@ class Plugin(indigo.PluginBase):
         log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} starting")
         self._init_modules()
         self.solcast.load_correction_factor()
+        # Pre-populate latest_forecast_data from disk cache so the first manager
+        # evaluation has forecast data available (disk cache was loaded in
+        # SolcastForecast.__init__; this propagates it into plugin.py's dict).
+        self._refresh_solcast()
+        self.store["last_solcast"] = time.time()
         # Set initial state images for all devices that already exist
         # (deviceStartComm handles newly created devices; this handles existing ones on reload)
         for dev in indigo.devices.iter("self"):
@@ -287,7 +292,12 @@ class Plugin(indigo.PluginBase):
             self._poll_modbus()
             self.store["last_modbus"] = now
 
-        # 2. Battery manager evaluation (every 15 min OR on SOC delta)
+        # 2. Solcast forecast (before manager so decision always has fresh data)
+        if now - self.store["last_solcast"] >= SOLCAST_FETCH_INTERVAL:
+            self._refresh_solcast()
+            self.store["last_solcast"] = now
+
+        # 3. Battery manager evaluation (every 15 min OR on SOC delta)
         soc_now    = self.latest_inverter_data.get("batterySoc", 0.0)
         soc_delta  = abs(soc_now - self.store["last_soc"])
         if (now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL
@@ -295,11 +305,6 @@ class Plugin(indigo.PluginBase):
             self._evaluate_manager()
             self.store["last_manager"] = now
             self.store["last_soc"]     = soc_now
-
-        # 3. Solcast forecast
-        if now - self.store["last_solcast"] >= SOLCAST_FETCH_INTERVAL:
-            self._refresh_solcast()
-            self.store["last_solcast"] = now
 
         # 4. Octopus rates
         if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
