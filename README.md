@@ -84,8 +84,8 @@ AXLE_PASSWORD        = "..."
 | Inverter max kW | Inverter rated output power -- sets battery discharge ceiling (default 10) |
 | Dawn SOC target (%) | Minimum SOC required at next solar dawn (default 10%) |
 | Battery health cutoff (%) | Hardware discharge floor (default 10%) |
-| Export enabled | Enable night export and daytime surplus export to grid |
-| Max export kW | DNO grid export cap for night export (default 4 kW) |
+| Export enabled | Enable grid export (requires active export MPAN) |
+| Max export kW | DNO export cap — used at startup to initialise the export limit register (default 4 kW) |
 | VPP (Axle) enabled | Enable Axle Virtual Power Plant integration |
 
 Note: Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) is detected
@@ -103,11 +103,9 @@ Every 60 seconds the plugin:
 2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
    and a 48-slot half-hourly consumption profile
 3. If projected SOC at dawn < dawn target: schedules or starts a grid import
-4. If SOC is above the export stage 1 threshold: opens the export limit register to
-   allow surplus solar to flow to grid (staged, 2 kW then 4 kW)
-5. If it is night (PV < 500W) and battery has surplus above the dawn floor: force-discharges
-   to grid, provided tomorrow's solar forecast is good enough to recharge (see below)
-6. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+4. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
+   provided tomorrow's solar forecast is good enough to recharge (see below)
+5. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
 
 ### Night export
 
@@ -147,25 +145,6 @@ Example log message:
           Tomorrow forecast 25.1 kWh (60% = 15.1) >= daily 14.4 kWh.
           Exporting 4.0 kW
 ```
-
-### Export staging (daytime)
-
-Daytime export is controlled via `HOLD_GRID_MAX_EXPORT_LIMIT` (Modbus register 40038) in
-Remote EMS Max Self Consumption mode. This allows surplus PV to export naturally without
-curtailing generation.
-
-**Export thresholds (with symmetric 10% hysteresis deadband):**
-
-| State | Condition |
-|-------|-----------|
-| Stage 1 starts | SOC >= stage1 + 5% (default: 85%) |
-| Stage 2 starts | SOC >= stage2 + 5% (default: 95%) |
-| Stage 2 to Stage 1 | SOC < stage2 - 5% (default: 85%) |
-| Stage 1 to off | SOC < stage1 - 5% (default: 75%) |
-
-The 10% wide deadband prevents rapid on/off cycling when SOC oscillates around
-a threshold, which would otherwise toggle the export limit register to 0W and
-cause grid import at night.
 
 ### Persistent Modbus register protection
 
