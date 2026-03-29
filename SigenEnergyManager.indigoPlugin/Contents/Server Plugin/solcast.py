@@ -5,7 +5,7 @@
 #              and daily bias correction
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        26-03-2026 15:30 GMT
-# Version:     1.0
+# Version:     1.3
 #
 # Solcast Hobbyist plan: 10 API calls/day/site (max)
 # Cache TTL: 8640 seconds (2.4 hours) per site to stay within 10 calls/day
@@ -134,7 +134,14 @@ class SolcastForecast:
             return self._empty_forecast("All API calls failed")
 
         # Combine site data (sum P50/P10/P90 per period)
-        combined = self._combine_sites(site_forecasts)
+        try:
+            combined = self._combine_sites(site_forecasts)
+        except Exception as e:
+            self.logger.error(f"Solcast _combine_sites failed: {e}")
+            if self._cached_forecast:
+                self.logger.warning("Returning stale cached forecast due to combine error")
+                return self._enrich_forecast(self._cached_forecast)
+            return self._empty_forecast(f"Combine error: {e}")
 
         if failed_sites:
             combined["forecastStatus"] = f"Partial - {len(failed_sites)} site(s) failed"
@@ -334,6 +341,7 @@ class SolcastForecast:
         hourly_p50_today    = {}
         hourly_p10_today    = {}
         hourly_p50_tomorrow = {}
+        hourly_p10_tomorrow = {}
 
         today_total    = 0.0
         tomorrow_total = 0.0
@@ -367,6 +375,7 @@ class SolcastForecast:
                 hourly_p10_today[hour_key]  = hourly_p10_today.get(hour_key, 0) + int(vals["p10"] * 500)
             elif period_date == tomorrow:
                 hourly_p50_tomorrow[hour_key] = hourly_p50_tomorrow.get(hour_key, 0) + int(period_wh_p50)
+                hourly_p10_tomorrow[hour_key] = hourly_p10_tomorrow.get(hour_key, 0) + int(vals["p10"] * 500)
 
             # Track dawn time for each date
             if vals["p50"] * 1000 > PV_GENERATION_THRESHOLD_W:  # kW -> W
@@ -399,6 +408,7 @@ class SolcastForecast:
             "_hourly_p50_today":    hourly_p50_today,
             "_hourly_p10_today":    hourly_p10_today,
             "_hourly_p50_tomorrow": hourly_p50_tomorrow,
+            "_hourly_p10_tomorrow": hourly_p10_tomorrow,
             "_dawn_times":          dawn_times,
         }
 
@@ -433,6 +443,7 @@ class SolcastForecast:
             "_hourly_p50_today":     {},
             "_hourly_p10_today":     {},
             "_hourly_p50_tomorrow":  {},
+            "_hourly_p10_tomorrow":  {},
             "_dawn_times":           {},
         }
 

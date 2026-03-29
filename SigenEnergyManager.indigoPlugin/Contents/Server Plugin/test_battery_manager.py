@@ -29,7 +29,8 @@ from battery_manager import (
     TARIFF_GO,
     TARIFF_FLUX,
     TRACKER_DEFER_THRESHOLD,
-    EXPORT_HYSTERESIS_PCT,
+    NIGHT_EXPORT_BUFFER_KWH,
+    MIN_NIGHT_EXPORT_KWH,
 )
 
 
@@ -61,16 +62,16 @@ def _make_snapshot(
     cheap_start=None,
     cheap_end=None,
     export_enabled=False,
-    export_stage1_soc_pct=80.0,
-    export_stage1_kw=2.0,
-    export_stage2_soc_pct=90.0,
-    export_stage2_kw=4.0,
-    current_export_tier=0,
     vpp_active=False,
     now_hour=14,
     forecast_p50=None,
+    forecast_p10=None,
     consumption_profile=None,
     dawn_times=None,
+    pv_watts=0,
+    export_active=False,
+    max_export_kw=4.0,
+    corrected_tomorrow_kwh=0.0,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -83,33 +84,32 @@ def _make_snapshot(
         cheap_end       = cheap_end,
     )
 
-    # Default: flat 0.3 kWh/slot profile
+    # Default: flat 0.3 kWh/slot profile (~14.4 kWh/day)
     if consumption_profile is None:
-        consumption_profile = [0.30] * 48  # ~7.2 kWh/day overnight
+        consumption_profile = [0.30] * 48
 
     # Default dawn times: tomorrow at 07:00
     if dawn_times is None:
         dawn_times = {tomorrow_str: _tomorrow_dawn(hour=7)}
 
     return ManagerSnapshot(
-        current_soc_pct       = soc_pct,
-        capacity_kwh          = CAPACITY_KWH,
-        efficiency            = EFFICIENCY,
-        dawn_target_pct       = DAWN_TARGET,
-        health_cutoff_pct     = HEALTH_FLOOR,
-        export_enabled        = export_enabled,
-        export_stage1_soc_pct = export_stage1_soc_pct,
-        export_stage1_kw      = export_stage1_kw,
-        export_stage2_soc_pct = export_stage2_soc_pct,
-        export_stage2_kw      = export_stage2_kw,
-        current_export_tier   = current_export_tier,
-        tariff                = tariff,
-        forecast_p50          = forecast_p50 or {},
-        forecast_p10          = {},
-        dawn_times            = dawn_times,
-        consumption_profile   = consumption_profile,
-        now                   = _now(hour=now_hour),
-        vpp_active            = vpp_active,
+        current_soc_pct        = soc_pct,
+        capacity_kwh           = CAPACITY_KWH,
+        efficiency             = EFFICIENCY,
+        dawn_target_pct        = DAWN_TARGET,
+        health_cutoff_pct      = HEALTH_FLOOR,
+        export_enabled         = export_enabled,
+        max_export_kw          = max_export_kw,
+        pv_watts               = pv_watts,
+        export_active          = export_active,
+        corrected_tomorrow_kwh = corrected_tomorrow_kwh,
+        tariff                 = tariff,
+        forecast_p50           = forecast_p50 or {},
+        forecast_p10           = forecast_p10 or {},
+        dawn_times             = dawn_times,
+        consumption_profile    = consumption_profile,
+        now                    = _now(hour=now_hour),
+        vpp_active             = vpp_active,
     )
 
 
@@ -322,213 +322,6 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         self.assertIn("cheap window", decision.reason.lower())
 
 
-class TestExportDecisions(unittest.TestCase):
-    """Tests for grid export logic."""
-
-    def setUp(self):
-        self.bm = BatteryManager()
-
-    def test_no_export_when_disabled(self):
-        """No export when export_enabled is False."""
-        snapshot = _make_snapshot(
-            soc_pct        = 95.0,
-            export_enabled = False,
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-    def test_no_export_below_stage1_soc(self):
-        """No export when SOC is below the stage 1 threshold."""
-        snapshot = _make_snapshot(
-            soc_pct               = 75.0,   # below 80% stage1 default
-            export_enabled        = True,
-            export_stage1_soc_pct = 80.0,
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-    def test_export_when_soc_above_stage2(self):
-        """Export at stage2 power when SOC >= stage2 + hysteresis restart threshold.
-
-        Fix: restart from tier 0 to tier 2 requires SOC >= s2_soc + EXPORT_HYSTERESIS_PCT.
-        Using soc=96% (>= 90+5=95%) to confirm direct tier 2 start from off.
-        At 92%, the new code correctly lands on tier 1 first (see TestExportRestartHysteresis).
-        """
-        snapshot = _make_snapshot(
-            soc_pct               = 96.0,
-            export_enabled        = True,
-            export_stage1_soc_pct = 80.0,
-            export_stage1_kw      = 2.0,
-            export_stage2_soc_pct = 90.0,
-            export_stage2_kw      = 4.0,
-            current_export_tier   = 0,
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.power_watts, 4000)
-        self.assertEqual(decision.export_tier, 2)
-
-    def test_no_export_if_it_would_breach_dawn_floor(self):
-        """Dynamic dawn floor blocks export when overnight drain exceeds headroom.
-
-        SOC = 11% = 3.85 kWh. With flat 0.3 kWh/slot profile at 14:00,
-        ~17h to dawn = 10.2 kWh expected drain.
-        dawn_required = 3.504 + 10.2 + 0.5 = 14.2 kWh >> 3.85 kWh -> blocked.
-        """
-        snapshot = _make_snapshot(
-            soc_pct               = 11.0,
-            export_enabled        = True,
-            export_stage1_soc_pct = 10.0,   # trigger below current SOC
-            export_stage1_kw      = 2.0,
-            export_stage2_soc_pct = 10.5,
-            export_stage2_kw      = 4.0,
-            current_export_tier   = 0,
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-    def test_dynamic_dawn_floor_blocks_export_static_floor_would_pass(self):
-        """Dynamic floor catches marginal case that static floor would miss.
-
-        SOC = 35% = 12.26 kWh.
-        Static floor (old): dawn_target + buffer = 3.504 + 0.5 = 4.0 kWh
-          -> 12.26 > 4.0, would PASS (export allowed).
-        Dynamic floor (new): dawn_target + consumption + buffer
-          = 3.504 + 10.2 + 0.5 = 14.2 kWh
-          -> 12.26 < 14.2, BLOCKED (correct).
-        Uses aggressive stage1 threshold (30%) so tier logic would fire.
-        """
-        snapshot = _make_snapshot(
-            soc_pct               = 35.0,
-            export_enabled        = True,
-            export_stage1_soc_pct = 30.0,   # aggressive: 35% triggers tier 1
-            export_stage1_kw      = 2.0,
-            export_stage2_soc_pct = 90.0,
-            export_stage2_kw      = 4.0,
-            current_export_tier   = 0,
-            now_hour              = 14,     # ~17h to dawn -> ~10.2 kWh consumption
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-
-class TestStagedExportDecisions(unittest.TestCase):
-    """Tests for 2-tier staged export logic with hysteresis."""
-
-    def setUp(self):
-        self.bm = BatteryManager()
-
-    def _snap(self, soc, tier=0, s1_soc=80.0, s1_kw=2.0, s2_soc=90.0, s2_kw=4.0):
-        """Shorthand snapshot builder for staged export tests."""
-        return _make_snapshot(
-            soc_pct               = soc,
-            export_enabled        = True,
-            export_stage1_soc_pct = s1_soc,
-            export_stage1_kw      = s1_kw,
-            export_stage2_soc_pct = s2_soc,
-            export_stage2_kw      = s2_kw,
-            current_export_tier   = tier,
-        )
-
-    def test_stage1_trigger_from_off(self):
-        """SOC well above stage1+hysteresis from off triggers stage 1 export.
-
-        Fix: restart requires SOC >= s1_soc + EXPORT_HYSTERESIS_PCT (85%), not just 80%.
-        Using 86% to confirm tier 1 starts correctly above the new restart threshold.
-        """
-        snapshot = self._snap(soc=86.0, tier=0)
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.power_watts, 2000)
-        self.assertEqual(decision.export_tier, 1)
-
-    def test_stage2_trigger_from_off(self):
-        """SOC above stage2+hysteresis from off triggers stage 2 export.
-
-        Fix: restart to tier 2 requires SOC >= s2_soc + EXPORT_HYSTERESIS_PCT (95%).
-        Using 96% to confirm tier 2 starts correctly above the new restart threshold.
-        """
-        snapshot = self._snap(soc=96.0, tier=0)
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.power_watts, 4000)
-        self.assertEqual(decision.export_tier, 2)
-
-    def test_tier1_upgrades_to_tier2_when_soc_rises(self):
-        """Currently at tier 1, SOC rises above stage2 threshold -> upgrade to tier 2."""
-        snapshot = self._snap(soc=91.0, tier=1)
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.power_watts, 4000)
-        self.assertEqual(decision.export_tier, 2)
-
-    def test_tier1_held_within_hysteresis_band(self):
-        """SOC drops slightly below stage1 but within hysteresis band - tier 1 maintained."""
-        # stage1=80%, hysteresis=5%, drop-off at 75%; SOC=76% is inside band
-        soc_inside_band = 80.0 - EXPORT_HYSTERESIS_PCT + 1.0   # 76%
-        snapshot = self._snap(soc=soc_inside_band, tier=1)
-        decision = self.bm.evaluate(snapshot)
-
-        # Should hold tier 1 (no change -> None from _check_export -> self_consumption)
-        self.assertNotEqual(decision.action, ACTION_STOP_EXPORT)
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-    def test_tier1_drops_to_off_below_hysteresis(self):
-        """SOC falls below stage1 minus hysteresis band -> STOP_EXPORT."""
-        # Drop-off at 75% (80 - 5); SOC=74% is below band
-        soc_below_band = 80.0 - EXPORT_HYSTERESIS_PCT - 1.0    # 74%
-        snapshot = self._snap(soc=soc_below_band, tier=1)
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
-        self.assertEqual(decision.export_tier, 0)
-
-    def test_tier2_downgrades_to_tier1(self):
-        """SOC drops from stage2 range to stage1 range -> downgrade to tier 1."""
-        # stage2=90%, hysteresis=5%, drop-off at 85%; SOC=84% is below that threshold
-        # but still above stage1 drop-off (80-5=75%), so target tier = 1
-        soc_in_stage1_range = 90.0 - EXPORT_HYSTERESIS_PCT - 1.0   # 84%
-        snapshot = self._snap(soc=soc_in_stage1_range, tier=2)
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.power_watts, 2000)
-        self.assertEqual(decision.export_tier, 1)
-
-    def test_dawn_viability_blocks_export(self):
-        """SOC is above stage1 but near the dawn floor - export must be blocked."""
-        # 11% SOC = 3.85 kWh; dawn floor = 10% (3.504) + 0.5 buffer = 4.004 kWh
-        # 3.85 < 4.004 so dawn guard blocks export
-        snapshot = _make_snapshot(
-            soc_pct               = 11.0,
-            export_enabled        = True,
-            export_stage1_soc_pct = 10.0,    # threshold below current SOC
-            export_stage1_kw      = 2.0,
-            export_stage2_soc_pct = 10.5,
-            export_stage2_kw      = 4.0,
-            current_export_tier   = 0,
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
-
-    def test_no_change_when_already_at_correct_tier(self):
-        """Already at tier 1 and SOC still in stage1 range -> no START_EXPORT re-issue."""
-        snapshot = self._snap(soc=85.0, tier=1)  # in stage1 range, already at tier 1
-        decision = self.bm.evaluate(snapshot)
-
-        # Should be self_consumption (no change needed)
-        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
-
-
 class TestVppSuppression(unittest.TestCase):
     """Tests that VPP active suppresses all manager decisions."""
 
@@ -608,154 +401,179 @@ class TestTimeWindowHelper(unittest.TestCase):
         self.assertFalse(self.bm._time_in_window("12:00", "23:30", "05:30"))
 
 
-class TestExportRestartHysteresis(unittest.TestCase):
-    """Tests for upward hysteresis on export restart from tier 0.
 
-    Bug fixed: When cur_tier == 0 (export stopped), the old code restarted export at
-    exactly the stage1 threshold (80%).  At night, with SOC oscillating around 80%, this
-    caused export to cycle on/off every 15 minutes.  Each stop wrote export_limit=0W to
-    register 40038, which caused Sigenergy to throttle battery discharge and import from
-    grid even at 78% SOC.
+class TestNightExport(unittest.TestCase):
+    """Tests for night export (force-discharge) logic.
 
-    Fix: require SOC >= s1_soc + EXPORT_HYSTERESIS_PCT (85%) before restarting from tier 0.
-    This creates a symmetric 10% deadband: stop at 75%, restart at 85%.
+    Tomorrow viability uses corrected_tomorrow_kwh (Solcast bias-corrected P50)
+    at 60% confidence: corrected_tomorrow_kwh * 0.6 must cover daily consumption.
+    Default consumption profile: [0.30] * 48 = 14.4 kWh/day.
+    Good:  25.0 kWh * 0.6 = 15.0 >= 14.4  (passes)
+    Poor:  15.0 kWh * 0.6 =  9.0 <  14.4  (blocked)
     """
 
     def setUp(self):
         self.bm = BatteryManager()
+        # Good tomorrow: 25 kWh forecast; 25 * 0.6 = 15.0 >= 14.4 kWh daily
+        self._good_tomorrow_kwh = 25.0
+        # Poor tomorrow: 15 kWh forecast; 15 * 0.6 =  9.0  < 14.4 kWh daily
+        self._poor_tomorrow_kwh = 15.0
 
-    def _snap(self, soc, tier=0, s1_soc=80.0, s2_soc=90.0, s1_kw=2.0, s2_kw=4.0, now_hour=21):
-        """Nighttime snapshot (no PV) for export cycling tests."""
-        return _make_snapshot(
-            soc_pct               = soc,
-            export_enabled        = True,
-            export_stage1_soc_pct = s1_soc,
-            export_stage1_kw      = s1_kw,
-            export_stage2_soc_pct = s2_soc,
-            export_stage2_kw      = s2_kw,
-            current_export_tier   = tier,
-            now_hour              = now_hour,
+    def test_night_export_starts_when_all_conditions_met(self):
+        """High SOC at night + good tomorrow forecast → start export."""
+        # SOC=80% (28.03 kWh). Drain to dawn (02:00 -> 07:00 = 5h * 0.6 kWh/h = 3.0 kWh)
+        # Projected dawn = 28.03 - 3.0 = 25.03 kWh. Dawn target = 3.504.
+        # Surplus = 25.03 - 3.504 - 1.0 buffer = 20.5 kWh -> export
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 2,
         )
+        decision = self.bm.evaluate(snapshot)
 
-    # ── Restart threshold correctness ────────────────────────────────────────
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertGreater(decision.power_watts, 0)
+        self.assertEqual(decision.export_kw, 4.0)
 
-    def test_no_restart_at_exactly_stage1_threshold(self):
-        """SOC = 80.0% with tier=0 must NOT restart — requires 85% (80 + 5 hysteresis)."""
-        decision = self.bm.evaluate(self._snap(soc=80.0, tier=0))
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT,
-            "Export restarted at exactly 80% — upward hysteresis not applied")
+    def test_night_export_blocked_when_export_disabled(self):
+        """Export disabled → no night export regardless of SOC."""
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = False,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 2,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-    def test_no_restart_just_above_stage1(self):
-        """SOC = 80.5% with tier=0 must NOT restart — still below 85% restart threshold."""
-        decision = self.bm.evaluate(self._snap(soc=80.5, tier=0))
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+
+    def test_night_export_blocked_when_solar_present(self):
+        """Solar above threshold → no export (force_discharge would suppress PV)."""
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = True,
+            pv_watts               = 600,   # above NIGHT_PV_THRESHOLD_W
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 8,
+        )
+        decision = self.bm.evaluate(snapshot)
+
         self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
-    def test_no_restart_midway_through_hysteresis_band(self):
-        """SOC = 82.5% with tier=0: inside the deadband (75%-85%), no restart."""
-        decision = self.bm.evaluate(self._snap(soc=82.5, tier=0))
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+    def test_night_export_stops_when_solar_returns(self):
+        """Solar detected while export active → stop export."""
+        snapshot = _make_snapshot(
+            soc_pct                = 75.0,
+            export_enabled         = True,
+            pv_watts               = 600,   # sunrise
+            export_active          = True,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 7,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-    def test_no_restart_just_below_upward_threshold(self):
-        """SOC = 84.9% with tier=0: just below restart threshold — no restart."""
-        decision = self.bm.evaluate(self._snap(soc=84.9, tier=0))
-        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
 
-    def test_restart_at_exactly_upward_hysteresis_threshold(self):
-        """SOC = 85.0% with tier=0: exactly at restart threshold — START tier 1."""
-        decision = self.bm.evaluate(self._snap(soc=85.0, tier=0))
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.export_tier, 1)
-        self.assertEqual(decision.power_watts, 2000)
+    def test_night_export_stops_when_soc_near_floor(self):
+        """Battery near dawn floor (above import threshold, below export threshold) → stop export."""
+        # now=03:00, dawn=07:00 (TODAY, so only 4h away - simulates late-night close to dawn)
+        # SOC=20% (7.008 kWh). Drain 03:00→07:00 = 4h * 0.6 kWh/h = 2.4 kWh.
+        # Projected dawn = 7.008 - 2.4 = 4.608 kWh. Dawn target = 3.504 kWh.
+        # Surplus = 4.608 - 3.504 - 1.0 buffer = 0.104 kWh < 0.5 MIN_NIGHT_EXPORT_KWH → stop.
+        today_str = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+        snapshot = _make_snapshot(
+            soc_pct                = 20.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            export_active          = True,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 3,
+            dawn_times             = {today_str: _now(hour=7)},   # dawn in 4h, not 28h
+        )
+        decision = self.bm.evaluate(snapshot)
 
-    def test_restart_clearly_above_threshold(self):
-        """SOC = 88% with tier=0: clearly above restart threshold — START tier 1."""
-        decision = self.bm.evaluate(self._snap(soc=88.0, tier=0))
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.export_tier, 1)
+        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
 
-    # ── Stage 2 restart threshold ─────────────────────────────────────────────
+    def test_night_export_blocked_when_poor_solar_tomorrow(self):
+        """Poor forecast tomorrow → don't export, keep battery for tomorrow.
 
-    def test_stage2_restart_starts_at_tier1_between_thresholds(self):
-        """SOC = 93% with tier=0: above restart_s1 (85%) but below restart_s2 (95%) — tier 1."""
-        decision = self.bm.evaluate(self._snap(soc=93.0, tier=0))
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.export_tier, 1,
-            "At 93%, restart should land on tier 1 (not tier 2 which needs 95%)")
-        self.assertEqual(decision.power_watts, 2000)
-
-    def test_stage2_restart_at_exact_tier2_threshold(self):
-        """SOC = 95% with tier=0: exactly at restart_s2 (90+5) — START tier 2."""
-        decision = self.bm.evaluate(self._snap(soc=95.0, tier=0))
-        self.assertEqual(decision.action, ACTION_START_EXPORT)
-        self.assertEqual(decision.export_tier, 2)
-        self.assertEqual(decision.power_watts, 4000)
-
-    # ── Observed bug reproduction ────────────────────────────────────────────
-
-    def test_nighttime_cycling_stop_then_no_restart(self):
-        """Reproduces the 27-Mar-2026 bug: export cycling at night causes grid import.
-
-        Scenario:
-          21:00 - tier=1, SOC=74% -> export stops (below 75% drop-off)
-          21:15 - tier=0, SOC=80.5% (SOC near threshold) -> must NOT restart
-        Old code: restarted at 80.5% -> set export_limit=0W -> battery throttled -> import
-        New code: does not restart until 85% -> no 0W limit -> battery discharges freely
+        corrected_tomorrow_kwh=15.0; 15.0 * 0.6 = 9.0 < 14.4 kWh daily → blocked.
         """
-        # Step 1: export stops when SOC drops below drop-off threshold
-        decision_stop = self.bm.evaluate(self._snap(soc=74.0, tier=1))
-        self.assertEqual(decision_stop.action, ACTION_STOP_EXPORT,
-            "Export should stop at 74% (below 80-5=75% drop-off threshold)")
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = self._poor_tomorrow_kwh,
+            now_hour               = 2,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-        # Step 2: next poll, tier=0, SOC reads 80.5% (evening SOC near threshold)
-        decision_next = self.bm.evaluate(self._snap(soc=80.5, tier=0))
-        self.assertNotEqual(decision_next.action, ACTION_START_EXPORT,
-            "Export must not restart at 80.5% — this is the bug that caused grid import")
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
-    def test_stop_and_restart_full_cycle(self):
-        """Full correct cycle: stop at 74%, SOC rises to 86% during solar, restart."""
-        # Stop
-        d_stop = self.bm.evaluate(self._snap(soc=74.0, tier=1))
-        self.assertEqual(d_stop.action, ACTION_STOP_EXPORT)
+    def test_night_export_stops_when_poor_solar_tomorrow(self):
+        """Poor forecast tomorrow while exporting → stop export."""
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            export_active          = True,
+            corrected_tomorrow_kwh = self._poor_tomorrow_kwh,
+            now_hour               = 2,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-        # Intermediate checks — should not restart at 80%, 82%, 84%
-        for soc in (80.0, 82.0, 84.0):
-            d = self.bm.evaluate(self._snap(soc=soc, tier=0))
-            self.assertNotEqual(d.action, ACTION_START_EXPORT,
-                f"Incorrectly restarted at {soc}% (threshold is 85%)")
+        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
 
-        # Restart when SOC genuinely recovers to 86% (e.g. next morning solar)
-        d_restart = self.bm.evaluate(self._snap(soc=86.0, tier=0))
-        self.assertEqual(d_restart.action, ACTION_START_EXPORT)
-        self.assertEqual(d_restart.export_tier, 1)
+    def test_night_export_respects_max_export_kw(self):
+        """power_watts matches max_export_kw setting."""
+        snapshot = _make_snapshot(
+            soc_pct                = 80.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            max_export_kw          = 3.5,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 2,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-    # ── Downward hysteresis unchanged ────────────────────────────────────────
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertEqual(decision.power_watts, 3500)
+        self.assertEqual(decision.export_kw, 3.5)
 
-    def test_downward_hysteresis_still_works_in_tier1(self):
-        """Downward hysteresis is unchanged: tier 1 holds until SOC < 80-5 = 75%."""
-        # 76% is inside band (above 75%) - hold tier 1
-        d_hold = self.bm.evaluate(self._snap(soc=76.0, tier=1))
-        self.assertNotEqual(d_hold.action, ACTION_STOP_EXPORT)
+    def test_import_takes_priority_over_night_export(self):
+        """Dawn viability at risk → import, not export."""
+        # 12% SOC at 20:00. Drain to dawn = 11h * 0.6 kWh/h = 6.6 kWh.
+        # 4.20 - 6.6 = -2.4 kWh -> import needed. Export should NOT be triggered.
+        snapshot = _make_snapshot(
+            soc_pct                = 12.0,
+            export_enabled         = True,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            now_hour               = 20,
+        )
+        decision = self.bm.evaluate(snapshot)
 
-        # 74.9% is below band - stop
-        d_stop = self.bm.evaluate(self._snap(soc=74.9, tier=1))
-        self.assertEqual(d_stop.action, ACTION_STOP_EXPORT)
+        self.assertEqual(decision.action, ACTION_START_IMPORT)
 
-    def test_symmetric_deadband_width(self):
-        """Confirm the deadband is symmetric: stop at 75%, restart at 85% = 10% wide."""
-        stop_threshold    = 80.0 - EXPORT_HYSTERESIS_PCT     # 75%
-        restart_threshold = 80.0 + EXPORT_HYSTERESIS_PCT     # 85%
-        deadband_width    = restart_threshold - stop_threshold
+    def test_sum_tomorrow_forecast_helper(self):
+        """_sum_tomorrow_forecast sums hourly P10 entries for tomorrow's date.
 
-        self.assertAlmostEqual(deadband_width, 10.0, places=1,
-            msg=f"Expected 10% deadband, got {deadband_width}%")
-
-        # Verify stop
-        d = self.bm.evaluate(self._snap(soc=stop_threshold - 0.1, tier=1))
-        self.assertEqual(d.action, ACTION_STOP_EXPORT)
-
-        # Verify restart
-        d = self.bm.evaluate(self._snap(soc=restart_threshold, tier=0))
-        self.assertEqual(d.action, ACTION_START_EXPORT)
+        This method is retained for use in advanced diagnostics.
+        The main export viability check now uses corrected_tomorrow_kwh (P50).
+        """
+        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
+        p10 = {
+            f"{today_str} 10:00:00":    5000,   # today - should be excluded
+            f"{tomorrow_str} 09:00:00": 3000,   # tomorrow - included
+            f"{tomorrow_str} 10:00:00": 4000,   # tomorrow - included
+        }
+        result = BatteryManager._sum_tomorrow_forecast(p10, datetime.now(timezone.utc))
+        # 3000 + 4000 = 7000 Wh = 7.0 kWh
+        self.assertAlmostEqual(result, 7.0, places=1)
 
 
 if __name__ == "__main__":

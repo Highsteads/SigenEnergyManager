@@ -5,7 +5,7 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        26-03-2026 15:30 GMT
-# Version:     1.0
+# Version:     1.3
 #
 # Register map verified against Sigenergy Modbus Protocol V2.8 (2025-11-28)
 # Adapted from SigenergySolar v3.1 sigenergy_modbus.py
@@ -609,7 +609,7 @@ class SigenergyModbus:
         if watts < 0:
             self.logger.error(f"Invalid charge limit: {watts}W (must be >= 0)")
             return False
-        self.logger.debug(f"Setting max charge limit: {watts}W")
+        self.logger.info(f"Setting ESS max charge limit: {watts}W")
         return self._write_uint32_registers(HOLD_ESS_MAX_CHARGE, watts)
 
     def set_discharge_limit(self, watts):
@@ -617,7 +617,7 @@ class SigenergyModbus:
         if watts < 0:
             self.logger.error(f"Invalid discharge limit: {watts}W (must be >= 0)")
             return False
-        self.logger.debug(f"Setting max discharge limit: {watts}W")
+        self.logger.info(f"Setting ESS max discharge limit: {watts}W")
         return self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts)
 
     def set_export_limit(self, watts):
@@ -673,19 +673,49 @@ class SigenergyModbus:
         return True
 
     def set_self_consumption(self):
-        """Set Max Self Consumption mode via Remote EMS."""
+        """Set Max Self Consumption mode via Remote EMS.
+
+        HOLD_ESS_MAX_CHARGE (40032) and HOLD_ESS_MAX_DISCHARGE (40034) are
+        persistent registers — their values survive mode changes on the inverter.
+        A previous force_charge() or force_discharge() call leaves a stale limit
+        that caps battery output even in self-consumption mode. Both are reset to
+        the inverter maximum (10000W) here on every transition to self-consumption.
+        """
         self.logger.info("Setting Remote EMS: Max Self Consumption")
         if not self.enable_remote_ems():
             return False
         if not self.set_remote_ems_mode(0x02):
             return False
-        self.logger.info("Remote EMS: Max Self Consumption active")
+        # Reset both power limits — they persist across mode changes
+        self.set_discharge_limit(10000)
+        self.set_charge_limit(10000)
+        self.logger.info("Remote EMS: Max Self Consumption active (charge/discharge limits cleared)")
         return True
 
     def return_to_local(self):
         """Return inverter to its own local EMS control."""
         self.logger.info("Returning to local EMS control")
         return self.disable_remote_ems()
+
+    def read_discharge_limit(self):
+        """Read current HOLD_ESS_MAX_DISCHARGE (registers 40034-40035). Returns watts or None."""
+        if not self._connected:
+            return None
+        raw = self._read_uint32(HOLD_ESS_MAX_DISCHARGE)
+        if raw is None:
+            return None
+        self.logger.debug(f"Discharge limit read: {raw}W")
+        return raw
+
+    def read_charge_limit(self):
+        """Read current HOLD_ESS_MAX_CHARGE (registers 40032-40033). Returns watts or None."""
+        if not self._connected:
+            return None
+        raw = self._read_uint32(HOLD_ESS_MAX_CHARGE)
+        if raw is None:
+            return None
+        self.logger.debug(f"Charge limit read: {raw}W")
+        return raw
 
     # ================================================================
     # ESS SOC Limits (V2.6+ registers)
@@ -725,4 +755,41 @@ class SigenergyModbus:
             return None
         soc_pct = raw / 10.0
         self.logger.debug(f"Discharge cutoff: {soc_pct:.1f}% (raw={raw})")
+        return soc_pct
+
+    def set_charge_cutoff(self, soc_pct):
+        """Set ESS maximum charge SOC (register 40047).
+
+        Battery will not charge above this SOC in Self Consumption mode.
+        Used to prevent the battery absorbing all surplus PV when export is active —
+        once the cutoff is reached, surplus PV flows to the grid naturally.
+        Restore to 100.0 when export stops to allow unrestricted charging.
+
+        Args:
+            soc_pct: Maximum charge SOC % (0.0 - 100.0)
+        """
+        if not (0.0 <= soc_pct <= 100.0):
+            self.logger.error(f"Invalid charge cutoff: {soc_pct}% (must be 0-100)")
+            return False
+        raw_value = int(round(soc_pct * 10))
+        self.logger.info(f"Setting ESS charge cutoff: {soc_pct:.1f}% (raw={raw_value})")
+        success = self._write_single_register(HOLD_ESS_CHARGE_CUTOFF, raw_value)
+        if not success:
+            self.logger.error(f"Failed to set charge cutoff to {soc_pct:.1f}%")
+        return success
+
+    def read_charge_cutoff(self):
+        """Read current ESS charge cutoff SOC from register 40047.
+
+        Returns:
+            float: Charge cutoff % or None on error.
+        """
+        if not self._connected:
+            self.logger.warning("Cannot read charge cutoff - not connected")
+            return None
+        raw = self._read_uint16(HOLD_ESS_CHARGE_CUTOFF)
+        if raw is None:
+            return None
+        soc_pct = raw / 10.0
+        self.logger.debug(f"Charge cutoff: {soc_pct:.1f}% (raw={raw})")
         return soc_pct

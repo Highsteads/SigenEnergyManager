@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        27-03-2026 22:11 GMT
-# Version:     1.2
+# Version:     1.3
 
 import indigo
 import json
@@ -173,10 +173,8 @@ class Plugin(indigo.PluginBase):
         self.store["import_scheduled_time"]  = None
         self.store["import_target_soc"]      = 0.0
 
-        # Export state
+        # Export state (export limit is set once at startup; no dynamic tracking needed)
         self.store["export_active"]   = False
-        self.store["export_tier"]     = 0      # 0=off, 1=stage1, 2=stage2
-        self.store["export_power_w"]  = 0      # last Modbus-written export power (W)
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
@@ -448,15 +446,14 @@ class Plugin(indigo.PluginBase):
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
             dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 10)),
-            export_enabled        = prefs.get("exportEnabled", False),
-            export_stage1_soc_pct = float(prefs.get("exportStage1Soc", 80)),
-            export_stage1_kw      = float(prefs.get("exportStage1Kw", 2.0)),
-            export_stage2_soc_pct = float(prefs.get("exportStage2Soc", 90)),
-            export_stage2_kw      = float(prefs.get("exportStage2Kw", 4.0)),
-            current_export_tier   = self.store.get("export_tier", 0),
-            tariff             = tariff_data,
-            forecast_p50       = self.latest_forecast_data.get("_hourly_p50_today", {}),
-            forecast_p10       = self.latest_forecast_data.get("_hourly_p10_today", {}),
+            export_enabled     = prefs.get("exportEnabled", False),
+            max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
+            pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
+            export_active           = self.store["export_active"],
+            corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
+            tariff                  = tariff_data,
+            forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
+            forecast_p10            = self.latest_forecast_data.get("_hourly_p10_tomorrow", {}),
             dawn_times         = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile = self.store.get("consumption_profile", []),
             now                = datetime.now(timezone.utc),
@@ -465,6 +462,14 @@ class Plugin(indigo.PluginBase):
 
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
+
+        log(
+            f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+            f"Action={decision.action}  {decision.reason}"
+        )
+
+        # Verify persistent inverter registers haven't drifted before acting
+        self._verify_ems_registers()
 
         # Act on the decision
         self._act_on_decision(decision)
@@ -500,27 +505,15 @@ class Plugin(indigo.PluginBase):
         prev_import = self.store["import_active"]
         prev_export = self.store["export_active"]
 
-        # ── DNO cap for export-limit writes ─────────────────────────────────────
-        # When export is active:  limit = tier power (2kW or 4kW)
-        # When export is stopped: NEVER write 0W — Sigenergy interprets 0W as a
-        # global output constraint and throttles battery discharge to prevent any
-        # accidental export, causing grid import even at high SOC at night.
-        # Instead use the DNO cap at night (no PV) or 0W only if PV is generating.
-        pv_watts   = self.latest_inverter_data.get("pvPowerWatts", 0)
-        dno_cap_w  = int(float(self.pluginPrefs.get("exportStage2Kw", 4.0)) * 1000)
-        # 0W only when solar is actively generating (prevents accidental PV export
-        # below the export tier threshold); otherwise DNO cap allows free discharge.
-        idle_limit = 0 if pv_watts > 500 else dno_cap_w
-
         if action == ACTION_START_IMPORT:
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
                 power_w = min(decision.power_watts or 10000,
                               int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000))
                 if self.modbus.force_charge(power_w):
-                    self.store["import_active"]       = True
-                    self.store["import_target_soc"]   = decision.target_soc_pct
-                    self.store["export_active"]       = False
+                    self.store["import_active"]     = True
+                    self.store["import_target_soc"] = decision.target_soc_pct
+                    self.store["export_active"]     = False
                     self._trigger_event("emergencyImportTriggered")
 
         elif action == ACTION_STOP_IMPORT:
@@ -538,47 +531,30 @@ class Plugin(indigo.PluginBase):
                 self.store["import_scheduled_logged"] = str(decision.scheduled_time)
 
         elif action == ACTION_START_EXPORT:
-            new_power_w    = decision.power_watts or dno_cap_w
-            current_power_w = self.store.get("export_power_w", 0)
-            power_changed   = prev_export and (current_power_w != new_power_w)
-
-            if not self.store["import_active"] and (not prev_export or power_changed):
-                verb = "Updating" if power_changed else "Starting"
-                log(f"[Manager] {verb} export (tier {decision.export_tier}, "
-                    f"{new_power_w}W): {decision.reason}")
-                # Set the export limit register — surplus solar exports naturally in
-                # Self-Consumption mode without curtailing PV (do NOT use force_discharge
-                # which sets mode 0x06 and cuts PV generation entirely)
-                if self.modbus.set_export_limit(new_power_w):
-                    self.modbus.set_self_consumption()   # ensure Remote EMS mode 0x02
-                    self.store["export_active"]  = True
-                    self.store["export_power_w"] = new_power_w
-                    self.store["export_tier"]    = decision.export_tier
-                    if not prev_export:
-                        self._trigger_event("exportStarted")
+            # Idempotent: only call force_discharge if not already exporting
+            if not prev_import and not prev_export:
+                log(f"[Manager] Starting night export: {decision.reason}")
+                if self.modbus.force_discharge(decision.power_watts):
+                    self.store["export_active"] = True
+                    self._trigger_event("exportStarted")
 
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
-                log(f"[Manager] Stopping export - setting idle limit to {idle_limit}W "
-                    f"(PV={pv_watts}W)")
-                self.modbus.set_export_limit(idle_limit)
-                self.store["export_active"]  = False
-                self.store["export_power_w"] = 0
-                self.store["export_tier"]    = 0
+                log("[Manager] Stopping night export - returning to self-consumption")
+                self.modbus.set_self_consumption()
+                self.store["export_active"] = False
                 self._trigger_event("exportStopped")
 
         elif action == ACTION_SELF_CONSUMPTION:
-            # Clear any active import/export
-            if prev_import or prev_export:
+            if prev_import:
                 log("[Manager] Returning to self-consumption")
                 self.modbus.set_self_consumption()
-                if prev_export:
-                    self.modbus.set_export_limit(idle_limit)
-                    self._trigger_event("exportStopped")
-                self.store["import_active"]  = False
-                self.store["export_active"]  = False
-                self.store["export_power_w"] = 0
-                self.store["export_tier"]    = 0
+                self.store["import_active"] = False
+            elif prev_export:
+                # export_enabled was disabled while exporting - clean up
+                log("[Manager] Export disabled - returning to self-consumption")
+                self.modbus.set_self_consumption()
+                self.store["export_active"] = False
 
         # Check if active import has reached target SOC
         if self.store["import_active"]:
@@ -589,6 +565,53 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_self_consumption()
                 self.store["import_active"]      = False
                 self.store["import_target_soc"]  = 0.0
+
+    def _verify_ems_registers(self):
+        """Read back HOLD_ESS_MAX_DISCHARGE and HOLD_ESS_MAX_CHARGE and correct if wrong.
+
+        These registers persist on the inverter across mode changes. A previous
+        force_discharge() or force_charge() call can leave a stale limit that
+        caps battery output in self-consumption mode. This runs every manager
+        evaluation cycle (~15 min) as a self-healing guard.
+
+        Expected values:
+          - export_active: discharge limit = maxExportKw, charge limit = inverter max
+          - import_active: charge limit = inverter max (full import power), discharge = inverter max
+          - otherwise:     both limits = inverter max (unrestricted self-consumption)
+        """
+        if not self.modbus or not self.modbus.connected:
+            return
+
+        inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+
+        if self.store["export_active"]:
+            expected_discharge_w = int(float(self.pluginPrefs.get("maxExportKw", 4.0)) * 1000)
+        else:
+            expected_discharge_w = inv_max_w
+
+        expected_charge_w = inv_max_w   # always unrestricted outside of VPP pre-charge
+
+        # --- Discharge limit ---
+        actual_discharge_w = self.modbus.read_discharge_limit()
+        if actual_discharge_w is not None:
+            if abs(actual_discharge_w - expected_discharge_w) > 200:
+                log(
+                    f"[Verify] Discharge limit mismatch: inverter={actual_discharge_w}W "
+                    f"expected={expected_discharge_w}W — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_discharge_limit(expected_discharge_w)
+
+        # --- Charge limit ---
+        actual_charge_w = self.modbus.read_charge_limit()
+        if actual_charge_w is not None:
+            if abs(actual_charge_w - expected_charge_w) > 200:
+                log(
+                    f"[Verify] Charge limit mismatch: inverter={actual_charge_w}W "
+                    f"expected={expected_charge_w}W — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_charge_limit(expected_charge_w)
 
     def _check_scheduled_import(self):
         """Check if a scheduled import time has arrived."""
@@ -913,7 +936,7 @@ class Plugin(indigo.PluginBase):
         """
         duration_hrs    = event.get("duration_hrs", 1.0)
         cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
-        max_export_kw   = float(self.pluginPrefs.get("exportStage2Kw", 4.0))
+        max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
         dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
 
         # Energy Axle will export + dawn reserve (replaces hard-coded 12 kWh)
@@ -1122,7 +1145,7 @@ class Plugin(indigo.PluginBase):
             ACTION_START_IMPORT:     "Grid Import Active",
             ACTION_STOP_IMPORT:      "Import Stopping",
             ACTION_SCHEDULE_IMPORT:  "Import Scheduled",
-            ACTION_START_EXPORT:     "Grid Export Active",
+            ACTION_START_EXPORT:     "Night Export Active",
             ACTION_STOP_EXPORT:      "Export Stopping",
         }.get(decision.action, decision.action)
 
@@ -1206,7 +1229,7 @@ class Plugin(indigo.PluginBase):
             end_str      = event["end_time"].strftime("%H:%M")
             duration_hrs = event.get("duration_hrs", 0.0)
 
-        max_export_kw = float(self.pluginPrefs.get("exportStage2Kw", 4.0))
+        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
         earnings_est  = round(max_export_kw * duration_hrs * 1.00, 2)  # GBP1/kWh Axle rate
 
         states = [
@@ -1630,13 +1653,17 @@ class Plugin(indigo.PluginBase):
             plant_address=plant_addr, inverter_address=inv_addr,
             logger=self.logger,
         )
-        # Initialise export limit to DNO cap at startup — never 0W, because 0W causes
-        # Sigenergy to throttle battery discharge and import from grid even at high SOC.
-        # The decision engine will set the correct tier limit once PV is generating and
-        # SOC thresholds are crossed.  0W is set only during solar hours if needed.
-        if prefs.get("exportEnabled", False):
-            if self.modbus.connect():
-                dno_startup_w = int(float(prefs.get("exportStage2Kw", 4.0)) * 1000)
+        # Startup Modbus initialisations — connect once for all startup writes.
+        # HOLD_ESS_MAX_DISCHARGE (40034) persists across mode changes on the inverter.
+        # A previous force_discharge() call may have left a low limit that caps battery
+        # output even in self-consumption mode. Always reset to full inverter capacity.
+        if self.modbus.connect():
+            inverter_max_w = int(float(prefs.get("inverterMaxKw", 10.0)) * 1000)
+            self.modbus.set_discharge_limit(inverter_max_w)   # clear any stale discharge cap
+            self.modbus.set_charge_limit(inverter_max_w)      # clear any stale charge cap
+            self.modbus.set_charge_cutoff(100.0)              # ensure unrestricted charging
+            if prefs.get("exportEnabled", False):
+                dno_startup_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
                 self.modbus.set_export_limit(dno_startup_w)
 
         # Solcast
