@@ -14,6 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 1.4 | 29-Mar-2026 | Fix: night export stop condition replaced -- PV watts reads 0W in Discharge ESS First mode so solar could never trigger a stop. Export now stops at Solcast-predicted sunrise (dawn_times) instead. Fix: night_export() sets HOLD_ESS_MAX_DISCHARGE=10000W and relies on the inverter's own DNO cap for grid limiting -- battery now supplies house load + 4kW to grid simultaneously. 54 unit tests, all pass. |
 | 1.3 | 29-Mar-2026 | Night export feature: force-discharge surplus to grid at night when SOC is high and tomorrow's forecast is good. Fix: persistent Modbus register (HOLD_ESS_MAX_DISCHARGE / HOLD_ESS_MAX_CHARGE) left at reduced value after force-discharge, capping battery output in self-consumption mode. Fix: tomorrow viability check now uses bias-corrected P50 (correctedTomorrowKwh x 60%) instead of P10. New: test_sigenergy_modbus.py (16 Modbus register tests). 49 unit tests total, all pass. |
 | 1.2 | 27-Mar-2026 | Fix: inverter capacity corrected to 10 kW. |
 | 1.1 | 27-Mar-2026 | Fix: nighttime grid import caused by export limit register set to 0W when export stops. Fix: symmetric hysteresis on export restart (10% deadband). 48 unit tests all pass. |
@@ -104,7 +105,7 @@ must all be true:
 
 | Condition | Detail |
 |-----------|--------|
-| **Night** | PV watts < 500W (safe to force-discharge -- no solar to suppress) |
+| **Night** | Current time is outside the daytime window (before today's Solcast dawn, or more than 14h after it) |
 | **Surplus** | Projected SOC at dawn > dawn target + 1 kWh safety buffer |
 | **Tomorrow viable** | `correctedTomorrowKwh x 0.6 >= daily_consumption_kWh` |
 
@@ -114,8 +115,16 @@ The tomorrow viability check uses Solcast's **bias-corrected P50** estimate
 conservative than P10 (10th percentile), which would block export even on nights
 before clearly sunny days.
 
+**Why PV watts is not used as the night/day indicator:** In Discharge ESS First mode
+(0x06) the Sigenergy inverter suppresses PV generation to 0W, so `pvPowerWatts`
+reads zero regardless of actual solar. A PV threshold check would never fire while
+exporting. Sunrise is instead detected from the Solcast-predicted `dawn_times`.
+
+**Daytime window:** Export is blocked for 14 hours after today's dawn time (e.g.
+dawn 07:00 -> blocked until 21:00, then nighttime resumes and export can start again).
+
 Night export stops automatically when:
-- Solar is detected at dawn (PV > 500W)
+- Today's Solcast dawn time is reached (sunrise)
 - Battery surplus drops below the minimum threshold
 - Tomorrow's forecast deteriorates below the viability check
 
@@ -179,7 +188,35 @@ reserve. After the event, the discharge cutoff register is restored to the healt
 
 ---
 
-## Bug fixes (v1.1 - v1.3)
+## Bug fixes (v1.1 - v1.4)
+
+### v1.4 -- Night export stop condition permanently blind (critical)
+
+**Symptom:** Night export ran through sunrise and into the morning without stopping.
+
+**Root cause:** The stop condition checked `pvPowerWatts >= 500W`. In Discharge ESS
+First mode (0x06) the inverter suppresses PV output to 0W regardless of actual solar
+generation, so this condition could never fire while export was active.
+
+**Fix:** PV watts check replaced with a dawn_times check. The Solcast-predicted
+sunrise time for today is stored in `snapshot.dawn_times`. Export is stopped (and
+blocked from starting) for 14 hours after today's dawn time. At dawn + 14h
+(typically 21:00) the nighttime window reopens and export can start again.
+
+### v1.4 -- Night export limited to 4kW total instead of 4kW to grid
+
+**Symptom:** With house consuming 0.9kW and export set to 4kW, only ~3.1kW reached
+the grid. Battery was discharging at exactly 4kW total.
+
+**Root cause:** `force_discharge(4000)` wrote `HOLD_ESS_MAX_DISCHARGE = 4000W`,
+capping total battery output. House load consumed ~0.9kW of that, leaving 3.1kW
+for the grid.
+
+**Fix:** New `night_export(inverter_max_w)` method sets `HOLD_ESS_MAX_DISCHARGE =
+10000W` (inverter maximum) and relies on the inverter's own DNO export cap (set
+during commissioning) to limit grid flow to 4kW. Battery now discharges at
+`house_load + 4kW`, so the grid always receives the full 4kW regardless of
+home consumption.
 
 ### v1.3 -- Persistent register caps battery output (critical)
 

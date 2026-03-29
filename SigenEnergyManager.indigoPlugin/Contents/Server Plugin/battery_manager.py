@@ -6,7 +6,7 @@
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        27-03-2026 22:11 GMT
-# Version:     1.3
+# Version:     1.4
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone

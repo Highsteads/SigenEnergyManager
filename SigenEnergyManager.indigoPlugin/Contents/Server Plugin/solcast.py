@@ -5,7 +5,7 @@
 #              and daily bias correction
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        26-03-2026 15:30 GMT
-# Version:     1.3
+# Version:     1.4
 #
 # Solcast Hobbyist plan: 10 API calls/day/site (max)
 # Cache TTL: 8640 seconds (2.4 hours) per site to stay within 10 calls/day

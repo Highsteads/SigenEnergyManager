@@ -5,7 +5,7 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        26-03-2026 15:30 GMT
-# Version:     1.3
+# Version:     1.4
 #
 # Register map verified against Sigenergy Modbus Protocol V2.8 (2025-11-28)
 # Adapted from SigenergySolar v3.1 sigenergy_modbus.py
