@@ -535,7 +535,7 @@ class Plugin(indigo.PluginBase):
             if not prev_import and not prev_export:
                 log(f"[Manager] Starting night export: {decision.reason}")
                 inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-                if self.modbus.night_export(decision.power_watts, inv_max_w):
+                if self.modbus.night_export(inv_max_w):
                     self.store["export_active"] = True
                     self._trigger_event("exportStarted")
 
@@ -1263,11 +1263,9 @@ class Plugin(indigo.PluginBase):
 
     def actionForceExport(self, action):
         """Action: Force immediate grid export."""
-        props     = action.props
-        power_kw  = float(props.get("powerKw", 4.0))
         inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-        log(f"[Action] Force export: {power_kw}kW")
-        if self.modbus and self.modbus.night_export(int(power_kw * 1000), inv_max_w):
+        log("[Action] Force export: night_export mode")
+        if self.modbus and self.modbus.night_export(inv_max_w):
             self.store["export_active"]  = True
             self.store["import_active"]  = False
 

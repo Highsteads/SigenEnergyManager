@@ -309,70 +309,57 @@ class TestNightExportMethod(unittest.TestCase):
 
     night_export() must:
       - Set mode 0x06 (Discharge ESS First)
-      - Set HOLD_ESS_MAX_DISCHARGE = inverter_max_w (NOT the export cap)
-      - Set HOLD_GRID_MAX_EXPORT_LIMIT = export_watts (DNO cap on grid flow)
+      - Set HOLD_ESS_MAX_DISCHARGE = inverter_max_w (uncapped — house load + grid export)
+      - NOT write HOLD_GRID_MAX_EXPORT_LIMIT (inverter's own DNO cap handles that)
 
-    This ensures the grid always receives the full export_watts, regardless of
-    house load, because battery discharge is uncapped up to inverter maximum.
+    Battery discharges at (house_load + grid_export), up to inverter_max_w.
+    The inverter's own configured export cap enforces the DNO limit automatically.
     """
 
     def test_night_export_sets_mode_0x06(self):
         """night_export() activates Discharge ESS First mode (0x06)."""
         modbus, mock_client = _make_modbus()
-        modbus.night_export(4000, 10000)
+        modbus.night_export(10000)
 
         mode_writes = _decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_MODE)
         self.assertIn(0x06, mode_writes)
 
-    def test_night_export_sets_discharge_limit_to_inverter_max(self):
-        """night_export() sets HOLD_ESS_MAX_DISCHARGE to inverter_max_w, NOT export_watts.
+    def test_night_export_sets_discharge_to_inverter_max(self):
+        """night_export() sets HOLD_ESS_MAX_DISCHARGE = inverter_max_w.
 
-        Battery must be free to supply (house_load + export_watts) simultaneously.
-        If discharge were capped at export_watts, house load would reduce grid export.
+        Battery must be uncapped so it can supply house_load + grid_export simultaneously.
         """
         modbus, mock_client = _make_modbus()
-        modbus.night_export(4000, 10000)
+        modbus.night_export(10000)
 
         discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
-        # Must NOT have written 4000 (the export cap) to the discharge register
-        self.assertNotIn(4000, discharge_writes)
-        # Must have written inverter_max_w (10000)
         self.assertIn(10000, discharge_writes)
 
-    def test_night_export_sets_export_limit_to_export_watts(self):
-        """night_export() sets HOLD_GRID_MAX_EXPORT_LIMIT = export_watts (DNO cap)."""
+    def test_night_export_does_not_write_export_limit_register(self):
+        """night_export() does NOT write HOLD_GRID_MAX_EXPORT_LIMIT.
+
+        The inverter's own DNO export cap (set during commissioning) handles grid
+        limiting — writing this register from software is redundant and risks
+        interfering with daytime staged export logic.
+        """
         modbus, mock_client = _make_modbus()
-        modbus.night_export(4000, 10000)
+        modbus.night_export(10000)
 
         export_writes = _decode_write_registers_calls(mock_client, HOLD_GRID_MAX_EXPORT_LIMIT)
-        self.assertIn(4000, export_writes)
+        self.assertEqual(len(export_writes), 0)
 
-    def test_night_export_respects_custom_export_watts(self):
-        """night_export(3500) caps grid at 3500W but discharge still at inverter max."""
+    def test_night_export_enables_remote_ems(self):
+        """night_export() enables Remote EMS before setting mode."""
         modbus, mock_client = _make_modbus()
-        modbus.night_export(3500, 10000)
+        modbus.night_export(10000)
 
-        discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
-        export_writes    = _decode_write_registers_calls(mock_client, HOLD_GRID_MAX_EXPORT_LIMIT)
-        self.assertIn(10000, discharge_writes)
-        self.assertNotIn(3500, discharge_writes)
-        self.assertIn(3500, export_writes)
-
-    def test_night_export_discharge_never_equals_export_cap(self):
-        """Discharge register is always inverter_max_w, never the export cap value."""
-        modbus, mock_client = _make_modbus()
-        modbus.night_export(4000, 10000)
-
-        discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
-        export_writes    = _decode_write_registers_calls(mock_client, HOLD_GRID_MAX_EXPORT_LIMIT)
-        # These must be different: discharge = 10000, export cap = 4000
-        if discharge_writes and export_writes:
-            self.assertNotEqual(max(discharge_writes), max(export_writes))
+        ems_enable_writes = _decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_ENABLE)
+        self.assertIn(1, ems_enable_writes)
 
     def test_sc_after_night_export_resets_discharge_to_inverter_max(self):
-        """Returning to SC after night_export still resets discharge limit to 10000W."""
+        """Returning to SC after night_export resets discharge limit to 10000W."""
         modbus, mock_client = _make_modbus()
-        modbus.night_export(4000, 10000)
+        modbus.night_export(10000)
         mock_client.reset_mock()
         modbus.set_self_consumption()
 
