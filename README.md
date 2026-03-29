@@ -14,7 +14,6 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
-| 1.5 | 29-Mar-2026 | New: 2-tier daytime staged export via HOLD_GRID_MAX_EXPORT_LIMIT register. Stage 1 (default 80% SOC → 2 kW) and Stage 2 (default 90% SOC → 4 kW) with 5% hysteresis deadband. Stays in Self Consumption mode; surplus PV flows to grid naturally without suppressing solar generation. Night export unchanged. 63 unit tests, all pass. |
 | 1.4 | 29-Mar-2026 | Fix: night export stop condition replaced -- PV watts reads 0W in Discharge ESS First mode so solar could never trigger a stop. Export now stops at Solcast-predicted sunrise (dawn_times) instead. Fix: night_export() sets HOLD_ESS_MAX_DISCHARGE=10000W and relies on the inverter's own DNO cap for grid limiting -- battery now supplies house load + 4kW to grid simultaneously. 54 unit tests, all pass. |
 | 1.3 | 29-Mar-2026 | Night export feature: force-discharge surplus to grid at night when SOC is high and tomorrow's forecast is good. Fix: persistent Modbus register (HOLD_ESS_MAX_DISCHARGE / HOLD_ESS_MAX_CHARGE) left at reduced value after force-discharge, capping battery output in self-consumption mode. Fix: tomorrow viability check now uses bias-corrected P50 (correctedTomorrowKwh x 60%) instead of P10. New: test_sigenergy_modbus.py (16 Modbus register tests). 49 unit tests total, all pass. |
 | 1.2 | 27-Mar-2026 | Fix: inverter capacity corrected to 10 kW. |
@@ -85,11 +84,8 @@ AXLE_PASSWORD        = "..."
 | Inverter max kW | Inverter rated output power -- sets battery discharge ceiling (default 10) |
 | Dawn SOC target (%) | Minimum SOC required at next solar dawn (default 10%) |
 | Battery health cutoff (%) | Hardware discharge floor (default 10%) |
-| Export enabled | Enable daytime staged export and night export to grid |
-| Stage 1 SOC (%) | SOC at which stage 1 export starts (default 80%) |
-| Stage 1 power (kW) | Export limit at stage 1 (default 2 kW) |
-| Stage 2 SOC (%) | SOC at which export increases to stage 2 (default 90%) |
-| Stage 2 power (kW) | Export limit at stage 2 -- set to DNO cap (default 4 kW) |
+| Export enabled | Enable night export and daytime surplus export to grid |
+| Max export kW | DNO grid export cap for night export (default 4 kW) |
 | VPP (Axle) enabled | Enable Axle Virtual Power Plant integration |
 
 Note: Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) is detected
@@ -155,34 +151,21 @@ Example log message:
 ### Export staging (daytime)
 
 Daytime export is controlled via `HOLD_GRID_MAX_EXPORT_LIMIT` (Modbus register 40038) in
-Remote EMS Max Self Consumption mode. The inverter stays in Self Consumption mode; the
-export limit register is opened to allow surplus PV to flow to grid naturally without
-suppressing solar generation.
+Remote EMS Max Self Consumption mode. This allows surplus PV to export naturally without
+curtailing generation.
 
-**Two tiers with 5% hysteresis deadband (default thresholds):**
+**Export thresholds (with symmetric 10% hysteresis deadband):**
 
 | State | Condition |
 |-------|-----------|
-| Stage 1 starts | SOC >= 80% (first entry, no hysteresis on initial trigger) |
-| Stage 2 starts | SOC >= 90% |
-| Stage 2 to Stage 1 | SOC < 90 - 5 = 85% |
-| Stage 1 to off | SOC < 80 - 5 = 75% |
+| Stage 1 starts | SOC >= stage1 + 5% (default: 85%) |
+| Stage 2 starts | SOC >= stage2 + 5% (default: 95%) |
+| Stage 2 to Stage 1 | SOC < stage2 - 5% (default: 85%) |
+| Stage 1 to off | SOC < stage1 - 5% (default: 75%) |
 
-Stage 1 sets the export limit to 2 kW; stage 2 sets it to 4 kW (the DNO cap). The
-5% deadband prevents rapid on/off cycling when SOC oscillates around a threshold.
-
-When stopping daytime export, the export limit is restored to the stage 2 value (DNO
-cap) rather than 0W, which would cause the inverter to target a small grid import to
-guarantee it never crosses zero.
-
-Example log messages:
-
-```
-[Manager] Starting daytime export (tier 1, 2000W): Daytime export Stage 1: SOC 82% >= 80% threshold.
-          Setting export limit to 2.0 kW to prevent 100% SOC cap
-[Manager] Updating daytime export (tier 2, 4000W): Daytime export Stage 2: SOC 91% >= 90% threshold.
-          Setting export limit to 4.0 kW to prevent 100% SOC cap
-```
+The 10% wide deadband prevents rapid on/off cycling when SOC oscillates around
+a threshold, which would otherwise toggle the export limit register to 0W and
+cause grid import at night.
 
 ### Persistent Modbus register protection
 
@@ -316,11 +299,11 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m unittest test_battery_manager test_sigenergy_modbus -v
 ```
 
-**63 tests** across two test files, all passing without Indigo installed:
+**49 tests** across two test files, all passing without Indigo installed:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_battery_manager.py` | 47 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), daytime staged export (9 cases: tier start/upgrade/downgrade/hysteresis/disable), night export (10 cases), VPP suppression |
+| `test_battery_manager.py` | 33 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (10 cases), VPP suppression |
 | `test_sigenergy_modbus.py` | 16 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation |
 
 ---

@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        29-03-2026 17:00 GMT
-# Version:     1.5
+# Date:        27-03-2026 22:11 GMT
+# Version:     1.4
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,8 +43,8 @@ ACTION_SELF_CONSUMPTION  = "self_consumption"   # default: battery covers home l
 ACTION_START_IMPORT      = "start_import"        # begin charging from grid now
 ACTION_STOP_IMPORT       = "stop_import"         # charging complete - return to self_consumption
 ACTION_SCHEDULE_IMPORT   = "schedule_import"     # defer import to a cheaper/later window
-ACTION_START_EXPORT      = "start_export"        # export to grid (daytime staged or night)
-ACTION_STOP_EXPORT       = "stop_export"         # stop export, return to self_consumption
+ACTION_START_EXPORT      = "start_export"        # force-discharge to grid at night
+ACTION_STOP_EXPORT       = "stop_export"         # stop night export, return to self_consumption
 
 # Minimum percentage cheaper to justify waiting for tomorrow's Tracker rate
 TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper)
@@ -62,10 +62,6 @@ NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cov
                                           # (P50 bias-corrected; 0.6 tolerates 40% shortfall)
 DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export is blocked
                                           # dawn 07:00 + 14h = 21:00 → nighttime resumes
-
-# Daytime staged export constants
-EXPORT_HYSTERESIS_PCT = 5.0   # ±5% deadband prevents rapid on/off cycling at SOC thresholds
-EXPORT_HEADROOM_BUFFER_KWH = 1.0  # safety buffer above dawn target before daytime export allowed
 
 
 @dataclass
@@ -92,17 +88,11 @@ class ManagerSnapshot:
     dawn_target_pct:   float = 10.0    # minimum SOC at dawn
     health_cutoff_pct: float = 10.0    # hardware discharge floor
     export_enabled:    bool  = False   # export MPAN active
-
-    # Staged export thresholds (daytime, via HOLD_GRID_MAX_EXPORT_LIMIT)
-    export_stage1_soc_pct: float = 80.0  # SOC% to start stage 1 export
-    export_stage1_kw:      float = 2.0   # export kW at stage 1
-    export_stage2_soc_pct: float = 90.0  # SOC% to increase to stage 2
-    export_stage2_kw:      float = 4.0   # export kW at stage 2 (= DNO cap)
-    current_export_tier:   int   = 0     # 0=off/night, 1=stage1, 2=stage2
+    max_export_kw:     float = 4.0     # DNO export cap (kW)
 
     # Live inverter readings (for night export logic)
     pv_watts:               int   = 0     # current PV generation (W)
-    export_active:          bool  = False # any export currently running
+    export_active:          bool  = False # night export currently running
     corrected_tomorrow_kwh: float = 0.0   # Solcast bias-corrected P50 for tomorrow (kWh)
 
     # Tariff data
@@ -154,7 +144,6 @@ class Decision:
     soc_at_dawn_kwh:  float = 0.0
     import_kwh:       float = 0.0
     export_kw:        float = 0.0    # kW being exported (night export)
-    export_tier:      int   = 0      # 0=night export, 1=daytime stage1, 2=daytime stage2
 
 
 class BatteryManager:
@@ -197,13 +186,7 @@ class BatteryManager:
             import_decision.import_kwh      = viability.import_kwh_grid
             return import_decision
 
-        # Step 3a: Daytime staged export (SOC-based, Self Consumption + export limit register)
-        if snapshot.export_enabled:
-            day_export = self._check_export(snapshot, viability)
-            if day_export is not None:
-                return day_export
-
-        # Step 3b: Night export (force-discharge battery to grid, nighttime only)
+        # Step 3: Night export opportunity (or stop if conditions no longer met)
         if snapshot.export_enabled:
             export_decision = self._check_night_export(snapshot, viability)
             if export_decision is not None:
@@ -554,142 +537,6 @@ class BatteryManager:
         )
 
     # ================================================================
-    # Daytime Staged Export
-    # ================================================================
-
-    def _check_export(
-        self, snapshot: ManagerSnapshot, viability: DawnViability
-    ) -> Optional[Decision]:
-        """Check if daytime staged export should start, change tier, or stop.
-
-        Daytime export stays in Self Consumption mode and opens the
-        HOLD_GRID_MAX_EXPORT_LIMIT register so surplus PV flows to grid.
-        Battery does NOT actively discharge; it continues absorbing surplus
-        PV first, only exporting once the battery approaches full.
-
-        Two tiers with 5% hysteresis deadband:
-          Stage 1: SOC >= stage1 + 5% to start; drops off below stage1 - 5%
-          Stage 2: SOC >= stage2 + 5% to start; falls back to stage1 below stage2 - 5%
-
-        Returns None if it is nighttime (night export handles that window).
-        """
-        # Only active during daytime window; return None at night so
-        # _check_night_export() gets a clean run.
-        try:
-            import pytz
-            _tz = pytz.timezone("Europe/London")
-            _local_now = snapshot.now.astimezone(_tz)
-        except (ImportError, Exception):
-            _local_now = snapshot.now
-
-        _today_str     = _local_now.date().strftime("%Y-%m-%d")
-        _today_dawn_dt = snapshot.dawn_times.get(_today_str)
-        _is_daytime    = (
-            _today_dawn_dt is not None
-            and snapshot.now >= _today_dawn_dt
-            and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
-        )
-
-        # If nighttime and daytime export was active, stop it so night export
-        # can start cleanly on the next evaluation cycle.
-        if not _is_daytime:
-            if snapshot.current_export_tier > 0:
-                return Decision(
-                    action          = ACTION_STOP_EXPORT,
-                    reason          = "Nighttime: stopping daytime export for night window",
-                    export_tier     = 0,
-                    dawn_viable     = viability.viable,
-                    soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
-                )
-            return None
-
-        soc       = snapshot.current_soc_pct
-        s1_soc    = snapshot.export_stage1_soc_pct
-        s2_soc    = snapshot.export_stage2_soc_pct
-        s1_kw     = snapshot.export_stage1_kw
-        s2_kw     = snapshot.export_stage2_kw
-        cur_tier  = snapshot.current_export_tier
-
-        # Determine target tier with EXPORT_HYSTERESIS_PCT deadband
-        if cur_tier == 0:
-            # Not exporting: require soc >= threshold to start (no hysteresis on initial entry)
-            if soc >= s2_soc:
-                target_tier = 2
-            elif soc >= s1_soc:
-                target_tier = 1
-            else:
-                target_tier = 0
-        elif cur_tier == 1:
-            if soc >= s2_soc:
-                target_tier = 2
-            elif soc < s1_soc - EXPORT_HYSTERESIS_PCT:
-                target_tier = 0
-            else:
-                target_tier = 1
-        else:  # cur_tier == 2
-            if soc < s1_soc - EXPORT_HYSTERESIS_PCT:
-                target_tier = 0
-            elif soc < s2_soc - EXPORT_HYSTERESIS_PCT:
-                target_tier = 1
-            else:
-                target_tier = 2
-
-        # Viability guard: never export below dawn_target + headroom buffer
-        cap_kwh          = snapshot.capacity_kwh
-        current_soc_kwh  = soc / 100.0 * cap_kwh
-        dawn_floor_kwh   = viability.dawn_target_kwh + EXPORT_HEADROOM_BUFFER_KWH
-        if current_soc_kwh <= dawn_floor_kwh:
-            if cur_tier > 0:
-                return Decision(
-                    action          = ACTION_STOP_EXPORT,
-                    reason          = (
-                        f"Daytime export: SOC {current_soc_kwh:.1f} kWh too close to "
-                        f"dawn floor ({viability.dawn_target_kwh:.1f} + "
-                        f"{EXPORT_HEADROOM_BUFFER_KWH:.1f} kWh buffer)"
-                    ),
-                    export_tier     = 0,
-                    dawn_viable     = viability.viable,
-                    soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
-                )
-            return None
-
-        if target_tier == 0:
-            if cur_tier > 0:
-                return Decision(
-                    action          = ACTION_STOP_EXPORT,
-                    reason          = (
-                        f"Daytime export: SOC {soc:.0f}% dropped below "
-                        f"stage 1 floor ({s1_soc - EXPORT_HYSTERESIS_PCT:.0f}%)"
-                    ),
-                    export_tier     = 0,
-                    dawn_viable     = viability.viable,
-                    soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
-                )
-            return None
-
-        # Select power for target tier
-        export_kw = s2_kw if target_tier == 2 else s1_kw
-        tier_label = f"Stage {target_tier}"
-
-        # Only emit a decision if tier or power has changed
-        if target_tier == cur_tier:
-            return None
-
-        threshold_pct = s2_soc if target_tier == 2 else s1_soc
-        return Decision(
-            action          = ACTION_START_EXPORT,
-            reason          = (
-                f"Daytime export {tier_label}: SOC {soc:.0f}% >= {threshold_pct:.0f}% threshold. "
-                f"Setting export limit to {export_kw:.1f} kW to prevent 100% SOC cap"
-            ),
-            power_watts     = int(export_kw * 1000),
-            export_kw       = export_kw,
-            export_tier     = target_tier,
-            dawn_viable     = viability.viable,
-            soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
-        )
-
-    # ================================================================
     # Night Export
     # ================================================================
 
@@ -726,14 +573,11 @@ class BatteryManager:
         )
 
         if _is_daytime:
-            # Only stop if night export (tier 0) was running — daytime export (tier > 0)
-            # is handled by _check_export() and should not be touched here.
-            if snapshot.export_active and snapshot.current_export_tier == 0:
+            if snapshot.export_active:
                 _dawn_str = _today_dawn_dt.astimezone(_tz).strftime("%H:%M")
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = f"Sunrise reached ({_dawn_str}) - stopping night export",
-                    export_tier     = 0,
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
                 )
@@ -748,14 +592,13 @@ class BatteryManager:
 
         # Condition 2: Battery has surplus worth exporting
         if surplus_kwh < MIN_NIGHT_EXPORT_KWH:
-            if snapshot.export_active and snapshot.current_export_tier == 0:
+            if snapshot.export_active:
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = (
                         f"Night export: projected dawn {projected_dawn:.1f} kWh approaching "
                         f"floor ({viability.dawn_target_kwh:.1f} + {NIGHT_EXPORT_BUFFER_KWH:.1f} kWh buffer) - stopping"
                     ),
-                    export_tier     = 0,
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
                 )
@@ -774,7 +617,7 @@ class BatteryManager:
         tomorrow_viable_kwh = snapshot.corrected_tomorrow_kwh * NIGHT_EXPORT_TOMORROW_CONFIDENCE
 
         if tomorrow_viable_kwh < daily_cons_kwh:
-            if snapshot.export_active and snapshot.current_export_tier == 0:
+            if snapshot.export_active:
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = (
@@ -782,16 +625,13 @@ class BatteryManager:
                         f"(x{NIGHT_EXPORT_TOMORROW_CONFIDENCE} = {tomorrow_viable_kwh:.1f}) < "
                         f"daily load {daily_cons_kwh:.1f} kWh - stopping"
                     ),
-                    export_tier     = 0,
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
                 )
             return None
 
         # All conditions met - export (idempotent if already running)
-        # export_stage2_kw = DNO cap; inverter enforces it via its own commissioned limit.
-        # Battery discharges at house_load + stage2_kw; grid always gets stage2_kw.
-        export_kw = snapshot.export_stage2_kw
+        export_kw = snapshot.max_export_kw
         return Decision(
             action          = ACTION_START_EXPORT,
             reason          = (
@@ -802,7 +642,6 @@ class BatteryManager:
             ),
             power_watts     = int(export_kw * 1000),
             export_kw       = export_kw,
-            export_tier     = 0,   # 0 = night export (active battery discharge)
             dawn_viable     = True,
             soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
         )

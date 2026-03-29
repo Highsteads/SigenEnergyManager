@@ -194,11 +194,6 @@
                 <TriggerLabel>Export state changed</TriggerLabel>
                 <ControlPageLabel>Grid Export Active</ControlPageLabel>
             </State>
-            <State id="exportTier">
-                <ValueType>String</ValueType>
-                <TriggerLabel>Export tier changed</TriggerLabel>
-                <ControlPageLabel>Export Tier (0=off/night, 1=stage1, 2=stage2)</ControlPageLabel>
-            </State>
             <State id="exportKw">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Export power changed</TriggerLabel>
