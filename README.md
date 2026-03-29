@@ -44,11 +44,21 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ## Configuration
 
-### Secrets (recommended)
+### Credentials
 
-Copy `secrets_example.py` to `/Library/Application Support/Perceptive Automation/secrets.py`
-and fill in your credentials. The plugin reads from this file at startup; all fields fall
-back to `PluginConfig.xml` if the file is absent.
+**If you already have a `secrets.py`** in your Indigo root folder
+(`/Library/Application Support/Perceptive Automation/Indigo 202x.x/`) add the
+keys below to it. The plugin will pick them up automatically at startup.
+
+**If you do not have a `secrets.py`** you can either:
+- Copy `secrets_example.py` (included in the plugin bundle) to
+  `/Library/Application Support/Perceptive Automation/secrets.py` and fill in
+  your credentials, **or**
+- Enter your credentials directly in the plugin's configuration dialog
+  (Indigo menu → Plugins → Sigenergy Energy Manager → Configure)
+
+All credential fields fall back to the plugin configuration dialog if
+`secrets.py` is absent or a key is missing.
 
 ```python
 OCTOPUS_API_KEY      = "sk_live_..."
