@@ -326,13 +326,27 @@ class BatteryManager:
         # Projected SOC at dawn (raw, before hardware floor)
         raw_soc_at_dawn = current_soc_kwh - expected_kwh
 
-        # Use raw projection for the import decision (before clamping to floor)
-        import_needed = raw_soc_at_dawn < dawn_target_kwh
+        # Import threshold: depends on whether tomorrow has meaningful solar.
+        # If tomorrow's bias-corrected forecast covers daily consumption, the
+        # battery will refill during the day regardless of dawn SOC — so only
+        # import if we would actually hit the hardware cutoff at dawn.
+        # If tomorrow is a poor solar day, maintain the full dawn target buffer.
+        daily_cons_kwh = (
+            sum(snapshot.consumption_profile)
+            if len(snapshot.consumption_profile) == 48
+            else 10.8
+        )
+        tomorrow_is_sunny = snapshot.corrected_tomorrow_kwh >= daily_cons_kwh
+        effective_import_threshold_kwh = (
+            health_floor_kwh if tomorrow_is_sunny else dawn_target_kwh
+        )
+
+        import_needed   = raw_soc_at_dawn < effective_import_threshold_kwh
 
         # Clamp reported value to hardware floor for display only
         soc_at_dawn_kwh = max(health_floor_kwh, raw_soc_at_dawn)
 
-        import_kwh_net  = max(0.0, dawn_target_kwh - raw_soc_at_dawn)
+        import_kwh_net  = max(0.0, effective_import_threshold_kwh - raw_soc_at_dawn)
         import_kwh_grid = import_kwh_net / max(0.01, snapshot.efficiency)
 
         return DawnViability(
