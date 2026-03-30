@@ -327,27 +327,35 @@ class BatteryManager:
         raw_soc_at_dawn = current_soc_kwh - expected_kwh
 
         # Import threshold: depends on whether tomorrow has meaningful solar.
-        # If tomorrow's bias-corrected forecast covers daily consumption, the
-        # battery will refill during the day regardless of dawn SOC — so only
-        # import if we would actually hit the hardware cutoff at dawn.
-        # If tomorrow is a poor solar day, maintain the full dawn target buffer.
+        #
+        # Tomorrow is sunny (forecast >= daily consumption):
+        #   The battery will refill during the day regardless of dawn SOC.
+        #   The inverter's own discharge cutoff register (40048) already prevents
+        #   the battery going below health_cutoff_pct — so no import is ever
+        #   needed. Let the hardware protect itself; don't waste grid energy.
+        #
+        # Tomorrow is a poor solar day (forecast < daily consumption):
+        #   The battery will not recover fully during the day. Maintain the full
+        #   dawn_target buffer so the house can run through the following night.
         daily_cons_kwh = (
             sum(snapshot.consumption_profile)
             if len(snapshot.consumption_profile) == 48
             else 10.8
         )
         tomorrow_is_sunny = snapshot.corrected_tomorrow_kwh >= daily_cons_kwh
-        effective_import_threshold_kwh = (
-            health_floor_kwh if tomorrow_is_sunny else dawn_target_kwh
-        )
 
-        import_needed   = raw_soc_at_dawn < effective_import_threshold_kwh
+        if tomorrow_is_sunny:
+            # Hardware cutoff protects the battery — never import on a sunny day
+            import_needed   = False
+            import_kwh_net  = 0.0
+            import_kwh_grid = 0.0
+        else:
+            import_needed   = raw_soc_at_dawn < dawn_target_kwh
+            import_kwh_net  = max(0.0, dawn_target_kwh - raw_soc_at_dawn)
+            import_kwh_grid = import_kwh_net / max(0.01, snapshot.efficiency)
 
         # Clamp reported value to hardware floor for display only
         soc_at_dawn_kwh = max(health_floor_kwh, raw_soc_at_dawn)
-
-        import_kwh_net  = max(0.0, effective_import_threshold_kwh - raw_soc_at_dawn)
-        import_kwh_grid = import_kwh_net / max(0.01, snapshot.efficiency)
 
         return DawnViability(
             viable                   = not import_needed,
