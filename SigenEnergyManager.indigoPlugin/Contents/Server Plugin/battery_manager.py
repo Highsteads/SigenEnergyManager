@@ -45,6 +45,7 @@ ACTION_STOP_IMPORT       = "stop_import"         # charging complete - return to
 ACTION_SCHEDULE_IMPORT   = "schedule_import"     # defer import to a cheaper/later window
 ACTION_START_EXPORT      = "start_export"        # force-discharge to grid at night
 ACTION_STOP_EXPORT       = "stop_export"         # stop night export, return to self_consumption
+ACTION_SOLAR_OVERFLOW    = "solar_overflow"      # daytime: cap charge so PV surplus exports
 
 # Minimum percentage cheaper to justify waiting for tomorrow's Tracker rate
 TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper)
@@ -62,6 +63,15 @@ NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cov
                                           # (P50 bias-corrected; 0.6 tolerates 40% shortfall)
 DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export is blocked
                                           # dawn 07:00 + 14h = 21:00 → nighttime resumes
+
+# Solar overflow constants (daytime charge-cap export)
+# Mode stays 0x02 throughout — only HOLD_ESS_MAX_CHARGE register is reduced.
+# PV is never suppressed; surplus that can't enter the battery flows to grid.
+SOLAR_OVERFLOW_HIGH_SOC    = 90    # SOC% → near-zero charge cap (all surplus exports)
+SOLAR_OVERFLOW_MED_SOC     = 80    # SOC% → 2 kW charge cap (trickle + surplus exports)
+SOLAR_OVERFLOW_RELEASE_SOC = 75    # SOC% below which cap is released (hysteresis)
+SOLAR_OVERFLOW_MED_CAP_W   = 2000  # charge cap (W) in medium overflow zone
+SOLAR_OVERFLOW_HIGH_CAP_W  = 200   # charge cap (W) in high overflow zone (near-zero)
 
 
 @dataclass
@@ -115,6 +125,10 @@ class ManagerSnapshot:
 
     # VPP active - when True all battery commands are suppressed
     vpp_active: bool = False
+
+    # Solar overflow state (from plugin.py store — passed in so manager is stateless)
+    solar_overflow_active:     bool = False  # charge cap currently applied
+    solar_overflow_charge_cap: int  = 0      # current cap in watts
 
 
 @dataclass
@@ -191,6 +205,14 @@ class BatteryManager:
             export_decision = self._check_night_export(snapshot, viability)
             if export_decision is not None:
                 return export_decision
+
+        # Step 4: Daytime solar overflow — cap charge so PV surplus exports to grid
+        # Only checked when export_enabled (export MPAN active); no point capping
+        # charge if there is nowhere for the surplus to go.
+        if snapshot.export_enabled:
+            overflow_decision = self._check_solar_overflow(snapshot)
+            if overflow_decision is not None:
+                return overflow_decision
 
         # Default: self-consumption
         return Decision(
@@ -539,6 +561,87 @@ class BatteryManager:
     # ================================================================
     # Night Export
     # ================================================================
+
+    def _check_solar_overflow(self, snapshot: ManagerSnapshot) -> Optional[Decision]:
+        """Cap battery charging when daytime SOC is too high so PV surplus exports.
+
+        Stays in mode 0x02 (Max Self Consumption) throughout — only
+        HOLD_ESS_MAX_CHARGE is reduced. The PV array is NEVER suppressed;
+        surplus that can't enter the battery flows to the grid via the export
+        connection. This is the correct approach for daytime solar overflow;
+        switching to mode 0x06 (Discharge ESS First) suppresses PV entirely.
+
+        Thresholds:
+            SOC >= 90%: cap to SOLAR_OVERFLOW_HIGH_CAP_W (~200 W, near-zero)
+            SOC >= 80%: cap to SOLAR_OVERFLOW_MED_CAP_W (2000 W, slow trickle)
+            SOC <  75%: release cap (hysteresis band prevents rapid cycling)
+
+        Only active during daytime (dawn to dawn + DAYTIME_WINDOW_HOURS).
+        Only called when export_enabled is True (MPAN active).
+        """
+        # Determine whether it is currently daytime
+        try:
+            import pytz
+            _tz        = pytz.timezone("Europe/London")
+            _local_now = snapshot.now.astimezone(_tz)
+        except (ImportError, Exception):
+            _local_now = snapshot.now
+
+        _today_str     = _local_now.date().strftime("%Y-%m-%d")
+        _today_dawn_dt = snapshot.dawn_times.get(_today_str)
+        _is_daytime    = (
+            _today_dawn_dt is not None
+            and snapshot.now >= _today_dawn_dt
+            and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
+        )
+
+        if not _is_daytime:
+            # Night — if a cap was left active (e.g. from before dusk), release it
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action          = ACTION_SELF_CONSUMPTION,
+                    reason          = "Solar overflow: night — releasing charge cap",
+                    dawn_viable     = True,
+                    soc_at_dawn_kwh = 0.0,
+                )
+            return None
+
+        soc = snapshot.current_soc_pct
+
+        # Determine required cap based on SOC thresholds
+        if soc >= SOLAR_OVERFLOW_HIGH_SOC:
+            cap_w = SOLAR_OVERFLOW_HIGH_CAP_W
+        elif soc >= SOLAR_OVERFLOW_MED_SOC:
+            cap_w = SOLAR_OVERFLOW_MED_CAP_W
+        elif snapshot.solar_overflow_active and soc >= SOLAR_OVERFLOW_RELEASE_SOC:
+            # In the hysteresis band (75-79%): maintain the current cap, don't release yet
+            cap_w = snapshot.solar_overflow_charge_cap
+        elif snapshot.solar_overflow_active:
+            # SOC has dropped below the release threshold — clear the cap
+            return Decision(
+                action          = ACTION_SELF_CONSUMPTION,
+                reason          = (
+                    f"Solar overflow: SOC {soc:.1f}% below release threshold "
+                    f"{SOLAR_OVERFLOW_RELEASE_SOC}% — restoring full charge rate"
+                ),
+                dawn_viable     = True,
+                soc_at_dawn_kwh = 0.0,
+            )
+        else:
+            # SOC below all thresholds, no overflow active — nothing to do
+            return None
+
+        return Decision(
+            action      = ACTION_SOLAR_OVERFLOW,
+            reason      = (
+                f"Solar overflow: SOC {soc:.1f}% — charge cap {cap_w}W "
+                f"({'near-zero' if cap_w <= SOLAR_OVERFLOW_HIGH_CAP_W else '2 kW trickle'}), "
+                f"PV surplus exporting"
+            ),
+            power_watts     = cap_w,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = 0.0,
+        )
 
     def _check_night_export(
         self, snapshot: ManagerSnapshot, viability: DawnViability
