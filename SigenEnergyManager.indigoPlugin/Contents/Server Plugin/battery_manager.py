@@ -265,6 +265,64 @@ class BatteryManager:
             now, dawn_dt, snapshot.consumption_profile
         )
 
+        # During daytime, credit remaining solar so import is not triggered
+        # while PV is actively charging the battery. Net solar (forecast minus
+        # home use from now to dusk) is added to current SOC before projecting
+        # to dawn — capped at battery capacity to avoid overcounting.
+        today_p50 = {
+            k: v for k, v in snapshot.forecast_p50.items()
+            if k.startswith(today_str)
+        }
+        _today_dawn_dt = snapshot.dawn_times.get(today_str)
+        _is_daytime    = (
+            _today_dawn_dt is not None
+            and now >= _today_dawn_dt
+            and (now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
+        )
+
+        if _is_daytime and today_p50:
+            try:
+                import pytz
+                _tz = pytz.timezone("Europe/London")
+                now_local = now.astimezone(_tz)
+            except (ImportError, Exception):
+                now_local = now
+            now_hour_naive = now_local.replace(minute=0, second=0,
+                                               microsecond=0, tzinfo=None)
+
+            # Find dusk = last hour above threshold
+            dusk_hour_dt = None
+            for key in sorted(today_p50.keys(), reverse=True):
+                if today_p50[key] >= SOLAR_DUSK_THRESHOLD_WH:
+                    try:
+                        dusk_hour_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+                        break
+                    except ValueError:
+                        continue
+
+            if dusk_hour_dt is not None and dusk_hour_dt > now_hour_naive:
+                remaining_solar_kwh = sum(
+                    wh / 1000.0
+                    for k, wh in today_p50.items()
+                    if now_hour_naive
+                       <= datetime.strptime(k, "%Y-%m-%d %H:%M:%S")
+                       <= dusk_hour_dt
+                ) * snapshot.bias_factor
+
+                now_slot  = now_local.hour * 2 + (1 if now_local.minute >= 30 else 0)
+                dusk_slot = min(dusk_hour_dt.hour * 2 + 2, 48)
+                if len(snapshot.consumption_profile) == 48:
+                    home_to_dusk_kwh = sum(
+                        snapshot.consumption_profile[now_slot:dusk_slot]
+                    )
+                else:
+                    home_to_dusk_kwh = 0.225 * max(
+                        0.0, (dusk_hour_dt - now_hour_naive).total_seconds() / 3600.0
+                    ) * 2
+
+                net_solar_kwh = max(0.0, remaining_solar_kwh - home_to_dusk_kwh)
+                current_soc_kwh = min(cap_kwh, current_soc_kwh + net_solar_kwh)
+
         # Projected SOC at dawn (raw, before hardware floor)
         raw_soc_at_dawn = current_soc_kwh - expected_kwh
 
