@@ -459,6 +459,7 @@ class Plugin(indigo.PluginBase):
             export_enabled     = prefs.get("exportEnabled", False),
             max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
+            house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
             corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
             tariff                  = tariff_data,
@@ -467,6 +468,7 @@ class Plugin(indigo.PluginBase):
             dawn_times         = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile = self.store.get("consumption_profile", []),
             now                = datetime.now(timezone.utc),
+            bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             vpp_active                  = self.store["vpp_active"],
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
@@ -561,27 +563,33 @@ class Plugin(indigo.PluginBase):
         elif action == ACTION_SOLAR_OVERFLOW:
             # Daytime charge cap: stay in mode 0x02, reduce HOLD_ESS_MAX_CHARGE.
             # PV keeps generating at full power; surplus flows to grid.
-            cap_w    = decision.power_watts
-            prev_cap = self.store["solar_overflow_charge_cap_w"]
-            inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+            cap_w     = decision.power_watts
+            export_kw = decision.export_kw
+            prev_cap  = self.store["solar_overflow_charge_cap_w"]
 
             if not self.store["solar_overflow_active"]:
-                # First entry: ensure we are in self-consumption mode, then apply cap.
-                # set_self_consumption() resets charge limit to inv_max_w, so we
+                # First entry: ensure self-consumption mode, then apply cap.
+                # set_self_consumption() resets charge limit to inv_max_w so we
                 # must call set_charge_limit() immediately after.
-                log(f"[Manager] Solar overflow: capping charge at {cap_w}W — PV surplus exporting")
+                log(
+                    f"[Manager] Solar overflow starting: target export {export_kw:.2f} kW, "
+                    f"charge cap {cap_w}W — PV surplus flowing to grid"
+                )
                 self.modbus.set_self_consumption()
                 self.modbus.set_charge_limit(cap_w)
-                self.store["solar_overflow_active"]      = True
+                self.store["solar_overflow_active"]       = True
                 self.store["solar_overflow_charge_cap_w"] = cap_w
-                self.store["export_active"]              = False
-                self.store["import_active"]              = False
-            elif abs(prev_cap - cap_w) > 100:
-                # SOC has crossed a threshold — update cap without full mode reset
-                log(f"[Manager] Solar overflow: charge cap {prev_cap}W -> {cap_w}W")
+                self.store["export_active"]               = False
+                self.store["import_active"]               = False
+            elif abs(prev_cap - cap_w) > 500:
+                # Cap has shifted by more than deadband — update inverter register
+                log(
+                    f"[Manager] Solar overflow: charge cap {prev_cap}W -> {cap_w}W "
+                    f"(target export {export_kw:.2f} kW)"
+                )
                 self.modbus.set_charge_limit(cap_w)
                 self.store["solar_overflow_charge_cap_w"] = cap_w
-            # else: same cap already active — idempotent, no Modbus writes
+            # else: cap within deadband — idempotent, no Modbus writes
 
         elif action == ACTION_SELF_CONSUMPTION:
             if prev_import:

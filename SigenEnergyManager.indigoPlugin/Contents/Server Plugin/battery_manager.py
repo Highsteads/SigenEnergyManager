@@ -64,14 +64,15 @@ NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cov
 DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export is blocked
                                           # dawn 07:00 + 14h = 21:00 → nighttime resumes
 
-# Solar overflow constants (daytime charge-cap export)
+# Solar overflow constants (daytime forecast-based export)
 # Mode stays 0x02 throughout — only HOLD_ESS_MAX_CHARGE register is reduced.
 # PV is never suppressed; surplus that can't enter the battery flows to grid.
-SOLAR_OVERFLOW_HIGH_SOC    = 90    # SOC% → near-zero charge cap (all surplus exports)
-SOLAR_OVERFLOW_MED_SOC     = 80    # SOC% → 2 kW charge cap (trickle + surplus exports)
-SOLAR_OVERFLOW_RELEASE_SOC = 75    # SOC% below which cap is released (hysteresis)
-SOLAR_OVERFLOW_MED_CAP_W   = 2000  # charge cap (W) in medium overflow zone
-SOLAR_OVERFLOW_HIGH_CAP_W  = 200   # charge cap (W) in high overflow zone (near-zero)
+# The export rate is calculated dynamically each evaluation so the battery
+# reaches exactly 100% SOC at dusk, exporting all genuine surplus to grid.
+SOLAR_OVERFLOW_MIN_SURPLUS_KWH = 0.3   # below this surplus don't bother exporting
+SOLAR_OVERFLOW_MIN_CHARGE_W    = 200   # minimum charge cap floor (avoid writing 0W to register)
+SOLAR_OVERFLOW_CAP_DEADBAND_W  = 500   # only rewrite charge limit if cap changes by > this
+SOLAR_DUSK_THRESHOLD_WH        = 500   # Wh/hr below which a slot is considered post-dusk
 
 
 @dataclass
@@ -100,10 +101,12 @@ class ManagerSnapshot:
     export_enabled:    bool  = False   # export MPAN active
     max_export_kw:     float = 4.0     # DNO export cap (kW)
 
-    # Live inverter readings (for night export logic)
+    # Live inverter readings
     pv_watts:               int   = 0     # current PV generation (W)
+    house_load_watts:       int   = 0     # current home consumption (W) = PV + grid - battery
     export_active:          bool  = False # night export currently running
     corrected_tomorrow_kwh: float = 0.0   # Solcast bias-corrected P50 for tomorrow (kWh)
+    bias_factor:            float = 1.0   # Solcast bias correction factor (applied to hourly P50)
 
     # Tariff data
     tariff: TariffData = field(default_factory=TariffData)
@@ -563,23 +566,25 @@ class BatteryManager:
     # ================================================================
 
     def _check_solar_overflow(self, snapshot: ManagerSnapshot) -> Optional[Decision]:
-        """Cap battery charging when daytime SOC is too high so PV surplus exports.
+        """Dynamic daytime export: cap battery charge so PV fills battery to 100% at dusk.
 
-        Stays in mode 0x02 (Max Self Consumption) throughout — only
-        HOLD_ESS_MAX_CHARGE is reduced. The PV array is NEVER suppressed;
-        surplus that can't enter the battery flows to the grid via the export
-        connection. This is the correct approach for daytime solar overflow;
-        switching to mode 0x06 (Discharge ESS First) suppresses PV entirely.
+        Algorithm:
+          1. Find dusk = last hour in today's P50 forecast above SOLAR_DUSK_THRESHOLD_WH
+          2. Sum remaining bias-corrected solar from now to dusk
+          3. Sum expected home consumption from now to dusk (from consumption profile)
+          4. Battery headroom = kWh needed to reach 100% SOC
+          5. surplus_kwh = remaining_solar - remaining_home - headroom
+          6. If surplus <= 0: solar won't fill battery anyway — no export
+          7. export_kw = min(surplus / hours_to_dusk, DNO cap)  ← spread evenly
+          8. charge_cap_w = max(MIN, pv_now - house_now - export_target_w)
 
-        Thresholds:
-            SOC >= 90%: cap to SOLAR_OVERFLOW_HIGH_CAP_W (~200 W, near-zero)
-            SOC >= 80%: cap to SOLAR_OVERFLOW_MED_CAP_W (2000 W, slow trickle)
-            SOC <  75%: release cap (hysteresis band prevents rapid cycling)
+        Mode stays 0x02 (Max Self Consumption) throughout. Only HOLD_ESS_MAX_CHARGE
+        is reduced. PV is never suppressed; surplus flows to grid via export connection.
+        Switching to mode 0x06 (Discharge ESS First) would suppress PV — wrong approach.
 
-        Only active during daytime (dawn to dawn + DAYTIME_WINDOW_HOURS).
-        Only called when export_enabled is True (MPAN active).
+        Only active during daytime. Only called when export_enabled is True (MPAN active).
         """
-        # Determine whether it is currently daytime
+        # ── 1. Daytime check ──────────────────────────────────────────────────
         try:
             import pytz
             _tz        = pytz.timezone("Europe/London")
@@ -596,51 +601,115 @@ class BatteryManager:
         )
 
         if not _is_daytime:
-            # Night — if a cap was left active (e.g. from before dusk), release it
             if snapshot.solar_overflow_active:
                 return Decision(
-                    action          = ACTION_SELF_CONSUMPTION,
-                    reason          = "Solar overflow: night — releasing charge cap",
-                    dawn_viable     = True,
-                    soc_at_dawn_kwh = 0.0,
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = "Solar overflow: night — releasing charge cap",
+                    dawn_viable = True,
                 )
             return None
 
-        soc = snapshot.current_soc_pct
+        # ── 2. Find dusk from today's forecast ───────────────────────────────
+        now_naive  = _local_now.replace(tzinfo=None)
+        now_hour   = now_naive.replace(minute=0, second=0, microsecond=0)
 
-        # Determine required cap based on SOC thresholds
-        if soc >= SOLAR_OVERFLOW_HIGH_SOC:
-            cap_w = SOLAR_OVERFLOW_HIGH_CAP_W
-        elif soc >= SOLAR_OVERFLOW_MED_SOC:
-            cap_w = SOLAR_OVERFLOW_MED_CAP_W
-        elif snapshot.solar_overflow_active and soc >= SOLAR_OVERFLOW_RELEASE_SOC:
-            # In the hysteresis band (75-79%): maintain the current cap, don't release yet
-            cap_w = snapshot.solar_overflow_charge_cap
-        elif snapshot.solar_overflow_active:
-            # SOC has dropped below the release threshold — clear the cap
-            return Decision(
-                action          = ACTION_SELF_CONSUMPTION,
-                reason          = (
-                    f"Solar overflow: SOC {soc:.1f}% below release threshold "
-                    f"{SOLAR_OVERFLOW_RELEASE_SOC}% — restoring full charge rate"
-                ),
-                dawn_viable     = True,
-                soc_at_dawn_kwh = 0.0,
-            )
-        else:
-            # SOC below all thresholds, no overflow active — nothing to do
+        today_p50 = {
+            k: v for k, v in snapshot.forecast_p50.items()
+            if k.startswith(_today_str)
+        }
+
+        if not today_p50:
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = "Solar overflow: no forecast data — releasing cap",
+                    dawn_viable = True,
+                )
             return None
+
+        # Last hour of the day with meaningful PV
+        dusk_hour_dt = None
+        for key in sorted(today_p50.keys(), reverse=True):
+            if today_p50[key] >= SOLAR_DUSK_THRESHOLD_WH:
+                try:
+                    dusk_hour_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+                    break
+                except ValueError:
+                    continue
+
+        if dusk_hour_dt is None or dusk_hour_dt <= now_hour:
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = "Solar overflow: at or past dusk — releasing cap",
+                    dawn_viable = True,
+                )
+            return None
+
+        hours_to_dusk = max(0.5, (dusk_hour_dt - now_hour).total_seconds() / 3600.0)
+
+        # ── 3. Remaining bias-corrected solar (now → dusk) ───────────────────
+        remaining_solar_kwh = 0.0
+        for key, wh in today_p50.items():
+            try:
+                key_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if now_hour <= key_dt <= dusk_hour_dt:
+                remaining_solar_kwh += wh / 1000.0
+        remaining_solar_kwh *= snapshot.bias_factor
+
+        # ── 4. Remaining home consumption (now → dusk, from 48-slot profile) ─
+        now_slot  = _local_now.hour * 2 + (1 if _local_now.minute >= 30 else 0)
+        dusk_slot = min(dusk_hour_dt.hour * 2 + 2, 48)   # +2 slots covers the full dusk hour
+        if len(snapshot.consumption_profile) == 48:
+            remaining_home_kwh = sum(snapshot.consumption_profile[now_slot:dusk_slot])
+        else:
+            remaining_home_kwh = 0.225 * hours_to_dusk * 2  # fallback: ~10 kWh/day flat
+
+        # ── 5. Battery headroom to reach 100% ────────────────────────────────
+        headroom_kwh = (100.0 - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh
+
+        # ── 6. Surplus calculation ────────────────────────────────────────────
+        net_to_battery = remaining_solar_kwh - remaining_home_kwh
+        surplus_kwh    = net_to_battery - headroom_kwh
+
+        if surplus_kwh < SOLAR_OVERFLOW_MIN_SURPLUS_KWH:
+            # Solar won't fill battery — every watt goes to charging
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = (
+                        f"Solar overflow: {remaining_solar_kwh:.1f} kWh remaining solar - "
+                        f"{remaining_home_kwh:.1f} kWh home = {net_to_battery:.1f} kWh net, "
+                        f"need {headroom_kwh:.1f} kWh headroom — no surplus, releasing cap"
+                    ),
+                    dawn_viable = True,
+                )
+            return None
+
+        # ── 7. Spread surplus export evenly to dusk ───────────────────────────
+        export_kw  = min(surplus_kwh / hours_to_dusk, snapshot.max_export_kw)
+        export_w   = int(export_kw * 1000)
+
+        # ── 8. Charge cap: battery absorbs what's left after export target ────
+        # Floor at MIN to avoid writing 0 to register (ambiguous on some inverters)
+        cap_w = max(
+            SOLAR_OVERFLOW_MIN_CHARGE_W,
+            snapshot.pv_watts - snapshot.house_load_watts - export_w,
+        )
 
         return Decision(
             action      = ACTION_SOLAR_OVERFLOW,
             reason      = (
-                f"Solar overflow: SOC {soc:.1f}% — charge cap {cap_w}W "
-                f"({'near-zero' if cap_w <= SOLAR_OVERFLOW_HIGH_CAP_W else '2 kW trickle'}), "
-                f"PV surplus exporting"
+                f"Solar overflow: {surplus_kwh:.1f} kWh surplus over {hours_to_dusk:.1f}h — "
+                f"target export {export_kw:.2f} kW, charge cap {cap_w}W  "
+                f"[solar {remaining_solar_kwh:.1f} kWh, home {remaining_home_kwh:.1f} kWh, "
+                f"headroom {headroom_kwh:.1f} kWh]"
             ),
-            power_watts     = cap_w,
-            dawn_viable     = True,
-            soc_at_dawn_kwh = 0.0,
+            power_watts = cap_w,
+            export_kw   = export_kw,
+            dawn_viable = True,
         )
 
     def _check_night_export(
