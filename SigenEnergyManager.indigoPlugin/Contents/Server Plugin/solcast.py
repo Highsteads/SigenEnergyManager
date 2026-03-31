@@ -49,7 +49,7 @@ class SolcastForecast:
 
     Makes API calls directly to the Solcast rooftop_sites API.
     Results are cached to disk to respect the 10 calls/day/site hobbyist limit.
-    Combines P50/P10/P90 estimates from 2 sites for total generation forecast.
+    Combines P50 estimates from 2 sites for total generation forecast.
 
     Bias correction (hones forecasts over time):
     1. At 00:05 each day: capture today's P50 total as _morning_forecast
@@ -97,7 +97,7 @@ class SolcastForecast:
             todayKwh, tomorrowKwh, correctedTodayKwh, correctedTomorrowKwh,
             biasFactor, currentHourWatts, nextHourWatts, remainingTodayKwh,
             forecastStatus, lastUpdate,
-            _hourly_p50_today, _hourly_p10_today (for battery_manager),
+            _hourly_p50_today (for battery_manager),
             _dawn_times (dict: date -> first slot with PV > threshold)
         """
         if not REQUESTS_AVAILABLE:
@@ -136,7 +136,7 @@ class SolcastForecast:
                 return self._enrich_forecast(self._cached_forecast)
             return self._empty_forecast("All API calls failed")
 
-        # Combine site data (sum P50/P10/P90 per period)
+        # Combine site data (sum P50 per period)
         try:
             combined = self._combine_sites(site_forecasts)
         except Exception as e:
@@ -315,7 +315,7 @@ class SolcastForecast:
     # ================================================================
 
     def _combine_sites(self, site_forecasts_list):
-        """Sum P50/P10/P90 kW values from all sites into half-hourly slots.
+        """Sum P50 kW values from all sites into half-hourly slots.
 
         Returns combined dict with hourly buckets for today and tomorrow.
         """
@@ -324,43 +324,36 @@ class SolcastForecast:
         tomorrow  = today + timedelta(days=1)
 
         # Accumulate summed power per period_end key
-        combined_periods = {}  # period_end_str -> {p50, p10, p90}
+        combined_periods = {}  # period_end_str -> p50 kW
 
         for forecasts in site_forecasts_list:
             for period in forecasts:
-                key      = period.get("period_end", "")
-                p50      = period.get("pv_estimate",   0.0)
-                p10      = period.get("pv_estimate10", 0.0)
-                p90      = period.get("pv_estimate90", 0.0)
+                key = period.get("period_end", "")
+                p50 = period.get("pv_estimate", 0.0)
 
                 if key not in combined_periods:
-                    combined_periods[key] = {"p50": 0.0, "p10": 0.0, "p90": 0.0}
+                    combined_periods[key] = 0.0
 
-                combined_periods[key]["p50"] += p50
-                combined_periods[key]["p10"] += p10
-                combined_periods[key]["p90"] += p90
+                combined_periods[key] += p50
 
         # Convert to hourly Wh buckets for today and tomorrow
         hourly_p50_today    = {}
-        hourly_p10_today    = {}
         hourly_p50_tomorrow = {}
-        hourly_p10_tomorrow = {}
 
         today_total    = 0.0
         tomorrow_total = 0.0
         dawn_times     = {}  # date_str -> datetime of first slot with >threshold PV
 
-        for period_end_str, vals in combined_periods.items():
+        for period_end_str, p50 in combined_periods.items():
             try:
                 period_end = self._parse_period_end(period_end_str)
             except (ValueError, TypeError):
                 continue
 
-            period_start    = period_end - timedelta(minutes=30)
-            period_date     = period_start.date()
-            period_kwh_p50  = vals["p50"] * 0.5   # kW * 0.5h = kWh
-            period_kwh_p10  = vals["p10"] * 0.5
-            period_wh_p50   = vals["p50"] * 500    # kW * 0.5h * 1000 = Wh
+            period_start   = period_end - timedelta(minutes=30)
+            period_date    = period_start.date()
+            period_kwh_p50 = p50 * 0.5   # kW * 0.5h = kWh
+            period_wh_p50  = p50 * 500   # kW * 0.5h * 1000 = Wh
 
             # Accumulate daily totals
             if period_date == today:
@@ -375,13 +368,11 @@ class SolcastForecast:
 
             if period_date == today:
                 hourly_p50_today[hour_key]  = hourly_p50_today.get(hour_key, 0) + int(period_wh_p50)
-                hourly_p10_today[hour_key]  = hourly_p10_today.get(hour_key, 0) + int(vals["p10"] * 500)
             elif period_date == tomorrow:
                 hourly_p50_tomorrow[hour_key] = hourly_p50_tomorrow.get(hour_key, 0) + int(period_wh_p50)
-                hourly_p10_tomorrow[hour_key] = hourly_p10_tomorrow.get(hour_key, 0) + int(vals["p10"] * 500)
 
             # Track dawn time for each date
-            if vals["p50"] * 1000 > PV_GENERATION_THRESHOLD_W:  # kW -> W
+            if p50 * 1000 > PV_GENERATION_THRESHOLD_W:  # kW -> W
                 date_str = period_date.strftime("%Y-%m-%d")
                 if date_str not in dawn_times:
                     dawn_times[date_str] = period_start
@@ -409,9 +400,7 @@ class SolcastForecast:
             "currentHourWatts":  current_hour_w,
             "nextHourWatts":     next_hour_w,
             "_hourly_p50_today":    hourly_p50_today,
-            "_hourly_p10_today":    hourly_p10_today,
             "_hourly_p50_tomorrow": hourly_p50_tomorrow,
-            "_hourly_p10_tomorrow": hourly_p10_tomorrow,
             "_dawn_times":          dawn_times,
         }
 
@@ -444,9 +433,7 @@ class SolcastForecast:
             "forecastStatus":        f"No data: {reason}",
             "lastUpdate":            datetime.now().strftime("%H:%M:%S"),
             "_hourly_p50_today":     {},
-            "_hourly_p10_today":     {},
             "_hourly_p50_tomorrow":  {},
-            "_hourly_p10_tomorrow":  {},
             "_dawn_times":           {},
         }
 

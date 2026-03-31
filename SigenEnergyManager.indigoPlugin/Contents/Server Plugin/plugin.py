@@ -61,7 +61,7 @@ from axle_api import AxleAPI
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "1.0"
+PLUGIN_VERSION = "2.6"
 PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
@@ -464,7 +464,6 @@ class Plugin(indigo.PluginBase):
             corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
             tariff                  = tariff_data,
             forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
-            forecast_p10            = self.latest_forecast_data.get("_hourly_p10_tomorrow", {}),
             dawn_times         = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile = self.store.get("consumption_profile", []),
             now                = datetime.now(timezone.utc),
@@ -705,6 +704,7 @@ class Plugin(indigo.PluginBase):
         self.latest_forecast_data = data
 
         self._update_forecast_device(data)
+        self._update_solcast_variables(data)
 
         status   = data.get("forecastStatus", "")
         tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
@@ -1275,6 +1275,23 @@ class Plugin(indigo.PluginBase):
             {"key": "lastUpdate",           "value": data.get("lastUpdate", "")},
         ]
         dev.updateStatesOnServer(states)
+
+    def _update_solcast_variables(self, data):
+        """Write Solcast forecast totals to Indigo variables in the Sigenergy folder."""
+        today_kwh    = data.get("correctedTodayKwh",   0.0)
+        tomorrow_kwh = data.get("correctedTomorrowKwh", 0.0)
+        now_str      = datetime.now().strftime("%H:%M %d/%m/%Y")
+
+        updates = [
+            (1085965464, str(today_kwh)),    # solcast_today_kwh
+            (1029984958, str(tomorrow_kwh)), # solcast_tomorrow_kwh
+            (1287165951, now_str),           # solcast_last_updated
+        ]
+        for var_id, value in updates:
+            try:
+                indigo.variable.updateValue(var_id, value)
+            except Exception as e:
+                log(f"[Solcast] Variable update failed (id {var_id}): {e}", level="WARNING")
 
     def _update_tariff_device(self, tariff_info, monitored):
         """Push Octopus tariff data to tariffMonitor device."""

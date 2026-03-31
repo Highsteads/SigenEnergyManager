@@ -14,6 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 2.6 | 31-Mar-2026 | Solar overflow SOC gate: export now only starts once battery SOC reaches 40%, preventing the algorithm from exporting aggressively while the battery is still low after overnight discharge. Solcast Indigo variables (solcast_today_kwh, solcast_tomorrow_kwh, solcast_last_updated) now populated on every Solcast refresh — were previously always 0.0. P10 forecast data removed from all modules: was dead code never used in any decision logic since v1.3; removes _hourly_p10_today and _hourly_p10_tomorrow from solcast.py, forecast_p10 from ManagerSnapshot, and _sum_tomorrow_forecast() static method from battery_manager.py. P90 also removed. |
 | 2.5 | 30-Mar-2026 | Fix: v2.4 ineffective because dawn_target_pct and health_cutoff_pct are both 10% so changing threshold had no effect. Root cause: when tomorrow is sunny (forecast >= daily consumption) import is never needed regardless of dawn SOC — the inverter's discharge cutoff register (40048) already prevents the battery going below health_cutoff_pct. Import now fully suppressed on sunny days. Only on poor solar days (tomorrow forecast < daily consumption) does the dawn_target buffer apply. |
 | 2.4 | 30-Mar-2026 | Fix: overnight grid import triggered unnecessarily when battery was low but tomorrow has good solar. Import threshold is now solar-aware: if tomorrow's bias-corrected Solcast P50 >= daily consumption, import only triggers if projected dawn SOC would hit the hardware cutoff floor (inverter stops discharging anyway). On poor solar days the full dawn_target buffer is maintained as before. Eliminates small unnecessary top-up imports on sunny days. |
 | 2.3 | 30-Mar-2026 | Fix: dawn viability check incorrectly triggered grid import during daylight when battery SOC was low but abundant solar remained. _check_dawn_viability() now credits remaining bias-corrected Solcast P50 solar (net of home consumption to dusk) to current SOC before projecting overnight drain to next dawn. Import is only triggered if the battery genuinely cannot reach dawn target even after today's remaining solar is accounted for. |
@@ -114,9 +115,11 @@ Every 60 seconds the plugin:
 2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
    and a 48-slot half-hourly consumption profile
 3. If projected SOC at dawn < dawn target: schedules or starts a grid import
-4. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
+4. During daylight, once SOC >= 40%: caps HOLD_ESS_MAX_CHARGE so PV surplus exports
+   to grid continuously, reaching 100% SOC as near to dusk as solar allows (see below)
+5. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
    provided tomorrow's solar forecast is good enough to recharge (see below)
-5. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+6. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
 
 ### Night export
 
@@ -243,9 +246,9 @@ data by date string), but the Solcast module only populated `_hourly_p10_today`.
 `_sum_tomorrow_forecast()` helper searched for tomorrow's date in today's dict, found
 nothing, returned 0 kWh, and the check `0 < 14.4` blocked export every night.
 
-**Fix:** Solcast module now populates `_hourly_p10_tomorrow`. The viability check was
-also switched from P10 to the bias-corrected P50 (`correctedTomorrowKwh x 0.6`), which
-is far more appropriate for this decision -- see Night export above.
+**Fix:** The viability check was switched from P10 to the bias-corrected P50
+(`correctedTomorrowKwh x 0.6`), which is far more appropriate for this decision
+-- see Night export above. P10 has since been removed entirely from the codebase.
 
 ### v1.1 -- Nighttime grid import at high SOC
 
@@ -276,7 +279,7 @@ oscillated around 80%.
 |------|---------|
 | Battery Manager | Main control device -- one per system |
 | Inverter Monitor | Real-time PV, battery, grid, home power readings |
-| Solcast Forecast | Today/tomorrow solar forecast (P10/P50) |
+| Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) |
 | Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
 | Axle VPP | VPP event state machine and SOC management |
 

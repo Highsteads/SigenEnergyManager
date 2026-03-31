@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 22:11 GMT
-# Version:     1.4
+# Date:        31-03-2026 13:00 BST
+# Version:     1.5
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -73,6 +73,7 @@ SOLAR_OVERFLOW_MIN_SURPLUS_KWH = 0.3   # below this surplus don't bother exporti
 SOLAR_OVERFLOW_MIN_CHARGE_W    = 200   # minimum charge cap floor (avoid writing 0W to register)
 SOLAR_OVERFLOW_CAP_DEADBAND_W  = 500   # only rewrite charge limit if cap changes by > this
 SOLAR_DUSK_THRESHOLD_WH        = 500   # Wh/hr below which a slot is considered post-dusk
+SOLAR_OVERFLOW_MIN_SOC_PCT     = 40    # don't export until battery reaches this SOC % first
 
 
 @dataclass
@@ -112,10 +113,7 @@ class ManagerSnapshot:
     tariff: TariffData = field(default_factory=TariffData)
 
     # Forecast: hourly Wh dicts {"YYYY-MM-DD HH:00:00": wh_int}
-    # P50 used for display and next-hour lookahead.
-    # P10 retained in snapshot for diagnostics; not used in decision logic.
     forecast_p50: Dict[str, int] = field(default_factory=dict)
-    forecast_p10: Dict[str, int] = field(default_factory=dict)
 
     # Dawn times: {"YYYY-MM-DD": datetime} - first hour with meaningful PV
     dawn_times: Dict[str, datetime] = field(default_factory=dict)
@@ -689,6 +687,19 @@ class BatteryManager:
                 )
             return None
 
+        # ── 1b. SOC gate: charge battery first, export only once >= 40% ──────
+        if snapshot.current_soc_pct < SOLAR_OVERFLOW_MIN_SOC_PCT:
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = (
+                        f"Solar overflow: SOC {snapshot.current_soc_pct:.0f}% below "
+                        f"{SOLAR_OVERFLOW_MIN_SOC_PCT}% gate — charging first"
+                    ),
+                    dawn_viable = True,
+                )
+            return None
+
         # ── 2. Find dusk from today's forecast ───────────────────────────────
         now_naive  = _local_now.replace(tzinfo=None)
         now_hour   = now_naive.replace(minute=0, second=0, microsecond=0)
@@ -897,28 +908,6 @@ class BatteryManager:
             dawn_viable     = True,
             soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
         )
-
-    @staticmethod
-    def _sum_tomorrow_forecast(forecast_p10: Dict[str, int], now: datetime) -> float:
-        """Sum P10 forecast Wh for tomorrow's date, returning kWh.
-
-        Forecast keys are in Europe/London local time ("YYYY-MM-DD HH:MM:SS").
-        """
-        try:
-            import pytz
-            local_now = now.astimezone(pytz.timezone("Europe/London"))
-        except (ImportError, Exception):
-            local_now = now   # fallback to UTC
-
-        tomorrow_str = (local_now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-        total_wh = 0
-        for key, wh in forecast_p10.items():
-            if key.startswith(tomorrow_str):
-                try:
-                    total_wh += int(wh)
-                except (ValueError, TypeError):
-                    continue
-        return total_wh / 1000.0
 
     # ================================================================
     # Helpers

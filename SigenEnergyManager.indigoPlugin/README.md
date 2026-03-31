@@ -14,6 +14,14 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 2.6 | 31-Mar-2026 | Solar overflow SOC gate: export now only starts once battery SOC reaches 40%, preventing the algorithm from exporting aggressively while the battery is still low after overnight discharge. Solcast Indigo variables (solcast_today_kwh, solcast_tomorrow_kwh, solcast_last_updated) now populated on every Solcast refresh — were previously always 0.0. P10 forecast data removed from all modules: was dead code never used in any decision logic since v1.3; removes _hourly_p10_today and _hourly_p10_tomorrow from solcast.py, forecast_p10 from ManagerSnapshot, and _sum_tomorrow_forecast() static method from battery_manager.py. P90 also removed. |
+| 2.5 | 30-Mar-2026 | Fix: v2.4 ineffective because dawn_target_pct and health_cutoff_pct are both 10% so changing threshold had no effect. Root cause: when tomorrow is sunny (forecast >= daily consumption) import is never needed regardless of dawn SOC — the inverter's discharge cutoff register (40048) already prevents the battery going below health_cutoff_pct. Import now fully suppressed on sunny days. Only on poor solar days (tomorrow forecast < daily consumption) does the dawn_target buffer apply. |
+| 2.4 | 30-Mar-2026 | Fix: overnight grid import triggered unnecessarily when battery was low but tomorrow has good solar. Import threshold is now solar-aware: if tomorrow's bias-corrected Solcast P50 >= daily consumption, import only triggers if projected dawn SOC would hit the hardware cutoff floor (inverter stops discharging anyway). On poor solar days the full dawn_target buffer is maintained as before. Eliminates small unnecessary top-up imports on sunny days. |
+| 2.3 | 30-Mar-2026 | Fix: dawn viability check incorrectly triggered grid import during daylight when battery SOC was low but abundant solar remained. _check_dawn_viability() now credits remaining bias-corrected Solcast P50 solar (net of home consumption to dusk) to current SOC before projecting overnight drain to next dawn. Import is only triggered if the battery genuinely cannot reach dawn target even after today's remaining solar is accounted for. |
+| 2.2 | 30-Mar-2026 | Replaced fixed SOC threshold overflow logic with forecast-based dynamic export. Each evaluation: sums remaining bias-corrected Solcast P50 from now to dusk, subtracts expected home consumption and battery headroom to reach 100%, spreads any genuine surplus evenly across remaining daylight hours up to 4 kW DNO cap. Battery reaches 100% as near to dusk as solar allows while exporting continuously from first surplus detection. Mode stays 0x02 throughout; PV never suppressed. Adds house_load_watts and bias_factor to ManagerSnapshot. |
+| 2.1 | 30-Mar-2026 | New: daytime solar overflow export. When SOC >= 80% during daylight, caps HOLD_ESS_MAX_CHARGE (register 40032) to 2 kW so PV surplus that can't enter the battery flows to grid instead. At SOC >= 90% caps to near-zero (200 W). Releases below 75% SOC (hysteresis). Mode stays 0x02 throughout — PV is never suppressed. Previous attempt used mode 0x06 (Discharge ESS First) which causes inverter to curtail PV. _verify_ems_registers() updated to respect the charge cap during overflow. |
+| 2.0 | 29-Mar-2026 | Fix: "Cannot find Tracker product code" warning still firing after v1.8. Root cause: two bugs. (1) _detect_tariff_from_account() returned the FIRST meter point regardless of whether it was import or export — accounts with an export MPAN (OUTGOING tariff) had it returned first, classifying as TARIFF_UNKNOWN and bypassing the account path. Fixed: filter by self.mpan when set, only check matching meter point; skip TARIFF_UNKNOWN results. (2) _probe_product_by_prefix() used is_variable=True filter — Tracker (SILVER-*) is a daily-changing flat rate, not flagged is_variable by Octopus, so it was silently excluded. Fixed: removed is_variable filter. |
+| 1.9 | 29-Mar-2026 | Fix: Night export still blocked after restart despite v1.7 disk-cache pre-warm. Root cause: _tick() ran manager (step 2) before Solcast refresh (step 3), so latest_forecast_data was still {} on the first evaluation. Two fixes: (1) startup() now calls _refresh_solcast() immediately after _init_modules() to pre-populate latest_forecast_data from the disk cache before any manager evaluation; (2) Solcast refresh moved before manager in _tick() as a permanent ordering guarantee. |
 | 1.8 | 29-Mar-2026 | Fix: "Cannot find Tracker product code" warning fired every 30 minutes. Root cause: _probe_tracker_product_code() guessed TRACKER-VAR-YY-MM-DD dates at 30-day intervals, which never match real Octopus product release dates. Replaced with _probe_product_by_prefix(("SILVER","TRACKER")) -- the same public-products-listing approach used by Go/Flux/Agile. _probe_tracker_product_code() deleted. |
 | 1.7 | 29-Mar-2026 | Fix: Solcast combined forecast now pre-warmed from disk cache on startup. Previously every plugin restart cleared the in-memory forecast, causing correctedTomorrowKwh=0.0 and silently blocking night export until the next live API fetch (up to 2.4h). _load_combined_cache() reads solcast_combined_cache.json at __init__ time; logs a warning if the cache is >7.2h old. _refresh_solcast() now logs an explicit WARNING if forecastStatus contains 'No data' or correctedTomorrowKwh==0.0, so the blockage is visible in the event log. |
 | 1.6 | 29-Mar-2026 | Fix: Intelligent Go cheap window corrected to 23:30-05:30 (was 00:30, same as standard Go). Fix: Intelligent Flux has no narrow cheap window -- entire 21h outside peak (16:00-19:00) is cheap, so window now modelled as 19:00-16:00 wrap-around instead of incorrectly using Flux's 02:00-05:00. Battery manager will now import immediately at any non-peak time on iFlux rather than waiting for a 02:00 window that doesn't exist. |
@@ -107,9 +115,11 @@ Every 60 seconds the plugin:
 2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
    and a 48-slot half-hourly consumption profile
 3. If projected SOC at dawn < dawn target: schedules or starts a grid import
-4. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
+4. During daylight, once SOC >= 40%: caps HOLD_ESS_MAX_CHARGE so PV surplus exports
+   to grid continuously, reaching 100% SOC as near to dusk as solar allows (see below)
+5. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
    provided tomorrow's solar forecast is good enough to recharge (see below)
-5. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+6. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
 
 ### Night export
 
@@ -236,9 +246,9 @@ data by date string), but the Solcast module only populated `_hourly_p10_today`.
 `_sum_tomorrow_forecast()` helper searched for tomorrow's date in today's dict, found
 nothing, returned 0 kWh, and the check `0 < 14.4` blocked export every night.
 
-**Fix:** Solcast module now populates `_hourly_p10_tomorrow`. The viability check was
-also switched from P10 to the bias-corrected P50 (`correctedTomorrowKwh x 0.6`), which
-is far more appropriate for this decision -- see Night export above.
+**Fix:** The viability check was switched from P10 to the bias-corrected P50
+(`correctedTomorrowKwh x 0.6`), which is far more appropriate for this decision
+-- see Night export above. P10 has since been removed entirely from the codebase.
 
 ### v1.1 -- Nighttime grid import at high SOC
 
@@ -269,7 +279,7 @@ oscillated around 80%.
 |------|---------|
 | Battery Manager | Main control device -- one per system |
 | Inverter Monitor | Real-time PV, battery, grid, home power readings |
-| Solcast Forecast | Today/tomorrow solar forecast (P10/P50) |
+| Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) |
 | Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
 | Axle VPP | VPP event state machine and SOC management |
 
