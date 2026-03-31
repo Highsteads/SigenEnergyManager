@@ -725,6 +725,16 @@ class SigenergyModbus:
         self.logger.info("Returning to local EMS control")
         return self.disable_remote_ems()
 
+    def read_ems_mode(self):
+        """Read current HOLD_REMOTE_EMS_MODE (40031). Returns int or None."""
+        if not self._connected:
+            return None
+        raw = self._read_uint16(HOLD_REMOTE_EMS_MODE)
+        if raw is None:
+            return None
+        self.logger.debug(f"EMS mode read: {REMOTE_EMS_MODES.get(raw, f'Unknown ({raw})')}")
+        return raw
+
     def read_discharge_limit(self):
         """Read current HOLD_ESS_MAX_DISCHARGE (registers 40034-40035). Returns watts or None."""
         if not self._connected:

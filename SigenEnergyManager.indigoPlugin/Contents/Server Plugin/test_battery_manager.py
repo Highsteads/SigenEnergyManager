@@ -66,7 +66,6 @@ def _make_snapshot(
     vpp_active=False,
     now_hour=14,
     forecast_p50=None,
-    forecast_p10=None,
     consumption_profile=None,
     dawn_times=None,
     pv_watts=0,
@@ -106,7 +105,6 @@ def _make_snapshot(
         corrected_tomorrow_kwh = corrected_tomorrow_kwh,
         tariff                 = tariff,
         forecast_p50           = forecast_p50 or {},
-        forecast_p10           = forecast_p10 or {},
         dawn_times             = dawn_times,
         consumption_profile    = consumption_profile,
         now                    = _now(hour=now_hour),
@@ -565,36 +563,25 @@ class TestNightExport(unittest.TestCase):
         self.assertEqual(decision.export_kw, 3.5)
 
     def test_import_takes_priority_over_night_export(self):
-        """Dawn viability at risk → import, not export."""
+        """Dawn viability at risk → import, not export.
+
+        Uses a poor tomorrow forecast (5 kWh < 14.4 kWh daily) so import is not
+        suppressed by the 'sunny day' rule (v2.5+).  Night export is also blocked
+        because corrected_tomorrow_kwh * 0.6 < daily consumption.
+        """
         # 12% SOC at 20:00. Drain to dawn = 11h * 0.6 kWh/h = 6.6 kWh.
         # 4.20 - 6.6 = -2.4 kWh -> import needed. Export should NOT be triggered.
         snapshot = _make_snapshot(
             soc_pct                = 12.0,
             export_enabled         = True,
             pv_watts               = 0,
-            corrected_tomorrow_kwh = self._good_tomorrow_kwh,
+            corrected_tomorrow_kwh = 5.0,   # poor day → import not suppressed
             now_hour               = 20,
         )
         decision = self.bm.evaluate(snapshot)
 
         self.assertEqual(decision.action, ACTION_START_IMPORT)
 
-    def test_sum_tomorrow_forecast_helper(self):
-        """_sum_tomorrow_forecast sums hourly P10 entries for tomorrow's date.
-
-        This method is retained for use in advanced diagnostics.
-        The main export viability check now uses corrected_tomorrow_kwh (P50).
-        """
-        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
-        p10 = {
-            f"{today_str} 10:00:00":    5000,   # today - should be excluded
-            f"{tomorrow_str} 09:00:00": 3000,   # tomorrow - included
-            f"{tomorrow_str} 10:00:00": 4000,   # tomorrow - included
-        }
-        result = BatteryManager._sum_tomorrow_forecast(p10, datetime.now(timezone.utc))
-        # 3000 + 4000 = 7000 Wh = 7.0 kWh
-        self.assertAlmostEqual(result, 7.0, places=1)
 
 
 if __name__ == "__main__":

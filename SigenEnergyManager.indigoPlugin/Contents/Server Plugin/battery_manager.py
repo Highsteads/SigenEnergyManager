@@ -6,7 +6,7 @@
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        31-03-2026 13:00 BST
-# Version:     1.5
+# Version:     1.6
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -829,15 +829,26 @@ class BatteryManager:
 
         _today_str     = _local_now.date().strftime("%Y-%m-%d")
         _today_dawn_dt = snapshot.dawn_times.get(_today_str)
-        _is_daytime    = (
-            _today_dawn_dt is not None
-            and snapshot.now >= _today_dawn_dt
-            and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
-        )
+        _local_hour    = _local_now.hour + _local_now.minute / 60.0
+
+        if _today_dawn_dt is not None:
+            _is_daytime = (
+                snapshot.now >= _today_dawn_dt
+                and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
+            )
+        else:
+            # No Solcast dawn time for today — use clock-based fallback.
+            # Safe assumption: 07:00–21:00 local time is always daytime.
+            # This prevents night export from firing during daylight when
+            # Solcast data is unavailable (e.g. API failure, first startup).
+            _is_daytime = 7.0 <= _local_hour < 21.0
 
         if _is_daytime:
             if snapshot.export_active:
-                _dawn_str = _today_dawn_dt.astimezone(_tz).strftime("%H:%M")
+                if _today_dawn_dt is not None:
+                    _dawn_str = _today_dawn_dt.astimezone(_tz).strftime("%H:%M")
+                else:
+                    _dawn_str = "07:00 (fallback)"
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = f"Sunrise reached ({_dawn_str}) - stopping night export",

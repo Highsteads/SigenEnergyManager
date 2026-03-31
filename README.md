@@ -14,6 +14,9 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 2.9 | 31-Mar-2026 | Fix: night export (mode 0x06) fired at 14:48 in full daylight because _check_night_export() computed _is_daytime=False when snapshot.dawn_times had no entry for today (Solcast data stale or not yet fetched). With _is_daytime=False the function fell through to export logic, suppressing PV to 0W and discharging battery to grid during daylight. Fixed in battery_manager.py v1.6: if today's dawn time is absent, fall back to clock-based safe window (07:00-21:00 local time) so export is always blocked during daylight regardless of Solcast data availability. |
+| 2.8 | 31-Mar-2026 | Fix: inverter stuck in mode 0x06 (Discharge ESS First) after plugin restart. After restart all store flags are False, so _act_on_decision(ACTION_SELF_CONSUMPTION) only called set_self_consumption() on a True→False transition — never on cold start. Fixed in two places: (1) _verify_ems_registers() now reads actual EMS mode register via new sigenergy_modbus.read_ems_mode() and corrects any mismatch; (2) _act_on_decision() checks emsWorkMode field from live inverter data and forces 0x02 if inverter is in wrong mode despite all store flags being False. |
+| 2.7 | 31-Mar-2026 | Plugin log file: daily rotating log written to plugin data dir (Preferences/Plugins/.../logs/YYYY-MM-DD.log). log() now writes to both Indigo event log and plugin file simultaneously. 14-day retention with automatic purge. File opened/rotated in startup() and on each 10-second tick (no-op unless date has rolled over). Closed cleanly in shutdown(). Enables post-mortem diagnosis without relying solely on Indigo's event log. |
 | 2.6 | 31-Mar-2026 | Solar overflow SOC gate: export now only starts once battery SOC reaches 40%, preventing the algorithm from exporting aggressively while the battery is still low after overnight discharge. Solcast Indigo variables (solcast_today_kwh, solcast_tomorrow_kwh, solcast_last_updated) now populated on every Solcast refresh — were previously always 0.0. P10 forecast data removed from all modules: was dead code never used in any decision logic since v1.3; removes _hourly_p10_today and _hourly_p10_tomorrow from solcast.py, forecast_p10 from ManagerSnapshot, and _sum_tomorrow_forecast() static method from battery_manager.py. P90 also removed. |
 | 2.5 | 30-Mar-2026 | Fix: v2.4 ineffective because dawn_target_pct and health_cutoff_pct are both 10% so changing threshold had no effect. Root cause: when tomorrow is sunny (forecast >= daily consumption) import is never needed regardless of dawn SOC — the inverter's discharge cutoff register (40048) already prevents the battery going below health_cutoff_pct. Import now fully suppressed on sunny days. Only on poor solar days (tomorrow forecast < daily consumption) does the dawn_target buffer apply. |
 | 2.4 | 30-Mar-2026 | Fix: overnight grid import triggered unnecessarily when battery was low but tomorrow has good solar. Import threshold is now solar-aware: if tomorrow's bias-corrected Solcast P50 >= daily consumption, import only triggers if projected dawn SOC would hit the hardware cutoff floor (inverter stops discharging anyway). On poor solar days the full dawn_target buffer is maintained as before. Eliminates small unnecessary top-up imports on sunny days. |
@@ -173,8 +176,8 @@ The plugin guards against register drift at three layers:
    10000W (inverter maximum) before setting the mode
 2. **On startup** -- both registers are explicitly written to 10000W before any other
    Modbus operation
-3. **Every 15 minutes** -- `_verify_ems_registers()` reads back both registers; if
-   either has drifted it is corrected and logged with a warning
+3. **Every 15 minutes** -- `_verify_ems_registers()` reads back both registers and
+   the EMS mode register; any drift is corrected and logged with a warning
 
 ### Tariff-aware import scheduling
 
@@ -292,12 +295,12 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m unittest test_battery_manager test_sigenergy_modbus -v
 ```
 
-**49 tests** across two test files, all passing without Indigo installed:
+**53 tests** across two test files, all passing without Indigo installed:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_battery_manager.py` | 33 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (10 cases), VPP suppression |
-| `test_sigenergy_modbus.py` | 16 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation |
+| `test_battery_manager.py` | 32 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (9 cases), VPP suppression |
+| `test_sigenergy_modbus.py` | 21 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, night_export sequence, read_discharge_limit/read_charge_limit, export limit validation |
 
 ---
 

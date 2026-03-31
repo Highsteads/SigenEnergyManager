@@ -61,7 +61,7 @@ from axle_api import AxleAPI
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "2.6"
+PLUGIN_VERSION = "2.9"
 PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
@@ -90,10 +90,58 @@ VPP_RESERVE_KWH          = 12.0  # 4 overnight + 3 morning + 5 buffer
 BATTERY_CAPACITY_KWH     = 35.04
 
 
+# ============================================================
+# Plugin log file (daily rotation, 14-day retention)
+# ============================================================
+
+_plugin_log_fh   = None
+_plugin_log_date = None
+
+def _ensure_plugin_log(data_dir):
+    """Open (or rotate) the daily plugin log file in data_dir/logs/."""
+    global _plugin_log_fh, _plugin_log_date
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _plugin_log_date == today and _plugin_log_fh is not None:
+        return  # already open for today
+    # Close previous file if open
+    if _plugin_log_fh is not None:
+        try:
+            _plugin_log_fh.close()
+        except Exception:
+            pass
+    log_dir  = os.path.join(data_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{today}.log")
+    try:
+        _plugin_log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    except Exception:
+        _plugin_log_fh = None
+    _plugin_log_date = today
+    # Purge log files older than 14 days
+    cutoff = datetime.now() - timedelta(days=14)
+    try:
+        for fname in os.listdir(log_dir):
+            if fname.endswith(".log") and len(fname) == 14:
+                try:
+                    fdate = datetime.strptime(fname[:10], "%Y-%m-%d")
+                    if fdate < cutoff:
+                        os.remove(os.path.join(log_dir, fname))
+                except (ValueError, OSError):
+                    pass
+    except OSError:
+        pass
+
+
 def log(message, level="INFO"):
-    """Custom log function with timestamp prefix."""
-    from datetime import datetime
-    indigo.server.log(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", level=level)
+    """Custom log function — writes to Indigo event log and daily plugin log file."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    indigo.server.log(f"[{ts}] {message}", level=level)
+    if _plugin_log_fh is not None:
+        try:
+            _plugin_log_fh.write(f"{ts} [{level:<7}] {message}\n")
+            _plugin_log_fh.flush()
+        except Exception:
+            pass
 
 
 class Plugin(indigo.PluginBase):
@@ -187,6 +235,7 @@ class Plugin(indigo.PluginBase):
         self._load_accumulators()
 
     def startup(self):
+        _ensure_plugin_log(self.data_dir)
         log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} starting")
         self._init_modules()
         self.solcast.load_correction_factor()
@@ -203,6 +252,13 @@ class Plugin(indigo.PluginBase):
 
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
+        global _plugin_log_fh
+        if _plugin_log_fh is not None:
+            try:
+                _plugin_log_fh.close()
+            except Exception:
+                pass
+            _plugin_log_fh = None
         if self.modbus and self.modbus.connected:
             # Return to self-consumption on shutdown
             try:
@@ -292,6 +348,7 @@ class Plugin(indigo.PluginBase):
 
     def _tick(self, now):
         """Called every 10 seconds. Dispatches all timed tasks."""
+        _ensure_plugin_log(self.data_dir)  # no-op unless date has rolled over
         # 1. Modbus poll
         if now - self.store["last_modbus"] >= MODBUS_POLL_INTERVAL:
             self._poll_modbus()
@@ -591,6 +648,12 @@ class Plugin(indigo.PluginBase):
             # else: cap within deadband — idempotent, no Modbus writes
 
         elif action == ACTION_SELF_CONSUMPTION:
+            # Determine if inverter is currently in a non-self-consumption mode.
+            # Check store flags first; fall back to actual emsWorkMode from inverter data
+            # so a restart (which resets all flags to False) can still recover a stuck mode.
+            ems_mode_str   = self.latest_inverter_data.get("emsWorkMode", "")
+            inverter_stuck = ems_mode_str in ("Discharge ESS First", "Charge Grid First")
+
             if prev_import:
                 log("[Manager] Returning to self-consumption")
                 self.modbus.set_self_consumption()
@@ -606,6 +669,11 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_self_consumption()   # resets charge limit to inv_max_w
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
+            elif inverter_stuck:
+                # Inverter is in wrong mode (e.g. stuck in 0x06 after restart cleared store flags)
+                log(f"[Manager] Inverter stuck in '{ems_mode_str}' — forcing self-consumption",
+                    level="WARNING")
+                self.modbus.set_self_consumption()
 
         # Check if active import has reached target SOC
         if self.store["import_active"]:
@@ -647,6 +715,28 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = self.store.get("solar_overflow_charge_cap_w", inv_max_w)
         else:
             expected_charge_w = inv_max_w
+
+        # --- EMS mode ---
+        # Determine what mode the inverter should be in based on store flags.
+        # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
+        # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
+        # this will catch and correct it on the next manager tick.
+        if self.store.get("export_active"):
+            expected_mode = 0x06  # Discharge ESS First
+        elif self.store.get("import_active"):
+            expected_mode = 0x03  # Charge Grid First
+        else:
+            expected_mode = 0x02  # Max Self Consumption
+
+        actual_mode = self.modbus.read_ems_mode()
+        if actual_mode is not None and actual_mode != expected_mode:
+            mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
+            log(
+                f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
+                f"expected={mode_names.get(expected_mode, expected_mode)} — correcting",
+                level="WARNING",
+            )
+            self.modbus.set_remote_ems_mode(expected_mode)
 
         # --- Discharge limit ---
         actual_discharge_w = self.modbus.read_discharge_limit()
