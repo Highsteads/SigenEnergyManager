@@ -582,6 +582,42 @@ class TestNightExport(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_START_IMPORT)
 
+    def test_emergency_floor_import_on_sunny_day(self):
+        """Emergency floor: even when tomorrow is sunny, import if raw SOC at dawn
+        would breach the hardware health floor (v1.7+).
+
+        Scenario: 16% SOC at 22:00, tomorrow forecast 40 kWh (sunny day).
+        9 hours to dawn = 18 slots × 0.30 kWh = 5.4 kWh drain.
+        Raw at dawn = 16% * 35.04 - 5.4 = 5.61 - 5.4 = 0.21 kWh (0.6%) → below 10% floor.
+        Import should be triggered despite tomorrow being sunny.
+        """
+        snapshot = _make_snapshot(
+            soc_pct                = 16.0,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = 40.0,   # sunny → tomorrow_is_sunny = True
+            now_hour               = 22,      # 22:00, 9 hours to next dawn at 07:00
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        # Must import to protect health floor even on a sunny day
+        self.assertEqual(decision.action, ACTION_START_IMPORT)
+
+    def test_no_emergency_import_sunny_day_adequate_soc(self):
+        """No import when tomorrow is sunny AND SOC at dawn stays above health floor.
+
+        Scenario: 60% SOC at 22:00, tomorrow forecast 40 kWh (sunny).
+        9 hours to dawn = 18 slots × 0.30 kWh = 5.4 kWh drain.
+        Raw at dawn = 60% * 35.04 - 5.4 = 21.02 - 5.4 = 15.62 kWh (44%) → well above floor.
+        """
+        snapshot = _make_snapshot(
+            soc_pct                = 60.0,
+            pv_watts               = 0,
+            corrected_tomorrow_kwh = 40.0,   # sunny → tomorrow_is_sunny = True
+            now_hour               = 22,      # 22:00, 9 hours to next dawn at 07:00
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
 
 
 if __name__ == "__main__":

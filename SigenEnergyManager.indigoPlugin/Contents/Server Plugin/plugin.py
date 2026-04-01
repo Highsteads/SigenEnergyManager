@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 22:11 GMT
-# Version:     1.4
+# Date:        01-04-2026 10:00 BST
+# Version:     1.5
 
 import indigo
 import json
@@ -760,6 +760,24 @@ class Plugin(indigo.PluginBase):
                 )
                 self.modbus.set_charge_limit(expected_charge_w)
 
+        # --- Discharge cutoff (health floor, register 40048) ---
+        # This register physically stops battery discharge. It is only written by
+        # VPP code, so on systems without VPP activity it drifts to whatever the
+        # inverter factory default is (typically 5%). Verify every cycle so the
+        # hardware floor always matches the plugin's batteryHealthCutoff preference.
+        # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
+        if not self.store.get("vpp_cutoff_raised"):
+            expected_cutoff_pct = float(self.pluginPrefs.get("batteryHealthCutoff", 10.0))
+            actual_cutoff_pct   = self.modbus.read_discharge_cutoff()
+            if actual_cutoff_pct is not None:
+                if abs(actual_cutoff_pct - expected_cutoff_pct) > 0.5:
+                    log(
+                        f"[Verify] Discharge cutoff mismatch: inverter={actual_cutoff_pct:.1f}% "
+                        f"expected={expected_cutoff_pct:.1f}% — correcting",
+                        level="WARNING",
+                    )
+                    self.modbus.set_discharge_cutoff(expected_cutoff_pct)
+
     def _check_scheduled_import(self):
         """Check if a scheduled import time has arrived."""
         scheduled = self.store.get("import_scheduled_time")
@@ -1147,6 +1165,7 @@ class Plugin(indigo.PluginBase):
         floor_pct       = max(floor_pct, dawn_target_pct)
         if self.modbus:
             self.modbus.set_discharge_cutoff(floor_pct)
+            self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
             log(
                 f"[VPP] Discharge cutoff raised to {floor_pct:.0f}% "
                 f"(dawn {dawn_target_pct:.0f}% + event {event_kwh:.1f} kWh)"
@@ -1157,6 +1176,7 @@ class Plugin(indigo.PluginBase):
         if self.modbus:
             health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 10.0))
             self.modbus.set_discharge_cutoff(health_floor)
+            self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
             log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
 
     def _vpp_transition(self, new_state):

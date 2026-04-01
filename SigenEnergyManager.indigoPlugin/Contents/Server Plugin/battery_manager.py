@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        31-03-2026 13:00 BST
-# Version:     1.6
+# Date:        01-04-2026 10:00 BST
+# Version:     1.7
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -136,7 +136,8 @@ class ManagerSnapshot:
 class DawnViability:
     """Result of the dawn viability check."""
     viable:           bool  = True
-    soc_at_dawn_kwh:  float = 0.0
+    soc_at_dawn_kwh:  float = 0.0    # clamped to health floor for display
+    raw_soc_at_dawn:  float = 0.0    # actual projection (may be below health floor)
     dawn_target_kwh:  float = 3.504   # 10% of 35.04
     import_needed:    bool  = False
     import_kwh_net:   float = 0.0     # energy needed at battery terminals
@@ -327,10 +328,11 @@ class BatteryManager:
         # Import threshold: depends on whether tomorrow has meaningful solar.
         #
         # Tomorrow is sunny (forecast >= daily consumption):
-        #   The battery will refill during the day regardless of dawn SOC.
-        #   The inverter's own discharge cutoff register (40048) already prevents
-        #   the battery going below health_cutoff_pct — so no import is ever
-        #   needed. Let the hardware protect itself; don't waste grid energy.
+        #   The battery will refill during the day. No import needed for the
+        #   dawn_target buffer — UNLESS the projected raw SOC at dawn is below
+        #   the health floor itself. In that case apply an emergency import to
+        #   reach the floor. We cannot rely solely on register 40048 because it
+        #   may not be at the expected value (e.g. factory default 5%, not 10%).
         #
         # Tomorrow is a poor solar day (forecast < daily consumption):
         #   The battery will not recover fully during the day. Maintain the full
@@ -343,21 +345,28 @@ class BatteryManager:
         tomorrow_is_sunny = snapshot.corrected_tomorrow_kwh >= daily_cons_kwh
 
         if tomorrow_is_sunny:
-            # Hardware cutoff protects the battery — never import on a sunny day
-            import_needed   = False
-            import_kwh_net  = 0.0
-            import_kwh_grid = 0.0
+            if raw_soc_at_dawn < health_floor_kwh:
+                # Emergency floor: battery would breach hardware health limit.
+                # Import just enough to reach the floor, even on a sunny day.
+                import_needed   = True
+                import_kwh_net  = max(0.0, health_floor_kwh - raw_soc_at_dawn)
+                import_kwh_grid = import_kwh_net / max(0.01, snapshot.efficiency)
+            else:
+                import_needed   = False
+                import_kwh_net  = 0.0
+                import_kwh_grid = 0.0
         else:
             import_needed   = raw_soc_at_dawn < dawn_target_kwh
             import_kwh_net  = max(0.0, dawn_target_kwh - raw_soc_at_dawn)
             import_kwh_grid = import_kwh_net / max(0.01, snapshot.efficiency)
 
-        # Clamp reported value to hardware floor for display only
+        # Clamp reported value to hardware floor for display; raw value logged by caller
         soc_at_dawn_kwh = max(health_floor_kwh, raw_soc_at_dawn)
 
         return DawnViability(
             viable                   = not import_needed,
             soc_at_dawn_kwh          = round(soc_at_dawn_kwh, 2),
+            raw_soc_at_dawn          = round(raw_soc_at_dawn, 2),
             dawn_target_kwh          = dawn_target_kwh,
             import_needed            = import_needed and import_kwh_grid >= MIN_IMPORT_KWH,
             import_kwh_net           = round(import_kwh_net, 2),
