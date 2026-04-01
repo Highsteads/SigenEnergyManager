@@ -21,6 +21,7 @@ from battery_manager import (
     Decision,
     DawnViability,
     ACTION_SELF_CONSUMPTION,
+    ACTION_SOLAR_OVERFLOW,
     ACTION_START_IMPORT,
     ACTION_SCHEDULE_IMPORT,
     ACTION_START_EXPORT,
@@ -32,6 +33,7 @@ from battery_manager import (
     NIGHT_EXPORT_BUFFER_KWH,
     MIN_NIGHT_EXPORT_KWH,
     DAYTIME_WINDOW_HOURS,
+    SOLAR_OVERFLOW_MIN_DAWN_MARGIN,
 )
 
 
@@ -618,6 +620,72 @@ class TestNightExport(unittest.TestCase):
         decision = self.bm.evaluate(snapshot)
 
         self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+
+
+class TestSolarOverflowDawnMargin(unittest.TestCase):
+    """Tests for the dawn margin gate in _check_solar_overflow (v1.8+).
+
+    Rationale: export earns 12p/kWh, overnight import costs 20p+ — a 67% loss.
+    Only export when projected SOC at dawn is comfortably above the dawn target.
+    """
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _tight_viability(self):
+        """Viability with raw_soc_at_dawn just barely above dawn target (margin < threshold)."""
+        return DawnViability(
+            viable          = True,
+            soc_at_dawn_kwh = 5.0,
+            raw_soc_at_dawn = 5.0,    # margin = 5.0 - 3.504 = 1.496 kWh < SOLAR_OVERFLOW_MIN_DAWN_MARGIN
+            dawn_target_kwh = 3.504,
+            import_needed   = False,
+        )
+
+    def _safe_viability(self):
+        """Viability with raw_soc_at_dawn well above dawn target (margin > threshold)."""
+        return DawnViability(
+            viable          = True,
+            soc_at_dawn_kwh = 20.0,
+            raw_soc_at_dawn = 20.0,   # margin = 20.0 - 3.504 = 16.5 kWh >> SOLAR_OVERFLOW_MIN_DAWN_MARGIN
+            dawn_target_kwh = 3.504,
+            import_needed   = False,
+        )
+
+    def test_tight_dawn_margin_stops_active_overflow(self):
+        """When solar overflow is active but dawn margin is tight, stop the export.
+
+        Battery projected at dawn is only 1.5 kWh above the target — much less than
+        the SOLAR_OVERFLOW_MIN_DAWN_MARGIN threshold.  The gate must stop the export
+        and release the charge cap (economic: 12p export < 20p overnight import).
+        """
+        snapshot = _make_snapshot(
+            soc_pct               = 60.0,
+            export_enabled        = True,
+            pv_watts              = 3000,
+        )
+        snapshot = ManagerSnapshot(
+            **{k: getattr(snapshot, k) for k in snapshot.__dataclass_fields__
+               if k != "solar_overflow_active"},
+            solar_overflow_active = True,   # overflow was active from a previous cycle
+        )
+        decision = self.bm._check_solar_overflow(snapshot, self._tight_viability())
+
+        # Must stop the overflow — return self_consumption to release charge cap
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+
+    def test_tight_dawn_margin_does_not_start_overflow(self):
+        """When solar overflow is NOT active, tight dawn margin returns None (no-op)."""
+        snapshot = _make_snapshot(
+            soc_pct        = 60.0,
+            export_enabled = True,
+            pv_watts       = 3000,
+        )
+        decision = self.bm._check_solar_overflow(snapshot, self._tight_viability())
+
+        # Tight margin + not currently exporting → return None (don't start)
+        self.assertIsNone(decision)
 
 
 if __name__ == "__main__":

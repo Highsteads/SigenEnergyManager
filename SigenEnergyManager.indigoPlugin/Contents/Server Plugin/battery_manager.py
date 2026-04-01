@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        01-04-2026 10:00 BST
-# Version:     1.7
+# Date:        01-04-2026 11:30 BST
+# Version:     1.8
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -69,11 +69,16 @@ DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export
 # PV is never suppressed; surplus that can't enter the battery flows to grid.
 # The export rate is calculated dynamically each evaluation so the battery
 # reaches exactly 100% SOC at dusk, exporting all genuine surplus to grid.
-SOLAR_OVERFLOW_MIN_SURPLUS_KWH = 0.3   # below this surplus don't bother exporting
-SOLAR_OVERFLOW_MIN_CHARGE_W    = 200   # minimum charge cap floor (avoid writing 0W to register)
-SOLAR_OVERFLOW_CAP_DEADBAND_W  = 500   # only rewrite charge limit if cap changes by > this
-SOLAR_DUSK_THRESHOLD_WH        = 500   # Wh/hr below which a slot is considered post-dusk
-SOLAR_OVERFLOW_MIN_SOC_PCT     = 40    # don't export until battery reaches this SOC % first
+SOLAR_OVERFLOW_MIN_SURPLUS_KWH   = 0.3   # below this surplus don't bother exporting
+SOLAR_OVERFLOW_MIN_CHARGE_W      = 200   # minimum charge cap floor (avoid writing 0W to register)
+SOLAR_OVERFLOW_CAP_DEADBAND_W    = 500   # only rewrite charge limit if cap changes by > this
+SOLAR_DUSK_THRESHOLD_WH          = 500   # Wh/hr below which a slot is considered post-dusk
+SOLAR_OVERFLOW_MIN_SOC_PCT       = 40    # don't export until battery reaches this SOC % first
+SOLAR_OVERFLOW_MIN_DAWN_MARGIN   = 3.5   # kWh margin required above dawn target before exporting
+                                          # e.g. target=3.5 kWh → need 7.0 kWh (20% SOC) at dawn
+                                          # guards against bias_factor over-inflation and keeps
+                                          # charge that's more valuable at night (20p) than
+                                          # earned by export (12p)
 
 
 @dataclass
@@ -210,9 +215,11 @@ class BatteryManager:
 
         # Step 4: Daytime solar overflow — cap charge so PV surplus exports to grid
         # Only checked when export_enabled (export MPAN active); no point capping
-        # charge if there is nowhere for the surplus to go.
+        # charge if there is nowhere for the surplus to go. Viability is passed so
+        # the overflow logic can verify there is enough dawn margin before exporting
+        # (export earns 12p/kWh; importing at night costs 20p+ — a net loss).
         if snapshot.export_enabled:
-            overflow_decision = self._check_solar_overflow(snapshot)
+            overflow_decision = self._check_solar_overflow(snapshot, viability)
             if overflow_decision is not None:
                 return overflow_decision
 
@@ -652,10 +659,16 @@ class BatteryManager:
     # Night Export
     # ================================================================
 
-    def _check_solar_overflow(self, snapshot: ManagerSnapshot) -> Optional[Decision]:
+    def _check_solar_overflow(
+        self, snapshot: ManagerSnapshot, viability: DawnViability
+    ) -> Optional[Decision]:
         """Dynamic daytime export: cap battery charge so PV fills battery to 100% at dusk.
 
         Algorithm:
+          0. Dawn margin gate: only export if projected SOC at dawn (from viability,
+             which already credits remaining today's solar) exceeds the dawn target by
+             SOLAR_OVERFLOW_MIN_DAWN_MARGIN kWh. This prevents exporting at 12p/kWh
+             when the battery may be needed overnight at 20p+/kWh.
           1. Find dusk = last hour in today's P50 forecast above SOLAR_DUSK_THRESHOLD_WH
           2. Sum remaining bias-corrected solar from now to dusk
           3. Sum expected home consumption from now to dusk (from consumption profile)
@@ -671,6 +684,25 @@ class BatteryManager:
 
         Only active during daytime. Only called when export_enabled is True (MPAN active).
         """
+        # ── 0. Dawn margin gate ───────────────────────────────────────────────
+        # Don't export if the projected SOC at dawn isn't comfortably above the
+        # target. The margin (default 3.5 kWh = 10% battery) means we need the
+        # battery at 20%+ SOC at dawn before we'll give away daytime kWh at 12p.
+        # This protects against bias_factor over-inflation (raw_soc_at_dawn may
+        # look fine at 1.5x bias but be borderline at the true generation level).
+        dawn_margin = viability.raw_soc_at_dawn - viability.dawn_target_kwh
+        if dawn_margin < SOLAR_OVERFLOW_MIN_DAWN_MARGIN:
+            if snapshot.solar_overflow_active:
+                return Decision(
+                    action      = ACTION_SELF_CONSUMPTION,
+                    reason      = (
+                        f"Solar overflow: dawn margin {dawn_margin:.1f} kWh below "
+                        f"{SOLAR_OVERFLOW_MIN_DAWN_MARGIN:.1f} kWh threshold — "
+                        f"holding charge (12p export < 20p+ overnight import)"
+                    ),
+                    dawn_viable = True,
+                )
+            return None
         # ── 1. Daytime check ──────────────────────────────────────────────────
         try:
             import pytz
