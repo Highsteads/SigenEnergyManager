@@ -237,6 +237,20 @@ class Plugin(indigo.PluginBase):
     def startup(self):
         _ensure_plugin_log(self.data_dir)
         log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} starting")
+
+        # ── Pref migrations ──────────────────────────────────────────────────
+        # v3.0: raise dawnSocTarget minimum to 15% so there is a real buffer
+        # above the 10% health floor on poor solar days.  Direct file edits are
+        # overwritten by Indigo on shutdown, so we correct the value here and
+        # let Indigo persist it naturally.
+        _dawn_target = float(self.pluginPrefs.get("dawnSocTarget", "10"))
+        if _dawn_target < 15.0:
+            self.pluginPrefs["dawnSocTarget"] = "15"
+            log(
+                f"[Migration] dawnSocTarget raised from {_dawn_target:.0f}% to 15% "
+                f"(minimum recommended to buffer above 10% health floor)"
+            )
+
         self._init_modules()
         self.solcast.load_correction_factor()
         # Pre-populate latest_forecast_data from disk cache so the first manager
