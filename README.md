@@ -66,9 +66,9 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 The plugin will pick them up automatically at startup.
 
 **If you do not have a `secrets.py`** you can either:
-- Rename `secrets_example.py` (included in the plugin bundle) to `secrets.py`,
-  move it to `/Library/Application Support/Perceptive Automation/` and fill in
-  your credentials, **or**
+- Copy `secrets_example.py` (included in the plugin bundle) to
+  `/Library/Application Support/Perceptive Automation/`, rename it to `secrets.py`,
+  and fill in your values, **or**
 - Enter your credentials directly in the plugin's configuration dialog
   (Indigo menu → Plugins → Sigenergy Energy Manager → Configure)
 
@@ -76,13 +76,13 @@ All credential fields fall back to the plugin configuration dialog if
 `secrets.py` is absent or a key is missing.
 
 ```python
-OCTOPUS_API_KEY      = "sk_live_..."
-OCTOPUS_ACCOUNT_NUM  = "A-XXXXXXXX"
-SOLCAST_SITE_1_ID    = "xxxx-xxxx-xxxx-xxxx"
-SOLCAST_SITE_2_ID    = "xxxx-xxxx-xxxx-xxxx"
-SOLCAST_API_KEY      = "..."
-AXLE_USERNAME        = "..."
-AXLE_PASSWORD        = "..."
+OCTOPUS_API_KEY   = "your-octopus-api-key-here"
+OCTOPUS_ACCOUNT   = "A-XXXXXXXX"
+SOLCAST_SITE_1_ID = "xxxx-xxxx-xxxx-xxxx"
+SOLCAST_SITE_2_ID = "xxxx-xxxx-xxxx-xxxx"
+SOLCAST_API_KEY   = "..."
+AXLE_API_KEY      = ""
+AXLE_CLIENT_ID    = ""
 ```
 
 ### Plugin preferences
