@@ -28,7 +28,7 @@ try:
     from secrets import (
         OCTOPUS_API_KEY, OCTOPUS_ACCOUNT, OCTOPUS_MPAN, OCTOPUS_SERIAL,
         SOLCAST_API_KEY, SOLCAST_SITE_1_ID, SOLCAST_SITE_2_ID,
-        AXLE_API_KEY,
+        AXLE_API_KEY, SIGENERGY_IP,
     )
 except ImportError:
     OCTOPUS_API_KEY   = ""
@@ -39,6 +39,7 @@ except ImportError:
     SOLCAST_SITE_1_ID = ""
     SOLCAST_SITE_2_ID = ""
     AXLE_API_KEY      = ""
+    SIGENERGY_IP      = ""
 
 try:
     from plugin_utils import log_startup_banner
@@ -55,13 +56,14 @@ from battery_manager  import (
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_SOLAR_OVERFLOW,
 )
-from axle_api import AxleAPI
+from axle_api    import AxleAPI
+from storm_watch import check_storm_level
 
 # ============================================================
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "2.9"
+PLUGIN_VERSION = "3.0"
 PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
@@ -73,6 +75,17 @@ OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
+STORM_WATCH_INTERVAL = 7200  # 2 hours
+ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo variables
+
+# Storm-level hierarchy (mirrors storm_watch._LEVELS)
+STORM_LEVELS = ["none", "yellow", "amber", "red"]
+
+# SOC targets applied when a Met Office warning covers our location
+# Yellow = watch level: charge to 50%, suspend exports
+# Amber/Red = significant disruption risk: charge to 80%, suspend exports
+STORM_SOC_YELLOW = 50.0
+STORM_SOC_AMBER  = 80.0
 
 # SOC delta trigger for immediate manager re-evaluation (percent)
 SOC_CHANGE_TRIGGER = 5.0
@@ -224,6 +237,13 @@ class Plugin(indigo.PluginBase):
 
         # Export state (export limit is set once at startup; no dynamic tracking needed)
         self.store["export_active"]   = False
+
+        # Storm watch state
+        self.store["last_storm_watch"]    = 0.0    # time.time() of last poll
+        self.store["last_energy_var"]     = 0.0    # time.time() of last variable write
+        self._energy_var_ids: dict        = {}     # cached variable IDs by name
+        self.store["storm_level"]         = "none" # current storm level
+        self.store["storm_alerted_level"] = "none" # level at which alert was sent
 
         # Solar overflow state (daytime charge-cap export)
         self.store["solar_overflow_active"]      = False
@@ -409,6 +429,16 @@ class Plugin(indigo.PluginBase):
         # 9. Check scheduled import
         self._check_scheduled_import()
 
+        # 10. Storm watch (every 2 hours)
+        if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
+            self._check_storm_watch()
+            self.store["last_storm_watch"] = now
+
+        # 11. Write energy summary to Indigo variables (every 30 min)
+        if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
+            self._write_energy_summary_variables()
+            self.store["last_energy_var"] = now
+
     # ================================================================
     # Modbus Polling
     # ================================================================
@@ -544,6 +574,23 @@ class Plugin(indigo.PluginBase):
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
         )
 
+        # --- Storm override: raise dawn target and suppress exports during storms ---
+        storm_level = self.store.get("storm_level", "none")
+        if storm_level in ("amber", "red"):
+            override_soc = STORM_SOC_AMBER
+        elif storm_level == "yellow":
+            override_soc = STORM_SOC_YELLOW
+        else:
+            override_soc = None
+
+        if override_soc is not None:
+            snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
+            snapshot.export_enabled  = False   # never export during a storm
+            log(
+                f"[Storm] Storm override active (level={storm_level}): "
+                f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
+            )
+
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
 
@@ -560,6 +607,88 @@ class Plugin(indigo.PluginBase):
 
         # Update batteryManager device states
         self._update_manager_device(decision, snapshot)
+
+    # ================================================================
+    # Storm Watch
+    # ================================================================
+
+    def _send_pushover(self, title, message, priority="0"):
+        """Send a Pushover notification. Called from the main plugin thread."""
+        try:
+            pushover = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
+            if pushover and pushover.isEnabled():
+                pushover.executeAction("sendPushover", props={
+                    "title":    title,
+                    "message":  message,
+                    "priority": priority,
+                })
+                log(f"[Storm] Pushover sent: {title}")
+            else:
+                log("[Storm] Pushover plugin not enabled — alert not sent", level="WARNING")
+        except Exception as exc:
+            log(f"[Storm] Pushover send failed: {exc}", level="WARNING")
+
+    def _check_storm_watch(self):
+        """
+        Poll Open-Meteo and MeteoAlarm for incoming wind/storm risk.
+        Updates self.store['storm_level'] and sends a Pushover alert when
+        the level escalates.  Sends an all-clear when level drops back to 'none'.
+        """
+        try:
+            new_level, reason = check_storm_level()
+        except Exception as exc:
+            log(f"[Storm] check_storm_level() raised: {exc}", level="WARNING")
+            return
+
+        prev_level    = self.store.get("storm_level", "none")
+        alerted_level = self.store.get("storm_alerted_level", "none")
+
+        self.store["storm_level"] = new_level
+
+        log(f"[Storm] Level={new_level}  prev={prev_level}  {reason}")
+
+        # Severity indices for comparison
+        new_idx     = STORM_LEVELS.index(new_level)    if new_level    in STORM_LEVELS else 0
+        alerted_idx = STORM_LEVELS.index(alerted_level) if alerted_level in STORM_LEVELS else 0
+
+        # Escalation: new level is more severe than the last alert sent
+        if new_idx > alerted_idx:
+            if new_level == "yellow":
+                title = "Storm Watch - Yellow"
+                body  = (
+                    f"A yellow-level wind risk is forecast for Medomsley. "
+                    f"Battery will be charged to {STORM_SOC_YELLOW:.0f}% and "
+                    f"export suspended until the risk passes.\n\n{reason}"
+                )
+                priority = "0"
+            elif new_level == "amber":
+                title = "Storm Warning - Amber"
+                body  = (
+                    f"An amber-level wind/storm warning is active for your area. "
+                    f"Battery will be charged to {STORM_SOC_AMBER:.0f}% and "
+                    f"export suspended as a precaution against power cuts.\n\n{reason}"
+                )
+                priority = "1"   # high priority
+            else:  # red
+                title = "Storm Warning - RED"
+                body  = (
+                    f"A RED storm warning is active for your area. "
+                    f"Battery will be charged to {STORM_SOC_AMBER:.0f}% and "
+                    f"all exports suspended. Power cut risk is high.\n\n{reason}"
+                )
+                priority = "1"   # high priority
+            self._send_pushover(title, body, priority)
+            self.store["storm_alerted_level"] = new_level
+
+        # De-escalation: level dropped back to none after an alert was sent
+        elif new_level == "none" and alerted_idx > 0:
+            self._send_pushover(
+                "Storm Watch Cleared",
+                "Storm/wind risk has passed for Medomsley. "
+                "Normal battery management and export schedule resumed.",
+                priority="0",
+            )
+            self.store["storm_alerted_level"] = "none"
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
@@ -1223,6 +1352,10 @@ class Plugin(indigo.PluginBase):
         # Write daily history ring buffer
         self._write_daily_history(yesterday)
 
+        # Write final daily totals to Indigo variables before reset
+        self._write_energy_summary_variables()
+        self.store["last_energy_var"] = time.time()
+
         # Reset accumulators
         self.store["pv_daily_kwh"]              = 0.0
         self.store["grid_import_daily_kwh"]     = 0.0
@@ -1416,6 +1549,85 @@ class Plugin(indigo.PluginBase):
                 indigo.variable.updateValue(var_id, value)
             except Exception as e:
                 log(f"[Solcast] Variable update failed (id {var_id}): {e}", level="WARNING")
+
+    def _sigenergy_folder_id(self) -> int:
+        """Return the Sigenergy variable folder ID, or 0 (root) if not found."""
+        try:
+            for fid in indigo.variables.folders:
+                f = indigo.variables.folders[fid]
+                if f.name.lower() in ("sigenergy", "sigen energy", "sigen"):
+                    return f.id
+        except Exception:
+            pass
+        return 0
+
+    def _ensure_var(self, name: str, folder_id: int) -> int:
+        """
+        Return the Indigo variable ID for `name`, creating it in `folder_id`
+        if it does not already exist. Caches the result in self._energy_var_ids.
+        """
+        if name in self._energy_var_ids:
+            return self._energy_var_ids[name]
+        # Look up by name
+        try:
+            v = indigo.variables[name]
+            self._energy_var_ids[name] = v.id
+            return v.id
+        except KeyError:
+            pass
+        # Create it
+        try:
+            v = indigo.variable.create(name, value="", folder=folder_id)
+            self._energy_var_ids[name] = v.id
+            log(f"[Energy Vars] Created variable '{name}' (id={v.id})")
+            return v.id
+        except Exception as exc:
+            log(f"[Energy Vars] Could not create '{name}': {exc}", level="WARNING")
+            return 0
+
+    def _write_energy_summary_variables(self):
+        """
+        Write today's running energy totals and battery decision to Indigo variables
+        in the Sigenergy folder. Called every 30 min and at midnight.
+        Variables created automatically if they do not exist.
+        """
+        try:
+            folder_id = self._sigenergy_folder_id()
+            pv     = round(self.store.get("pv_daily_kwh",          0.0), 2)
+            imp    = round(self.store.get("grid_import_daily_kwh",  0.0), 2)
+            exp    = round(self.store.get("grid_export_daily_kwh",  0.0), 2)
+            home   = round(self.store.get("home_daily_kwh",         0.0), 2)
+            peak   = round(self.store.get("peak_soc",               0.0), 1)
+            minsoc = round(self.store.get("min_soc",              100.0), 1)
+            sself  = (round((1 - imp / home) * 100, 1)
+                      if home > 0 else 0.0)
+
+            decision = self.latest_decision
+            action   = str(decision.action)  if decision else ""
+            reason   = str(decision.reason)  if decision else ""
+
+            updates = [
+                ("sigen_today_pv_kwh",       str(pv)),
+                ("sigen_today_import_kwh",   str(imp)),
+                ("sigen_today_export_kwh",   str(exp)),
+                ("sigen_today_home_kwh",     str(home)),
+                ("sigen_today_self_suff_pct", str(sself)),
+                ("sigen_today_peak_soc",     str(peak)),
+                ("sigen_today_min_soc",      str(minsoc)),
+                ("sigen_decision_action",    action),
+                ("sigen_decision_reason",    reason),
+            ]
+            for var_name, value in updates:
+                var_id = self._ensure_var(var_name, folder_id)
+                if var_id:
+                    try:
+                        indigo.variable.updateValue(var_id, value)
+                    except Exception as exc:
+                        log(f"[Energy Vars] Update failed '{var_name}': {exc}",
+                            level="WARNING")
+        except Exception as exc:
+            log(f"[Energy Vars] _write_energy_summary_variables failed: {exc}",
+                level="WARNING")
 
     def _update_tariff_device(self, tariff_info, monitored):
         """Push Octopus tariff data to tariffMonitor device."""
@@ -1869,7 +2081,7 @@ class Plugin(indigo.PluginBase):
 
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
-        inv_ip     = prefs.get("inverterIp", "192.168.100.49")
+        inv_ip     = SIGENERGY_IP
         inv_port   = int(prefs.get("modbusPort", 502))
         plant_addr = int(prefs.get("plantAddress", 247))
         inv_addr   = int(prefs.get("inverterSlaveId", 1))
