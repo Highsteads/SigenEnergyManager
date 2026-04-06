@@ -675,7 +675,8 @@ class BatteryManager:
           4. Battery headroom = kWh needed to reach 100% SOC
           5. surplus_kwh = remaining_solar - remaining_home - headroom
           6. If surplus <= 0: solar won't fill battery anyway — no export
-          7. export_kw = min(surplus / hours_to_dusk, DNO cap)  ← spread evenly
+          7. required_charge_kw = headroom / hours_to_dusk  (fills battery exactly at dusk)
+             export_kw = min(max(0, pv_now - house_now - required_charge_kw), DNO cap)
           8. charge_cap_w = max(MIN, pv_now - house_now - export_target_w)
 
         Mode stays 0x02 (Max Self Consumption) throughout. Only HOLD_ESS_MAX_CHARGE
@@ -820,9 +821,18 @@ class BatteryManager:
                 )
             return None
 
-        # ── 7. Spread surplus export evenly to dusk ───────────────────────────
-        export_kw  = min(surplus_kwh / hours_to_dusk, snapshot.max_export_kw)
-        export_w   = int(export_kw * 1000)
+        # ── 7. Real-time export: give battery exactly enough charge to fill by dusk ──
+        # required_charge_kw = rate at which battery must charge to reach 100% at dusk.
+        # Everything above that in the real-time PV surplus is exported immediately.
+        # This starts exporting much earlier on sunny days vs the old "spread forecast
+        # surplus evenly" approach (e.g. 2.3 kW from 10am vs waiting until 1pm).
+        required_charge_kw = headroom_kwh / hours_to_dusk
+        pv_surplus_kw      = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
+        export_kw          = min(
+            max(0.0, pv_surplus_kw - required_charge_kw),
+            snapshot.max_export_kw,
+        )
+        export_w           = int(export_kw * 1000)
 
         # ── 8. Charge cap: battery absorbs what's left after export target ────
         # Floor at MIN to avoid writing 0 to register (ambiguous on some inverters)
@@ -834,10 +844,11 @@ class BatteryManager:
         return Decision(
             action      = ACTION_SOLAR_OVERFLOW,
             reason      = (
-                f"Solar overflow: {surplus_kwh:.1f} kWh surplus over {hours_to_dusk:.1f}h — "
-                f"target export {export_kw:.2f} kW, charge cap {cap_w}W  "
+                f"Solar overflow: {surplus_kwh:.1f} kWh forecast surplus — "
+                f"req charge {required_charge_kw:.2f} kW, PV surplus {pv_surplus_kw:.2f} kW, "
+                f"export {export_kw:.2f} kW, charge cap {cap_w}W  "
                 f"[solar {remaining_solar_kwh:.1f} kWh, home {remaining_home_kwh:.1f} kWh, "
-                f"headroom {headroom_kwh:.1f} kWh]"
+                f"headroom {headroom_kwh:.1f} kWh, {hours_to_dusk:.1f}h to dusk]"
             ),
             power_watts = cap_w,
             export_kw   = export_kw,
@@ -866,6 +877,7 @@ class BatteryManager:
             _tz = pytz.timezone("Europe/London")
             _local_now = snapshot.now.astimezone(_tz)
         except (ImportError, Exception):
+            _tz = None
             _local_now = snapshot.now
 
         _today_str     = _local_now.date().strftime("%Y-%m-%d")
@@ -886,8 +898,10 @@ class BatteryManager:
 
         if _is_daytime:
             if snapshot.export_active:
-                if _today_dawn_dt is not None:
+                if _today_dawn_dt is not None and _tz is not None:
                     _dawn_str = _today_dawn_dt.astimezone(_tz).strftime("%H:%M")
+                elif _today_dawn_dt is not None:
+                    _dawn_str = _today_dawn_dt.strftime("%H:%M")
                 else:
                     _dawn_str = "07:00 (fallback)"
                 return Decision(

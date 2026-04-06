@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        01-04-2026 10:00 BST
-# Version:     1.5
+# Date:        06-04-2026
+# Version:     1.7
 
 import indigo
 import json
@@ -28,7 +28,7 @@ try:
     from secrets import (
         OCTOPUS_API_KEY, OCTOPUS_ACCOUNT, OCTOPUS_MPAN, OCTOPUS_SERIAL,
         SOLCAST_API_KEY, SOLCAST_SITE_1_ID, SOLCAST_SITE_2_ID,
-        AXLE_API_KEY, SIGENERGY_IP,
+        AXLE_API_KEY,
     )
 except ImportError:
     OCTOPUS_API_KEY   = ""
@@ -39,7 +39,6 @@ except ImportError:
     SOLCAST_SITE_1_ID = ""
     SOLCAST_SITE_2_ID = ""
     AXLE_API_KEY      = ""
-    SIGENERGY_IP      = ""
 
 try:
     from plugin_utils import log_startup_banner
@@ -63,7 +62,7 @@ from storm_watch import check_storm_level
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "3.0"
+PLUGIN_VERSION = "3.1"
 PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
@@ -86,6 +85,9 @@ STORM_LEVELS = ["none", "yellow", "amber", "red"]
 # Amber/Red = significant disruption risk: charge to 80%, suspend exports
 STORM_SOC_YELLOW = 50.0
 STORM_SOC_AMBER  = 80.0
+
+# Power cut lockout: suppress export for this many hours after grid is restored
+POWER_CUT_LOCKOUT_HOURS = 4.0
 
 # SOC delta trigger for immediate manager re-evaluation (percent)
 SOC_CHANGE_TRIGGER = 5.0
@@ -244,6 +246,9 @@ class Plugin(indigo.PluginBase):
         self._energy_var_ids: dict        = {}     # cached variable IDs by name
         self.store["storm_level"]         = "none" # current storm level
         self.store["storm_alerted_level"] = "none" # level at which alert was sent
+
+        # Power cut detection
+        self.store["grid_status_prev"] = "On-grid"  # previous poll's gridStatus
 
         # Solar overflow state (daytime charge-cap export)
         self.store["solar_overflow_active"]      = False
@@ -455,6 +460,20 @@ class Plugin(indigo.PluginBase):
 
         self.latest_inverter_data = data
 
+        # Detect Off-grid → On-grid transition (power cut recovery)
+        new_grid_status  = data.get("gridStatus", "On-grid")
+        prev_grid_status = self.store.get("grid_status_prev", "On-grid")
+        if prev_grid_status != "On-grid" and new_grid_status == "On-grid":
+            restored_at = datetime.now(timezone.utc)
+            self.store["power_restored_time"] = restored_at
+            self.pluginPrefs["powerRestoredTime"] = restored_at.isoformat()
+            log(
+                f"[PowerCut] Grid restored after outage — export locked for "
+                f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution",
+                level="WARNING",
+            )
+        self.store["grid_status_prev"] = new_grid_status
+
         # Update daily energy accumulators
         self._accumulate_daily_energy(data)
 
@@ -550,6 +569,18 @@ class Plugin(indigo.PluginBase):
         # Build TariffData from latest rates
         tariff_data = self._build_tariff_data()
 
+        # Power cut lockout: suppress export for POWER_CUT_LOCKOUT_HOURS after grid restore
+        export_enabled = bool(prefs.get("exportEnabled", False))
+        prt_str = self.pluginPrefs.get("powerRestoredTime", "")
+        if prt_str and export_enabled:
+            try:
+                power_restored = datetime.fromisoformat(prt_str)
+                hours_since = (datetime.now(timezone.utc) - power_restored).total_seconds() / 3600.0
+                if hours_since < POWER_CUT_LOCKOUT_HOURS:
+                    export_enabled = False
+            except (ValueError, TypeError):
+                pass
+
         # Build snapshot
         snapshot = ManagerSnapshot(
             current_soc_pct    = soc_pct,
@@ -557,7 +588,7 @@ class Plugin(indigo.PluginBase):
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
             dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 10)),
-            export_enabled     = prefs.get("exportEnabled", False),
+            export_enabled     = export_enabled,
             max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
@@ -2081,7 +2112,7 @@ class Plugin(indigo.PluginBase):
 
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
-        inv_ip     = SIGENERGY_IP
+        inv_ip     = prefs.get("inverterIp", "192.168.100.49")
         inv_port   = int(prefs.get("modbusPort", 502))
         plant_addr = int(prefs.get("plantAddress", 247))
         inv_addr   = int(prefs.get("inverterSlaveId", 1))
