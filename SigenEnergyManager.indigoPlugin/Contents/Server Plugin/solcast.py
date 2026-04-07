@@ -4,8 +4,8 @@
 # Description: Solcast solar forecast API client - direct calls with disk cache
 #              and daily bias correction
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026 15:30 GMT
-# Version:     1.4
+# Date:        07-04-2026 16:25 BST
+# Version:     1.5
 #
 # Solcast Hobbyist plan: 10 API calls/day/site (max)
 # Cache TTL: 8640 seconds (2.4 hours) per site to stay within 10 calls/day
@@ -550,6 +550,36 @@ class SolcastForecast:
             cached_time = data.pop("_cached_time", 0.0)
             self._cached_forecast = data
             self._cached_time     = cached_time
+
+            # Reconstruct _dawn_times from cached hourly P50 data.
+            # _dawn_times was stripped at save time (datetime objects can't be
+            # JSON-serialised). Without this, _is_daytime stays False after any
+            # mid-day restart and solar_overflow is blocked for up to 2.4h until
+            # the next live Solcast fetch.
+            dawn_times = {}
+            try:
+                import pytz as _pytz
+                _london = _pytz.timezone("Europe/London")
+            except ImportError:
+                _london = None
+
+            for kwh_dict in (
+                data.get("_hourly_p50_today", {}),
+                data.get("_hourly_p50_tomorrow", {}),
+            ):
+                for key in sorted(kwh_dict.keys()):
+                    # Each slot is 30 min; threshold 250 Wh ≡ 500W average
+                    if kwh_dict[key] >= PV_GENERATION_THRESHOLD_W / 2:
+                        try:
+                            dt_naive = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+                            dt = _london.localize(dt_naive) if _london else dt_naive
+                            date_str = dt_naive.strftime("%Y-%m-%d")
+                            if date_str not in dawn_times:
+                                dawn_times[date_str] = dt
+                        except (ValueError, Exception):
+                            continue
+            self._cached_forecast["_dawn_times"] = dawn_times
+
             age_h = (time.time() - cached_time) / 3600.0
             if age_h > (CACHE_TTL / 3600.0) * 3:   # stale if > 7.2h
                 self.logger.warning(
