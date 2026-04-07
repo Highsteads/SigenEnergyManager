@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        06-04-2026
-# Version:     1.7
+# Date:        07-04-2026
+# Version:     1.8
 
 import indigo
 import json
@@ -53,7 +53,7 @@ from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
-    ACTION_SOLAR_OVERFLOW,
+    ACTION_SOLAR_OVERFLOW, SOLAR_OVERFLOW_CAP_DEADBAND_W,
 )
 from axle_api    import AxleAPI
 from storm_watch import check_storm_level
@@ -67,7 +67,8 @@ PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
 MODBUS_POLL_INTERVAL      = 60
-MANAGER_EVAL_INTERVAL     = 900   # 15 minutes
+MANAGER_EVAL_INTERVAL     = 60    # evaluate every Modbus poll cycle
+MANAGER_LOG_INTERVAL      = 900   # heartbeat log every 15 min even if action unchanged
 SOLCAST_FETCH_INTERVAL    = 8640  # 2.4 hours (10 calls/day/site limit)
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
@@ -89,8 +90,6 @@ STORM_SOC_AMBER  = 80.0
 # Power cut lockout: suppress export for this many hours after grid is restored
 POWER_CUT_LOCKOUT_HOURS = 4.0
 
-# SOC delta trigger for immediate manager re-evaluation (percent)
-SOC_CHANGE_TRIGGER = 5.0
 
 # VPP state machine values
 VPP_IDLE         = "idle"
@@ -205,9 +204,11 @@ class Plugin(indigo.PluginBase):
         self.store["last_solcast"]   = 0.0
         self.store["last_octopus"]   = 0.0
         self.store["last_profile"]   = 0.0
-        self.store["last_vpp"]       = 0.0
-        self.store["last_acc_save"]  = 0.0
-        self.store["last_soc"]       = 0.0  # for SOC delta trigger
+        self.store["last_vpp"]            = 0.0
+        self.store["last_acc_save"]       = 0.0
+        self.store["last_manager_action"] = ""
+        self.store["last_manager_log"]    = 0.0
+        self.store["last_overflow_cap_w"] = 0
 
         # Daily energy accumulators (kWh, reset at midnight)
         self.store["pv_daily_kwh"]              = 0.0
@@ -398,14 +399,10 @@ class Plugin(indigo.PluginBase):
             self._refresh_solcast()
             self.store["last_solcast"] = now
 
-        # 3. Battery manager evaluation (every 15 min OR on SOC delta)
-        soc_now    = self.latest_inverter_data.get("batterySoc", 0.0)
-        soc_delta  = abs(soc_now - self.store["last_soc"])
-        if (now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL
-                or soc_delta >= SOC_CHANGE_TRIGGER):
+        # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
+        if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
             self._evaluate_manager()
             self.store["last_manager"] = now
-            self.store["last_soc"]     = soc_now
 
         # 4. Octopus rates
         if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
@@ -625,10 +622,26 @@ class Plugin(indigo.PluginBase):
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
 
-        log(
-            f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
-            f"Action={decision.action}  {decision.reason}"
+        # Log on: action change, significant overflow cap shift, or 15-min heartbeat.
+        # Suppress repeated identical lines when evaluating every 60s.
+        _last_action  = self.store.get("last_manager_action", "")
+        _last_log     = self.store.get("last_manager_log", 0.0)
+        _last_cap     = self.store.get("last_overflow_cap_w", 0)
+        _action_changed = decision.action != _last_action
+        _cap_shifted    = (
+            decision.action == ACTION_SOLAR_OVERFLOW
+            and abs(decision.power_watts - _last_cap) > SOLAR_OVERFLOW_CAP_DEADBAND_W
         )
+        _heartbeat = (time.time() - _last_log) >= MANAGER_LOG_INTERVAL
+
+        if _action_changed or _cap_shifted or _heartbeat:
+            log(
+                f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+                f"Action={decision.action}  {decision.reason}"
+            )
+            self.store["last_manager_action"] = decision.action
+            self.store["last_manager_log"]    = time.time()
+            self.store["last_overflow_cap_w"] = decision.power_watts
 
         # Verify persistent inverter registers haven't drifted before acting
         self._verify_ems_registers()

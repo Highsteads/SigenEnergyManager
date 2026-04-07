@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        01-04-2026 11:30 BST
-# Version:     1.8
+# Date:        07-04-2026 16:45 BST
+# Version:     1.9
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -73,7 +73,6 @@ SOLAR_OVERFLOW_MIN_SURPLUS_KWH   = 0.3   # below this surplus don't bother expor
 SOLAR_OVERFLOW_MIN_CHARGE_W      = 200   # minimum charge cap floor (avoid writing 0W to register)
 SOLAR_OVERFLOW_CAP_DEADBAND_W    = 500   # only rewrite charge limit if cap changes by > this
 SOLAR_DUSK_THRESHOLD_WH          = 500   # Wh/hr below which a slot is considered post-dusk
-SOLAR_OVERFLOW_MIN_SOC_PCT       = 40    # don't export until battery reaches this SOC % first
 SOLAR_OVERFLOW_MIN_DAWN_MARGIN   = 3.5   # kWh margin required above dawn target before exporting
                                           # e.g. target=3.5 kWh → need 7.0 kWh (20% SOC) at dawn
                                           # guards against bias_factor over-inflation and keeps
@@ -674,7 +673,10 @@ class BatteryManager:
           3. Sum expected home consumption from now to dusk (from consumption profile)
           4. Battery headroom = kWh needed to reach 100% SOC
           5. surplus_kwh = remaining_solar - remaining_home - headroom
-          6. If surplus <= 0: solar won't fill battery anyway — no export
+          6. If surplus < SOLAR_OVERFLOW_MIN_SURPLUS_KWH: solar can fill battery without
+             any export — no cap applied. (Replaces the old fixed 40% SOC gate: if there
+             is genuine forecast surplus the battery will fill regardless of current SOC,
+             so export can start from any SOC when solar clearly exceeds capacity.)
           7. required_charge_kw = headroom / hours_to_dusk  (fills battery exactly at dusk)
              export_kw = min(max(0, pv_now - house_now - required_charge_kw), DNO cap)
           8. charge_cap_w = max(MIN, pv_now - house_now - export_target_w)
@@ -725,19 +727,6 @@ class BatteryManager:
                 return Decision(
                     action      = ACTION_SELF_CONSUMPTION,
                     reason      = "Solar overflow: night — releasing charge cap",
-                    dawn_viable = True,
-                )
-            return None
-
-        # ── 1b. SOC gate: charge battery first, export only once >= 40% ──────
-        if snapshot.current_soc_pct < SOLAR_OVERFLOW_MIN_SOC_PCT:
-            if snapshot.solar_overflow_active:
-                return Decision(
-                    action      = ACTION_SELF_CONSUMPTION,
-                    reason      = (
-                        f"Solar overflow: SOC {snapshot.current_soc_pct:.0f}% below "
-                        f"{SOLAR_OVERFLOW_MIN_SOC_PCT}% gate — charging first"
-                    ),
                     dawn_viable = True,
                 )
             return None
