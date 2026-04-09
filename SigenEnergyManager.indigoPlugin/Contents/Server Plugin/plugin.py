@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        09-04-2026
-# Version:     1.9
+# Version:     2.0
 
 import indigo
 import json
@@ -578,6 +578,16 @@ class Plugin(indigo.PluginBase):
             except (ValueError, TypeError):
                 pass
 
+        # Pre-compute VPP energy reserve for snapshot.
+        # If an event is ANNOUNCED or PRE_CHARGING, protect that kWh from night export.
+        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        _vpp_event = self.store.get("vpp_event") or {}
+        _vpp_reserved_kwh = 0.0
+        if _vpp_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING) and _vpp_event:
+            _max_export_kw   = float(prefs.get("maxExportKw", 4.0))
+            _duration_hrs    = _vpp_event.get("duration_hrs", 1.0)
+            _vpp_reserved_kwh = _max_export_kw * _duration_hrs / VPP_DISCHARGE_EFFICIENCY
+
         # Build snapshot
         snapshot = ManagerSnapshot(
             current_soc_pct    = soc_pct,
@@ -598,6 +608,7 @@ class Plugin(indigo.PluginBase):
             now                = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             vpp_active                  = self.store["vpp_active"],
+            vpp_reserved_kwh            = _vpp_reserved_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
         )

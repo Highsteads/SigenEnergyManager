@@ -5,8 +5,8 @@
 #              No grid import unless battery cannot reach next-day solar at minimum SOC.
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        07-04-2026 16:45 BST
-# Version:     1.9
+# Date:        09-04-2026
+# Version:     2.0
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -130,6 +130,11 @@ class ManagerSnapshot:
 
     # VPP active - when True all battery commands are suppressed
     vpp_active: bool = False
+
+    # VPP reserve: kWh to protect from night export for an upcoming event.
+    # Non-zero when state is ANNOUNCED or PRE_CHARGING. Pre-computed by plugin.py
+    # so battery_manager.py stays stateless and free of VPP constants.
+    vpp_reserved_kwh: float = 0.0
 
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False  # charge cap currently applied
@@ -906,16 +911,25 @@ class BatteryManager:
         current_soc_kwh  = snapshot.current_soc_pct / 100.0 * cap_kwh
         drain_to_dawn    = viability.expected_consumption_kwh
         projected_dawn   = current_soc_kwh - drain_to_dawn
-        surplus_kwh      = projected_dawn - viability.dawn_target_kwh - NIGHT_EXPORT_BUFFER_KWH
+
+        # VPP reserve: if an event is announced for tomorrow morning, protect
+        # that energy from being exported overnight. The reserve is zero when
+        # no event is pending (vpp_reserved_kwh defaults to 0.0).
+        vpp_reserve      = snapshot.vpp_reserved_kwh
+        surplus_kwh      = projected_dawn - viability.dawn_target_kwh - NIGHT_EXPORT_BUFFER_KWH - vpp_reserve
 
         # Condition 2: Battery has surplus worth exporting
         if surplus_kwh < MIN_NIGHT_EXPORT_KWH:
             if snapshot.export_active:
+                vpp_note = (
+                    f" + {vpp_reserve:.1f} kWh VPP reserve" if vpp_reserve > 0 else ""
+                )
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = (
                         f"Night export: projected dawn {projected_dawn:.1f} kWh approaching "
-                        f"floor ({viability.dawn_target_kwh:.1f} + {NIGHT_EXPORT_BUFFER_KWH:.1f} kWh buffer) - stopping"
+                        f"floor ({viability.dawn_target_kwh:.1f} + {NIGHT_EXPORT_BUFFER_KWH:.1f} kWh buffer"
+                        f"{vpp_note}) - stopping"
                     ),
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
@@ -950,10 +964,14 @@ class BatteryManager:
 
         # All conditions met - export (idempotent if already running)
         export_kw = snapshot.max_export_kw
+        vpp_note = (
+            f", {vpp_reserve:.1f} kWh VPP reserve held" if vpp_reserve > 0 else ""
+        )
         return Decision(
             action          = ACTION_START_EXPORT,
             reason          = (
-                f"Night export: {surplus_kwh:.1f} kWh surplus above dawn floor. "
+                f"Night export: {surplus_kwh:.1f} kWh surplus above dawn floor"
+                f"{vpp_note}. "
                 f"Tomorrow forecast {snapshot.corrected_tomorrow_kwh:.1f} kWh "
                 f"(60% = {tomorrow_viable_kwh:.1f}) >= daily {daily_cons_kwh:.1f} kWh. "
                 f"Exporting {export_kw:.1f} kW"
