@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        07-04-2026
-# Version:     1.8
+# Date:        09-04-2026
+# Version:     1.9
 
 import indigo
 import json
@@ -1125,7 +1125,11 @@ class Plugin(indigo.PluginBase):
 
         if current_state == VPP_IDLE and hours_to_start > 0:
             self.store["vpp_event"] = event
-            self._set_vpp_discharge_cutoff(event)
+            # Discharge cutoff is NOT raised here — it is raised at pre-charge time
+            # (30 min before event). Raising it at announcement (up to 24h early)
+            # locks the battery below the floor if SOC is low, causing unnecessary
+            # grid imports. Solar will always restore SOC before the event; if not,
+            # Axle's own firmware will decline to dispatch.
             self._vpp_transition(VPP_ANNOUNCED)
             self._trigger_event("vppAnnounced")
             log(
@@ -1291,18 +1295,21 @@ class Plugin(indigo.PluginBase):
             log(f"[VPP] Email alert failed: {e}", level="WARNING")
 
     def _start_vpp_precharge(self, event):
-        """Calculate required SOC for VPP event; pre-charge only if needed.
+        """Assess SOC 30 min before VPP event; raise discharge cutoff; no grid import.
 
-        Pre-charge is skipped if the current SOC already covers the event
-        export plus the configured dawn SOC target.  The discharge cutoff
-        register is always set to the dawn target for reserve protection.
+        The discharge cutoff is raised here (not at announcement) so it only
+        applies close to the event — avoiding unnecessary battery lockout hours
+        in advance. If SOC is below the required level, we do NOT import from
+        grid: solar will have charged the battery throughout the day, and if
+        energy is still short, Axle's own firmware will decline to dispatch
+        rather than us importing at cost to cover their export.
         """
         duration_hrs    = event.get("duration_hrs", 1.0)
         cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
         max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
         dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
 
-        # Energy Axle will export + dawn reserve (replaces hard-coded 12 kWh)
+        # Energy Axle will export + dawn reserve
         export_kwh    = max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
         dawn_kwh      = cap_kwh * dawn_target_pct / 100.0
         required_kwh  = export_kwh + dawn_kwh
@@ -1315,31 +1322,31 @@ class Plugin(indigo.PluginBase):
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        # Discharge cutoff was raised to VPP-aware floor at VPP_ANNOUNCED; no change needed here
+        # Raise discharge cutoff now (30 min before) — not at announcement time
+        self._set_vpp_discharge_cutoff(event)
 
         if current_kwh >= required_kwh:
             log(
                 f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
                 f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) + dawn reserve "
-                f"({dawn_kwh:.1f} kWh) - no pre-charge needed"
+                f"({dawn_kwh:.1f} kWh)"
             )
         else:
             shortfall = required_kwh - current_kwh
             log(
-                f"[VPP] Pre-charging to {required_soc:.0f}% for {duration_hrs:.1f}h event "
-                f"({export_kwh:.1f} kWh export + {dawn_kwh:.1f} kWh dawn reserve, "
-                f"shortfall: {shortfall:.1f} kWh)"
+                f"[VPP] SOC low ({current_soc:.0f}%, shortfall {shortfall:.1f} kWh) — "
+                f"proceeding without grid import; Axle will assess at dispatch time"
             )
-            if self.modbus:
-                self.modbus.force_charge(10000)
 
         self._vpp_transition(VPP_PRE_CHARGING)
 
     def _set_vpp_discharge_cutoff(self, event):
-        """Raise discharge cutoff at VPP_ANNOUNCED to protect event energy reserve.
+        """Raise discharge cutoff at pre-charge time (30 min before event).
 
         Floor = dawn target kWh + full event export energy (conservative).
-        The inverter enforces this floor regardless of night export or self-consumption.
+        The inverter enforces this floor during the event window, preventing
+        overnight discharge or self-consumption from depleting the VPP reserve.
+        Called from _start_vpp_precharge(), NOT at announcement time.
         """
         import math
         duration_hrs    = event.get("duration_hrs", 1.0)
