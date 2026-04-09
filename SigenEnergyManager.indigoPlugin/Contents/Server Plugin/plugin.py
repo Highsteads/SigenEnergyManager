@@ -1318,16 +1318,8 @@ class Plugin(indigo.PluginBase):
 
         # Email to Axle support
         try:
-            email_plugin = indigo.server.getPlugin("com.indigodomo.email")
-            if email_plugin and email_plugin.isEnabled():
-                email_plugin.executeAction("sendEmail", deviceId=1192809466,
-                    props={
-                        "emailTo":      "axle@strudwick.co.uk",
-                        "emailSubject": subject,
-                        "emailBody":    html,
-                    }
-                )
-                log("[VPP] Email alert sent to axle@strudwick.co.uk")
+            indigo.server.sendEmailTo("axle@strudwick.co.uk", subject=subject, body=html)
+            log("[VPP] Email alert sent to axle@strudwick.co.uk")
         except Exception as e:
             log(f"[VPP] Email alert failed: {e}", level="WARNING")
 
