@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        09-04-2026
-# Version:     2.0
+# Version:     2.1
 
 import indigo
 import json
@@ -915,26 +915,32 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Determine what mode the inverter should be in based on store flags.
-        # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
-        # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
-        # this will catch and correct it on the next manager tick.
-        if self.store.get("export_active"):
-            expected_mode = 0x06  # Discharge ESS First
-        elif self.store.get("import_active"):
-            expected_mode = 0x03  # Charge Grid First
-        else:
-            expected_mode = 0x02  # Max Self Consumption
+        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle has control of the inverter
+        # and may have changed register 40031. Writing to it during this window could
+        # fight Axle's firmware or confuse the inverter during the handback sequence.
+        # _vpp_check_axle_release() reinstates Remote EMS once Axle has fully released.
+        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
+            # Determine what mode the inverter should be in based on store flags.
+            # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
+            # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
+            # this will catch and correct it on the next manager tick.
+            if self.store.get("export_active"):
+                expected_mode = 0x06  # Discharge ESS First
+            elif self.store.get("import_active"):
+                expected_mode = 0x03  # Charge Grid First
+            else:
+                expected_mode = 0x02  # Max Self Consumption
 
-        actual_mode = self.modbus.read_ems_mode()
-        if actual_mode is not None and actual_mode != expected_mode:
-            mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
-            log(
-                f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
-                f"expected={mode_names.get(expected_mode, expected_mode)} — correcting",
-                level="WARNING",
-            )
-            self.modbus.set_remote_ems_mode(expected_mode)
+            actual_mode = self.modbus.read_ems_mode()
+            if actual_mode is not None and actual_mode != expected_mode:
+                mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
+                log(
+                    f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
+                    f"expected={mode_names.get(expected_mode, expected_mode)} — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_remote_ems_mode(expected_mode)
 
         # --- Discharge limit ---
         actual_discharge_w = self.modbus.read_discharge_limit()
@@ -1075,11 +1081,16 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _vpp_poll_interval(self):
-        """Return adaptive VPP poll interval."""
+        """Return adaptive VPP poll interval.
+
+        COOLING_OFF polls at 60s: Axle can release the inverter within 1-2 minutes
+        of an event ending. The Modbus poll already refreshes emsWorkMode every 60s;
+        we need to check equally often so Remote EMS is reinstated promptly.
+        """
         state = self.store["vpp_state"]
         event = self.store["vpp_event"]
 
-        if state == VPP_ACTIVE:
+        if state in (VPP_ACTIVE, VPP_COOLING_OFF):
             return VPP_POLL_ACTIVE_INTERVAL
 
         if event and state in (VPP_ANNOUNCED, VPP_PRE_CHARGING):
