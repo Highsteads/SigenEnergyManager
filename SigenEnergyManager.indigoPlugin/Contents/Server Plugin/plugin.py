@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        09-04-2026
-# Version:     2.1
+# Version:     2.2
 
 import indigo
 import json
@@ -156,6 +156,21 @@ def log(message, level="INFO"):
             _plugin_log_fh.flush()
         except Exception:
             pass
+
+
+def _local_time(dt, fmt="%H:%M"):
+    """Format a UTC-aware datetime in Europe/London local time (BST/GMT).
+
+    All datetimes from the Axle API and VPP state machine are UTC-aware.
+    Displaying them without conversion shows UTC, which is 1 hour behind
+    BST during British Summer Time (late March — late October).
+    """
+    try:
+        import pytz
+        local = pytz.timezone("Europe/London")
+        return dt.astimezone(local).strftime(fmt)
+    except Exception:
+        return dt.strftime(fmt)   # fallback: still UTC but won't crash
 
 
 class Plugin(indigo.PluginBase):
@@ -1155,8 +1170,8 @@ class Plugin(indigo.PluginBase):
             self._vpp_transition(VPP_ANNOUNCED)
             self._trigger_event("vppAnnounced")
             log(
-                f"[VPP] Event announced: {start_time.strftime('%H:%M')} - "
-                f"{end_time.strftime('%H:%M')} ({event['duration_hrs']:.1f}h)"
+                f"[VPP] Event announced: {_local_time(start_time)} - "
+                f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
             )
 
         elif current_state == VPP_ANNOUNCED:
@@ -1740,8 +1755,8 @@ class Plugin(indigo.PluginBase):
         duration_hrs  = 0.0
 
         if event.get("start_time"):
-            start_str    = event["start_time"].strftime("%H:%M %d/%m")
-            end_str      = event["end_time"].strftime("%H:%M")
+            start_str    = _local_time(event["start_time"], "%H:%M %d/%m")
+            end_str      = _local_time(event["end_time"])
             duration_hrs = event.get("duration_hrs", 0.0)
 
         max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
@@ -1997,7 +2012,9 @@ class Plugin(indigo.PluginBase):
         if event:
             start = event.get("start_time")
             end   = event.get("end_time")
-            log(f"[VPP] Next event: {start} - {end} "
+            start_s = _local_time(start, "%H:%M %d/%m") if start else "?"
+            end_s   = _local_time(end)                  if end   else "?"
+            log(f"[VPP] Next event: {start_s} - {end_s} BST "
                 f"({event.get('duration_hrs', 0):.1f}h) "
                 f"precharge={self.store.get('vpp_pre_charge_soc', 0):.0f}%")
         else:

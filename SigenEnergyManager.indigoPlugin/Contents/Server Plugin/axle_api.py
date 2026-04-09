@@ -3,8 +3,8 @@
 # Filename:    axle_api.py
 # Description: Axle VPP REST API client - polls for export event schedule
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026 15:30 GMT
-# Version:     1.0
+# Date:        09-04-2026
+# Version:     1.1
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
 # Changes: Updated logger name to SigenEnergyManager
@@ -114,10 +114,16 @@ class AxleAPI:
 
             duration_hrs = (end_time - start_time).total_seconds() / 3600.0
 
+            try:
+                import pytz
+                _tz = pytz.timezone("Europe/London")
+                _s  = start_time.astimezone(_tz).strftime("%H:%M")
+                _e  = end_time.astimezone(_tz).strftime("%H:%M")
+            except Exception:
+                _s, _e = start_time.strftime("%H:%M"), end_time.strftime("%H:%M")
             self.logger.debug(
                 f"Axle event: {data.get('import_export', '?')} "
-                f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')} "
-                f"({duration_hrs:.1f}h)"
+                f"{_s} - {_e} BST ({duration_hrs:.1f}h)"
             )
 
             return {
