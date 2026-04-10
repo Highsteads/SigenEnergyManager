@@ -88,7 +88,7 @@ class AxleAPI:
                 return None
 
             if response.status_code == 204 or not response.content:
-                self.logger.debug("Axle API: no event scheduled (204 / empty body)")
+                self.logger.info("Axle poll: no event scheduled (204 / empty body)")
                 return None
 
             if response.status_code != 200:
@@ -100,7 +100,7 @@ class AxleAPI:
             data = response.json()
 
             if not data:
-                self.logger.debug("Axle API: no event scheduled (null response)")
+                self.logger.info("Axle poll: no event scheduled (null response)")
                 return None
 
             start_time = self._parse_dt(data.get("start_time"))

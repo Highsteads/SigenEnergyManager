@@ -1174,6 +1174,21 @@ class Plugin(indigo.PluginBase):
                 f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
             )
 
+        elif current_state == VPP_IDLE and hours_to_start <= 0 and now < end_time:
+            # Axle published the event late — it's already under way.
+            # Skip straight to ACTIVE; Axle's firmware already has control.
+            mins_late = int(-hours_to_start * 60)
+            log(
+                f"[VPP] Late detection: event already active {_local_time(start_time)} - "
+                f"{_local_time(end_time)} BST (Axle published {mins_late} min late) — "
+                f"entering ACTIVE, suppressing plugin Modbus writes"
+            )
+            self.store["vpp_event"] = event
+            self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
+            self._vpp_transition(VPP_ACTIVE)
+            self.store["vpp_active"] = True
+            self._trigger_event("vppStarted")
+
         elif current_state == VPP_ANNOUNCED:
             if hours_to_start <= 1.0:
                 log(f"[VPP] Event in {hours_to_start * 60:.0f} min - preparing")
