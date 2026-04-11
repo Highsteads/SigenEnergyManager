@@ -957,27 +957,31 @@ class Plugin(indigo.PluginBase):
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
 
-        # --- Discharge limit ---
-        actual_discharge_w = self.modbus.read_discharge_limit()
-        if actual_discharge_w is not None:
-            if abs(actual_discharge_w - expected_discharge_w) > 200:
-                log(
-                    f"[Verify] Discharge limit mismatch: inverter={actual_discharge_w}W "
-                    f"expected={expected_discharge_w}W — correcting",
-                    level="WARNING",
-                )
-                self.modbus.set_discharge_limit(expected_discharge_w)
+        # --- Discharge limit and charge limit ---
+        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle controls these registers.
+        # Writing them during the handover window caused a brief 2kW grid import on
+        # 10-Apr-2026 when the solar_overflow charge cap (2395W) was written back 1s
+        # after Axle cleared it to allow full discharge.
+        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
+            actual_discharge_w = self.modbus.read_discharge_limit()
+            if actual_discharge_w is not None:
+                if abs(actual_discharge_w - expected_discharge_w) > 200:
+                    log(
+                        f"[Verify] Discharge limit mismatch: inverter={actual_discharge_w}W "
+                        f"expected={expected_discharge_w}W — correcting",
+                        level="WARNING",
+                    )
+                    self.modbus.set_discharge_limit(expected_discharge_w)
 
-        # --- Charge limit ---
-        actual_charge_w = self.modbus.read_charge_limit()
-        if actual_charge_w is not None:
-            if abs(actual_charge_w - expected_charge_w) > 200:
-                log(
-                    f"[Verify] Charge limit mismatch: inverter={actual_charge_w}W "
-                    f"expected={expected_charge_w}W — correcting",
-                    level="WARNING",
-                )
-                self.modbus.set_charge_limit(expected_charge_w)
+            actual_charge_w = self.modbus.read_charge_limit()
+            if actual_charge_w is not None:
+                if abs(actual_charge_w - expected_charge_w) > 200:
+                    log(
+                        f"[Verify] Charge limit mismatch: inverter={actual_charge_w}W "
+                        f"expected={expected_charge_w}W — correcting",
+                        level="WARNING",
+                    )
+                    self.modbus.set_charge_limit(expected_charge_w)
 
         # --- Discharge cutoff (health floor, register 40048) ---
         # This register physically stops battery discharge. It is only written by
@@ -1423,6 +1427,17 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_state"] = new_state
         if self.debug:
             log(f"[VPP] State: {old_state} -> {new_state}")
+
+        # When entering ACTIVE, release any solar_overflow charge cap.
+        # Axle needs full control of the charge/discharge registers; leaving a
+        # reduced charge cap in place caused a 2kW grid import on 10-Apr-2026
+        # as Axle cleared it and _verify_ems_registers() wrote it back 1s later.
+        if new_state == VPP_ACTIVE and self.store.get("solar_overflow_active"):
+            log("[VPP] Clearing solar overflow cap before handing control to Axle")
+            if self.modbus and self.modbus.connected:
+                self.modbus.set_self_consumption()
+            self.store["solar_overflow_active"]       = False
+            self.store["solar_overflow_charge_cap_w"] = 0
 
     # ================================================================
     # Midnight Tasks
