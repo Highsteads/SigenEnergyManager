@@ -836,17 +836,18 @@ class BatteryManager:
         )
 
         return Decision(
-            action      = ACTION_SOLAR_OVERFLOW,
-            reason      = (
+            action           = ACTION_SOLAR_OVERFLOW,
+            reason           = (
                 f"Solar overflow: {surplus_kwh:.1f} kWh forecast surplus — "
                 f"req charge {required_charge_kw:.2f} kW, PV surplus {pv_surplus_kw:.2f} kW, "
                 f"export {export_kw:.2f} kW, charge cap {cap_w}W  "
                 f"[solar {remaining_solar_kwh:.1f} kWh, home {remaining_home_kwh:.1f} kWh, "
                 f"headroom {headroom_kwh:.1f} kWh, {hours_to_dusk:.1f}h to dusk]"
             ),
-            power_watts = cap_w,
-            export_kw   = export_kw,
-            dawn_viable = True,
+            power_watts      = cap_w,
+            export_kw        = export_kw,
+            dawn_viable      = True,
+            soc_at_dawn_kwh  = viability.soc_at_dawn_kwh,
         )
 
     def _check_night_export(
