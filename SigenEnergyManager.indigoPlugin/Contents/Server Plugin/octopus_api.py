@@ -190,12 +190,15 @@ class OctopusAPI:
         return self._get_tou_rates(tariff_key, force=force)
 
     def get_all_monitored_rates(self, force=False):
-        """Fetch rates for all three monitored tariffs (Tracker, Go, Flux).
+        """Fetch rates for all monitored tariffs (Tracker, Go, Flux, Flexible if active).
 
         Returns dict keyed by tariff_key with rate sub-dicts.
         Used to populate the tariffMonitor device.
         """
         result = {}
+
+        # Active tariff from cache — no extra API call
+        tariff_info = self.get_current_tariff()
 
         tracker = self._get_tracker_rates(force=force)
         if tracker:
@@ -205,6 +208,12 @@ class OctopusAPI:
             tou = self._get_tou_rates(tariff_key, force=force)
             if tou:
                 result[tariff_key] = tou
+
+        # Fetch Flexible unit rate only when that is the active tariff
+        if tariff_info and tariff_info.get("tariff_key") == TARIFF_FLEXIBLE:
+            flexible = self._get_flexible_rate(tariff_info=tariff_info, force=force)
+            if flexible.get("today_p") is not None:
+                result[TARIFF_FLEXIBLE] = flexible
 
         return result
 
@@ -327,6 +336,38 @@ class OctopusAPI:
         result = self._parse_tou_slots(slots, window)
 
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
+        return result
+
+    def _get_flexible_rate(self, tariff_info=None, force=False):
+        """Fetch the unit rate for the active Flexible Octopus tariff.
+
+        Flexible Octopus is a simple flat rate with no time-of-use windows.
+        The rate is fetched from the standard-unit-rates endpoint using the
+        product_code and tariff_code already identified by get_current_tariff().
+
+        Returns dict: {"today_p": float_or_None}
+        """
+        cache_key = "flexible_rate"
+        now = time.time()
+        cached = self._rates_cache.get(cache_key)
+        if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
+            return cached["data"]
+
+        if not tariff_info:
+            tariff_info = self.get_current_tariff()
+
+        product_code = (tariff_info or {}).get("product_code")
+        tariff_code  = (tariff_info or {}).get("tariff_code")
+
+        if not product_code or not tariff_code:
+            self.logger.debug("Flexible rate: no product/tariff code available")
+            return {"today_p": None}
+
+        rate   = self._fetch_current_rate(product_code, tariff_code)
+        result = {"today_p": rate}
+        self._rates_cache[cache_key] = {"data": result, "cached_at": now}
+        if rate is not None:
+            self.logger.debug(f"Flexible rate: {rate:.4f}p/kWh ({product_code})")
         return result
 
     def _parse_tou_slots(self, slots, window):

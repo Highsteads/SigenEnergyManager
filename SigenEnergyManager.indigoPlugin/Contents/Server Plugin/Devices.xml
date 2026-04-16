@@ -290,7 +290,7 @@
     </Device>
 
     <!-- ============================================================
-         tariffMonitor - Octopus tariff rates (Tracker, Go, Flux)
+         tariffMonitor - Octopus tariff rates (Tracker, Go, Flux, Flexible)
          ============================================================ -->
     <Device type="custom" id="tariffMonitor">
         <Name>Tariff Monitor</Name>
@@ -355,6 +355,11 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Flux peak rate changed</TriggerLabel>
                 <ControlPageLabel>Flux Peak (p/kWh)</ControlPageLabel>
+            </State>
+            <State id="flexibleRate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flexible rate changed</TriggerLabel>
+                <ControlPageLabel>Flexible Rate (p/kWh)</ControlPageLabel>
             </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>

@@ -762,17 +762,26 @@ class Plugin(indigo.PluginBase):
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
-        rates   = self.latest_rates_data
+        rates       = self.latest_rates_data
         tariff_info = rates.get("tariff_info", {})
         tariff_key  = tariff_info.get("tariff_key", TARIFF_TRACKER)
 
-        tracker = rates.get(TARIFF_TRACKER, {})
-        tou     = rates.get(tariff_key, {})  # may be same as tracker or go/flux
+        tracker  = rates.get(TARIFF_TRACKER, {})
+        tou      = rates.get(tariff_key, {})     # cheap window data for Go/Flux/iGo/iFlux
+
+        # today_rate_p: use the active tariff's rate, not always Tracker.
+        # Flexible is a flat rate — no tomorrow rate.
+        if tariff_key == TARIFF_FLEXIBLE:
+            today_rate_p    = rates.get(TARIFF_FLEXIBLE, {}).get("today_p")
+            tomorrow_rate_p = None
+        else:
+            today_rate_p    = tracker.get("today_p")
+            tomorrow_rate_p = tracker.get("tomorrow_p")
 
         return TariffData(
             tariff_key      = tariff_key,
-            today_rate_p    = tracker.get("today_p"),
-            tomorrow_rate_p = tracker.get("tomorrow_p"),
+            today_rate_p    = today_rate_p,
+            tomorrow_rate_p = tomorrow_rate_p,
             cheap_start     = tou.get("cheap_start"),
             cheap_end       = tou.get("cheap_end"),
             cheap_rate_p    = tou.get("cheap_p"),
@@ -1756,23 +1765,34 @@ class Plugin(indigo.PluginBase):
         if not dev:
             return
 
-        tracker = monitored.get("tracker", {})
-        go      = monitored.get("go", {})
-        flux    = monitored.get("flux", {})
+        active_key = tariff_info.get("tariff_key", TARIFF_TRACKER)
+        tracker    = monitored.get("tracker",  {})
+        go         = monitored.get("go",       {})
+        flux       = monitored.get("flux",     {})
+        flexible   = monitored.get("flexible", {})
+
+        # rateToday: show the active tariff's actual unit rate
+        if active_key == TARIFF_FLEXIBLE:
+            active_rate_today    = str(flexible.get("today_p", ""))
+            active_rate_tomorrow = ""                                 # flat rate — no tomorrow
+        else:
+            active_rate_today    = str(tracker.get("today_p", ""))
+            active_rate_tomorrow = str(tracker.get("tomorrow_p") or "")
 
         states = [
-            {"key": "tariffActive",      "value": tariff_info.get("display_name", "")},
-            {"key": "rateToday",         "value": str(tracker.get("today_p", ""))},
-            {"key": "rateTomorrow",      "value": str(tracker.get("tomorrow_p") or "")},
-            {"key": "trackerRateToday",  "value": str(tracker.get("today_p", ""))},
+            {"key": "tariffActive",        "value": tariff_info.get("display_name", "")},
+            {"key": "rateToday",           "value": active_rate_today},
+            {"key": "rateTomorrow",        "value": active_rate_tomorrow},
+            {"key": "trackerRateToday",    "value": str(tracker.get("today_p", ""))},
             {"key": "trackerRateTomorrow", "value": str(tracker.get("tomorrow_p") or "")},
-            {"key": "goOffPeakRate",     "value": str(go.get("cheap_p", ""))},
-            {"key": "goStandardRate",    "value": str(go.get("standard_p", ""))},
-            {"key": "goPeakRate",        "value": str(go.get("peak_p", ""))},
-            {"key": "fluxOffPeakRate",   "value": str(flux.get("cheap_p", ""))},
-            {"key": "fluxStandardRate",  "value": str(flux.get("standard_p", ""))},
-            {"key": "fluxPeakRate",      "value": str(flux.get("peak_p", ""))},
-            {"key": "lastUpdate",        "value": datetime.now().strftime("%H:%M:%S")},
+            {"key": "goOffPeakRate",       "value": str(go.get("cheap_p", ""))},
+            {"key": "goStandardRate",      "value": str(go.get("standard_p", ""))},
+            {"key": "goPeakRate",          "value": str(go.get("peak_p", ""))},
+            {"key": "fluxOffPeakRate",     "value": str(flux.get("cheap_p", ""))},
+            {"key": "fluxStandardRate",    "value": str(flux.get("standard_p", ""))},
+            {"key": "fluxPeakRate",        "value": str(flux.get("peak_p", ""))},
+            {"key": "flexibleRate",        "value": str(flexible.get("today_p", ""))},
+            {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
         dev.updateStatesOnServer(states)
 
@@ -2013,9 +2033,16 @@ class Plugin(indigo.PluginBase):
         go          = rates.get("go", {})
         flux        = rates.get("flux", {})
 
+        flexible = rates.get("flexible", {})
+
         log(f"[Tariff] Active tariff: {tariff_info.get('display_name', '?')} "
             f"({tariff_info.get('tariff_key', '?')})")
 
+        # Flexible Octopus (flat rate — no TOU windows)
+        if flexible.get("today_p") is not None:
+            log(f"[Tariff] Flexible: {flexible['today_p']:.2f}p/kWh (flat rate, no cheap window)")
+
+        # Tracker (shown if available, e.g. when user is on Tracker or monitoring it)
         today_p    = tracker.get("today_p")
         tomorrow_p = tracker.get("tomorrow_p")
         if today_p is not None:
@@ -2023,7 +2050,7 @@ class Plugin(indigo.PluginBase):
                 (f"  tomorrow: {tomorrow_p:.2f}p/kWh" if tomorrow_p is not None else
                  "  tomorrow: not yet published"))
         else:
-            log("[Tariff] Tracker: not available")
+            log("[Tariff] Tracker: not available (suspended or not active)")
 
         if go:
             log(f"[Tariff] Go: off-peak={go.get('cheap_p', '?')}p "
