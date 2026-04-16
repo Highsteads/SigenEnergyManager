@@ -288,7 +288,7 @@ class OctopusAPI:
 
         product_code = self._find_product_code(TARIFF_TRACKER)
         if not product_code:
-            self.logger.warning("Cannot find Tracker product code")
+            self.logger.debug("Tracker product code not found (tariff may be suspended)")
             return {"today_p": None, "tomorrow_p": None}
 
         tariff_code = self._build_tariff_code(product_code)
