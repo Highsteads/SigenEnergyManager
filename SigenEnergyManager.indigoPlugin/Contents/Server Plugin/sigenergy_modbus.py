@@ -604,12 +604,19 @@ class SigenergyModbus:
             self.logger.error(f"Failed to set Remote EMS mode: {mode_name}")
         return success
 
-    def set_charge_limit(self, watts):
-        """Set ESS max charging power (registers 40032-40033, watts)."""
+    def set_charge_limit(self, watts, quiet=False):
+        """Set ESS max charging power (registers 40032-40033, watts).
+
+        quiet=True suppresses the INFO log — used during solar overflow
+        cap adjustments where the Manager summary already logs the change.
+        """
         if watts < 0:
             self.logger.error(f"Invalid charge limit: {watts}W (must be >= 0)")
             return False
-        self.logger.info(f"Setting ESS max charge limit: {watts}W")
+        if not quiet:
+            self.logger.info(f"Setting ESS max charge limit: {watts}W")
+        else:
+            self.logger.debug(f"Setting ESS max charge limit: {watts}W")
         return self._write_uint32_registers(HOLD_ESS_MAX_CHARGE, watts)
 
     def set_discharge_limit(self, watts):

@@ -650,13 +650,16 @@ class Plugin(indigo.PluginBase):
 
         # Log on: action change, significant overflow cap shift, or 15-min heartbeat.
         # Suppress repeated identical lines when evaluating every 60s.
+        # Solar overflow uses a 2000W log threshold (4x the Modbus write deadband of 500W)
+        # so the summary line only appears when PV genuinely shifts — not every 60s poll.
+        SOLAR_OVERFLOW_LOG_DEADBAND_W = 2000
         _last_action  = self.store.get("last_manager_action", "")
         _last_log     = self.store.get("last_manager_log", 0.0)
         _last_cap     = self.store.get("last_overflow_cap_w", 0)
         _action_changed = decision.action != _last_action
         _cap_shifted    = (
             decision.action == ACTION_SOLAR_OVERFLOW
-            and abs(decision.power_watts - _last_cap) > SOLAR_OVERFLOW_CAP_DEADBAND_W
+            and abs(decision.power_watts - _last_cap) > SOLAR_OVERFLOW_LOG_DEADBAND_W
         )
         _heartbeat = (time.time() - _last_log) >= MANAGER_LOG_INTERVAL
 
@@ -854,18 +857,20 @@ class Plugin(indigo.PluginBase):
                     f"charge cap {cap_w}W — PV surplus flowing to grid"
                 )
                 self.modbus.set_self_consumption()
-                self.modbus.set_charge_limit(cap_w)
+                self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_active"]       = True
                 self.store["solar_overflow_charge_cap_w"] = cap_w
                 self.store["export_active"]               = False
                 self.store["import_active"]               = False
             elif abs(prev_cap - cap_w) > 500:
-                # Cap has shifted by more than deadband — update inverter register
+                # Cap has shifted by more than deadband — update inverter register.
+                # Logged at DEBUG only: the Manager summary line already shows the new cap.
                 log(
                     f"[Manager] Solar overflow: charge cap {prev_cap}W -> {cap_w}W "
-                    f"(target export {export_kw:.2f} kW)"
+                    f"(target export {export_kw:.2f} kW)",
+                    level="DEBUG"
                 )
-                self.modbus.set_charge_limit(cap_w)
+                self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_charge_cap_w"] = cap_w
             # else: cap within deadband — idempotent, no Modbus writes
 
