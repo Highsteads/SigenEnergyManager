@@ -43,22 +43,24 @@ RATES_CACHE_TTL       = 1800   # 30 min - rates change daily but check frequentl
 CONSUMPTION_CACHE_TTL = 86400  # 24 hours - consumption profile updated daily
 
 # Tariff key constants
-TARIFF_TRACKER = "tracker"
-TARIFF_GO      = "go"
-TARIFF_FLUX    = "flux"
-TARIFF_IGO     = "igo"
-TARIFF_IFLUX   = "iflux"
-TARIFF_AGILE   = "agile"
-TARIFF_UNKNOWN = "unknown"
+TARIFF_TRACKER  = "tracker"
+TARIFF_GO       = "go"
+TARIFF_FLUX     = "flux"
+TARIFF_IGO      = "igo"
+TARIFF_IFLUX    = "iflux"
+TARIFF_AGILE    = "agile"
+TARIFF_FLEXIBLE = "flexible"   # Octopus Flexible / standard variable rate
+TARIFF_UNKNOWN  = "unknown"
 
 # Product code prefixes for auto-detection
 TARIFF_PRODUCT_PREFIXES = {
-    TARIFF_TRACKER: ("SILVER", "TRACKER"),
-    TARIFF_GO:      ("GO-VAR",),
-    TARIFF_FLUX:    ("FLUX-IMPORT",),
-    TARIFF_IGO:     ("INTELLI-VAR", "INTELLI-GO"),
-    TARIFF_IFLUX:   ("INTELLI-FLUX",),
-    TARIFF_AGILE:   ("AGILE-",),
+    TARIFF_TRACKER:  ("SILVER", "TRACKER"),
+    TARIFF_GO:       ("GO-VAR",),
+    TARIFF_FLUX:     ("FLUX-IMPORT",),
+    TARIFF_IGO:      ("INTELLI-VAR", "INTELLI-GO"),
+    TARIFF_IFLUX:    ("INTELLI-FLUX",),
+    TARIFF_AGILE:    ("AGILE-",),
+    TARIFF_FLEXIBLE: ("VAR-", "FLEX-", "SILVER-FLEX"),
 }
 
 # Time-of-use windows for each tariff (local time, 24h)
@@ -574,12 +576,13 @@ class OctopusAPI:
             for prefix in prefixes:
                 if product_code.upper().startswith(prefix):
                     display_names = {
-                        TARIFF_TRACKER: "Octopus Tracker",
-                        TARIFF_GO:      "Octopus Go",
-                        TARIFF_FLUX:    "Octopus Flux",
-                        TARIFF_IGO:     "Intelligent Go",
-                        TARIFF_IFLUX:   "Intelligent Flux",
-                        TARIFF_AGILE:   "Octopus Agile",
+                        TARIFF_TRACKER:  "Octopus Tracker",
+                        TARIFF_GO:       "Octopus Go",
+                        TARIFF_FLUX:     "Octopus Flux",
+                        TARIFF_IGO:      "Intelligent Go",
+                        TARIFF_IFLUX:    "Intelligent Flux",
+                        TARIFF_AGILE:    "Octopus Agile",
+                        TARIFF_FLEXIBLE: "Octopus Flexible",
                     }
                     return {
                         "tariff_key":   tariff_key,

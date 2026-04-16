@@ -48,7 +48,7 @@ except ImportError:
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
 from solcast          import SolcastForecast
-from octopus_api      import OctopusAPI, TARIFF_TRACKER
+from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE
 from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
@@ -609,7 +609,7 @@ class Plugin(indigo.PluginBase):
             capacity_kwh       = float(prefs.get("batteryCapacityKwh", 35.04)),
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
             dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
-            health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 10)),
+            health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 1)),
             export_enabled     = export_enabled,
             max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
@@ -868,9 +868,20 @@ class Plugin(indigo.PluginBase):
             inverter_stuck = ems_mode_str in ("Discharge ESS First", "Charge Grid First")
 
             if prev_import:
-                log("[Manager] Returning to self-consumption")
-                self.modbus.set_self_consumption()
-                self.store["import_active"] = False
+                # Only cancel an active import if the target SOC has been reached.
+                # Without this guard the manager oscillates: one tick of importing
+                # nudges SOC above the viability floor → next evaluate() returns
+                # SELF_CONSUMPTION → import cancelled → SOC drops → repeat.
+                current_soc = self.latest_inverter_data.get("batterySoc", 0.0)
+                target_soc  = self.store.get("import_target_soc", 0.0)
+                if current_soc >= target_soc:
+                    log(f"[Manager] Import complete ({current_soc:.1f}% >= {target_soc:.0f}%) - returning to self-consumption")
+                    self.modbus.set_self_consumption()
+                    self.store["import_active"]     = False
+                    self.store["import_target_soc"] = 0.0
+                else:
+                    log(f"[Manager] Holding import - SOC {current_soc:.1f}% / target {target_soc:.0f}%",
+                        level="DEBUG")
             elif prev_export:
                 # export_enabled was disabled while exporting - clean up
                 log("[Manager] Export disabled - returning to self-consumption")
@@ -990,7 +1001,7 @@ class Plugin(indigo.PluginBase):
         # hardware floor always matches the plugin's batteryHealthCutoff preference.
         # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
         if not self.store.get("vpp_cutoff_raised"):
-            expected_cutoff_pct = float(self.pluginPrefs.get("batteryHealthCutoff", 10.0))
+            expected_cutoff_pct = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
             actual_cutoff_pct   = self.modbus.read_discharge_cutoff()
             if actual_cutoff_pct is not None:
                 if abs(actual_cutoff_pct - expected_cutoff_pct) > 0.5:
@@ -1416,7 +1427,7 @@ class Plugin(indigo.PluginBase):
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""
         if self.modbus:
-            health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 10.0))
+            health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
             self.modbus.set_discharge_cutoff(health_floor)
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
             log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")

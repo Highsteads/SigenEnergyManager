@@ -17,17 +17,19 @@ try:
     from octopus_api import (
         TARIFF_TRACKER, TARIFF_GO, TARIFF_FLUX,
         TARIFF_IGO, TARIFF_IFLUX, TARIFF_AGILE,
+        TARIFF_FLEXIBLE,
         TARIFF_WINDOWS,
     )
 except ImportError:
     # Allow standalone testing without Indigo environment
-    TARIFF_TRACKER = "tracker"
-    TARIFF_GO      = "go"
-    TARIFF_FLUX    = "flux"
-    TARIFF_IGO     = "igo"
-    TARIFF_IFLUX   = "iflux"
-    TARIFF_AGILE   = "agile"
-    TARIFF_WINDOWS = {
+    TARIFF_TRACKER  = "tracker"
+    TARIFF_GO       = "go"
+    TARIFF_FLUX     = "flux"
+    TARIFF_IGO      = "igo"
+    TARIFF_IFLUX    = "iflux"
+    TARIFF_AGILE    = "agile"
+    TARIFF_FLEXIBLE = "flexible"
+    TARIFF_WINDOWS  = {
         "go":    {"cheap_start": "00:30", "cheap_end": "05:30"},
         "flux":  {"cheap_start": "02:00", "cheap_end": "05:00"},
         "igo":   {"cheap_start": "23:30", "cheap_end": "05:30"},  # 23:30-05:30 (6h)
@@ -102,7 +104,7 @@ class ManagerSnapshot:
 
     # Manager settings
     dawn_target_pct:   float = 10.0    # minimum SOC at dawn
-    health_cutoff_pct: float = 10.0    # hardware discharge floor
+    health_cutoff_pct: float = 1.0     # hardware discharge floor
     export_enabled:    bool  = False   # export MPAN active
     max_export_kw:     float = 4.0     # DNO export cap (kW)
 
@@ -457,7 +459,10 @@ class BatteryManager:
         if tariff.tariff_key == TARIFF_AGILE:
             return self._plan_agile_import(snapshot, viability, target_soc)
 
-        # Unknown tariff - import now
+        if tariff.tariff_key == TARIFF_FLEXIBLE:
+            return self._plan_flexible_import(snapshot, viability, target_soc)
+
+        # Unknown tariff - import now at half inverter power
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = f"Dawn viability at risk ({viability.soc_at_dawn_kwh:.1f} kWh at dawn, need {viability.dawn_target_kwh:.1f}). Unknown tariff - importing now.",
@@ -655,6 +660,28 @@ class BatteryManager:
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = "Dawn risk - no viable Agile slot available, importing now",
+            power_watts    = 10000,
+            target_soc_pct = target_soc,
+        )
+
+    def _plan_flexible_import(
+        self, snapshot: ManagerSnapshot, viability: DawnViability, target_soc: float
+    ) -> Decision:
+        """Plan import on Flexible Octopus (flat rate, no time-of-use windows).
+
+        Flexible Octopus is a simple flat rate with no cheap period — there is
+        no benefit in delaying, so import immediately when dawn viability is at risk.
+        Uses the rate from today_rate_p for logging if available.
+        """
+        tariff   = snapshot.tariff
+        rate_str = f"{tariff.today_rate_p:.2f}p/kWh" if tariff.today_rate_p else "flat rate"
+        return Decision(
+            action         = ACTION_START_IMPORT,
+            reason         = (
+                f"Dawn risk ({viability.soc_at_dawn_kwh:.1f} kWh at dawn, "
+                f"need {viability.dawn_target_kwh:.1f}). "
+                f"Importing now at Flexible {rate_str}"
+            ),
             power_watts    = 10000,
             target_soc_pct = target_soc,
         )

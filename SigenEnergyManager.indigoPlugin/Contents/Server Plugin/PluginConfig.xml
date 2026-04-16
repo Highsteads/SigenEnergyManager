@@ -98,8 +98,8 @@
     <Field id="dawnSocTarget" type="textfield" defaultValue="10">
         <Label>Minimum SOC at dawn target (%, default 10):</Label>
     </Field>
-    <Field id="batteryHealthCutoff" type="textfield" defaultValue="10">
-        <Label>Battery health cutoff floor (%, default 10):</Label>
+    <Field id="batteryHealthCutoff" type="textfield" defaultValue="1">
+        <Label>Battery health cutoff floor (%, default 1):</Label>
     </Field>
 
     <Field id="separator_export" type="separator"/>
