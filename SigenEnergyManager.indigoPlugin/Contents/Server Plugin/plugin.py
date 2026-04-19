@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        19-04-2026
-# Version:     3.4
+# Version:     3.5
 
 import indigo
 import json
@@ -51,15 +51,17 @@ from battery_manager  import (
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_SOLAR_OVERFLOW, SOLAR_OVERFLOW_CAP_DEADBAND_W,
 )
-from axle_api    import AxleAPI
-from storm_watch import check_storm_level
+from axle_api      import AxleAPI
+from storm_watch   import check_storm_level
+from web_dashboard import WebDashboard
 
 # ============================================================
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "3.4"
-PLUGIN_NAME    = "SigenEnergyManager"
+PLUGIN_VERSION     = "3.5"
+PLUGIN_NAME        = "SigenEnergyManager"
+WEB_DASHBOARD_PORT = 8179
 
 # Polling intervals (seconds)
 MODBUS_POLL_INTERVAL      = 60
@@ -213,6 +215,9 @@ class Plugin(indigo.PluginBase):
         self.latest_rates_data    = {}
         self.latest_decision      = None
 
+        # Web dashboard server (started in startup, stopped in shutdown)
+        self.web_dashboard        = None
+
         # Poll timers
         self.store                   = {}   # mutable state dict (replaces globals)
         self.store["last_modbus"]    = 0.0
@@ -308,8 +313,21 @@ class Plugin(indigo.PluginBase):
             self._set_device_initial_state(dev)
         log(f"{PLUGIN_NAME} ready")
 
+        try:
+            self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT)
+            self.web_dashboard.start()
+            log(f"[Web] Dashboard at http://192.168.100.160:{WEB_DASHBOARD_PORT}")
+        except Exception as exc:
+            log(f"[Web] Dashboard failed to start: {exc}", level="WARNING")
+
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
+        if self.web_dashboard:
+            try:
+                self.web_dashboard.stop()
+                log("[Web] Dashboard stopped")
+            except Exception as exc:
+                log(f"[Web] Dashboard stop error: {exc}", level="WARNING")
         global _plugin_log_fh
         if _plugin_log_fh is not None:
             try:
@@ -325,6 +343,106 @@ class Plugin(indigo.PluginBase):
                 pass
             self.modbus.disconnect()
         self._save_accumulators()
+
+    # ------------------------------------------------------------------ #
+    # Web dashboard data provider                                          #
+    # ------------------------------------------------------------------ #
+
+    def get_dashboard_data(self):
+        """Return a dict of live system data for the web dashboard /api/status."""
+        try:
+            inv    = self.latest_inverter_data  or {}
+            fcast  = self.latest_forecast_data  or {}
+            rates  = self.latest_rates_data     or {}
+            dec    = self.latest_decision
+
+            tariff_info = rates.get("tariff_info", {})
+            tracker     = rates.get("tracker", {})
+
+            pv_w   = int(inv.get("pvPowerWatts",     0))
+            bat_w  = int(inv.get("batteryPowerWatts", 0))
+            grid_w = int(inv.get("gridPowerWatts",    0))
+            home_w = int(inv.get("homePowerWatts",    0))
+            soc    = float(inv.get("batterySoc",      0.0))
+
+            # Hourly forecast: {hour_label: kWh}
+            raw_hourly = fcast.get("_hourly_p50_today", {})
+            hourly = {}
+            for key in sorted(raw_hourly.keys()):
+                wh = raw_hourly[key]
+                try:
+                    hour = int(str(key).split(" ")[1].split(":")[0])
+                except (IndexError, ValueError):
+                    continue
+                hourly[f"{hour:02d}:00"] = round(wh / 1000.0, 2)
+
+            # Self-sufficiency
+            home_kwh   = self.store.get("home_daily_kwh", 0.0)
+            import_kwh = self.store.get("grid_import_daily_kwh", 0.0)
+            if home_kwh > 0:
+                self_suff = round(max(0.0, (home_kwh - import_kwh) / home_kwh * 100.0), 1)
+            else:
+                self_suff = 100.0
+
+            return {
+                "timestamp":  datetime.now().strftime("%H:%M:%S"),
+                "battery": {
+                    "soc_pct":  round(soc, 1),
+                    "power_w":  bat_w,
+                },
+                "solar": {
+                    "power_w":        pv_w,
+                    "today_kwh":      round(fcast.get("correctedTodayKwh",     0.0), 1),
+                    "tomorrow_kwh":   round(fcast.get("correctedTomorrowKwh",  0.0), 1),
+                    "bias_factor":    round(fcast.get("biasFactor",            1.0), 3),
+                    "remaining_kwh":  round(fcast.get("remainingTodayKwh",     0.0), 1),
+                },
+                "grid": {
+                    "power_w": grid_w,
+                    "status":  inv.get("gridStatus", "On-grid"),
+                },
+                "home": {
+                    "load_w": home_w,
+                },
+                "decision": {
+                    "action":        dec.action         if dec else "unknown",
+                    "reason":        dec.reason         if dec else "",
+                    "dawn_viable":   dec.dawn_viable     if dec else True,
+                    "soc_at_dawn_kwh": round(dec.soc_at_dawn_kwh if dec else 0.0, 1),
+                },
+                "tariff": {
+                    "name":         tariff_info.get("display_name", "Unknown"),
+                    "product_code": tariff_info.get("product_code", ""),
+                    "today_p":      tracker.get("today_p"),
+                    "tomorrow_p":   tracker.get("tomorrow_p"),
+                },
+                "today_summary": {
+                    "pv_kwh":     round(self.store.get("pv_daily_kwh",          0.0), 2),
+                    "import_kwh": round(import_kwh,                                   2),
+                    "export_kwh": round(self.store.get("grid_export_daily_kwh", 0.0), 2),
+                    "home_kwh":   round(home_kwh,                                     2),
+                    "peak_soc":   round(self.store.get("peak_soc",            0.0), 1),
+                    "min_soc":    round(self.store.get("min_soc",           100.0), 1),
+                    "self_suff":  self_suff,
+                },
+                "vpp": {
+                    "state":     self.store.get("vpp_state",  "idle"),
+                    "active":    self.store.get("vpp_active", False),
+                    "event_str": "",
+                },
+                "storm": {
+                    "level": self.store.get("storm_level", "none"),
+                },
+                "flags": {
+                    "export_active":         self.store.get("export_active",         False),
+                    "solar_overflow_active": self.store.get("solar_overflow_active", False),
+                    "import_active":         self.store.get("import_active",         False),
+                    "modbus_connected":      bool(inv),
+                },
+                "hourly_forecast": hourly,
+            }
+        except Exception as exc:
+            return {"error": str(exc), "timestamp": datetime.now().strftime("%H:%M:%S")}
 
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
