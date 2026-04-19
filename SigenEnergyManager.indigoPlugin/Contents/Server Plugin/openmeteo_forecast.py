@@ -568,7 +568,7 @@ class OpenMeteoForecast:
                     if utc_key is None:
                         continue
                     kwh = round(wh_int / 1000.0, 3)
-                    hourly_out[utc_key] = {"kwh": kwh, "kwh_p10": 0.0, "kwh_p90": 0.0}
+                    hourly_out[utc_key] = {"kwh": kwh}
                     if target_date == today_date:
                         today_kwh += kwh
                     else:
@@ -590,8 +590,6 @@ class OpenMeteoForecast:
                 "bias_factor":      factor,
                 "today_kwh":        round(today_kwh, 2),
                 "tomorrow_kwh":     corrected_tmrw,
-                "tomorrow_kwh_p10": 0.0,  # not available from Open-Meteo
-                "tomorrow_kwh_p90": 0.0,
                 "hourly":           hourly_out,
             }
 
