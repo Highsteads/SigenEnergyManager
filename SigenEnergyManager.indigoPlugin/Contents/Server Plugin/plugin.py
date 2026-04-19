@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        09-04-2026
-# Version:     2.2
+# Date:        19-04-2026
+# Version:     3.4
 
 import indigo
 import json
@@ -62,7 +62,7 @@ from storm_watch import check_storm_level
 # Constants
 # ============================================================
 
-PLUGIN_VERSION = "3.1"
+PLUGIN_VERSION = "3.4"
 PLUGIN_NAME    = "SigenEnergyManager"
 
 # Polling intervals (seconds)
