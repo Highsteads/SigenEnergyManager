@@ -58,7 +58,7 @@ MIN_IMPORT_KWH = 0.5
 # Night export constants
 # Note: pvPowerWatts reads 0W in Discharge ESS First mode (0x06) — the inverter
 # suppresses PV. A PV-based night/day check is therefore permanently blind while
-# exporting. Sunrise is detected via today's Solcast dawn_time instead.
+# exporting. Sunrise is detected via today's forecast dawn_time instead.
 NIGHT_EXPORT_BUFFER_KWH           = 1.0   # safety margin above dawn target before exporting
 MIN_NIGHT_EXPORT_KWH              = 0.5   # minimum surplus to bother starting export
 NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cover daily load
@@ -117,8 +117,8 @@ class ManagerSnapshot:
     pv_watts:               int   = 0     # current PV generation (W)
     house_load_watts:       int   = 0     # current home consumption (W) = PV + grid - battery
     export_active:          bool  = False # night export currently running
-    corrected_tomorrow_kwh: float = 0.0   # Solcast bias-corrected P50 for tomorrow (kWh)
-    bias_factor:            float = 1.0   # Solcast bias correction factor (applied to hourly P50)
+    corrected_tomorrow_kwh: float = 0.0   # bias-corrected forecast for tomorrow (kWh)
+    bias_factor:            float = 1.0   # forecast bias correction factor (applied to hourly values)
 
     # Tariff data
     tariff: TariffData = field(default_factory=TariffData)
@@ -891,16 +891,16 @@ class BatteryManager:
         """Check if conditions are right for night export via force-discharge.
 
         All three conditions must hold:
-        1. Before sunrise — checked against today's Solcast dawn time.
+        1. Before sunrise — checked against today's forecast dawn time.
            pvPowerWatts cannot be used: in Discharge ESS First mode (0x06)
            the inverter suppresses PV to 0W regardless of actual solar.
         2. Battery surplus above dawn floor + safety buffer
-        3. Tomorrow P50 solar (at 60% confidence) >= expected daily consumption
+        3. Tomorrow forecast solar (at 60% confidence) >= expected daily consumption
 
         Returns a Decision or None if conditions not met.
         """
         # Condition 1: Night only — stop/block export once sunrise is reached.
-        # Dawn time for today comes from the Solcast forecast in snapshot.dawn_times.
+        # Dawn time for today comes from the forecast in snapshot.dawn_times.
         # Export is blocked for DAYTIME_WINDOW_HOURS after dawn (covers full daylight).
         try:
             import pytz
@@ -920,10 +920,10 @@ class BatteryManager:
                 and (snapshot.now - _today_dawn_dt).total_seconds() < DAYTIME_WINDOW_HOURS * 3600
             )
         else:
-            # No Solcast dawn time for today — use clock-based fallback.
+            # No forecast dawn time for today — use clock-based fallback.
             # Safe assumption: 07:00–21:00 local time is always daytime.
             # This prevents night export from firing during daylight when
-            # Solcast data is unavailable (e.g. API failure, first startup).
+            # forecast data is unavailable (e.g. fetch failure, first startup).
             _is_daytime = 7.0 <= _local_hour < 21.0
 
         if _is_daytime:
@@ -996,7 +996,7 @@ class BatteryManager:
         # Condition 3: Tomorrow P50 (bias-corrected) at 60% confidence >= daily consumption
         # Using correctedTomorrowKwh rather than P10 because P10 (10th percentile) is
         # too pessimistic — it blocks export even on days that clearly will be sunny.
-        # At 60% confidence we tolerate a 40% shortfall below Solcast's best estimate,
+        # At 60% confidence we tolerate a 40% shortfall below the forecast's best estimate,
         # while the dawn floor (condition 2) remains the real safety net.
         daily_cons_kwh      = (
             sum(snapshot.consumption_profile)

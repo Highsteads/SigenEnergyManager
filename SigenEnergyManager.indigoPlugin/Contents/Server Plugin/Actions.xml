@@ -44,9 +44,9 @@
         <CallbackMethod>actionResumeManager</CallbackMethod>
     </Action>
 
-    <Action id="refreshSolcast" deviceFilter="self.solarForecast">
+    <Action id="refreshForecast" deviceFilter="self.solarForecast">
         <Name>Refresh Solar Forecast</Name>
-        <CallbackMethod>actionRefreshSolcast</CallbackMethod>
+        <CallbackMethod>actionRefreshForecast</CallbackMethod>
     </Action>
 
     <Action id="refreshOctopus" deviceFilter="self.tariffMonitor">

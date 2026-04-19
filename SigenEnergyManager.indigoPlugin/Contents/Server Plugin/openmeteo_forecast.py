@@ -128,7 +128,7 @@ class OpenMeteoForecast:
         self._load_combined_cache()
 
     # ================================================================
-    # Public API (identical interface to SolcastForecast)
+    # Public API
     # ================================================================
 
     def fetch_forecast(self, force=False):
@@ -490,7 +490,7 @@ class OpenMeteoForecast:
         }
 
     # ================================================================
-    # Bias Correction (identical algorithm to SolcastForecast)
+    # Bias Correction
     # ================================================================
 
     def _compute_correction_factor(self, records):

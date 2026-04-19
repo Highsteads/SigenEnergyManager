@@ -224,14 +224,14 @@
     </Device>
 
     <!-- ============================================================
-         solarForecast - Solcast solar generation forecast
+         solarForecast - Open-Meteo solar generation forecast
          ============================================================ -->
     <Device type="custom" id="solarForecast">
         <Name>Solar Forecast</Name>
         <ConfigUI>
             <SupportURL>https://github.com/Highsteads/SigenEnergyManager</SupportURL>
             <Field id="info" type="label">
-                <Label>Shows Solcast solar generation forecasts for today and tomorrow, with bias correction. No configuration required — managed automatically by the plugin.</Label>
+                <Label>Shows Open-Meteo solar generation forecasts for today and tomorrow, with bias correction. All 4 arrays are modelled directly — no API key required. Managed automatically by the plugin.</Label>
             </Field>
         </ConfigUI>
         <States>

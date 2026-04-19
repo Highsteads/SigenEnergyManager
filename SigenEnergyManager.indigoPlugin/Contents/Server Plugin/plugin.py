@@ -27,18 +27,14 @@ sys.path.insert(0, "/Library/Application Support/Perceptive Automation")
 try:
     from secrets import (
         OCTOPUS_API_KEY, OCTOPUS_ACCOUNT, OCTOPUS_MPAN, OCTOPUS_SERIAL,
-        SOLCAST_API_KEY, SOLCAST_SITE_1_ID, SOLCAST_SITE_2_ID,
         AXLE_API_KEY,
     )
 except ImportError:
-    OCTOPUS_API_KEY   = ""
-    OCTOPUS_ACCOUNT   = ""
-    OCTOPUS_MPAN      = ""
-    OCTOPUS_SERIAL    = ""
-    SOLCAST_API_KEY   = ""
-    SOLCAST_SITE_1_ID = ""
-    SOLCAST_SITE_2_ID = ""
-    AXLE_API_KEY      = ""
+    OCTOPUS_API_KEY = ""
+    OCTOPUS_ACCOUNT = ""
+    OCTOPUS_MPAN    = ""
+    OCTOPUS_SERIAL  = ""
+    AXLE_API_KEY    = ""
 
 try:
     from plugin_utils import log_startup_banner
@@ -206,7 +202,7 @@ class Plugin(indigo.PluginBase):
 
         # Initialise module instances (configured properly in startup())
         self.modbus   = None
-        self.solcast  = None
+        self.forecast  = None
         self.octopus  = None
         self.manager  = BatteryManager()
         self.axle     = None
@@ -221,7 +217,7 @@ class Plugin(indigo.PluginBase):
         self.store                   = {}   # mutable state dict (replaces globals)
         self.store["last_modbus"]    = 0.0
         self.store["last_manager"]   = 0.0
-        self.store["last_solcast"]   = 0.0
+        self.store["last_forecast"]   = 0.0
         self.store["last_octopus"]   = 0.0
         self.store["last_profile"]   = 0.0
         self.store["last_vpp"]            = 0.0
@@ -300,12 +296,12 @@ class Plugin(indigo.PluginBase):
             )
 
         self._init_modules()
-        self.solcast.load_correction_factor()
+        self.forecast.load_correction_factor()
         # Pre-populate latest_forecast_data from disk cache so the first manager
         # evaluation has forecast data available (disk cache was loaded in
         # OpenMeteoForecast.__init__; this propagates it into plugin.py's dict).
-        self._refresh_solcast()
-        self.store["last_solcast"] = time.time()
+        self._refresh_forecast()
+        self.store["last_forecast"] = time.time()
         # Set initial state images for all devices that already exist
         # (deviceStartComm handles newly created devices; this handles existing ones on reload)
         for dev in indigo.devices.iter("self"):
@@ -417,9 +413,9 @@ class Plugin(indigo.PluginBase):
             self.store["last_modbus"] = now
 
         # 2. Solar forecast (before manager so decision always has fresh data)
-        if now - self.store["last_solcast"] >= FORECAST_FETCH_INTERVAL:
-            self._refresh_solcast()
-            self.store["last_solcast"] = now
+        if now - self.store["last_forecast"] >= FORECAST_FETCH_INTERVAL:
+            self._refresh_forecast()
+            self.store["last_forecast"] = now
 
         # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
         if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
@@ -1059,19 +1055,19 @@ class Plugin(indigo.PluginBase):
                 self._trigger_event("emergencyImportTriggered")
 
     # ================================================================
-    # Solcast Refresh
+    # Solar Forecast Refresh
     # ================================================================
 
-    def _refresh_solcast(self, force=False):
-        """Fetch updated solar forecast from Solcast API."""
-        if not self.solcast:
+    def _refresh_forecast(self, force=False):
+        """Fetch updated solar forecast from Open-Meteo."""
+        if not self.forecast:
             return
 
-        data = self.solcast.fetch_forecast(force=force)
+        data = self.forecast.fetch_forecast(force=force)
         self.latest_forecast_data = data
 
         self._update_forecast_device(data)
-        self._update_solcast_variables(data)
+        self._update_forecast_variables(data)
 
         status   = data.get("forecastStatus", "")
         tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
@@ -1523,10 +1519,10 @@ class Plugin(indigo.PluginBase):
         log(f"Midnight: recording daily history for {yesterday}")
 
         # Capture morning forecast for bias correction (00:05 next run)
-        self.solcast.capture_morning_forecast()
+        self.forecast.capture_morning_forecast()
 
         # Write accuracy record for yesterday
-        self.solcast.record_accuracy(self.store["pv_daily_kwh"])
+        self.forecast.record_accuracy(self.store["pv_daily_kwh"])
 
         # Write daily history ring buffer
         self._write_daily_history(yesterday)
@@ -1694,7 +1690,7 @@ class Plugin(indigo.PluginBase):
         dev.updateStatesOnServer(states)
 
     def _update_forecast_device(self, data):
-        """Push Solcast forecast to solarForecast device."""
+        """Push Open-Meteo forecast to solarForecast device."""
         dev = self._find_device("solarForecast")
         if not dev:
             return
@@ -1712,8 +1708,8 @@ class Plugin(indigo.PluginBase):
         ]
         dev.updateStatesOnServer(states)
 
-    def _update_solcast_variables(self, data):
-        """Write Solcast forecast totals to Indigo variables in the Sigenergy folder."""
+    def _update_forecast_variables(self, data):
+        """Write solar forecast totals to Indigo variables in the Sigenergy folder."""
         today_kwh    = data.get("correctedTodayKwh",   0.0)
         tomorrow_kwh = data.get("correctedTomorrowKwh", 0.0)
         now_str      = datetime.now().strftime("%H:%M %d/%m/%Y")
@@ -1931,11 +1927,11 @@ class Plugin(indigo.PluginBase):
         if dev:
             dev.updateStateOnServer("managerStatus", value="Running")
 
-    def actionRefreshSolcast(self, action):
-        """Action: Manual solar forecast refresh."""
+    def actionRefreshForecast(self, action):
+        """Action: Manual solar forecast refresh (Open-Meteo)."""
         log("[Action] Manual solar forecast refresh")
-        self._refresh_solcast(force=True)
-        self.store["last_solcast"] = time.time()
+        self._refresh_forecast(force=True)
+        self.store["last_forecast"] = time.time()
 
     def actionRefreshOctopus(self, action):
         """Action: Manual Octopus rates refresh."""
@@ -1950,8 +1946,8 @@ class Plugin(indigo.PluginBase):
     def menuRefreshAll(self):
         """Menu: Force refresh solar forecast + Octopus + re-evaluate manager."""
         log("[Menu] Refresh All: fetching solar forecast, Octopus and re-evaluating...")
-        self._refresh_solcast(force=True)
-        self.store["last_solcast"] = time.time()
+        self._refresh_forecast(force=True)
+        self.store["last_forecast"] = time.time()
         self._refresh_octopus_rates(force=True)
         self.store["last_octopus"] = time.time()
         self._evaluate_manager()
@@ -2303,7 +2299,7 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_export_limit(dno_startup_w)
 
         # Solar forecast (Open-Meteo — all 4 arrays, no API key needed)
-        self.solcast = OpenMeteoForecast(
+        self.forecast = OpenMeteoForecast(
             data_dir=self.data_dir,
             logger=self.logger,
         )

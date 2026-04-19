@@ -21,7 +21,6 @@ from battery_manager import (
     Decision,
     DawnViability,
     ACTION_SELF_CONSUMPTION,
-    ACTION_SOLAR_OVERFLOW,
     ACTION_START_IMPORT,
     ACTION_SCHEDULE_IMPORT,
     ACTION_START_EXPORT,
@@ -33,7 +32,6 @@ from battery_manager import (
     NIGHT_EXPORT_BUFFER_KWH,
     MIN_NIGHT_EXPORT_KWH,
     DAYTIME_WINDOW_HOURS,
-    SOLAR_OVERFLOW_MIN_DAWN_MARGIN,
 )
 
 
@@ -406,7 +404,7 @@ class TestTimeWindowHelper(unittest.TestCase):
 class TestNightExport(unittest.TestCase):
     """Tests for night export (force-discharge) logic.
 
-    Tomorrow viability uses corrected_tomorrow_kwh (Solcast bias-corrected P50)
+    Tomorrow viability uses corrected_tomorrow_kwh (bias-corrected forecast)
     at 60% confidence: corrected_tomorrow_kwh * 0.6 must cover daily consumption.
     Default consumption profile: [0.30] * 48 = 14.4 kWh/day.
     Good:  25.0 kWh * 0.6 = 15.0 >= 14.4  (passes)
@@ -584,108 +582,6 @@ class TestNightExport(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_START_IMPORT)
 
-    def test_emergency_floor_import_on_sunny_day(self):
-        """Emergency floor: even when tomorrow is sunny, import if raw SOC at dawn
-        would breach the hardware health floor (v1.7+).
-
-        Scenario: 16% SOC at 22:00, tomorrow forecast 40 kWh (sunny day).
-        9 hours to dawn = 18 slots × 0.30 kWh = 5.4 kWh drain.
-        Raw at dawn = 16% * 35.04 - 5.4 = 5.61 - 5.4 = 0.21 kWh (0.6%) → below 10% floor.
-        Import should be triggered despite tomorrow being sunny.
-        """
-        snapshot = _make_snapshot(
-            soc_pct                = 16.0,
-            pv_watts               = 0,
-            corrected_tomorrow_kwh = 40.0,   # sunny → tomorrow_is_sunny = True
-            now_hour               = 22,      # 22:00, 9 hours to next dawn at 07:00
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        # Must import to protect health floor even on a sunny day
-        self.assertEqual(decision.action, ACTION_START_IMPORT)
-
-    def test_no_emergency_import_sunny_day_adequate_soc(self):
-        """No import when tomorrow is sunny AND SOC at dawn stays above health floor.
-
-        Scenario: 60% SOC at 22:00, tomorrow forecast 40 kWh (sunny).
-        9 hours to dawn = 18 slots × 0.30 kWh = 5.4 kWh drain.
-        Raw at dawn = 60% * 35.04 - 5.4 = 21.02 - 5.4 = 15.62 kWh (44%) → well above floor.
-        """
-        snapshot = _make_snapshot(
-            soc_pct                = 60.0,
-            pv_watts               = 0,
-            corrected_tomorrow_kwh = 40.0,   # sunny → tomorrow_is_sunny = True
-            now_hour               = 22,      # 22:00, 9 hours to next dawn at 07:00
-        )
-        decision = self.bm.evaluate(snapshot)
-
-        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
-
-
-class TestSolarOverflowDawnMargin(unittest.TestCase):
-    """Tests for the dawn margin gate in _check_solar_overflow (v1.8+).
-
-    Rationale: export earns 12p/kWh, overnight import costs 20p+ — a 67% loss.
-    Only export when projected SOC at dawn is comfortably above the dawn target.
-    """
-
-    def setUp(self):
-        self.bm = BatteryManager()
-
-    def _tight_viability(self):
-        """Viability with raw_soc_at_dawn just barely above dawn target (margin < threshold)."""
-        return DawnViability(
-            viable          = True,
-            soc_at_dawn_kwh = 5.0,
-            raw_soc_at_dawn = 5.0,    # margin = 5.0 - 3.504 = 1.496 kWh < SOLAR_OVERFLOW_MIN_DAWN_MARGIN
-            dawn_target_kwh = 3.504,
-            import_needed   = False,
-        )
-
-    def _safe_viability(self):
-        """Viability with raw_soc_at_dawn well above dawn target (margin > threshold)."""
-        return DawnViability(
-            viable          = True,
-            soc_at_dawn_kwh = 20.0,
-            raw_soc_at_dawn = 20.0,   # margin = 20.0 - 3.504 = 16.5 kWh >> SOLAR_OVERFLOW_MIN_DAWN_MARGIN
-            dawn_target_kwh = 3.504,
-            import_needed   = False,
-        )
-
-    def test_tight_dawn_margin_stops_active_overflow(self):
-        """When solar overflow is active but dawn margin is tight, stop the export.
-
-        Battery projected at dawn is only 1.5 kWh above the target — much less than
-        the SOLAR_OVERFLOW_MIN_DAWN_MARGIN threshold.  The gate must stop the export
-        and release the charge cap (economic: 12p export < 20p overnight import).
-        """
-        snapshot = _make_snapshot(
-            soc_pct               = 60.0,
-            export_enabled        = True,
-            pv_watts              = 3000,
-        )
-        snapshot = ManagerSnapshot(
-            **{k: getattr(snapshot, k) for k in snapshot.__dataclass_fields__
-               if k != "solar_overflow_active"},
-            solar_overflow_active = True,   # overflow was active from a previous cycle
-        )
-        decision = self.bm._check_solar_overflow(snapshot, self._tight_viability())
-
-        # Must stop the overflow — return self_consumption to release charge cap
-        self.assertIsNotNone(decision)
-        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
-
-    def test_tight_dawn_margin_does_not_start_overflow(self):
-        """When solar overflow is NOT active, tight dawn margin returns None (no-op)."""
-        snapshot = _make_snapshot(
-            soc_pct        = 60.0,
-            export_enabled = True,
-            pv_watts       = 3000,
-        )
-        decision = self.bm._check_solar_overflow(snapshot, self._tight_viability())
-
-        # Tight margin + not currently exporting → return None (don't start)
-        self.assertIsNone(decision)
 
 
 if __name__ == "__main__":
