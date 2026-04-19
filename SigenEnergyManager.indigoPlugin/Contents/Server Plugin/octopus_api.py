@@ -436,6 +436,10 @@ class OctopusAPI:
     def _probe_product_by_prefix(self, prefixes):
         """Search public products listing for a product matching given prefixes.
 
+        Returns the most recently launched matching product (highest available_from)
+        so that when Octopus issues a new Tracker product (e.g. SILVER-26-04-XX),
+        it is preferred over the older SILVER-25-04-11.
+
         No is_variable filter: Tracker (SILVER-*) is a daily-changing flat
         rate that Octopus does not flag as is_variable in their products API,
         so filtering on that flag silently excludes it.
@@ -451,12 +455,21 @@ class OctopusAPI:
             if not response:
                 return None
 
-            results = response.get("results", [])
+            results   = response.get("results", [])
+            best_code = None
+            best_date = ""   # ISO string — lexicographic sort is correct for YYYY-MM-DD
+
             for product in results:
                 code = product.get("code", "")
                 for prefix in prefixes:
                     if code.startswith(prefix):
-                        return code
+                        avail_from = product.get("available_from") or ""
+                        if avail_from > best_date:
+                            best_date = avail_from
+                            best_code = code
+                        break   # matched a prefix — no need to check others
+
+            return best_code
 
         except Exception as e:
             self.logger.debug(f"Product probe error: {e}")

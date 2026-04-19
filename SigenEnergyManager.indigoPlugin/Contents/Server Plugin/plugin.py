@@ -1114,7 +1114,8 @@ class Plugin(indigo.PluginBase):
                 self.store["_last_tariff_rate"] = today_rate
             if _changed or self.debug:
                 log(
-                    f"[Octopus] Tariff: {tariff_info.get('display_name', tariff_key)}, "
+                    f"[Octopus] Tariff: {tariff_info.get('display_name', tariff_key)} "
+                    f"({tariff_info.get('product_code', '?')}), "
                     f"today: {today_rate}p, "
                     f"tomorrow: {tracker.get('tomorrow_p', 'TBD')}p"
                 )
