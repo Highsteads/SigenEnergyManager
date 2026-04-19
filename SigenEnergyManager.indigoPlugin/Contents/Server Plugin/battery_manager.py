@@ -6,7 +6,7 @@
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        09-04-2026
-# Version:     2.0
+# Version:     2.1
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -65,6 +65,11 @@ NIGHT_EXPORT_TOMORROW_CONFIDENCE  = 0.6   # 60% of correctedTomorrowKwh must cov
                                           # (P50 bias-corrected; 0.6 tolerates 40% shortfall)
 DAYTIME_WINDOW_HOURS              = 14    # hours after dawn during which export is blocked
                                           # dawn 07:00 + 14h = 21:00 → nighttime resumes
+NIGHT_EXPORT_START_HOUR           = 0     # export only permitted from midnight (00:00 local).
+                                          # 21:00-00:00: self-consume — house load naturally
+                                          # drains the battery to a lower pre-dawn SOC.
+                                          # 00:00-dawn: export surplus if viable.
+                                          # Lower dawn SOC = more solar headroom = less clipping.
 
 # Solar overflow constants (daytime forecast-based export)
 # Mode stays 0x02 throughout — only HOLD_ESS_MAX_CHARGE register is reduced.
@@ -865,11 +870,14 @@ class BatteryManager:
         return Decision(
             action           = ACTION_SOLAR_OVERFLOW,
             reason           = (
-                f"Solar overflow: {surplus_kwh:.1f} kWh forecast surplus — "
-                f"req charge {required_charge_kw:.2f} kW, PV surplus {pv_surplus_kw:.2f} kW, "
-                f"export {export_kw:.2f} kW, charge cap {cap_w}W  "
-                f"[solar {remaining_solar_kwh:.1f} kWh, home {remaining_home_kwh:.1f} kWh, "
-                f"headroom {headroom_kwh:.1f} kWh, {hours_to_dusk:.1f}h to dusk]"
+                f"Solar overflow: {surplus_kwh:.1f} kWh forecast surplus\n"
+                f"Req charge {required_charge_kw:.2f} kW  |  "
+                f"PV surplus {pv_surplus_kw:.2f} kW  |  "
+                f"Export {export_kw:.2f} kW  |  Cap {cap_w}W\n"
+                f"Solar {remaining_solar_kwh:.1f} kWh  |  "
+                f"Home {remaining_home_kwh:.1f} kWh  |  "
+                f"Headroom {headroom_kwh:.1f} kWh  |  "
+                f"{hours_to_dusk:.1f}h to dusk"
             ),
             power_watts      = cap_w,
             export_kw        = export_kw,
@@ -929,6 +937,27 @@ class BatteryManager:
                 return Decision(
                     action          = ACTION_STOP_EXPORT,
                     reason          = f"Sunrise reached ({_dawn_str}) - stopping night export",
+                    dawn_viable     = viability.viable,
+                    soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
+                )
+            return None
+
+        # Block export before midnight (21:00-23:59). Let the house load drain the
+        # battery naturally in the early evening — it arrives at midnight at a lower
+        # SOC than if export had run from 21:00. From 00:00 onwards, if there is still
+        # a genuine surplus above the dawn floor, export runs until sunrise.
+        # This maximises solar headroom: a lower dawn SOC absorbs more morning PV
+        # before the battery hits 100% and PV clipping begins (export cap 4 kW).
+        # Storm watch already protects resilience by raising dawn_target_pct.
+        _pre_midnight = _local_hour >= 21.0   # 21:00-23:59 — wait for midnight
+        if _pre_midnight:
+            if snapshot.export_active:
+                return Decision(
+                    action          = ACTION_STOP_EXPORT,
+                    reason          = (
+                        f"Night export: before midnight ({_local_now.strftime('%H:%M')}) — "
+                        f"self-consuming until 00:00 to lower dawn SOC"
+                    ),
                     dawn_viable     = viability.viable,
                     soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
                 )

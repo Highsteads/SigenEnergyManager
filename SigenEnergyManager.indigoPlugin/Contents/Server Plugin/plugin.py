@@ -47,7 +47,7 @@ except ImportError:
 
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
-from solcast          import SolcastForecast
+from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE
 from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
@@ -69,7 +69,7 @@ PLUGIN_NAME    = "SigenEnergyManager"
 MODBUS_POLL_INTERVAL      = 60
 MANAGER_EVAL_INTERVAL     = 60    # evaluate every Modbus poll cycle
 MANAGER_LOG_INTERVAL      = 900   # heartbeat log every 15 min even if action unchanged
-SOLCAST_FETCH_INTERVAL    = 8640  # 2.4 hours (10 calls/day/site limit)
+FORECAST_FETCH_INTERVAL   = 1800  # 30 minutes (Open-Meteo: 10,000 calls/day free)
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
@@ -99,9 +99,14 @@ VPP_ACTIVE       = "active"
 VPP_COOLING_OFF  = "cooling_off"
 
 # Axle VPP SOC calculation constants (from SigenergySolar)
-VPP_DISCHARGE_EFFICIENCY = 0.97
-VPP_RESERVE_KWH          = 12.0  # 4 overnight + 3 morning + 5 buffer
-BATTERY_CAPACITY_KWH     = 35.04
+VPP_DISCHARGE_EFFICIENCY  = 0.97
+VPP_RESERVE_KWH           = 12.0  # 4 overnight + 3 morning + 5 buffer
+BATTERY_CAPACITY_KWH      = 35.04
+VPP_PRE_EXPORT_MINUTES    = 5     # start exporting this many minutes before event start.
+                                   # Axle pays based on smart meter readings during their
+                                   # event window — being already exporting at T+0 captures
+                                   # the full paid window even if Axle's dispatch command
+                                   # arrives late (observed: 08:30 event, command at 08:45).
 
 
 # ============================================================
@@ -247,6 +252,8 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_last_export_kwh"]   = 0.0   # export kWh during last completed event
         self.store["vpp_cooling_start"]     = 0.0   # time.time() when COOLING_OFF entered
         self.store["vpp_release_alerted"]   = False # True once 45-min alert has been sent
+        self.store["vpp_pre_export_active"] = False # True while plugin is pre-exporting
+        self.store["vpp_charge_stopped"]    = False # True once pre-charge import has ended
 
         # Scheduled import state
         self.store["import_active"]          = False
@@ -296,7 +303,7 @@ class Plugin(indigo.PluginBase):
         self.solcast.load_correction_factor()
         # Pre-populate latest_forecast_data from disk cache so the first manager
         # evaluation has forecast data available (disk cache was loaded in
-        # SolcastForecast.__init__; this propagates it into plugin.py's dict).
+        # OpenMeteoForecast.__init__; this propagates it into plugin.py's dict).
         self._refresh_solcast()
         self.store["last_solcast"] = time.time()
         # Set initial state images for all devices that already exist
@@ -409,8 +416,8 @@ class Plugin(indigo.PluginBase):
             self._poll_modbus()
             self.store["last_modbus"] = now
 
-        # 2. Solcast forecast (before manager so decision always has fresh data)
-        if now - self.store["last_solcast"] >= SOLCAST_FETCH_INTERVAL:
+        # 2. Solar forecast (before manager so decision always has fresh data)
+        if now - self.store["last_solcast"] >= FORECAST_FETCH_INTERVAL:
             self._refresh_solcast()
             self.store["last_solcast"] = now
 
@@ -648,29 +655,34 @@ class Plugin(indigo.PluginBase):
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
 
-        # Log on: action change, significant overflow cap shift, or 15-min heartbeat.
-        # Suppress repeated identical lines when evaluating every 60s.
-        # Solar overflow uses a 2000W log threshold (4x the Modbus write deadband of 500W)
-        # so the summary line only appears when PV genuinely shifts — not every 60s poll.
-        SOLAR_OVERFLOW_LOG_DEADBAND_W = 2000
-        _last_action  = self.store.get("last_manager_action", "")
-        _last_log     = self.store.get("last_manager_log", 0.0)
-        _last_cap     = self.store.get("last_overflow_cap_w", 0)
+        # Log on: action change or 15-min heartbeat only.
+        # Solar overflow cap shifts are silent Modbus writes — logged only when
+        # the action itself changes (overflow starts/stops) or at heartbeat.
+        # Indigo shows all indigo.server.log() calls regardless of level= parameter,
+        # so any per-cap-change log line would flood the event log during sunny days.
+        _last_action    = self.store.get("last_manager_action", "")
+        _last_log       = self.store.get("last_manager_log", 0.0)
         _action_changed = decision.action != _last_action
-        _cap_shifted    = (
-            decision.action == ACTION_SOLAR_OVERFLOW
-            and abs(decision.power_watts - _last_cap) > SOLAR_OVERFLOW_LOG_DEADBAND_W
-        )
-        _heartbeat = (time.time() - _last_log) >= MANAGER_LOG_INTERVAL
+        _heartbeat      = (time.time() - _last_log) >= MANAGER_LOG_INTERVAL
 
-        if _action_changed or _cap_shifted or _heartbeat:
-            log(
-                f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
-                f"Action={decision.action}  {decision.reason}"
-            )
+        if _action_changed or _heartbeat:
+            if decision.action == ACTION_SOLAR_OVERFLOW:
+                # Header on its own line; each continuation is a separate log call so
+                # Indigo renders them as proper rows with the plugin name column —
+                # content then aligns naturally with all other log messages.
+                log(
+                    f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+                    f"Action=solar_overflow"
+                )
+                for _line in decision.reason.split("\n"):
+                    indigo.server.log(f"  {_line}")
+            else:
+                log(
+                    f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+                    f"Action={decision.action}  {decision.reason}"
+                )
             self.store["last_manager_action"] = decision.action
             self.store["last_manager_log"]    = time.time()
-            self.store["last_overflow_cap_w"] = decision.power_watts
 
         # Verify persistent inverter registers haven't drifted before acting
         self._verify_ems_registers()
@@ -718,7 +730,8 @@ class Plugin(indigo.PluginBase):
 
         self.store["storm_level"] = new_level
 
-        log(f"[Storm] Level={new_level}  prev={prev_level}  {reason}")
+        log(f"[Storm] Level={new_level}  prev={prev_level}")
+        indigo.server.log(f"  {reason}")
 
         # Severity indices for comparison
         new_idx     = STORM_LEVELS.index(new_level)    if new_level    in STORM_LEVELS else 0
@@ -854,8 +867,9 @@ class Plugin(indigo.PluginBase):
                 # must call set_charge_limit() immediately after.
                 log(
                     f"[Manager] Solar overflow starting: target export {export_kw:.2f} kW, "
-                    f"charge cap {cap_w}W — PV surplus flowing to grid"
+                    f"charge cap {cap_w}W"
                 )
+                indigo.server.log("  PV surplus flowing to grid")
                 self.modbus.set_self_consumption()
                 self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_active"]       = True
@@ -863,13 +877,10 @@ class Plugin(indigo.PluginBase):
                 self.store["export_active"]               = False
                 self.store["import_active"]               = False
             elif abs(prev_cap - cap_w) > 500:
-                # Cap has shifted by more than deadband — update inverter register.
-                # Logged at DEBUG only: the Manager summary line already shows the new cap.
-                log(
-                    f"[Manager] Solar overflow: charge cap {prev_cap}W -> {cap_w}W "
-                    f"(target export {export_kw:.2f} kW)",
-                    level="DEBUG"
-                )
+                # Cap has shifted by more than deadband — update inverter register silently.
+                # No log here: Indigo shows all indigo.server.log() calls regardless of
+                # level= so any per-cap-change line floods the event log. The 15-min
+                # heartbeat summary already reflects the current cap in its reason string.
                 self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_charge_cap_w"] = cap_w
             # else: cap within deadband — idempotent, no Modbus writes
@@ -1066,12 +1077,12 @@ class Plugin(indigo.PluginBase):
         tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
 
         if "No data" in status:
-            log(f"[Solcast] WARNING: forecast unavailable ({status}) — night export condition 3 will block", level="WARNING")
+            log(f"[Solar] WARNING: forecast unavailable ({status}) — night export condition 3 will block", level="WARNING")
         elif tmrw_kwh == 0.0:
-            log(f"[Solcast] WARNING: tomorrow forecast is 0.0 kWh (status: {status!r}) — night export condition 3 will block", level="WARNING")
+            log(f"[Solar] WARNING: tomorrow forecast is 0.0 kWh (status: {status!r}) — night export condition 3 will block", level="WARNING")
         else:
             log(
-                f"[Solcast] Today: {data.get('correctedTodayKwh', 0):.1f} kWh "
+                f"[Solar] Today: {data.get('correctedTodayKwh', 0):.1f} kWh "
                 f"(raw {data.get('todayKwh', 0):.1f}, bias {data.get('biasFactor', 1):.3f}), "
                 f"Tomorrow: {tmrw_kwh:.1f} kWh"
             )
@@ -1178,6 +1189,12 @@ class Plugin(indigo.PluginBase):
             elif current_state != VPP_IDLE:
                 log("[VPP] Event cancelled/disappeared - restoring discharge cutoff")
                 self._restore_discharge_cutoff()
+                if self.store.get("vpp_pre_export_active"):
+                    if self.modbus:
+                        self.modbus.set_self_consumption()
+                    log("[VPP] Pre-export stopped (event cancelled)")
+                self.store["vpp_pre_export_active"] = False
+                self.store["vpp_charge_stopped"]    = False
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
 
@@ -1225,21 +1242,48 @@ class Plugin(indigo.PluginBase):
                 self._start_vpp_precharge(event)
 
         elif current_state == VPP_PRE_CHARGING:
-            required_soc = self.store["vpp_pre_charge_soc"]
-            current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
+            required_soc      = self.store["vpp_pre_charge_soc"]
+            current_soc       = self.latest_inverter_data.get("batterySoc", 0.0)
+            pre_export_active = self.store.get("vpp_pre_export_active", False)
+            charge_stopped    = self.store.get("vpp_charge_stopped", False)
+            soc_ready         = current_soc >= required_soc
 
-            if current_soc >= required_soc or hours_to_start <= 0:
+            # Step 1: stop charging once SOC target is reached (fire once only)
+            if soc_ready and not pre_export_active and not charge_stopped:
                 if self.modbus:
                     self.modbus.set_self_consumption()
-                log(f"[VPP] Ready for event. SOC: {current_soc:.0f}%")
+                self.store["vpp_charge_stopped"] = True
+                log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= {required_soc:.0f}% target. Holding.")
 
+            # Step 2: pre-export — start exporting VPP_PRE_EXPORT_MINUTES before event.
+            # Axle pays on smart meter readings during their window, not dispatch commands.
+            # Starting export early ensures the full event window is captured even when
+            # Axle's dispatch command arrives late (e.g. 08:30 event, command at 08:45).
+            if (soc_ready and not pre_export_active
+                    and 0 < hours_to_start <= VPP_PRE_EXPORT_MINUTES / 60.0):
+                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+                if self.modbus and self.modbus.night_export(inv_max_w):
+                    self.store["vpp_pre_export_active"] = True
+                    log(
+                        f"[VPP] Pre-export started {int(hours_to_start * 60 + 0.5)} min "
+                        f"before event (SOC {current_soc:.0f}%) — "
+                        f"capturing full metered window from event start"
+                    )
+
+            # Step 3: event window open — hand over to Axle
             if hours_to_start <= 0:
-                # Record export baseline when Axle takes over
-                self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
+                # Record export baseline at the moment the paid window opens.
+                # Export may already be running from pre-export above; Axle's own
+                # command will confirm the same mode — no conflict.
+                self.store["vpp_export_start_kwh"]  = self.store["grid_export_daily_kwh"]
+                self.store["vpp_pre_export_active"] = False
+                self.store["vpp_charge_stopped"]    = False
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
-                log(f"[VPP] Event ACTIVE - Axle has control")
+                log(f"[VPP] Event ACTIVE - Axle has control (export already running)"
+                    if pre_export_active else
+                    f"[VPP] Event ACTIVE - Axle has control")
 
         elif current_state == VPP_ACTIVE:
             if now >= end_time:
@@ -1683,7 +1727,7 @@ class Plugin(indigo.PluginBase):
             try:
                 indigo.variable.updateValue(var_id, value)
             except Exception as e:
-                log(f"[Solcast] Variable update failed (id {var_id}): {e}", level="WARNING")
+                log(f"[Solar] Variable update failed (id {var_id}): {e}", level="WARNING")
 
     def _sigenergy_folder_id(self) -> int:
         """Return the Sigenergy variable folder ID, or 0 (root) if not found."""
@@ -1888,8 +1932,8 @@ class Plugin(indigo.PluginBase):
             dev.updateStateOnServer("managerStatus", value="Running")
 
     def actionRefreshSolcast(self, action):
-        """Action: Manual Solcast forecast refresh."""
-        log("[Action] Manual Solcast refresh")
+        """Action: Manual solar forecast refresh."""
+        log("[Action] Manual solar forecast refresh")
         self._refresh_solcast(force=True)
         self.store["last_solcast"] = time.time()
 
@@ -1904,8 +1948,8 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def menuRefreshAll(self):
-        """Menu: Force refresh Solcast + Octopus + re-evaluate manager."""
-        log("[Menu] Refresh All: fetching Solcast, Octopus and re-evaluating...")
+        """Menu: Force refresh solar forecast + Octopus + re-evaluate manager."""
+        log("[Menu] Refresh All: fetching solar forecast, Octopus and re-evaluating...")
         self._refresh_solcast(force=True)
         self.store["last_solcast"] = time.time()
         self._refresh_octopus_rates(force=True)
@@ -2230,10 +2274,6 @@ class Plugin(indigo.PluginBase):
         serial     = OCTOPUS_SERIAL  or prefs.get("octopusSerial", "")
         region     = prefs.get("octopusRegion", "F")
 
-        sc_key     = SOLCAST_API_KEY   or prefs.get("solcastApiKey", "")
-        sc_site1   = SOLCAST_SITE_1_ID or prefs.get("solcastSite1Id", "")
-        sc_site2   = SOLCAST_SITE_2_ID or prefs.get("solcastSite2Id", "")
-
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
         inv_ip     = prefs.get("inverterIp", "192.168.100.49")
@@ -2262,11 +2302,8 @@ class Plugin(indigo.PluginBase):
                 dno_startup_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
                 self.modbus.set_export_limit(dno_startup_w)
 
-        # Solcast
-        self.solcast = SolcastForecast(
-            api_key=sc_key,
-            site_1_id=sc_site1,
-            site_2_id=sc_site2,
+        # Solar forecast (Open-Meteo — all 4 arrays, no API key needed)
+        self.solcast = OpenMeteoForecast(
             data_dir=self.data_dir,
             logger=self.logger,
         )
@@ -2288,7 +2325,7 @@ class Plugin(indigo.PluginBase):
         log(
             f"[Init] Modbus={inv_ip}:{inv_port}, "
             f"Octopus={'OK' if api_key else 'not configured'}, "
-            f"Solcast={'OK' if sc_key else 'not configured'}, "
+            f"Solar=Open-Meteo (4 arrays), "
             f"Axle={'OK' if axle_key else 'disabled'}"
         )
 
