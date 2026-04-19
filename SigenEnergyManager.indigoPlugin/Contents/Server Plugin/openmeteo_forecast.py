@@ -76,11 +76,10 @@ BIAS_CORRECTION_MAX          = 1.5   # tighter than Solcast (was 3.0 for 2-array
 BIAS_CORRECTION_MIN          = 0.5
 MIN_CALIBRATION_FORECAST_KWH = 10.0  # ignore days where forecast < 10 kWh (overcast outliers)
 
-# Path of the optimiser input file (read by solcast_battery_optimiser.py).
-# Writing here keeps the same filename so the optimiser needs zero changes.
+# Path of the optimiser input file (read by openmeteo_battery_optimiser.py).
 OPTIMISER_FORECAST_FILE = (
     "/Library/Application Support/Perceptive Automation/"
-    "Python Scripts/solcast_forecast.json"
+    "Python Scripts/openmeteo_forecast.json"
 )
 
 
@@ -540,7 +539,7 @@ class OpenMeteoForecast:
     # ================================================================
 
     def _write_optimiser_file(self, combined):
-        """Write solcast_forecast.json for the battery optimiser script.
+        """Write openmeteo_forecast.json for the battery optimiser script.
 
         The optimiser reads {"hourly": {"YYYY-MM-DDTHH:MM:SSZ": {"kwh": float}}, ...}
         with UTC timestamp keys. Our internal dict uses local (BST/GMT) keys so
