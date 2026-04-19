@@ -1103,11 +1103,19 @@ class Plugin(indigo.PluginBase):
 
             self._update_tariff_device(tariff_info, monitored)
 
-            if self.debug:
-                tracker = monitored.get("tracker", {})
+            # Log on first fetch or when tariff / rate changes; also in debug mode
+            tracker    = monitored.get("tracker", {})
+            tariff_key = tariff_info.get("tariff_key", "?")
+            today_rate = tracker.get("today_p")
+            _changed   = (tariff_key != self.store.get("_last_tariff_key")
+                          or today_rate != self.store.get("_last_tariff_rate"))
+            if _changed:
+                self.store["_last_tariff_key"]  = tariff_key
+                self.store["_last_tariff_rate"] = today_rate
+            if _changed or self.debug:
                 log(
-                    f"[Octopus] Tariff: {tariff_info.get('display_name', '?')}, "
-                    f"Tracker today: {tracker.get('today_p', '?')}p, "
+                    f"[Octopus] Tariff: {tariff_info.get('display_name', tariff_key)}, "
+                    f"today: {today_rate}p, "
                     f"tomorrow: {tracker.get('tomorrow_p', 'TBD')}p"
                 )
 
