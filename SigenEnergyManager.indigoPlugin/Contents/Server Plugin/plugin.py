@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        19-04-2026
-# Version:     3.5
+# Version:     3.6
 
 import indigo
 import json
@@ -59,7 +59,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "3.5"
+PLUGIN_VERSION     = "3.6"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
 
@@ -1084,8 +1084,12 @@ class Plugin(indigo.PluginBase):
         # and may have changed register 40031. Writing to it during this window could
         # fight Axle's firmware or confuse the inverter during the handback sequence.
         # _vpp_check_axle_release() reinstates Remote EMS once Axle has fully released.
-        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
-        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
+        # Also skip while vpp_pre_export_active: the plugin has intentionally set the
+        # inverter to 0x06 (Discharge ESS First) a few minutes before the event window
+        # opens — correcting it back to Self Consumption would cancel the pre-export.
+        _vpp_state      = self.store.get("vpp_state", VPP_IDLE)
+        _pre_exporting  = self.store.get("vpp_pre_export_active", False)
+        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF) and not _pre_exporting:
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -1549,12 +1553,20 @@ class Plugin(indigo.PluginBase):
         max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
         dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
 
-        # Energy Axle will export + dawn reserve
-        export_kwh    = max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
-        dawn_kwh      = cap_kwh * dawn_target_pct / 100.0
-        required_kwh  = export_kwh + dawn_kwh
-        required_soc  = min(100.0, (required_kwh / cap_kwh) * 100.0)
-        required_soc  = max(required_soc, dawn_target_pct)
+        # For daytime events solar will recharge during/after the event, so we
+        # only need to hold the export energy itself.  For night events we must
+        # also hold the dawn reserve so the battery survives until morning.
+        is_daytime  = self._event_is_daytime(event.get("start_time"))
+        export_kwh  = max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
+        if is_daytime:
+            required_kwh = export_kwh
+            required_soc = min(100.0, (required_kwh / cap_kwh) * 100.0)
+            dawn_kwh     = 0.0
+        else:
+            dawn_kwh     = cap_kwh * dawn_target_pct / 100.0
+            required_kwh = export_kwh + dawn_kwh
+            required_soc = min(100.0, (required_kwh / cap_kwh) * 100.0)
+            required_soc = max(required_soc, dawn_target_pct)
 
         # Current battery level
         current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
@@ -1562,15 +1574,21 @@ class Plugin(indigo.PluginBase):
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        # Raise discharge cutoff now (30 min before) — not at announcement time
-        self._set_vpp_discharge_cutoff(event)
+        # Set discharge cutoff now (30 min before) — not at announcement time
+        self._set_vpp_discharge_cutoff(event, is_daytime)
 
         if current_kwh >= required_kwh:
-            log(
-                f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
-                f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) + dawn reserve "
-                f"({dawn_kwh:.1f} kWh)"
-            )
+            if is_daytime:
+                log(
+                    f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
+                    f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) — daytime, solar will recharge"
+                )
+            else:
+                log(
+                    f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
+                    f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) + dawn reserve "
+                    f"({dawn_kwh:.1f} kWh)"
+                )
         else:
             shortfall = required_kwh - current_kwh
             log(
@@ -1580,30 +1598,98 @@ class Plugin(indigo.PluginBase):
 
         self._vpp_transition(VPP_PRE_CHARGING)
 
-    def _set_vpp_discharge_cutoff(self, event):
-        """Raise discharge cutoff at pre-charge time (30 min before event).
+    def _set_vpp_discharge_cutoff(self, event, is_daytime=False):
+        """Set discharge cutoff at pre-charge time (30 min before event).
 
-        Floor = dawn target kWh + full event export energy (conservative).
-        The inverter enforces this floor during the event window, preventing
-        overnight discharge or self-consumption from depleting the VPP reserve.
-        Called from _start_vpp_precharge(), NOT at announcement time.
+        Daytime events (solar forecast available during/after event):
+          Use the health floor (1%) — the battery can discharge freely because
+          solar will recharge it during the day.  No need to hold a dawn reserve.
+
+        Night events (before dawn or after dusk, no solar recharge coming):
+          Use the dawn target (15%) — ensures the battery can survive overnight
+          until the next morning's solar even after the event has dispatched.
+
+        Called from _start_vpp_precharge() with the is_daytime flag already
+        determined, NOT at announcement time.
         """
-        import math
-        duration_hrs    = event.get("duration_hrs", 1.0)
-        cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
-        max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        health_floor    = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
         dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
-        dawn_kwh        = cap_kwh * dawn_target_pct / 100.0
-        event_kwh       = duration_hrs * max_export_kw / VPP_DISCHARGE_EFFICIENCY
-        floor_pct       = math.ceil((dawn_kwh + event_kwh) / cap_kwh * 100.0)
-        floor_pct       = max(floor_pct, dawn_target_pct)
+
+        if is_daytime:
+            floor_pct = health_floor
+            reason    = "daytime event — solar will recharge"
+        else:
+            floor_pct = dawn_target_pct
+            reason    = f"night event — protecting dawn floor"
+
+        floor_pct = max(floor_pct, health_floor)  # never below the health floor
+
         if self.modbus:
             self.modbus.set_discharge_cutoff(floor_pct)
             self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
-            log(
-                f"[VPP] Discharge cutoff raised to {floor_pct:.0f}% "
-                f"(dawn {dawn_target_pct:.0f}% + event {event_kwh:.1f} kWh)"
-            )
+            log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
+
+    def _event_is_daytime(self, event_start):
+        """Return True if event_start falls within the solar generation window.
+
+        Uses _dawn_times (first PV slot above threshold) and the hourly forecast
+        (last non-zero slot) to bracket the solar window for the event's date.
+        Returns False if event_start is None or solar data is unavailable —
+        night-event behaviour is the safe fallback.
+        """
+        if event_start is None:
+            return False
+
+        fcast      = self.latest_forecast_data or {}
+        dawn_times = fcast.get("_dawn_times", {})
+
+        # Convert event start to local (London) time for date lookup
+        try:
+            import pytz as _pytz
+            _london     = _pytz.timezone("Europe/London")
+            event_local = event_start.astimezone(_london)
+        except Exception:
+            event_local = event_start
+
+        event_date_str = event_local.strftime("%Y-%m-%d")
+
+        # Dawn: first PV-generating slot on the event's date
+        dawn = dawn_times.get(event_date_str)
+        if dawn is None:
+            return False   # no solar expected that day
+
+        # Dusk: last slot with non-zero generation on the event's date
+        # Check both today and tomorrow hourly dicts
+        dusk = None
+        for hourly_key in ("_hourly_p50_today", "_hourly_p50_tomorrow"):
+            hourly = fcast.get(hourly_key, {})
+            for slot_str in sorted(hourly.keys(), reverse=True):
+                if slot_str.startswith(event_date_str) and hourly[slot_str] > 0:
+                    try:
+                        dt_naive = datetime.strptime(slot_str, "%Y-%m-%d %H:%M:%S")
+                        try:
+                            import pytz as _pytz
+                            _london = _pytz.timezone("Europe/London")
+                            dusk = _london.localize(dt_naive)
+                        except Exception:
+                            dusk = dt_naive
+                    except Exception:
+                        pass
+                    break
+            if dusk is not None:
+                break
+
+        if dusk is None:
+            return False   # can't determine dusk — treat as night
+
+        # Compare event_start against the solar window
+        try:
+            return dawn <= event_start <= dusk
+        except TypeError:
+            # Mixed tz-aware / naive — strip timezone for comparison
+            def _naive(dt):
+                return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
+            return _naive(dawn) <= _naive(event_start) <= _naive(dusk)
 
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""
