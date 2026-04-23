@@ -59,9 +59,14 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "3.6"
+PLUGIN_VERSION     = "3.7"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
+
+# Minimum inverter readings required per half-hourly slot before we trust the
+# accumulated average over the default profile.  5 readings = ~5 days of data
+# in that time-slot (one reading per day during that 30-min window).
+HOME_PROFILE_MIN_READINGS = 5
 
 # Polling intervals (seconds)
 MODBUS_POLL_INTERVAL      = 60
@@ -281,7 +286,13 @@ class Plugin(indigo.PluginBase):
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
 
+        # Long-lived home-load profile accumulators (persist across days; never reset at midnight)
+        # Built from real homePowerWatts inverter readings, one reading per Modbus poll.
+        self.store["home_profile_watts_sum"] = [0.0] * 48
+        self.store["home_profile_count"]     = [0]   * 48
+
         self._load_accumulators()
+        self._load_home_profile()   # restore accumulated inverter profile from disk
 
     def startup(self):
         _ensure_plugin_log(self.data_dir)
@@ -609,6 +620,9 @@ class Plugin(indigo.PluginBase):
 
         # Update daily energy accumulators
         self._accumulate_daily_energy(data)
+
+        # Accumulate home load into persistent half-hourly profile
+        self._accumulate_home_profile(max(0.0, float(data.get("homePowerWatts", 0))))
 
         # Update device states
         self._update_inverter_device(data)
@@ -1245,18 +1259,99 @@ class Plugin(indigo.PluginBase):
         except Exception as e:
             log(f"[Octopus] Rate refresh error: {e}", level="ERROR")
 
+    def _accumulate_home_profile(self, home_watts):
+        """Accumulate one inverter home-load reading into the 48-slot half-hourly profile.
+
+        Called every Modbus poll (~60s).  Readings are averaged per 30-min slot over
+        many days, giving a robust consumption profile that reflects actual house load
+        rather than the Octopus import meter (which shows only ~0.7 kWh/day on a
+        near self-sufficient system instead of the real ~12-15 kWh/day load).
+        """
+        now  = datetime.now()
+        slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
+        slot = max(0, min(47, slot))
+        self.store["home_profile_watts_sum"][slot] += home_watts
+        self.store["home_profile_count"][slot]     += 1
+
     def _refresh_consumption_profile(self, force=False):
-        """Fetch 30-day consumption profile from Octopus API."""
-        if not self.octopus:
+        """Rebuild 48-slot consumption profile from accumulated inverter readings.
+
+        Each slot (0=00:00, 1=00:30 … 47=23:30) holds the average homePowerWatts
+        seen during that half-hour across all polling days.  Slots with fewer than
+        HOME_PROFILE_MIN_READINGS readings fall back to the OctopusAPI default
+        (UK typical ~12 kWh/day shape) so the first day still works correctly.
+
+        Profile values are kWh per half-hourly slot (watts × 0.5 h / 1000).
+        """
+        try:
+            default  = OctopusAPI._default_consumption_profile()
+            watts_sum = self.store["home_profile_watts_sum"]
+            counts    = self.store["home_profile_count"]
+            profile   = []
+            real_slots = 0
+            for i in range(48):
+                if counts[i] >= HOME_PROFILE_MIN_READINGS:
+                    avg_watts = watts_sum[i] / counts[i]
+                    profile.append(round(avg_watts * 0.5 / 1000.0, 4))
+                    real_slots += 1
+                else:
+                    profile.append(default[i])
+
+            self.store["consumption_profile"] = profile
+            daily_kwh = sum(profile)
+            log(
+                f"[Profile] Consumption profile updated from inverter data — "
+                f"daily: {daily_kwh:.1f} kWh  "
+                f"({real_slots}/48 slots from real data, "
+                f"{48 - real_slots} using default)"
+            )
+        except Exception as e:
+            log(f"[Profile] Refresh error: {e}", level="ERROR")
+
+    def _save_home_profile(self):
+        """Persist home-load profile accumulators to disk (home_load_profile.json).
+
+        Written every 5 minutes (via _save_accumulators) and on plugin shutdown.
+        The file survives across restarts and day-rollover; it is never deleted.
+        """
+        path = os.path.join(self.data_dir, "home_load_profile.json")
+        data = {
+            "watts_sum": self.store["home_profile_watts_sum"],
+            "count":     self.store["home_profile_count"],
+            "saved_at":  datetime.now().isoformat(),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            self.logger.warning(f"Cannot save home profile: {e}")
+
+    def _load_home_profile(self):
+        """Restore home-load profile accumulators from disk on startup.
+
+        If no file exists (fresh install) the in-memory defaults of all-zeros
+        remain, and the first HOME_PROFILE_MIN_READINGS days fall back to the
+        OctopusAPI default shape.
+        """
+        path = os.path.join(self.data_dir, "home_load_profile.json")
+        if not os.path.exists(path):
             return
         try:
-            profile = self.octopus.get_consumption_profile(force=force)
-            self.store["consumption_profile"] = profile
-            if self.debug:
-                daily_kwh = sum(profile)
-                log(f"[Octopus] Consumption profile updated. Daily total: {daily_kwh:.1f} kWh")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            watts_sum = data.get("watts_sum", [])
+            counts    = data.get("count", [])
+            if len(watts_sum) == 48 and len(counts) == 48:
+                self.store["home_profile_watts_sum"] = [float(v) for v in watts_sum]
+                self.store["home_profile_count"]     = [int(v)   for v in counts]
+                # Immediately build consumption_profile from restored data
+                self._refresh_consumption_profile()
+                real_slots = sum(1 for c in counts if c >= HOME_PROFILE_MIN_READINGS)
+                self.logger.info(
+                    f"Home load profile restored — {real_slots}/48 slots from real data"
+                )
         except Exception as e:
-            log(f"[Octopus] Profile refresh error: {e}", level="ERROR")
+            self.logger.warning(f"Cannot load home profile: {e}")
 
     # ================================================================
     # VPP State Machine
@@ -2578,6 +2673,7 @@ class Plugin(indigo.PluginBase):
                 json.dump(data, f)
         except Exception as e:
             self.logger.warning(f"Cannot save accumulators: {e}")
+        self._save_home_profile()
 
     def _load_accumulators(self):
         """Load daily accumulators from disk on startup."""
