@@ -59,7 +59,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.2"
+PLUGIN_VERSION     = "4.3"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
 
@@ -764,6 +764,24 @@ class Plugin(indigo.PluginBase):
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
         )
+
+        # --- Seasonal buffer: raise resilience floor Oct-Mar (longer nights, weaker solar) ---
+        # Apr-Sep: summer buffer (dawnSocTarget, default 10%)
+        # Oct-Mar: winter buffer (winterBufferPct, default 20%)
+        try:
+            import pytz as _pytz_s
+            _local_month = datetime.now(_pytz_s.timezone("Europe/London")).month
+        except Exception:
+            _local_month = datetime.now().month
+
+        if _local_month in (10, 11, 12, 1, 2, 3):
+            _winter_buf = float(prefs.get("winterBufferPct", 20))
+            if _winter_buf > snapshot.dawn_target_pct:
+                snapshot.dawn_target_pct = _winter_buf
+                log(
+                    f"[Seasonal] Winter buffer active (month {_local_month}): "
+                    f"resilience floor raised to {_winter_buf:.0f}%"
+                )
 
         # --- Storm override: raise dawn target and suppress exports during storms ---
         storm_level = self.store.get("storm_level", "none")
