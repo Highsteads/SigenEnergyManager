@@ -231,6 +231,39 @@ class BatteryManager:
         # Calculate 24-hour sufficiency balance
         balance = self._calculate_24h_balance(snapshot)
 
+        # ── Resilience buffer (flat-rate tariffs only) ───────────────────────
+        # On Tracker/Flexible there is no rate benefit in pre-charging the battery
+        # for tomorrow (grid passthrough is more efficient at the same price).
+        # The ONE reason to import on a flat-rate tariff is power-cut resilience:
+        # keep the battery at dawn_target_pct (default 10%) so the house can run
+        # for several hours if the grid fails overnight.
+        #
+        # Import stops at dawn_target_pct (+2% overshoot to prevent cycling).
+        # During daytime, solar recharges the battery naturally — no import needed.
+        _flat_rate = snapshot.tariff.tariff_key in (TARIFF_TRACKER, TARIFF_FLEXIBLE)
+        if (_flat_rate
+                and not balance.is_daytime
+                and snapshot.current_soc_pct < snapshot.dawn_target_pct):
+            buffer_pct    = snapshot.dawn_target_pct          # default 10%
+            buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
+            cap_kwh       = snapshot.capacity_kwh
+            deficit_kwh   = (buffer_pct - snapshot.current_soc_pct) / 100.0 * cap_kwh
+            rate_str      = (f"{snapshot.tariff.today_rate_p:.2f}p/kWh"
+                             if snapshot.tariff.today_rate_p else "")
+            return Decision(
+                action          = ACTION_START_IMPORT,
+                reason          = (
+                    f"Resilience buffer: {snapshot.current_soc_pct:.1f}% below "
+                    f"{buffer_pct:.0f}% minimum — importing {deficit_kwh:.1f} kWh "
+                    f"to {buffer_target:.0f}% for power-cut protection "
+                    f"(Tracker flat rate {rate_str}, solar recharges from dawn)"
+                ),
+                power_watts     = 10000,
+                target_soc_pct  = buffer_target,
+                dawn_viable     = True,
+                soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            )
+
         # Import takes priority: ensure tomorrow is covered before exporting today
         if balance.import_needed:
             decision = self._plan_import(snapshot, balance)

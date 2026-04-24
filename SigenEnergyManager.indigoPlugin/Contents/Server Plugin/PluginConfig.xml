@@ -84,7 +84,7 @@
         <Label>Inverter max charge power (kW):</Label>
     </Field>
     <Field id="dawnSocTarget" type="textfield" defaultValue="10">
-        <Label>Minimum SOC at dawn target (%, default 10, used for VPP/storm):</Label>
+        <Label>Resilience buffer / dawn target (%, default 10) — minimum SOC kept overnight on flat-rate tariffs (Tracker/Flexible) for power-cut protection; also used as VPP and storm floor:</Label>
     </Field>
     <Field id="batteryHealthCutoff" type="textfield" defaultValue="1">
         <Label>Battery health cutoff floor (%, default 1):</Label>

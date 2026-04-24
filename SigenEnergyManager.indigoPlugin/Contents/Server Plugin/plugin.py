@@ -59,7 +59,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.1"
+PLUGIN_VERSION     = "4.2"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
 
