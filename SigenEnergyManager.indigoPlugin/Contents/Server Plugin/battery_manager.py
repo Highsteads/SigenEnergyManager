@@ -6,7 +6,7 @@
 #              Export to prevent 100% cap during solar generation window.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        09-04-2026
-# Version:     2.1
+# Version:     2.2
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -460,7 +460,30 @@ class BatteryManager:
         tariff     = snapshot.tariff
         import_kwh = viability.import_kwh_grid
         now        = snapshot.now
-        target_soc = snapshot.dawn_target_pct + 2.0  # small buffer above minimum
+
+        # Correct target: charge enough so that after overnight drain we reach dawn_target.
+        #   target_kwh = dawn_target + expected_drain
+        #   target_soc = target_kwh / cap * 100 + 2%  (2% safety buffer above minimum)
+        # Capped at 98% (preserve solar headroom at full charge).
+        # Floored at dawn_target_pct + 2% = 17% to guard against zero-drain edge cases.
+        target_kwh = viability.dawn_target_kwh + viability.expected_consumption_kwh
+        target_soc = min(98.0, target_kwh / max(1.0, snapshot.capacity_kwh) * 100.0 + 2.0)
+        target_soc = max(target_soc, snapshot.dawn_target_pct + 2.0)
+
+        # Defensive guard: if battery already meets the import target, return immediately.
+        # With the corrected formula above, target_soc accounts for overnight drain, so
+        # this guard only fires when there is a genuine inconsistency between the viability
+        # calculation (which flagged "import needed") and the actual battery state — e.g.
+        # if a buggy dawn-time lookup produced an inflated drain estimate while the battery
+        # is comfortably safe.  This prevents runaway start/stop import cycling.
+        if snapshot.current_soc_pct >= target_soc:
+            return Decision(
+                action          = ACTION_SELF_CONSUMPTION,
+                reason          = (f"Import target {target_soc:.0f}% already met "
+                                   f"({snapshot.current_soc_pct:.1f}% SOC) — no import needed"),
+                dawn_viable     = True,
+                soc_at_dawn_kwh = viability.soc_at_dawn_kwh,
+            )
 
         # Tariff-specific import timing
         if tariff.tariff_key in (TARIFF_GO, TARIFF_FLUX, TARIFF_IGO, TARIFF_IFLUX):

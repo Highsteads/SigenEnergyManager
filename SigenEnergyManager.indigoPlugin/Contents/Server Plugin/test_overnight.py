@@ -458,6 +458,94 @@ print(f"         CLOUDY 30% ({batt_30:.1f} kWh): drain@01:00BST≈{drain_30:.2f}
 
 
 # ============================================================
+# Section 7: _plan_import() target formula and defensive guard
+# ============================================================
+section("7. Import guard: corrected target formula + guard against looping")
+
+# With the FIXED formula, target accounts for overnight drain:
+#   target_soc = (dawn_target_kwh + drain_kwh) / cap * 100 + 2%
+#
+# The guard fires only when current_soc >= target_soc — i.e. the battery is
+# genuinely safe at dawn with margin, meaning viability must have been wrong.
+#
+# Since normal viability flags "not viable" only when current < dawn_target + drain,
+# the guard is a pure belt-and-suspenders check for future calculation bugs.
+
+# Helper: build a forced DawnViability object (simulates a buggy viability result
+# where import_needed=True but with controllable drain).  In real operation the
+# v3.8 dawn fix prevents this — but the guard provides an extra safety net.
+def forced_viability(drain_kwh, dawn_target_kwh=FLOOR, dawn_dt=DAWN_APR24):
+    return DawnViability(
+        viable=False,
+        soc_at_dawn_kwh=dawn_target_kwh * 0.5,
+        raw_soc_at_dawn=dawn_target_kwh * 0.5 - 0.5,
+        dawn_target_kwh=dawn_target_kwh,
+        import_needed=True,
+        import_kwh_net=1.0,
+        import_kwh_grid=1.064,
+        dawn_dt=dawn_dt,
+        hours_to_dawn=drain_kwh / 0.5,
+        expected_consumption_kwh=drain_kwh,
+        current_soc_kwh=5.0,
+    )
+
+# Compute expected target for 2kWh drain: (5.256 + 2.0) / 35.04 * 100 + 2 ≈ 22.7%
+TARGET_2KWH = min(98.0, (FLOOR + 2.0) / CAP * 100.0 + 2.0)
+
+# 7.1 — Guard fires: 30% SOC, forced viability with 2kWh drain → target≈22.7%
+#        30% >= 22.7% → guard fires, returns self_consumption
+t = datetime(2026, 4, 24, 0, 0, tzinfo=UTC)
+fv2 = forced_viability(2.0)
+d71 = mgr._plan_import(snap(30.0, t), fv2)
+check(f"Guard fires: 30% SOC, target≈{TARGET_2KWH:.1f}% (dawn+2kWh drain+2%) → self_consumption",
+      d71.action == "self_consumption",
+      f"action={d71.action}  reason={d71.reason[:80]}")
+
+# 7.2 — Guard fires at exactly target boundary (boundary + 0.1%)
+d72 = mgr._plan_import(snap(TARGET_2KWH + 0.1, t), fv2)
+check(f"Guard fires at exactly {TARGET_2KWH:.1f}%+0.1 (boundary is inclusive)",
+      d72.action == "self_consumption",
+      f"action={d72.action}")
+
+# 7.3 — Guard does NOT fire: 20% SOC, target≈22.7% (20 < 22.7) → import proceeds
+d73 = mgr._plan_import(snap(20.0, t), fv2)
+check(f"Guard doesn't fire: 20% SOC < target {TARGET_2KWH:.1f}% → import proceeds",
+      d73.action in ("start_import", "schedule_import"),
+      f"action={d73.action}")
+
+# 7.4 — Guard does NOT fire: 16% SOC, long drain (8 kWh) → target≈37%
+fv8 = forced_viability(8.0)
+TARGET_8KWH = min(98.0, (FLOOR + 8.0) / CAP * 100.0 + 2.0)
+d74 = mgr._plan_import(snap(16.0, t), fv8)
+check(f"Guard doesn't fire: 16% SOC < target {TARGET_8KWH:.1f}% (8kWh drain) → import",
+      d74.action in ("start_import", "schedule_import"),
+      f"action={d74.action}")
+
+# 7.5 — Genuine 19% SOC at 00:00 UTC, cloudy tomorrow: evaluate() triggers import.
+#        19% = 6.66 kWh, drain=2.39 kWh to dawn → at_dawn=4.27 kWh < 5.26 floor.
+#        import_kwh_net = 0.99 kWh ≥ MIN_IMPORT_KWH (0.5) → fires.
+#        With fixed target, import charges to ~24% (not 17%), so the import
+#        controller won't immediately stop — this was the root of the 340-cycle loop.
+t = datetime(2026, 4, 24, 0, 0, tzinfo=UTC)
+d75 = mgr.evaluate(snap(19.0, t, export_enabled=True, corrected_tomorrow_kwh=5.0))
+check("Genuine 19% SOC at 00:00 UTC, CLOUDY: evaluate() triggers import (not blocked)",
+      d75.action == "start_import",
+      f"action={d75.action}  reason={d75.reason[:70]}")
+
+# Verify the target is above current SOC: import controller won't immediately stop.
+check(f"Genuine 19% import: target_soc_pct ({d75.target_soc_pct:.1f}%) > current SOC (19%)",
+      d75.target_soc_pct > 19.0,
+      f"target_soc_pct={d75.target_soc_pct:.1f}%  — must be > 19 to avoid instant stop")
+
+# 7.6 — Full evaluate(): 54% SOC, sunny, pre-dawn → no import (viable, never enters _plan_import)
+t = datetime(2026, 4, 24, 0, 0, tzinfo=UTC)
+d76 = mgr.evaluate(snap(54.3, t, export_enabled=True, corrected_tomorrow_kwh=74.0))
+check("evaluate() 54% SOC, sunny: no import (primary v3.8 fix; export starts)",
+      d76.action != "start_import",
+      f"action={d76.action}  reason={d76.reason[:80]}")
+
+
+# ============================================================
 # Summary
 # ============================================================
 section("Summary")
