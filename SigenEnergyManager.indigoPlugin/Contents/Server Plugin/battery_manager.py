@@ -259,14 +259,22 @@ class BatteryManager:
         health_floor_kwh = snapshot.health_cutoff_pct / 100.0 * cap_kwh
         now              = snapshot.now
 
-        # Find next dawn time (first hour with meaningful PV generation tomorrow)
-        tomorrow_str = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-        today_str    = now.date().strftime("%Y-%m-%d")
-
-        dawn_dt = (
-            snapshot.dawn_times.get(tomorrow_str)
-            or snapshot.dawn_times.get(today_str)
-        )
+        # Find next dawn: the nearest future dawn in the forecast.
+        # Always scan today → tomorrow → day-after so we never land on a
+        # UTC date that is a full calendar day ahead of the local BST date.
+        # This matters between 23:00 BST and 00:00 BST (= 00:00-01:00 UTC)
+        # when the UTC date has rolled over but the local date has not —
+        # without this guard the code looks up UTC "tomorrow" dawn which
+        # is ~27 hours away rather than the correct 3-4 hours away.
+        today_str = now.date().strftime("%Y-%m-%d")   # kept for daytime credit below
+        dawn_dt   = None
+        for _days in range(3):
+            _candidate_dt = snapshot.dawn_times.get(
+                (now.date() + timedelta(days=_days)).strftime("%Y-%m-%d")
+            )
+            if _candidate_dt is not None and _candidate_dt > now:
+                dawn_dt = _candidate_dt
+                break
 
         if dawn_dt is None:
             # No forecast data - assume dawn at 07:00 tomorrow
