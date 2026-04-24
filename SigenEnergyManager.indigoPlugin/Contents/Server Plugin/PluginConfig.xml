@@ -84,10 +84,16 @@
         <Label>Inverter max charge power (kW):</Label>
     </Field>
     <Field id="dawnSocTarget" type="textfield" defaultValue="10">
-        <Label>Minimum SOC at dawn target (%, default 10):</Label>
+        <Label>Minimum SOC at dawn target (%, default 10, used for VPP/storm):</Label>
     </Field>
     <Field id="batteryHealthCutoff" type="textfield" defaultValue="1">
         <Label>Battery health cutoff floor (%, default 1):</Label>
+    </Field>
+    <Field id="weekdayKwh" type="textfield" defaultValue="22.0">
+        <Label>Weekday daily consumption (kWh Mon-Fri, default 22):</Label>
+    </Field>
+    <Field id="weekendKwh" type="textfield" defaultValue="30.0">
+        <Label>Weekend daily consumption (kWh Sat-Sun, default 30):</Label>
     </Field>
 
     <Field id="separator_export" type="separator"/>

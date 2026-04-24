@@ -59,7 +59,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "3.9"
+PLUGIN_VERSION     = "4.0"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
 
@@ -743,10 +743,12 @@ class Plugin(indigo.PluginBase):
             current_soc_pct    = soc_pct,
             capacity_kwh       = float(prefs.get("batteryCapacityKwh", 35.04)),
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
-            dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),
+            dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),    # v4.0: retained for VPP/storm
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 1)),
             export_enabled     = export_enabled,
             max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
+            weekday_kwh        = float(prefs.get("weekdayKwh", 22.0)),
+            weekend_kwh        = float(prefs.get("weekendKwh", 30.0)),
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
