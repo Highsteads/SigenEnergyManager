@@ -197,10 +197,14 @@ class BatteryManager:
     1. Export surplus today: if battery + remaining solar exceeds today's 24h
        consumption, cap charge rate so excess PV flows to grid via the export
        connection. Export starts early on sunny days rather than waiting for 90%.
-    2. Import only for tomorrow: if projected battery at dawn + tomorrow's solar
-       falls short of tomorrow's daily load, import the shortfall tonight.
+    2. Import only for tomorrow — and only when there is a rate benefit:
+       - TOU tariffs (Go/Flux/Agile): import during cheap window. Rate saving
+         (15-20p/kWh) far outweighs 6% round-trip conversion loss (~1.4p/kWh).
+       - Flat-rate tariffs (Tracker/Flexible): do NOT pre-charge battery.
+         When battery is low, the inverter imports direct from grid to house with
+         ZERO conversion loss. Pre-charging wastes ~6% at no rate benefit.
+         Exception: defer to 00:05 if tomorrow's Tracker rate is 10%+ cheaper.
     3. No overnight force-discharge: stays in Self Consumption mode (0x02) always.
-       The 21:00-dawn self-consumption window naturally lowers pre-dawn SOC.
     4. VPP events override all decisions (Axle cloud controls battery).
 
     This class is stateless: it takes a ManagerSnapshot and returns a Decision.
@@ -229,8 +233,12 @@ class BatteryManager:
 
         # Import takes priority: ensure tomorrow is covered before exporting today
         if balance.import_needed:
-            decision             = self._plan_import(snapshot, balance)
-            decision.dawn_viable     = False
+            decision = self._plan_import(snapshot, balance)
+            # Only flag dawn as not viable when we're actually importing.
+            # Flat-rate planners (Tracker/Flexible) may return self_consumption
+            # intentionally — grid passthrough is more efficient than pre-charging.
+            if decision.action in (ACTION_START_IMPORT, ACTION_SCHEDULE_IMPORT):
+                decision.dawn_viable = False
             decision.soc_at_dawn_kwh = balance.battery_at_dawn_kwh
             decision.import_kwh      = balance.import_kwh_grid
             return decision
@@ -622,12 +630,16 @@ class BatteryManager:
         balance:    SufficiencyBalance,
         target_soc: float,
     ) -> Decision:
-        """Plan import on Tracker tariff.
+        """Plan import on Tracker tariff (flat rate, same price all day).
 
-        Tracker is flat rate all day. Compare today vs tomorrow:
-        - If tomorrow's rate is published AND 10%+ cheaper AND battery has margin:
-          defer import until 00:05 (new day rate starts)
-        - Otherwise: import now at today's rate
+        On a flat-rate tariff, pre-charging the battery wastes ~6% in AC/DC/AC
+        conversion with zero rate benefit. When battery is low, the inverter's
+        Self Consumption mode imports from the grid directly to the house with
+        no conversion loss. Battery passthrough is more efficient in this case.
+
+        Only exception: if tomorrow's Tracker rate is published and 10%+ cheaper,
+        defer a small import to 00:05. The rate saving (~3p+/kWh typical) exceeds
+        the ~1.4p round-trip efficiency loss, so it's worth pre-charging then.
         """
         tariff        = snapshot.tariff
         now           = snapshot.now
@@ -636,7 +648,7 @@ class BatteryManager:
         cap_kwh       = snapshot.capacity_kwh
         floor_kwh     = snapshot.health_cutoff_pct / 100.0 * cap_kwh
 
-        # Defer if tomorrow's rate is published and meaningfully cheaper
+        # Defer to 00:05 if tomorrow's rate is meaningfully cheaper
         if (tomorrow_rate is not None
                 and today_rate is not None
                 and today_rate > 0
@@ -658,24 +670,27 @@ class BatteryManager:
                     action         = ACTION_SCHEDULE_IMPORT,
                     reason         = (
                         f"Tomorrow at risk — Tracker rate tomorrow {tomorrow_rate:.2f}p "
-                        f"({saving_p:.2f}p/kWh cheaper than today {today_rate:.2f}p). "
-                        f"Deferring import to 00:05"
+                        f"({saving_p:.2f}p/kWh cheaper than today {today_rate:.2f}p, "
+                        f"exceeds ~1.4p/kWh efficiency loss). Deferring import to 00:05"
                     ),
                     power_watts    = 10000,
                     target_soc_pct = target_soc,
                     scheduled_time = import_time,
                 )
 
+        # Same rate all day — let inverter import direct to house as needed.
+        # Pre-charging wastes ~6% (AC→DC→AC) at no rate benefit.
         rate_str = f"{today_rate:.2f}p/kWh" if today_rate else "unknown rate"
         return Decision(
-            action         = ACTION_START_IMPORT,
-            reason         = (
+            action          = ACTION_SELF_CONSUMPTION,
+            reason          = (
                 f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
-                f"need {balance.tomorrow_need_kwh:.1f}). "
-                f"Importing now at Tracker {rate_str}"
+                f"need {balance.tomorrow_need_kwh:.1f}) — Tracker flat rate ({rate_str}). "
+                f"Grid imports direct to house; pre-charging wastes ~6% conversion loss "
+                f"with no rate benefit"
             ),
-            power_watts    = 10000,
-            target_soc_pct = target_soc,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
 
     def _plan_agile_import(
@@ -760,18 +775,24 @@ class BatteryManager:
         balance:    SufficiencyBalance,
         target_soc: float,
     ) -> Decision:
-        """Plan import on Flexible Octopus — flat rate, import immediately."""
+        """Plan import on Flexible Octopus (flat rate, no time-of-use windows).
+
+        Same logic as Tracker: pre-charging a flat-rate battery wastes ~6% in
+        conversion losses with no rate benefit. Inverter imports direct to house
+        automatically when battery is low — more efficient, same price.
+        """
         tariff   = snapshot.tariff
         rate_str = f"{tariff.today_rate_p:.2f}p/kWh" if tariff.today_rate_p else "flat rate"
         return Decision(
-            action         = ACTION_START_IMPORT,
-            reason         = (
+            action          = ACTION_SELF_CONSUMPTION,
+            reason          = (
                 f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
-                f"need {balance.tomorrow_need_kwh:.1f}). "
-                f"Importing now at Flexible {rate_str}"
+                f"need {balance.tomorrow_need_kwh:.1f}) — Flexible flat rate ({rate_str}). "
+                f"Grid imports direct to house; pre-charging wastes ~6% conversion loss "
+                f"with no rate benefit"
             ),
-            power_watts    = 10000,
-            target_soc_pct = target_soc,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
 
     # ================================================================
