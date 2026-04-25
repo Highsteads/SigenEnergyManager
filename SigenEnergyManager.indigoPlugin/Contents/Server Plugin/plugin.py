@@ -59,7 +59,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.3"
+PLUGIN_VERSION     = "4.4"
 PLUGIN_NAME        = "SigenEnergyManager"
 WEB_DASHBOARD_PORT = 8179
 
@@ -282,6 +282,9 @@ class Plugin(indigo.PluginBase):
         # Solar overflow state (daytime charge-cap export)
         self.store["solar_overflow_active"]      = False
         self.store["solar_overflow_charge_cap_w"] = 0
+
+        # Flood prevention state (overnight pre-drain)
+        self.store["flood_prev_target_soc"] = None  # set when pre-drain export is active
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
@@ -991,7 +994,17 @@ class Plugin(indigo.PluginBase):
             if not prev_import and not prev_export:
                 log(f"[Manager] Starting night export: {decision.reason}")
                 inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-                if self.modbus.night_export(inv_max_w):
+                # Flood prevention uses DNO export cap (decision.power_watts).
+                # Legacy night export falls back to full inverter capacity (inv_max_w).
+                export_w = decision.power_watts if decision.power_watts > 0 else inv_max_w
+                if self.modbus.night_export(export_w):
+                    # Set hardware floor so battery stops automatically at target SOC.
+                    # Plugin resets this cutoff on return to self-consumption.
+                    if decision.target_soc_pct > 0:
+                        self.modbus.set_discharge_cutoff(decision.target_soc_pct)
+                        self.store["flood_prev_target_soc"] = decision.target_soc_pct
+                        log(f"[Manager] Discharge cutoff set to {decision.target_soc_pct:.0f}% "
+                            f"(flood prevention floor)")
                     self.store["export_active"] = True
                     self._trigger_event("exportStarted")
 
@@ -1019,6 +1032,16 @@ class Plugin(indigo.PluginBase):
                 )
                 indigo.server.log("  PV surplus flowing to grid")
                 self.modbus.set_self_consumption()
+                # If flood prevention was running overnight and dawn broke before
+                # the target SOC was reached, reset the discharge cutoff register
+                # now so it does not act as a hidden floor during daytime operation.
+                flood_target = self.store.get("flood_prev_target_soc")
+                if flood_target:
+                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    self.modbus.set_discharge_cutoff(health_floor)
+                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% "
+                        f"(flood prevention interrupted at dawn)")
+                    self.store["flood_prev_target_soc"] = None
                 self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_active"]       = True
                 self.store["solar_overflow_charge_cap_w"] = cap_w
@@ -1056,9 +1079,21 @@ class Plugin(indigo.PluginBase):
                     log(f"[Manager] Holding import - SOC {current_soc:.1f}% / target {target_soc:.0f}%",
                         level="DEBUG")
             elif prev_export:
-                # export_enabled was disabled while exporting - clean up
-                log("[Manager] Export disabled - returning to self-consumption")
+                # Flood prevention complete, export disabled, or other export end
+                flood_target = self.store.get("flood_prev_target_soc")
+                current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
+                if flood_target:
+                    log(f"[Manager] Flood prevention complete "
+                        f"(SOC {current_soc:.1f}% reached {flood_target:.0f}% target) "
+                        f"— returning to self-consumption")
+                else:
+                    log("[Manager] Export disabled — returning to self-consumption")
                 self.modbus.set_self_consumption()
+                if flood_target:
+                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    self.modbus.set_discharge_cutoff(health_floor)
+                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
+                    self.store["flood_prev_target_soc"] = None
                 self.store["export_active"] = False
             elif self.store.get("solar_overflow_active"):
                 # SOC dropped below release threshold — restore full charge rate
@@ -1177,7 +1212,8 @@ class Plugin(indigo.PluginBase):
         # inverter factory default is (typically 5%). Verify every cycle so the
         # hardware floor always matches the plugin's batteryHealthCutoff preference.
         # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
-        if not self.store.get("vpp_cutoff_raised"):
+        # Skip if flood prevention has temporarily raised the cutoff — it owns it too.
+        if not self.store.get("vpp_cutoff_raised") and not self.store.get("flood_prev_target_soc"):
             expected_cutoff_pct = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
             actual_cutoff_pct   = self.modbus.read_discharge_cutoff()
             if actual_cutoff_pct is not None:

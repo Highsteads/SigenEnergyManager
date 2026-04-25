@@ -5,8 +5,8 @@
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        24-04-2026
-# Version:     3.0
+# Date:        25-04-2026
+# Version:     3.1
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -59,6 +59,16 @@ MIN_IMPORT_KWH = 0.5
 # Below this the battery has barely enough for 24h — every kWh is worth more
 # overnight (20p+) than as daytime export (12p flat).
 MIN_EXPORT_KWH = 0.3
+
+# Flood prevention — overnight pre-drain to create headroom for peak solar absorption.
+# On high-SOC nights before very sunny days, a full battery at ~09:00 chokes off
+# daytime export when the 4 kW DNO cap cannot route peak PV (7+ kW) fast enough.
+# Pre-draining to TARGET% earns export revenue AND enables uninterrupted 4 kW export
+# through peak hours because the battery has room to absorb the temporal surplus.
+# Only fires when tomorrow solar >= MULT × tomorrow need (safe to refill without reimport).
+FLOOD_PREV_SOC_THRESHOLD_PCT = 55.0   # min SOC % to trigger overnight pre-drain
+FLOOD_PREV_TARGET_PCT        = 40.0   # drain to this SOC % before sunrise
+FLOOD_PREV_FORECAST_MULT     = 2.0    # tomorrow solar must be >= this × tomorrow need
 
 # Solar overflow constants (daytime forecast-based export)
 # Mode stays 0x02 (Max Self Consumption) throughout.
@@ -263,6 +273,15 @@ class BatteryManager:
                 dawn_viable     = True,
                 soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
             )
+
+        # ── Flood prevention: overnight pre-drain on high-SOC + very sunny forecast ─
+        # Pre-drain to FLOOD_PREV_TARGET_PCT so the battery has headroom to absorb
+        # peak solar all day. Without this, a near-full battery at 09:00 fills within
+        # a few hours at peak PV, cutting off the DNO-capped export prematurely.
+        if snapshot.export_enabled and not balance.is_daytime:
+            flood = self._check_flood_prevention(snapshot, balance)
+            if flood is not None:
+                return flood
 
         # Import takes priority: ensure tomorrow is covered before exporting today
         if balance.import_needed:
@@ -903,6 +922,95 @@ class BatteryManager:
             ),
             power_watts     = cap_w,
             export_kw       = export_kw,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+        )
+
+    # ================================================================
+    # Flood Prevention (Night Pre-Drain)
+    # ================================================================
+
+    def _check_flood_prevention(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> Optional[Decision]:
+        """Overnight pre-drain to create headroom for peak solar absorption.
+
+        On high-SOC nights before very sunny days, the battery fills early in the
+        morning and cuts off daytime export at the DNO limit (4 kW). Pre-draining
+        to FLOOD_PREV_TARGET_PCT creates enough capacity to absorb the full peak
+        surplus, so export runs at the DNO cap continuously rather than being choked
+        off when the battery tops out.
+
+        Example (25-Apr): SOC 70%, tomorrow forecast 68 kWh vs 22 kWh need.
+          Without pre-drain: battery fills ~13:00 → export stops → ~5 kWh clipped.
+          With pre-drain: 70% → 40% overnight = 10.5 kWh exported (~£1.26 @ 12p),
+          then 4 kW export runs uninterrupted 10:00–18:00 through peak hours.
+
+        Conditions:
+          - Nighttime only (daytime handled by solar overflow)
+          - Export MPAN active
+          - tomorrow_solar >= FLOOD_PREV_FORECAST_MULT × tomorrow_need (safe to refill)
+          - Current SOC >= FLOOD_PREV_SOC_THRESHOLD_PCT (worth draining)
+          - Effective target < threshold (storm resilience floor not too high)
+
+        Storm/seasonal floor is respected: if dawn_target_pct (raised by storm watch
+        or seasonal buffer) is above FLOOD_PREV_TARGET_PCT, the higher floor is used.
+        If the floor reaches the trigger threshold the method returns None — no point
+        draining a few percent when storm resilience dominates.
+
+        plugin.py ACTION_START_EXPORT handler sets the hardware discharge cutoff
+        register (HOLD_ESS_DISCHARGE_CUTOFF) to target_soc_pct so the battery stops
+        automatically. The cutoff is reset to health_floor on return to self-consumption.
+        """
+        # Nighttime only — daytime export handled by solar overflow
+        if balance.is_daytime:
+            return None
+
+        # Export MPAN required
+        if not snapshot.export_enabled:
+            return None
+
+        # Safety gate: tomorrow must be abundantly sunny to guarantee solar refill.
+        # Without this, pre-draining could leave the battery short and force reimport
+        # at full Tracker price — wiping out the export revenue.
+        if balance.tomorrow_solar_kwh < FLOOD_PREV_FORECAST_MULT * balance.tomorrow_need_kwh:
+            return None
+
+        # Effective target: respect storm/seasonal SOC floor.
+        # If dawn_target_pct was raised above the default (e.g. storm → 50%),
+        # drain to that floor instead of the hard-coded 40%.
+        effective_target = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
+
+        # If the floor is at or above the trigger threshold there is too little
+        # headroom to bother — storm resilience takes priority over flood prevention.
+        if effective_target >= FLOOD_PREV_SOC_THRESHOLD_PCT:
+            return None
+
+        # Already drained to (or below) effective target — nothing to do
+        if snapshot.current_soc_pct <= effective_target:
+            return None
+
+        # SOC must be above threshold to warrant pre-drain
+        if snapshot.current_soc_pct < FLOOD_PREV_SOC_THRESHOLD_PCT:
+            return None
+
+        # Estimate export quantity and revenue
+        cap_kwh     = snapshot.capacity_kwh
+        export_kwh  = (snapshot.current_soc_pct - effective_target) / 100.0 * cap_kwh
+        revenue_gbp = export_kwh * 12.0 / 100.0   # 12p/kWh flat Outgoing rate
+
+        return Decision(
+            action          = ACTION_START_EXPORT,
+            reason          = (
+                f"Flood prevention: SOC {snapshot.current_soc_pct:.1f}% → "
+                f"{effective_target:.0f}% ({export_kwh:.1f} kWh @ 12p = ~£{revenue_gbp:.2f}). "
+                f"Tomorrow {balance.tomorrow_solar_kwh:.1f} kWh forecast "
+                f">= {FLOOD_PREV_FORECAST_MULT:.0f}x need ({balance.tomorrow_need_kwh:.1f} kWh) "
+                f"— solar refills without reimport. "
+                f"Lower dawn SOC sustains DNO-capped export through peak hours"
+            ),
+            power_watts     = int(snapshot.max_export_kw * 1000),
+            target_soc_pct  = effective_target,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
