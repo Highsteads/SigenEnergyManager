@@ -115,7 +115,7 @@ class ManagerSnapshot:
     # Live inverter readings
     pv_watts:               int   = 0
     house_load_watts:       int   = 0
-    export_active:          bool  = False   # legacy night export still running (v3.x)
+    export_active:          bool  = False   # export active (flood prevention v4.4, or legacy v3.x)
     corrected_tomorrow_kwh: float = 0.0     # bias-corrected forecast for tomorrow (kWh)
     bias_factor:            float = 1.0     # forecast correction (applied to hourly values)
 
@@ -143,6 +143,10 @@ class ManagerSnapshot:
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
     solar_overflow_charge_cap: int  = 0       # current cap in watts
+
+    # Flood prevention state (from plugin.py store — so evaluate() can continue a running pre-drain)
+    # 0.0 when inactive; set to the target SOC % when a flood-prevention export is running
+    flood_prev_target_soc: float = 0.0
 
 
 @dataclass
@@ -230,13 +234,19 @@ class BatteryManager:
                 reason = "VPP event active — Axle has control",
             )
 
-        # Stop any legacy night export still running from v3.x (migration safety)
+        # Handle active exports: distinguish flood prevention (v4.4) from legacy v3.x
         if snapshot.export_active:
-            return Decision(
-                action      = ACTION_STOP_EXPORT,
-                reason      = "Night export disabled in v4.0 — returning to self-consumption",
-                dawn_viable = True,
-            )
+            if snapshot.flood_prev_target_soc > 0:
+                # Flood prevention pre-drain is running — check whether to continue or stop
+                balance = self._calculate_24h_balance(snapshot)
+                return self._continue_flood_prevention(snapshot, balance)
+            else:
+                # Legacy v3.x night export — stop immediately (disabled in v4.0)
+                return Decision(
+                    action      = ACTION_STOP_EXPORT,
+                    reason      = "Night export disabled in v4.0 — returning to self-consumption",
+                    dawn_viable = True,
+                )
 
         # Calculate 24-hour sufficiency balance
         balance = self._calculate_24h_balance(snapshot)
@@ -1011,6 +1021,73 @@ class BatteryManager:
             ),
             power_watts     = int(snapshot.max_export_kw * 1000),
             target_soc_pct  = effective_target,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+        )
+
+    def _continue_flood_prevention(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> Decision:
+        """Decide whether to continue or stop an in-progress flood prevention pre-drain.
+
+        Called from evaluate() when export_active=True and flood_prev_target_soc > 0.
+        Returns ACTION_START_EXPORT (idempotent — plugin.py skips if already exporting)
+        to continue, or ACTION_SELF_CONSUMPTION to stop and clean up.
+
+        Stopping triggers plugin.py's prev_export → SELF_CONSUMPTION branch which:
+          - calls set_self_consumption()
+          - resets HOLD_ESS_DISCHARGE_CUTOFF to health_floor
+          - clears flood_prev_target_soc in the store
+        """
+        target = snapshot.flood_prev_target_soc
+
+        # Dawn broke — stop now; ACTION_SOLAR_OVERFLOW first-entry handles cutoff reset
+        if balance.is_daytime:
+            return Decision(
+                action      = ACTION_SELF_CONSUMPTION,
+                reason      = (
+                    f"Flood prevention: stopping at dawn (SOC {snapshot.current_soc_pct:.1f}%, "
+                    f"target {target:.0f}%) — daytime solar will continue charging"
+                ),
+                dawn_viable = True,
+            )
+
+        # Target SOC reached — hardware cutoff will have stopped the discharge;
+        # confirm and return to self-consumption
+        if snapshot.current_soc_pct <= target:
+            return Decision(
+                action      = ACTION_SELF_CONSUMPTION,
+                reason      = (
+                    f"Flood prevention: target {target:.0f}% reached "
+                    f"(SOC {snapshot.current_soc_pct:.1f}%) — returning to self-consumption"
+                ),
+                dawn_viable = True,
+            )
+
+        # Conditions changed (rare): tomorrow is no longer abundantly sunny — abort
+        if balance.tomorrow_solar_kwh < FLOOD_PREV_FORECAST_MULT * balance.tomorrow_need_kwh:
+            return Decision(
+                action      = ACTION_SELF_CONSUMPTION,
+                reason      = (
+                    f"Flood prevention: aborting — forecast {balance.tomorrow_solar_kwh:.1f} kWh "
+                    f"no longer >= {FLOOD_PREV_FORECAST_MULT:.0f}x need "
+                    f"({balance.tomorrow_need_kwh:.1f} kWh)"
+                ),
+                dawn_viable = True,
+            )
+
+        # Still nighttime, above target, sunny forecast — continue pre-drain
+        # ACTION_START_EXPORT is idempotent: plugin.py's `if not prev_export` guard
+        # skips the Modbus calls when export is already running, so no register noise.
+        return Decision(
+            action          = ACTION_START_EXPORT,
+            reason          = (
+                f"Flood prevention in progress: SOC {snapshot.current_soc_pct:.1f}% → "
+                f"{target:.0f}% target "
+                f"({snapshot.current_soc_pct - target:.1f}% remaining)"
+            ),
+            power_watts     = int(snapshot.max_export_kw * 1000),
+            target_soc_pct  = target,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )

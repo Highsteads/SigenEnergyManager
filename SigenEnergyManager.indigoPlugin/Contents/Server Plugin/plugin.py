@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        19-04-2026
-# Version:     3.6
+# Date:        25-04-2026
+# Version:     4.4
 
 import indigo
 import json
@@ -766,6 +766,7 @@ class Plugin(indigo.PluginBase):
             vpp_reserved_kwh            = _vpp_reserved_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
+            flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
         )
 
         # --- Seasonal buffer: raise resilience floor Oct-Mar (longer nights, weaker solar) ---
@@ -1012,6 +1013,13 @@ class Plugin(indigo.PluginBase):
             if prev_export:
                 log("[Manager] Stopping night export - returning to self-consumption")
                 self.modbus.set_self_consumption()
+                # Clean up flood prevention cutoff if it was active
+                flood_target = self.store.get("flood_prev_target_soc")
+                if flood_target:
+                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    self.modbus.set_discharge_cutoff(health_floor)
+                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
+                    self.store["flood_prev_target_soc"] = None
                 self.store["export_active"] = False
                 self._trigger_event("exportStopped")
 
