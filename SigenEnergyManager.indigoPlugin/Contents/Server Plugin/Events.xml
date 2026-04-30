@@ -37,4 +37,28 @@
         <Description>Fires when an Axle VPP export event ends and battery manager control is restored.</Description>
     </Event>
 
+    <Event id="floodPreventionStarted">
+        <Name>Flood Prevention Pre-Drain Started</Name>
+        <TriggerLabel>Overnight flood-prevention pre-drain started</TriggerLabel>
+        <Description>Fires when the battery manager begins overnight pre-drain to create headroom for the next day's peak solar absorption (tomorrow's forecast is high enough that a full battery would choke off morning export).</Description>
+    </Event>
+
+    <Event id="floodPreventionStopped">
+        <Name>Flood Prevention Pre-Drain Stopped</Name>
+        <TriggerLabel>Overnight flood-prevention pre-drain stopped</TriggerLabel>
+        <Description>Fires when overnight pre-drain ends — either the target SOC was reached, dawn broke, the forecast revised down, or export was disabled.</Description>
+    </Event>
+
+    <Event id="powerCutLockoutStarted">
+        <Name>Power Cut Lockout Started</Name>
+        <TriggerLabel>4-hour export lockout active after grid restoration</TriggerLabel>
+        <Description>Fires when the grid is restored after a power cut. Export is suppressed for 4 hours as a precaution while grid stability is observed.</Description>
+    </Event>
+
+    <Event id="powerCutLockoutCleared">
+        <Name>Power Cut Lockout Cleared</Name>
+        <TriggerLabel>Power cut export lockout has expired</TriggerLabel>
+        <Description>Fires when the 4-hour post-grid-restore export lockout expires and normal export operation resumes.</Description>
+    </Event>
+
 </Events>

@@ -45,7 +45,7 @@ ACTION_SELF_CONSUMPTION = "self_consumption"   # default: battery covers home lo
 ACTION_START_IMPORT     = "start_import"        # begin charging from grid now
 ACTION_STOP_IMPORT      = "stop_import"         # charging complete - return to self_consumption
 ACTION_SCHEDULE_IMPORT  = "schedule_import"     # defer import to a cheaper/later window
-ACTION_START_EXPORT     = "start_export"        # deprecated in v4.0 — night discharge removed
+ACTION_START_EXPORT     = "start_export"        # used by flood prevention pre-drain (v4.4+)
 ACTION_STOP_EXPORT      = "stop_export"         # stop active legacy export (v3.x migration)
 ACTION_SOLAR_OVERFLOW   = "solar_overflow"      # daytime: cap charge so PV surplus exports
 
@@ -716,9 +716,23 @@ class BatteryManager:
                 and today_rate > 0
                 and tomorrow_rate < today_rate * TRACKER_DEFER_THRESHOLD):
 
-            midnight_dt = datetime.combine(
-                now.date() + timedelta(days=1), datetime.min.time()
-            ).replace(tzinfo=now.tzinfo)
+            # Build midnight at Europe/London (00:00 local), not at now.tzinfo.
+            # `now` is UTC, so a naive .replace(tzinfo=now.tzinfo) places the
+            # boundary at UTC midnight — which is 01:00 BST in summer. The
+            # cheap-rate Tracker boundary is local-time midnight.
+            try:
+                import pytz
+                _tz_l        = pytz.timezone("Europe/London")
+                local_now    = now.astimezone(_tz_l)
+                midnight_naive = datetime.combine(
+                    local_now.date() + timedelta(days=1), datetime.min.time()
+                )
+                midnight_dt  = _tz_l.localize(midnight_naive).astimezone(now.tzinfo or timezone.utc)
+            except ImportError:
+                # Fallback: UTC midnight if pytz unavailable
+                midnight_dt = datetime.combine(
+                    now.date() + timedelta(days=1), datetime.min.time()
+                ).replace(tzinfo=now.tzinfo or timezone.utc)
 
             drain_to_midnight   = self._estimate_consumption_until(
                 now, midnight_dt, snapshot.consumption_profile
@@ -1091,24 +1105,6 @@ class BatteryManager:
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
-
-    # ================================================================
-    # Night Export (disabled in v4.0)
-    # ================================================================
-
-    def _check_night_export(
-        self, snapshot: ManagerSnapshot, viability=None
-    ) -> Optional[Decision]:
-        """Night export disabled in v4.0.
-
-        The 24-hour sufficiency model uses reactive daytime export only.
-        Overnight force-discharge (Discharge ESS First mode 0x06) removed:
-        it suppresses PV generation and is uneconomic on a flat export tariff.
-
-        Any active night export is stopped in evaluate() before this is reached.
-        Retained as a stub for backward compatibility.
-        """
-        return None
 
     # ================================================================
     # Helpers

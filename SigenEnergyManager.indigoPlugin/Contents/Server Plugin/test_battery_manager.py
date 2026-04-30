@@ -260,6 +260,10 @@ class TestTrackerImportDecisions(unittest.TestCase):
         Today: 28p, tomorrow: 20p (28.6% cheaper → above TRACKER_DEFER_THRESHOLD=10%).
         Battery at 25% (8.76 kWh). Drain to midnight (4h * 0.6 = 2.4 kWh).
         SOC at midnight: 8.76 - 2.4 = 6.36 kWh >> 3.504 health floor → can defer.
+
+        Schedule must be Europe/London midnight (00:05 local) — represented as
+        either UTC 00:05 (winter/GMT) or UTC 23:05 (summer/BST). The defer is
+        anchored to the local-time tariff boundary, not UTC midnight.
         """
         snapshot = _make_snapshot(
             soc_pct         = 25.0,
@@ -272,7 +276,10 @@ class TestTrackerImportDecisions(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_SCHEDULE_IMPORT)
         self.assertIsNotNone(decision.scheduled_time)
-        self.assertEqual(decision.scheduled_time.hour, 0)   # midnight
+        # Midnight Europe/London converted to UTC == 00 (GMT) or 23 (BST).
+        # Both are valid; the +5 minutes makes it hour 0 (GMT) or hour 23 (BST).
+        self.assertIn(decision.scheduled_time.hour, (0, 23))
+        self.assertEqual(decision.scheduled_time.minute, 5)
 
     def test_tracker_cannot_defer_when_soc_too_low_to_reach_midnight(self):
         """When battery cannot safely reach midnight, fall back to grid passthrough.
@@ -828,6 +835,148 @@ class TestFloodPrevention(unittest.TestCase):
         decision = self.bm.evaluate(snapshot)
 
         self.assertEqual(decision.action, ACTION_STOP_EXPORT)
+
+
+class TestTrackerMidnightLocal(unittest.TestCase):
+    """Tests for Tracker defer scheduling at Europe/London midnight (v4.5 fix).
+
+    The tariff boundary is at local midnight, not UTC midnight. During BST
+    this means UTC 23:00, during GMT this means UTC 00:00. Either is valid;
+    importantly the schedule must NEVER land at UTC 01:00 (the bug we fixed).
+    """
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def test_tracker_defer_uses_europe_london_midnight(self):
+        """Schedule must be at Europe/London 00:05, not now.tzinfo midnight."""
+        snapshot = _make_snapshot(
+            soc_pct         = 25.0,
+            tariff_key      = TARIFF_TRACKER,
+            today_rate_p    = 28.0,
+            tomorrow_rate_p = 20.0,
+            now_hour        = 20,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_SCHEDULE_IMPORT)
+        # Resolve the scheduled time in Europe/London — must always be 00:05 local.
+        try:
+            import pytz
+            london = decision.scheduled_time.astimezone(pytz.timezone("Europe/London"))
+            self.assertEqual(london.hour, 0)
+            self.assertEqual(london.minute, 5)
+        except ImportError:
+            self.skipTest("pytz not available")
+
+
+class TestPowerCutLockoutParsing(unittest.TestCase):
+    """Tests for defensive parsing of pluginPrefs powerRestoredTime (v4.5)."""
+
+    def test_isoformat_with_tz_parses_cleanly(self):
+        """The normal case: a tz-aware ISO timestamp parses back to UTC."""
+        from datetime import datetime, timezone
+        original = datetime(2026, 4, 30, 6, 4, 42, tzinfo=timezone.utc)
+        s        = original.isoformat()
+        parsed   = datetime.fromisoformat(s)
+        self.assertEqual(parsed, original)
+        self.assertIsNotNone(parsed.tzinfo)
+
+    def test_naive_isoformat_can_be_recovered(self):
+        """A hand-edited naive timestamp must be recoverable as UTC."""
+        from datetime import datetime, timezone
+        s      = "2026-04-30T06:04:42"   # naive
+        parsed = datetime.fromisoformat(s)
+        self.assertIsNone(parsed.tzinfo)
+        # plugin.py promotes naive to UTC; ensure that doesn't crash subtraction
+        promoted = parsed.replace(tzinfo=timezone.utc)
+        delta_h  = (datetime.now(timezone.utc) - promoted).total_seconds() / 3600.0
+        self.assertIsInstance(delta_h, float)
+
+    def test_garbage_string_raises_valueerror(self):
+        """A corrupt timestamp raises ValueError (caught and cleared by plugin)."""
+        from datetime import datetime
+        with self.assertRaises(ValueError):
+            datetime.fromisoformat("not a timestamp")
+
+
+class TestOctopusTouLocalBucketing(unittest.TestCase):
+    """Tests for Octopus TOU UTC→Europe/London conversion (v4.5 fix).
+
+    The bug: cheap_start/cheap_end are local-time strings ("00:30"–"05:30")
+    but slots arrive as UTC. During BST a UTC slot at 23:30 is local 00:30 —
+    so it should be classified as cheap. Pre-fix it was classified as standard.
+    """
+
+    def setUp(self):
+        try:
+            from octopus_api import OctopusAPI, TARIFF_GO, TARIFF_WINDOWS
+            self.api    = OctopusAPI(api_key="", account_id="", mpan="", serial="")
+            self.window = TARIFF_WINDOWS[TARIFF_GO]
+        except ImportError:
+            self.skipTest("octopus_api not importable")
+
+    def test_bst_utc_2330_classified_as_cheap_local_0030(self):
+        """During BST: UTC 23:30 == local 00:30 (cheap window starts at 00:30)."""
+        # Build a Go-style cheap slot at UTC 23:30 in summer (BST in effect).
+        slots = [{
+            "valid_from":    "2026-06-15T23:30:00Z",
+            "valid_to":      "2026-06-16T00:00:00Z",
+            "value_inc_vat": 7.0,
+        }]
+        result = self.api._parse_tou_slots(slots, self.window)
+        # Should be picked up as cheap (local 00:30 is in the 00:30-05:30 window)
+        self.assertIsNotNone(result.get("cheap_p"))
+        self.assertEqual(result["cheap_p"], 7.0)
+
+    def test_gmt_utc_0030_still_classified_as_cheap(self):
+        """During GMT (winter): UTC 00:30 == local 00:30 — cheap as expected."""
+        slots = [{
+            "valid_from":    "2026-12-15T00:30:00Z",
+            "valid_to":      "2026-12-15T01:00:00Z",
+            "value_inc_vat": 7.0,
+        }]
+        result = self.api._parse_tou_slots(slots, self.window)
+        self.assertEqual(result.get("cheap_p"), 7.0)
+
+
+class TestModbusSleepFunction(unittest.TestCase):
+    """Tests for sigenergy_modbus sleep_func injection (v4.5 fix)."""
+
+    def test_default_uses_time_sleep(self):
+        """Without sleep_func, _sleep is the standard time.sleep."""
+        try:
+            import time as _time
+            from sigenergy_modbus import SigenergyModbus
+        except ImportError:
+            self.skipTest("sigenergy_modbus not importable")
+        m = SigenergyModbus(ip="127.0.0.1")
+        self.assertIs(m._sleep, _time.sleep)
+
+    def test_injected_sleep_func_used(self):
+        """A custom sleep_func is invoked by _throttle()."""
+        try:
+            from sigenergy_modbus import SigenergyModbus
+        except ImportError:
+            self.skipTest("sigenergy_modbus not importable")
+
+        calls = []
+        def fake_sleep(secs):
+            calls.append(secs)
+
+        m = SigenergyModbus(ip="127.0.0.1", sleep_func=fake_sleep)
+        m._last_request_time = time_module.time()   # force throttle to engage
+        m._throttle()
+        m._throttle()   # second call within 1s — must sleep
+        self.assertGreater(len(calls), 0)
+        # All sleeps must be <= the 1.0s protocol minimum
+        for s in calls:
+            self.assertLessEqual(s, 1.0)
+            self.assertGreaterEqual(s, 0.0)
+
+
+# Provide time module alias so the Modbus test above can grab a baseline timestamp
+import time as time_module
 
 
 if __name__ == "__main__":

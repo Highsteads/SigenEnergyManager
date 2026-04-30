@@ -199,6 +199,26 @@
                 <TriggerLabel>Export power changed</TriggerLabel>
                 <ControlPageLabel>Export Power (kW)</ControlPageLabel>
             </State>
+            <State id="floodPrevActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flood prevention active changed</TriggerLabel>
+                <ControlPageLabel>Flood Prevention Active</ControlPageLabel>
+            </State>
+            <State id="floodPrevTarget">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Flood prevention target changed</TriggerLabel>
+                <ControlPageLabel>Flood Prevention Target SOC (%)</ControlPageLabel>
+            </State>
+            <State id="powerCutLockoutActive">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Power cut lockout changed</TriggerLabel>
+                <ControlPageLabel>Power Cut Lockout Active</ControlPageLabel>
+            </State>
+            <State id="powerCutLockoutRemainingMin">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Power cut lockout remaining changed</TriggerLabel>
+                <ControlPageLabel>Power Cut Lockout Remaining (min)</ControlPageLabel>
+            </State>
             <State id="tariffActive">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Active tariff changed</TriggerLabel>

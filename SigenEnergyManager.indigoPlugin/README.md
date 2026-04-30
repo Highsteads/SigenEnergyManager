@@ -67,7 +67,7 @@ The plugin will pick them up automatically at startup.
   `/Library/Application Support/Perceptive Automation/`, rename it to `secrets.py`,
   and fill in your values, **or**
 - Enter your credentials directly in the plugin's configuration dialog
-  (Indigo menu → Plugins → Sigenergy Energy Manager → Configure)
+  (Indigo menu → Plugins → Sigenergy Manager → Configure)
 
 All credential fields fall back to the plugin configuration dialog if
 `secrets.py` is absent or a key is missing.

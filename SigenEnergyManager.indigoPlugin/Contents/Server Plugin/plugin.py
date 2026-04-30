@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        25-04-2026
-# Version:     4.4
+# Date:        30-04-2026
+# Version:     4.5
 
 import indigo
 import json
@@ -59,8 +59,8 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.4"
-PLUGIN_NAME        = "SigenEnergyManager"
+PLUGIN_VERSION     = "4.5"
+PLUGIN_NAME        = "Sigenergy Manager"
 WEB_DASHBOARD_PORT = 8179
 
 # Minimum inverter readings required per half-hourly slot before we trust the
@@ -103,7 +103,6 @@ VPP_COOLING_OFF  = "cooling_off"
 
 # Axle VPP SOC calculation constants (from SigenergySolar)
 VPP_DISCHARGE_EFFICIENCY  = 0.97
-VPP_RESERVE_KWH           = 12.0  # 4 overnight + 3 morning + 5 buffer
 BATTERY_CAPACITY_KWH      = 35.04
 VPP_PRE_EXPORT_MINUTES    = 5     # start exporting this many minutes before event start.
                                    # Axle pays based on smart meter readings during their
@@ -283,7 +282,11 @@ class Plugin(indigo.PluginBase):
         self.store["solar_overflow_active"]      = False
         self.store["solar_overflow_charge_cap_w"] = 0
 
-        # Flood prevention state (overnight pre-drain)
+        # Flood prevention state (overnight pre-drain).
+        # Persisted to pluginPrefs so a mid-pre-drain plugin restart doesn't leave
+        # the inverter cutoff register raised but the store flag empty — which
+        # would let _verify_ems_registers() reset the hardware floor and break
+        # the in-progress drain. Rehydrated in startup() below.
         self.store["flood_prev_target_soc"] = None  # set when pre-drain export is active
 
         # Consumption profile (48 slots)
@@ -321,6 +324,26 @@ class Plugin(indigo.PluginBase):
         # OpenMeteoForecast.__init__; this propagates it into plugin.py's dict).
         self._refresh_forecast()
         self.store["last_forecast"] = time.time()
+
+        # Rehydrate flood prevention target SOC from pluginPrefs.
+        # If the plugin restarts mid-pre-drain, the inverter still has its
+        # discharge cutoff register raised to this target — without rehydrating
+        # we'd lose the flag and _verify_ems_registers() would lower the cutoff
+        # back to the health floor mid-drain.
+        _flood_prev_str = self.pluginPrefs.get("floodPrevTargetSoc", "")
+        if _flood_prev_str:
+            try:
+                _flood_prev_val = float(_flood_prev_str)
+                if _flood_prev_val > 0:
+                    self.store["flood_prev_target_soc"] = _flood_prev_val
+                    self.store["export_active"]         = True
+                    log(
+                        f"[Manager] Flood prevention rehydrated from prefs: "
+                        f"target {_flood_prev_val:.0f}% — pre-drain still in progress"
+                    )
+            except (ValueError, TypeError):
+                pass
+
         # Set initial state images for all devices that already exist
         # (deviceStartComm handles newly created devices; this handles existing ones on reload)
         for dev in indigo.devices.iter("self"):
@@ -612,13 +635,15 @@ class Plugin(indigo.PluginBase):
         prev_grid_status = self.store.get("grid_status_prev", "On-grid")
         if prev_grid_status != "On-grid" and new_grid_status == "On-grid":
             restored_at = datetime.now(timezone.utc)
-            self.store["power_restored_time"] = restored_at
+            self.store["power_restored_time"]  = restored_at
+            self.store["power_cut_lockout_active"] = True
             self.pluginPrefs["powerRestoredTime"] = restored_at.isoformat()
             log(
                 f"[PowerCut] Grid restored after outage — export locked for "
                 f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution",
                 level="WARNING",
             )
+            self._trigger_event("powerCutLockoutStarted")
         self.store["grid_status_prev"] = new_grid_status
 
         # Update daily energy accumulators
@@ -709,40 +734,113 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _evaluate_manager(self):
-        """Run the battery manager decision engine and act on the result."""
+        """Run the battery manager decision engine and act on the result.
+
+        Orchestrates:
+          1. resolve power-cut lockout state (and toggle lockout-cleared event)
+          2. compute VPP energy reserve
+          3. build the immutable ManagerSnapshot
+          4. apply seasonal + storm overrides
+          5. evaluate the manager
+          6. log on action change / heartbeat
+          7. verify persistent inverter registers
+          8. act on the decision
+          9. push device state
+        """
         if not self.latest_inverter_data:
             return
 
         soc_pct = self.latest_inverter_data.get("batterySoc", 0.0)
-        prefs   = self.pluginPrefs
 
-        # Build TariffData from latest rates
-        tariff_data = self._build_tariff_data()
+        # 1. Power cut lockout
+        export_enabled = self._resolve_export_lockout()
 
-        # Power cut lockout: suppress export for POWER_CUT_LOCKOUT_HOURS after grid restore
-        export_enabled = bool(prefs.get("exportEnabled", False))
-        prt_str = self.pluginPrefs.get("powerRestoredTime", "")
+        # 2. VPP reserve
+        vpp_reserved_kwh = self._compute_vpp_reserved_kwh()
+
+        # 3. Build snapshot
+        snapshot = self._build_manager_snapshot(
+            soc_pct, export_enabled, vpp_reserved_kwh,
+        )
+
+        # 4. Seasonal + storm overrides (mutates snapshot)
+        self._apply_seasonal_override(snapshot)
+        self._apply_storm_override(snapshot)
+
+        # 5. Evaluate
+        decision = self.manager.evaluate(snapshot)
+        self.latest_decision = decision
+
+        # 6. Log if action changed or heartbeat
+        self._log_manager_decision(decision, snapshot, soc_pct)
+
+        # 7. Verify persistent inverter registers haven't drifted before acting
+        self._verify_ems_registers()
+
+        # 8. Act
+        self._act_on_decision(decision)
+
+        # 9. Push device state
+        self._update_manager_device(decision, snapshot)
+
+    def _resolve_export_lockout(self):
+        """Apply the post-power-cut export lockout (returns export_enabled bool).
+
+        Defensive parsing: a hand-edited or corrupt pluginPrefs value (naive ISO,
+        garbage string, or wrong type) must NEVER fail-open and let export
+        resume during the lockout window. On parse failure we clear the bad
+        value (so it doesn't block forever) and resume normal operation.
+
+        Side effects: updates `power_cut_lockout_active` store flag and fires
+        `powerCutLockoutCleared` trigger event when the lockout transitions
+        from active to cleared.
+        """
+        export_enabled = bool(self.pluginPrefs.get("exportEnabled", False))
+        prt_str        = self.pluginPrefs.get("powerRestoredTime", "")
+        lockout_active = False
+
         if prt_str and export_enabled:
             try:
                 power_restored = datetime.fromisoformat(prt_str)
+                if power_restored.tzinfo is None:
+                    power_restored = power_restored.replace(tzinfo=timezone.utc)
                 hours_since = (datetime.now(timezone.utc) - power_restored).total_seconds() / 3600.0
                 if hours_since < POWER_CUT_LOCKOUT_HOURS:
                     export_enabled = False
-            except (ValueError, TypeError):
-                pass
+                    lockout_active = True
+            except (ValueError, TypeError, AttributeError) as exc:
+                log(
+                    f"[PowerCut] Bad powerRestoredTime in prefs ({exc!r}) — "
+                    f"clearing and resuming normal operation",
+                    level="WARNING",
+                )
+                self.pluginPrefs["powerRestoredTime"] = ""
 
-        # Pre-compute VPP energy reserve for snapshot.
-        # If an event is ANNOUNCED or PRE_CHARGING, protect that kWh from night export.
-        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
-        _vpp_event = self.store.get("vpp_event") or {}
-        _vpp_reserved_kwh = 0.0
-        if _vpp_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING) and _vpp_event:
-            _max_export_kw   = float(prefs.get("maxExportKw", 4.0))
-            _duration_hrs    = _vpp_event.get("duration_hrs", 1.0)
-            _vpp_reserved_kwh = _max_export_kw * _duration_hrs / VPP_DISCHARGE_EFFICIENCY
+        # Detect lockout-cleared transition for Indigo trigger event
+        prev_lockout = bool(self.store.get("power_cut_lockout_active", False))
+        if prev_lockout and not lockout_active:
+            log("[PowerCut] Export lockout cleared — normal operation resumed")
+            self.store["power_cut_lockout_active"] = False
+            self._trigger_event("powerCutLockoutCleared")
+        else:
+            self.store["power_cut_lockout_active"] = lockout_active
 
-        # Build snapshot
-        snapshot = ManagerSnapshot(
+        return export_enabled
+
+    def _compute_vpp_reserved_kwh(self):
+        """Pre-compute kWh that must be reserved for an upcoming VPP event."""
+        vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        vpp_event = self.store.get("vpp_event") or {}
+        if vpp_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING) and vpp_event:
+            max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+            duration_hrs  = vpp_event.get("duration_hrs", 1.0)
+            return max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
+        return 0.0
+
+    def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
+        """Construct the immutable snapshot passed to manager.evaluate()."""
+        prefs = self.pluginPrefs
+        return ManagerSnapshot(
             current_soc_pct    = soc_pct,
             capacity_kwh       = float(prefs.get("batteryCapacityKwh", 35.04)),
             efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
@@ -756,94 +854,86 @@ class Plugin(indigo.PluginBase):
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
             corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
-            tariff                  = tariff_data,
+            tariff                  = self._build_tariff_data(),
             forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
-            dawn_times         = self.latest_forecast_data.get("_dawn_times", {}),
-            consumption_profile = self.store.get("consumption_profile", []),
-            now                = datetime.now(timezone.utc),
+            dawn_times              = self.latest_forecast_data.get("_dawn_times", {}),
+            consumption_profile     = self.store.get("consumption_profile", []),
+            now                     = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             vpp_active                  = self.store["vpp_active"],
-            vpp_reserved_kwh            = _vpp_reserved_kwh,
+            vpp_reserved_kwh            = vpp_reserved_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
             flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
         )
 
-        # --- Seasonal buffer: raise resilience floor Oct-Mar (longer nights, weaker solar) ---
-        # Apr-Sep: summer buffer (dawnSocTarget, default 10%)
-        # Oct-Mar: winter buffer (winterBufferPct, default 20%)
+    def _apply_seasonal_override(self, snapshot):
+        """Raise resilience floor in winter months (Oct–Mar) — longer nights."""
         try:
             import pytz as _pytz_s
-            _local_month = datetime.now(_pytz_s.timezone("Europe/London")).month
+            local_month = datetime.now(_pytz_s.timezone("Europe/London")).month
         except Exception:
-            _local_month = datetime.now().month
+            local_month = datetime.now().month
 
-        if _local_month in (10, 11, 12, 1, 2, 3):
-            _winter_buf = float(prefs.get("winterBufferPct", 20))
-            if _winter_buf > snapshot.dawn_target_pct:
-                snapshot.dawn_target_pct = _winter_buf
+        if local_month in (10, 11, 12, 1, 2, 3):
+            winter_buf = float(self.pluginPrefs.get("winterBufferPct", 20))
+            if winter_buf > snapshot.dawn_target_pct:
+                snapshot.dawn_target_pct = winter_buf
                 log(
-                    f"[Seasonal] Winter buffer active (month {_local_month}): "
-                    f"resilience floor raised to {_winter_buf:.0f}%"
+                    f"[Seasonal] Winter buffer active (month {local_month}): "
+                    f"resilience floor raised to {winter_buf:.0f}%"
                 )
 
-        # --- Storm override: raise dawn target and suppress exports during storms ---
+    def _apply_storm_override(self, snapshot):
+        """Raise dawn target and suppress exports during active storm warnings."""
         storm_level = self.store.get("storm_level", "none")
         if storm_level in ("amber", "red"):
             override_soc = STORM_SOC_AMBER
         elif storm_level == "yellow":
             override_soc = STORM_SOC_YELLOW
         else:
-            override_soc = None
+            return
 
-        if override_soc is not None:
-            snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
-            snapshot.export_enabled  = False   # never export during a storm
+        snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
+        snapshot.export_enabled  = False   # never export during a storm
+        log(
+            f"[Storm] Storm override active (level={storm_level}): "
+            f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
+        )
+
+    def _log_manager_decision(self, decision, snapshot, soc_pct):
+        """Log decisions on action change or 15-min heartbeat only.
+
+        Solar overflow cap shifts are silent Modbus writes — logged only when
+        the action itself changes (overflow starts/stops) or at heartbeat,
+        otherwise sunny days flood the event log with per-cap-tick lines.
+        """
+        last_action    = self.store.get("last_manager_action", "")
+        last_log       = self.store.get("last_manager_log", 0.0)
+        action_changed = decision.action != last_action
+        heartbeat      = (time.time() - last_log) >= MANAGER_LOG_INTERVAL
+
+        if not (action_changed or heartbeat):
+            return
+
+        if decision.action == ACTION_SOLAR_OVERFLOW:
+            # Header on its own line; each continuation is a separate log call
+            # so Indigo renders them as proper rows with the plugin name column
+            # — content then aligns naturally with all other log messages.
             log(
-                f"[Storm] Storm override active (level={storm_level}): "
-                f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
+                f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+                f"Action=solar_overflow"
+            )
+            for line in decision.reason.split("\n"):
+                indigo.server.log(f"  {line}")
+        else:
+            log(
+                f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
+                f"Action={decision.action}  {decision.reason}"
             )
 
-        decision = self.manager.evaluate(snapshot)
-        self.latest_decision = decision
-
-        # Log on: action change or 15-min heartbeat only.
-        # Solar overflow cap shifts are silent Modbus writes — logged only when
-        # the action itself changes (overflow starts/stops) or at heartbeat.
-        # Indigo shows all indigo.server.log() calls regardless of level= parameter,
-        # so any per-cap-change log line would flood the event log during sunny days.
-        _last_action    = self.store.get("last_manager_action", "")
-        _last_log       = self.store.get("last_manager_log", 0.0)
-        _action_changed = decision.action != _last_action
-        _heartbeat      = (time.time() - _last_log) >= MANAGER_LOG_INTERVAL
-
-        if _action_changed or _heartbeat:
-            if decision.action == ACTION_SOLAR_OVERFLOW:
-                # Header on its own line; each continuation is a separate log call so
-                # Indigo renders them as proper rows with the plugin name column —
-                # content then aligns naturally with all other log messages.
-                log(
-                    f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
-                    f"Action=solar_overflow"
-                )
-                for _line in decision.reason.split("\n"):
-                    indigo.server.log(f"  {_line}")
-            else:
-                log(
-                    f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
-                    f"Action={decision.action}  {decision.reason}"
-                )
-            self.store["last_manager_action"] = decision.action
-            self.store["last_manager_log"]    = time.time()
-
-        # Verify persistent inverter registers haven't drifted before acting
-        self._verify_ems_registers()
-
-        # Act on the decision
-        self._act_on_decision(decision)
-
-        # Update batteryManager device states
-        self._update_manager_device(decision, snapshot)
+        self.store["last_manager_action"] = decision.action
+        self.store["last_manager_log"]    = time.time()
 
     # ================================================================
     # Storm Watch
@@ -974,6 +1064,7 @@ class Plugin(indigo.PluginBase):
                     self.store["import_active"]     = True
                     self.store["import_target_soc"] = decision.target_soc_pct
                     self.store["export_active"]     = False
+                    self.store["had_import_today"]  = True   # daily history flag
                     self._trigger_event("emergencyImportTriggered")
 
         elif action == ACTION_STOP_IMPORT:
@@ -1003,10 +1094,14 @@ class Plugin(indigo.PluginBase):
                     # Plugin resets this cutoff on return to self-consumption.
                     if decision.target_soc_pct > 0:
                         self.modbus.set_discharge_cutoff(decision.target_soc_pct)
-                        self.store["flood_prev_target_soc"] = decision.target_soc_pct
+                        self._set_flood_prev_target(decision.target_soc_pct)
                         log(f"[Manager] Discharge cutoff set to {decision.target_soc_pct:.0f}% "
                             f"(flood prevention floor)")
-                    self.store["export_active"] = True
+                        self._trigger_event("floodPreventionStarted")
+                    self.store["export_active"]      = True
+                    self.store["export_count_today"] = (
+                        self.store.get("export_count_today", 0) + 1
+                    )
                     self._trigger_event("exportStarted")
 
         elif action == ACTION_STOP_EXPORT:
@@ -1019,7 +1114,8 @@ class Plugin(indigo.PluginBase):
                     health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
-                    self.store["flood_prev_target_soc"] = None
+                    self._set_flood_prev_target(None)
+                    self._trigger_event("floodPreventionStopped")
                 self.store["export_active"] = False
                 self._trigger_event("exportStopped")
 
@@ -1049,7 +1145,8 @@ class Plugin(indigo.PluginBase):
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% "
                         f"(flood prevention interrupted at dawn)")
-                    self.store["flood_prev_target_soc"] = None
+                    self._set_flood_prev_target(None)
+                    self._trigger_event("floodPreventionStopped")
                 self.modbus.set_charge_limit(cap_w, quiet=True)
                 self.store["solar_overflow_active"]       = True
                 self.store["solar_overflow_charge_cap_w"] = cap_w
@@ -1101,7 +1198,8 @@ class Plugin(indigo.PluginBase):
                     health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
-                    self.store["flood_prev_target_soc"] = None
+                    self._set_flood_prev_target(None)
+                    self._trigger_event("floodPreventionStopped")
                 self.store["export_active"] = False
             elif self.store.get("solar_overflow_active"):
                 # SOC dropped below release threshold — restore full charge rate
@@ -1124,6 +1222,22 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_self_consumption()
                 self.store["import_active"]      = False
                 self.store["import_target_soc"]  = 0.0
+
+    def _set_flood_prev_target(self, target_soc_pct):
+        """Set or clear flood-prevention target SOC, persisted to pluginPrefs.
+
+        Persistence is critical: if the plugin restarts mid-pre-drain, the
+        inverter's HOLD_ESS_DISCHARGE_CUTOFF register is still raised to the
+        target. Without a persisted flag, startup() would lose the state and
+        _verify_ems_registers() would reset the cutoff to the health floor —
+        breaking the in-progress drain. Pass None or 0 to clear.
+        """
+        if target_soc_pct:
+            self.store["flood_prev_target_soc"]    = target_soc_pct
+            self.pluginPrefs["floodPrevTargetSoc"] = str(target_soc_pct)
+        else:
+            self.store["flood_prev_target_soc"]    = None
+            self.pluginPrefs["floodPrevTargetSoc"] = ""
 
     def _verify_ems_registers(self):
         """Read back HOLD_ESS_MAX_DISCHARGE and HOLD_ESS_MAX_CHARGE and correct if wrong.
@@ -1252,6 +1366,7 @@ class Plugin(indigo.PluginBase):
                 self.store["import_active"]      = True
                 self.store["import_target_soc"]  = target_soc
                 self.store["import_scheduled_time"] = None
+                self.store["had_import_today"]   = True   # daily history flag
                 self._trigger_event("emergencyImportTriggered")
 
     # ================================================================
@@ -1881,8 +1996,18 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _check_midnight(self):
-        """Run once-daily tasks at midnight."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        """Run once-daily tasks at local (Europe/London) midnight.
+
+        Naive datetime.now() returns server-local time which may not match
+        Europe/London if the host runs UTC, causing accumulators to roll over
+        on the wrong calendar day around BST/UTC boundaries.
+        """
+        try:
+            import pytz
+            _tz_l = pytz.timezone("Europe/London")
+            today = datetime.now(timezone.utc).astimezone(_tz_l).strftime("%Y-%m-%d")
+        except ImportError:
+            today = datetime.now().strftime("%Y-%m-%d")
         if today == self.store["today_date"]:
             return  # Not yet midnight
 
@@ -2042,6 +2167,22 @@ class Plugin(indigo.PluginBase):
             ACTION_STOP_EXPORT:      "Export Stopping",
         }.get(decision.action, decision.action)
 
+        # Flood prevention visibility (v4.5)
+        flood_target_pct  = self.store.get("flood_prev_target_soc")
+        flood_active      = bool(flood_target_pct)
+
+        # Power cut lockout visibility (v4.5)
+        lockout_active    = bool(self.store.get("power_cut_lockout_active", False))
+        lockout_remain_min = ""
+        if lockout_active:
+            prt = self.store.get("power_restored_time")
+            if prt and isinstance(prt, datetime):
+                # Re-promote to UTC if naive
+                _prt = prt if prt.tzinfo else prt.replace(tzinfo=timezone.utc)
+                _hours_since = (datetime.now(timezone.utc) - _prt).total_seconds() / 3600.0
+                _hours_left  = max(0.0, POWER_CUT_LOCKOUT_HOURS - _hours_since)
+                lockout_remain_min = str(int(round(_hours_left * 60)))
+
         states = [
             {"key": "managerStatus",       "value": "Running" if not self.store["vpp_active"] else "VPP Active"},
             {"key": "currentAction",       "value": action_display},
@@ -2054,6 +2195,10 @@ class Plugin(indigo.PluginBase):
             {"key": "importKwh",           "value": str(round(decision.import_kwh, 2))},
             {"key": "exportActive",        "value": str(self.store["export_active"])},
             {"key": "exportKw",            "value": str(round(decision.export_kw, 1))},
+            {"key": "floodPrevActive",     "value": str(flood_active)},
+            {"key": "floodPrevTarget",     "value": str(flood_target_pct) if flood_active else ""},
+            {"key": "powerCutLockoutActive",        "value": str(lockout_active)},
+            {"key": "powerCutLockoutRemainingMin",  "value": lockout_remain_min},
             {"key": "tariffActive",        "value": snapshot.tariff.tariff_key},
             {"key": "rateToday",           "value": str(snapshot.tariff.today_rate_p or "")},
             {"key": "rateTomorrow",        "value": str(snapshot.tariff.tomorrow_rate_p or "")},
@@ -2652,10 +2797,15 @@ class Plugin(indigo.PluginBase):
         # Modbus
         if self.modbus:
             self.modbus.disconnect()
+        # Pass self.sleep so the Modbus 1-second throttle between reads can be
+        # interrupted by StopThread during plugin shutdown. Without this,
+        # read_all() can block the plugin thread for ~16s and Indigo hard-kills
+        # the plugin if it doesn't respond to StopThread within ~10s.
         self.modbus = SigenergyModbus(
             ip=inv_ip, port=inv_port,
             plant_address=plant_addr, inverter_address=inv_addr,
             logger=self.logger,
+            sleep_func=self.sleep,
         )
         # Startup Modbus initialisations — connect once for all startup writes.
         # HOLD_ESS_MAX_DISCHARGE (40034) persists across mode changes on the inverter.

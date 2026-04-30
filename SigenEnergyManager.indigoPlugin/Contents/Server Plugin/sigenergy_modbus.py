@@ -4,8 +4,8 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026 15:30 GMT
-# Version:     1.4
+# Date:        30-04-2026
+# Version:     1.5
 #
 # Register map verified against Sigenergy Modbus Protocol V2.8 (2025-11-28)
 # Adapted from SigenergySolar v3.1 sigenergy_modbus.py
@@ -13,6 +13,11 @@
 #   - Added set_export_limit(watts) wrapper for register 40038-39
 #   - Fixed read_discharge_cutoff() bugs (throttle, address reference, register offset)
 #   - Updated logger name to SigenEnergyManager
+# v1.5 (30-04-2026):
+#   - sleep_func injection so plugin thread can interrupt long throttle sleeps
+#     during shutdown (read_all does ~16 reads × 1s, was blocking StopThread).
+#   - Writes now mark connection invalid on result.isError() so a failed write
+#     triggers a reconnect on the next operation instead of zombie state.
 
 import logging
 import time
@@ -126,7 +131,8 @@ class SigenergyModbus:
       homePowerWatts:    always >= 0 (calculated: PV + Grid - Battery)
     """
 
-    def __init__(self, ip, port=502, plant_address=247, inverter_address=1, logger=None):
+    def __init__(self, ip, port=502, plant_address=247, inverter_address=1,
+                 logger=None, sleep_func=None):
         self.ip               = ip
         self.port             = port
         self.plant_address    = plant_address
@@ -137,6 +143,11 @@ class SigenergyModbus:
         self._last_connect_attempt = 0
         self._reconnect_delay      = 30
         self._last_request_time    = 0.0
+        # sleep_func: callable taking seconds. When called from a plugin thread,
+        # pass plugin.sleep so StopThread can interrupt the 1s throttle delay
+        # between Modbus requests (read_all does ~16 reads = up to 16s blocking).
+        # Defaults to time.sleep for standalone/test use.
+        self._sleep            = sleep_func or time.sleep
 
     @property
     def connected(self):
@@ -202,10 +213,15 @@ class SigenergyModbus:
     # ================================================================
 
     def _throttle(self):
-        """Enforce 1000ms minimum between Modbus requests per protocol spec."""
+        """Enforce 1000ms minimum between Modbus requests per protocol spec.
+
+        Uses the sleep_func injected at construction time so when called from
+        a plugin thread the sleep can be interrupted by StopThread during
+        shutdown (Indigo hard-kills plugins that don't respond within ~10s).
+        """
         elapsed = time.time() - self._last_request_time
         if elapsed < MIN_REQUEST_INTERVAL:
-            time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+            self._sleep(MIN_REQUEST_INTERVAL - elapsed)
         self._last_request_time = time.time()
 
     # ================================================================
@@ -534,6 +550,10 @@ class SigenergyModbus:
             result = self.client.write_register(address=register, value=value, device_id=slave)
             if result.isError():
                 self.logger.error(f"Failed to write reg {register}={value} (slave {slave}): {result}")
+                # Mark connection invalid so the next operation reconnects.
+                # Without this, a failed write leaves the socket in zombie state
+                # and subsequent writes silently fail.
+                self._connected = False
                 return False
             return True
         except (ModbusException, ConnectionException) as e:
@@ -542,6 +562,7 @@ class SigenergyModbus:
             return False
         except Exception as e:
             self.logger.error(f"Unexpected write error reg {register} (slave {slave}): {e}")
+            self._connected = False
             return False
 
     def _write_uint32_registers(self, register, value, slave=None):
@@ -562,6 +583,8 @@ class SigenergyModbus:
                 self.logger.error(
                     f"Failed to write regs {register}-{register+1}={value} (slave {slave}): {result}"
                 )
+                # Mark connection invalid so the next operation reconnects.
+                self._connected = False
                 return False
             return True
         except (ModbusException, ConnectionException) as e:
@@ -570,6 +593,7 @@ class SigenergyModbus:
             return False
         except Exception as e:
             self.logger.error(f"Unexpected write error regs {register}-{register+1} (slave {slave}): {e}")
+            self._connected = False
             return False
 
     # ================================================================

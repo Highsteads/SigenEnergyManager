@@ -336,7 +336,11 @@ class OpenMeteoForecast:
                 date_str = slot_date.strftime("%Y-%m-%d")
                 if date_str not in dawn_times:
                     if PYTZ_AVAILABLE and LONDON_TZ:
-                        dt_aware = LONDON_TZ.localize(dt_naive)
+                        # is_dst=False handles the autumn fallback ambiguity
+                        # (01:00–02:00 BST exists twice on the last Sunday in
+                        # October). Without it, pytz raises AmbiguousTimeError
+                        # and crashes the forecast parse once a year.
+                        dt_aware = LONDON_TZ.localize(dt_naive, is_dst=False)
                     else:
                         dt_aware = dt_naive
                     dawn_times[date_str] = dt_aware
@@ -619,7 +623,8 @@ class OpenMeteoForecast:
 
         try:
             if PYTZ_AVAILABLE and LONDON_TZ:
-                dt_local = LONDON_TZ.localize(dt_naive)
+                # is_dst=False handles the autumn fallback ambiguity safely
+                dt_local = LONDON_TZ.localize(dt_naive, is_dst=False)
                 dt_utc   = dt_local.astimezone(timezone.utc)
             else:
                 # Fallback: assume BST (UTC+1) — accurate April-October
@@ -710,7 +715,12 @@ class OpenMeteoForecast:
                     if kwh_dict[key] >= PV_GENERATION_THRESHOLD_WH:
                         try:
                             dt_naive = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
-                            dt       = _london.localize(dt_naive) if _london else dt_naive
+                            # is_dst=False to avoid AmbiguousTimeError on
+                            # the autumn fallback Sunday (01:00–02:00 occurs twice).
+                            dt       = (
+                                _london.localize(dt_naive, is_dst=False)
+                                if _london else dt_naive
+                            )
                             date_str = dt_naive.strftime("%Y-%m-%d")
                             if date_str not in dawn_times:
                                 dawn_times[date_str] = dt

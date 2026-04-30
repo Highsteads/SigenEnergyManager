@@ -371,12 +371,25 @@ class OctopusAPI:
         return result
 
     def _parse_tou_slots(self, slots, window):
-        """Parse rate slots into cheap/standard/peak breakdown."""
+        """Parse rate slots into cheap/standard/peak breakdown.
+
+        TARIFF_WINDOWS values (cheap_start, cheap_end, peak times) are LOCAL
+        time strings (Europe/London). Slot timestamps from Octopus are UTC.
+        Convert each slot to Europe/London before comparing — otherwise during
+        BST the cheap window is detected 1 hour earlier than reality.
+        """
         if not slots:
             return {}
 
         cheap_start = window.get("cheap_start", "02:00")
         cheap_end   = window.get("cheap_end", "05:00")
+
+        # Resolve Europe/London timezone once
+        try:
+            import pytz
+            _tz_l = pytz.timezone("Europe/London")
+        except ImportError:
+            _tz_l = None
 
         # Group rates by time window
         cheap_rates    = []
@@ -388,8 +401,14 @@ class OctopusAPI:
                 valid_from = datetime.fromisoformat(
                     slot["valid_from"].replace("Z", "+00:00")
                 )
-                # Use UTC hour for time comparison (rates are in UTC)
-                hour_min = valid_from.strftime("%H:%M")
+                # Convert UTC slot to Europe/London for window comparison.
+                # TARIFF_WINDOWS are stored in local time.
+                if _tz_l is not None:
+                    valid_local = valid_from.astimezone(_tz_l)
+                else:
+                    # Fallback: assume UTC == local (wrong in BST but won't crash)
+                    valid_local = valid_from
+                hour_min = valid_local.strftime("%H:%M")
                 rate     = slot["value_inc_vat"]
             except (KeyError, ValueError):
                 continue
