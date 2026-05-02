@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import platform
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -272,6 +273,13 @@ class Plugin(indigo.PluginBase):
         self.store["last_storm_watch"]    = 0.0    # time.time() of last poll
         self.store["last_energy_var"]     = 0.0    # time.time() of last variable write
         self._energy_var_ids: dict        = {}     # cached variable IDs by name
+
+        # Half-hourly SQLite logging — delta anchors (reset each write)
+        self.store["hh_anchor_pv_kwh"]     = None  # cumulative PV at last slot boundary
+        self.store["hh_anchor_import_kwh"] = None  # cumulative import at last slot boundary
+        self.store["hh_anchor_export_kwh"] = None  # cumulative export at last slot boundary
+        self.store["hh_anchor_home_kwh"]   = None  # cumulative home at last slot boundary
+        self.store["hh_anchor_soc_pct"]    = None  # SOC at start of current slot
         self.store["storm_level"]         = "none" # current storm level
         self.store["storm_alerted_level"] = "none" # level at which alert was sent
 
@@ -318,6 +326,7 @@ class Plugin(indigo.PluginBase):
             )
 
         self._init_modules()
+        self._init_timeseries_db()
         self.forecast.load_correction_factor()
         # Pre-populate latest_forecast_data from disk cache so the first manager
         # evaluation has forecast data available (disk cache was loaded in
@@ -609,8 +618,9 @@ class Plugin(indigo.PluginBase):
             self._check_storm_watch()
             self.store["last_storm_watch"] = now
 
-        # 11. Write energy summary to Indigo variables (every 30 min)
+        # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
         if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
+            self._log_halfhourly_to_db()
             self._write_energy_summary_variables()
             self.store["last_energy_var"] = now
 
@@ -2276,6 +2286,121 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             log(f"[Energy Vars] Could not create '{name}': {exc}", level="WARNING")
             return 0
+
+    def _init_timeseries_db(self):
+        """Create energy_timeseries.db in data_dir if it does not already exist."""
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        try:
+            con = sqlite3.connect(db_path)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS halfhourly (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slot_start       TEXT    NOT NULL UNIQUE,
+                    slot_end         TEXT    NOT NULL,
+                    grid_import_kwh  REAL    NOT NULL DEFAULT 0.0,
+                    grid_export_kwh  REAL    NOT NULL DEFAULT 0.0,
+                    pv_kwh           REAL    NOT NULL DEFAULT 0.0,
+                    home_kwh         REAL    NOT NULL DEFAULT 0.0,
+                    battery_soc_start_pct REAL,
+                    battery_soc_end_pct   REAL,
+                    battery_net_kwh  REAL,
+                    tracker_price_p  REAL,
+                    manager_action   TEXT
+                )
+            """)
+            con.commit()
+            con.close()
+            log(f"[Timeseries] DB ready: {db_path}")
+        except Exception as exc:
+            log(f"[Timeseries] DB init failed: {exc}", level="WARNING")
+
+    def _log_halfhourly_to_db(self):
+        """Append one half-hourly slot to energy_timeseries.db.
+
+        Computes energy deltas since the last write. On the very first call
+        (anchors are None) the deltas would span an unknown period so the
+        row is skipped and anchors are seeded for the next call instead.
+        """
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        if not os.path.exists(db_path):
+            return
+
+        now_dt   = datetime.now()
+        slot_end = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        slot_start_dt = now_dt - timedelta(seconds=ENERGY_VAR_INTERVAL)
+        slot_start = slot_start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        cur_pv     = round(self.store.get("pv_daily_kwh",          0.0), 4)
+        cur_import = round(self.store.get("grid_import_daily_kwh", 0.0), 4)
+        cur_export = round(self.store.get("grid_export_daily_kwh", 0.0), 4)
+        cur_home   = round(self.store.get("home_daily_kwh",        0.0), 4)
+
+        inv_data  = self.latest_inverter_data or {}
+        cur_soc   = float(inv_data.get("batterySoc", 0.0))
+        cap_kwh   = float(self.pluginPrefs.get("batteryCapacityKwh", "35.04"))
+
+        anchor_pv     = self.store.get("hh_anchor_pv_kwh")
+        anchor_import = self.store.get("hh_anchor_import_kwh")
+        anchor_export = self.store.get("hh_anchor_export_kwh")
+        anchor_home   = self.store.get("hh_anchor_home_kwh")
+        anchor_soc    = self.store.get("hh_anchor_soc_pct")
+
+        # Seed anchors on first call — skip writing this slot (unknown period)
+        if anchor_pv is None:
+            self.store["hh_anchor_pv_kwh"]     = cur_pv
+            self.store["hh_anchor_import_kwh"] = cur_import
+            self.store["hh_anchor_export_kwh"] = cur_export
+            self.store["hh_anchor_home_kwh"]   = cur_home
+            self.store["hh_anchor_soc_pct"]    = cur_soc
+            return
+
+        # Guard against midnight reset making deltas negative
+        delta_pv     = max(0.0, round(cur_pv     - anchor_pv,     4))
+        delta_import = max(0.0, round(cur_import - anchor_import,  4))
+        delta_export = max(0.0, round(cur_export - anchor_export,  4))
+        delta_home   = max(0.0, round(cur_home   - anchor_home,    4))
+        battery_net  = round((cur_soc - (anchor_soc or cur_soc)) * cap_kwh / 100.0, 4)
+
+        # Tracker price from tariff monitor device state
+        tracker_p = None
+        try:
+            tariff_dev = self._find_device("tariffMonitor")
+            if tariff_dev:
+                rate_str = tariff_dev.states.get("rateToday", "")
+                if rate_str:
+                    tracker_p = float(rate_str)
+        except Exception:
+            pass
+
+        action = ""
+        if self.latest_decision:
+            action = str(self.latest_decision.action)
+
+        try:
+            con = sqlite3.connect(db_path)
+            con.execute(
+                """INSERT OR IGNORE INTO halfhourly
+                   (slot_start, slot_end,
+                    grid_import_kwh, grid_export_kwh, pv_kwh, home_kwh,
+                    battery_soc_start_pct, battery_soc_end_pct, battery_net_kwh,
+                    tracker_price_p, manager_action)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (slot_start, slot_end,
+                 delta_import, delta_export, delta_pv, delta_home,
+                 anchor_soc, cur_soc, battery_net,
+                 tracker_p, action)
+            )
+            con.commit()
+            con.close()
+        except Exception as exc:
+            log(f"[Timeseries] Write failed: {exc}", level="WARNING")
+
+        # Advance anchors
+        self.store["hh_anchor_pv_kwh"]     = cur_pv
+        self.store["hh_anchor_import_kwh"] = cur_import
+        self.store["hh_anchor_export_kwh"] = cur_export
+        self.store["hh_anchor_home_kwh"]   = cur_home
+        self.store["hh_anchor_soc_pct"]    = cur_soc
 
     def _write_energy_summary_variables(self):
         """
