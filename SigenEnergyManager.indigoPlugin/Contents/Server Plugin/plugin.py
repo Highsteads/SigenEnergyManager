@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        30-04-2026
-# Version:     4.5
+# Date:        02-05-2026
+# Version:     4.6
 
 import indigo
 import json
@@ -60,7 +60,7 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.5"
+PLUGIN_VERSION     = "4.6"
 PLUGIN_NAME        = "Sigenergy Manager"
 WEB_DASHBOARD_PORT = 8179
 
