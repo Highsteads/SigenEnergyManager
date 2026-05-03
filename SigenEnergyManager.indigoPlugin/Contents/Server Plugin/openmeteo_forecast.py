@@ -99,9 +99,8 @@ class OpenMeteoForecast:
     Public interface is identical to SolcastForecast so plugin.py needs only a
     constructor swap (no API key / site ID params).
 
-    Also writes solcast_forecast.json to the Python Scripts folder on every refresh
-    so the battery optimiser script receives up-to-date Open-Meteo data with no
-    changes to the optimiser or its Indigo schedule.
+    Also writes openmeteo_forecast.json to the Python Scripts folder on every refresh
+    so the battery optimiser script receives up-to-date Open-Meteo data.
     """
 
     def __init__(self, data_dir, logger=None):

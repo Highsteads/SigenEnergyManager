@@ -5,8 +5,8 @@
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        25-04-2026
-# Version:     3.1
+# Date:        03-05-2026
+# Version:     3.2
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -68,7 +68,7 @@ MIN_EXPORT_KWH = 0.3
 # Only fires when tomorrow solar >= MULT × tomorrow need (safe to refill without reimport).
 FLOOD_PREV_SOC_THRESHOLD_PCT = 55.0   # min SOC % to trigger overnight pre-drain
 FLOOD_PREV_TARGET_PCT        = 40.0   # drain to this SOC % before sunrise
-FLOOD_PREV_FORECAST_MULT     = 2.0    # tomorrow solar must be >= this × tomorrow need
+FLOOD_PREV_FORECAST_MULT     = 3.0    # tomorrow solar must be >= this × tomorrow need
 
 # Solar overflow constants (daytime forecast-based export)
 # Mode stays 0x02 (Max Self Consumption) throughout.
@@ -973,7 +973,7 @@ class BatteryManager:
         Conditions:
           - Nighttime only (daytime handled by solar overflow)
           - Export MPAN active
-          - tomorrow_solar >= FLOOD_PREV_FORECAST_MULT × tomorrow_need (safe to refill)
+          - tomorrow_solar >= FLOOD_PREV_FORECAST_MULT × tomorrow_need (safe to refill, no reimport risk)
           - Current SOC >= FLOOD_PREV_SOC_THRESHOLD_PCT (worth draining)
           - Effective target < threshold (storm resilience floor not too high)
 
@@ -997,6 +997,8 @@ class BatteryManager:
         # Safety gate: tomorrow must be abundantly sunny to guarantee solar refill.
         # Without this, pre-draining could leave the battery short and force reimport
         # at full Tracker price — wiping out the export revenue.
+        # With export@12p and Tracker import@23p+, reimporting even half the exported
+        # kWh wipes the revenue. Require 3x need so only genuinely excellent days qualify.
         if balance.tomorrow_solar_kwh < FLOOD_PREV_FORECAST_MULT * balance.tomorrow_need_kwh:
             return None
 

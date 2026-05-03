@@ -4,8 +4,8 @@
 # Description: Unit tests for battery_manager.py decision engine
 #              Runs without Indigo installed
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026 22:11 GMT
-# Version:     1.2
+# Date:        03-05-2026
+# Version:     1.3
 
 import sys
 import unittest
@@ -92,6 +92,8 @@ def _make_snapshot(
     corrected_tomorrow_kwh=0.0,
     flood_prev_target_soc=0.0,
     dawn_target_pct=DAWN_TARGET,
+    weekday_kwh=22.0,
+    weekend_kwh=30.0,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -130,6 +132,8 @@ def _make_snapshot(
         consumption_profile    = consumption_profile,
         now                    = _now(hour=now_hour),
         vpp_active             = vpp_active,
+        weekday_kwh            = weekday_kwh,
+        weekend_kwh            = weekend_kwh,
     )
 
 
@@ -608,17 +612,17 @@ class TestNightExport(unittest.TestCase):
 class TestFloodPrevention(unittest.TestCase):
     """Tests for overnight flood prevention pre-drain logic (v4.4).
 
-    Constants: threshold=55%, target=40%, forecast_mult=2.0x
-    Default daily need from consumption_profile [0.30]*48 = 14.4 kWh/day.
-    Flood prevention fires when: tomorrow_solar >= 2 * 14.4 = 28.8 kWh.
-    sunny_tomorrow = 60.0 kWh  (well above 2x threshold)
-    poor_tomorrow  = 20.0 kWh  (below 2x threshold)
+    Constants: threshold=55%, target=40%, forecast_mult=3.0x
+    Daily need pinned to 22.0 kWh via weekday_kwh=22.0, weekend_kwh=22.0 in snapshots.
+    Flood prevention fires when: tomorrow_solar >= 3 * 22.0 = 66.0 kWh.
+    sunny_tomorrow = 70.0 kWh  (well above 3x threshold, pinned need avoids day-of-week fragility)
+    poor_tomorrow  = 20.0 kWh  (below 3x threshold)
     """
 
     def setUp(self):
         self.bm = BatteryManager()
-        self.sunny_tomorrow   = 60.0   # 60 >= 28.8 — triggers flood prevention
-        self.poor_tomorrow    = 20.0   # 20 <  28.8 — blocked
+        self.sunny_tomorrow   = 70.0   # 70 >= 66.0 — triggers flood prevention (3 * 22.0)
+        self.poor_tomorrow    = 20.0   # 20 <  66.0 — blocked
 
     # ── Trigger conditions ─────────────────────────────────────────────────────
 
@@ -629,6 +633,8 @@ class TestFloodPrevention(unittest.TestCase):
             export_enabled         = True,
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -649,7 +655,7 @@ class TestFloodPrevention(unittest.TestCase):
         self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
     def test_flood_prev_blocked_when_forecast_not_abundant(self):
-        """Tomorrow forecast < 2x daily need → don't pre-drain (risk of reimport)."""
+        """Tomorrow forecast < 3x daily need → don't pre-drain (risk of reimport)."""
         snapshot = _make_snapshot(
             soc_pct                = 70.0,
             export_enabled         = True,
@@ -717,6 +723,8 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
             dawn_target_pct        = 50.0,   # storm raised floor
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -745,6 +753,8 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
             max_export_kw          = 3.6,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -763,6 +773,8 @@ class TestFloodPrevention(unittest.TestCase):
             flood_prev_target_soc  = 40.0,
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 23,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 

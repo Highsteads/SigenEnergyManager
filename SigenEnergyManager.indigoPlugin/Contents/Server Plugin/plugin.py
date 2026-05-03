@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        02-05-2026
-# Version:     4.6
+# Date:        03-05-2026
+# Version:     4.7
 
 import indigo
 import json
@@ -912,31 +912,32 @@ class Plugin(indigo.PluginBase):
         )
 
     def _log_manager_decision(self, decision, snapshot, soc_pct):
-        """Log decisions on action change or 15-min heartbeat only.
+        """Log decisions on action change; heartbeat suppressed for solar_overflow.
 
-        Solar overflow cap shifts are silent Modbus writes — logged only when
-        the action itself changes (overflow starts/stops) or at heartbeat,
-        otherwise sunny days flood the event log with per-cap-tick lines.
+        Solar overflow runs for hours on sunny days — logging it on a 15-min
+        heartbeat floods the event log with identical lines. It is logged once
+        when it starts and once when it ends. Other actions keep the heartbeat
+        so transient states (import, export, self-consuming) remain visible.
         """
         last_action    = self.store.get("last_manager_action", "")
         last_log       = self.store.get("last_manager_log", 0.0)
         action_changed = decision.action != last_action
-        heartbeat      = (time.time() - last_log) >= MANAGER_LOG_INTERVAL
-
-        if not (action_changed or heartbeat):
-            return
 
         if decision.action == ACTION_SOLAR_OVERFLOW:
-            # Header on its own line; each continuation is a separate log call
-            # so Indigo renders them as proper rows with the plugin name column
-            # — content then aligns naturally with all other log messages.
+            # Only log solar_overflow on action change; suppress heartbeat repeats.
+            if not action_changed:
+                return
             log(
                 f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
                 f"Action=solar_overflow"
             )
-            for line in decision.reason.split("\n"):
-                indigo.server.log(f"  {line}")
+            if self.debug:
+                for line in decision.reason.split("\n"):
+                    indigo.server.log(f"  {line}")
         else:
+            heartbeat = (time.time() - last_log) >= MANAGER_LOG_INTERVAL
+            if not (action_changed or heartbeat):
+                return
             log(
                 f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
                 f"Action={decision.action}  {decision.reason}"
@@ -1392,7 +1393,6 @@ class Plugin(indigo.PluginBase):
         self.latest_forecast_data = data
 
         self._update_forecast_device(data)
-        self._update_forecast_variables(data)
 
         status   = data.get("forecastStatus", "")
         tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
@@ -1401,7 +1401,7 @@ class Plugin(indigo.PluginBase):
             log(f"[Solar] WARNING: forecast unavailable ({status}) — night export condition 3 will block", level="WARNING")
         elif tmrw_kwh == 0.0:
             log(f"[Solar] WARNING: tomorrow forecast is 0.0 kWh (status: {status!r}) — night export condition 3 will block", level="WARNING")
-        else:
+        elif self.debug:
             log(
                 f"[Solar] Today: {data.get('correctedTodayKwh', 0):.1f} kWh "
                 f"(raw {data.get('todayKwh', 0):.1f}, bias {data.get('biasFactor', 1):.3f}), "
@@ -2234,23 +2234,6 @@ class Plugin(indigo.PluginBase):
             {"key": "lastUpdate",           "value": data.get("lastUpdate", "")},
         ]
         dev.updateStatesOnServer(states)
-
-    def _update_forecast_variables(self, data):
-        """Write solar forecast totals to Indigo variables in the Sigenergy folder."""
-        today_kwh    = data.get("correctedTodayKwh",   0.0)
-        tomorrow_kwh = data.get("correctedTomorrowKwh", 0.0)
-        now_str      = datetime.now().strftime("%H:%M %d/%m/%Y")
-
-        updates = [
-            (1085965464, str(today_kwh)),    # solcast_today_kwh
-            (1029984958, str(tomorrow_kwh)), # solcast_tomorrow_kwh
-            (1287165951, now_str),           # solcast_last_updated
-        ]
-        for var_id, value in updates:
-            try:
-                indigo.variable.updateValue(var_id, value)
-            except Exception as e:
-                log(f"[Solar] Variable update failed (id {var_id}): {e}", level="WARNING")
 
     def _sigenergy_folder_id(self) -> int:
         """Return the Sigenergy variable folder ID, or 0 (root) if not found."""
