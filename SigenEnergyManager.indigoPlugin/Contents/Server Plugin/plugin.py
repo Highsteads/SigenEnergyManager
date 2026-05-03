@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        03-05-2026
-# Version:     4.7
+# Version:     4.8
 
 import indigo
 import json
@@ -72,7 +72,6 @@ HOME_PROFILE_MIN_READINGS = 5
 # Polling intervals (seconds)
 MODBUS_POLL_INTERVAL      = 60
 MANAGER_EVAL_INTERVAL     = 60    # evaluate every Modbus poll cycle
-MANAGER_LOG_INTERVAL      = 900   # heartbeat log every 15 min even if action unchanged
 FORECAST_FETCH_INTERVAL   = 1800  # 30 minutes (Open-Meteo: 10,000 calls/day free)
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
@@ -233,7 +232,6 @@ class Plugin(indigo.PluginBase):
         self.store["last_vpp"]            = 0.0
         self.store["last_acc_save"]       = 0.0
         self.store["last_manager_action"] = ""
-        self.store["last_manager_log"]    = 0.0
         self.store["last_overflow_cap_w"] = 0
 
         # Daily energy accumulators (kWh, reset at midnight)
@@ -912,19 +910,11 @@ class Plugin(indigo.PluginBase):
         )
 
     def _log_manager_decision(self, decision, snapshot, soc_pct):
-        """Log decisions on action change; heartbeat suppressed for solar_overflow.
-
-        Solar overflow runs for hours on sunny days — logging it on a 15-min
-        heartbeat floods the event log with identical lines. It is logged once
-        when it starts and once when it ends. Other actions keep the heartbeat
-        so transient states (import, export, self-consuming) remain visible.
-        """
+        """Log manager decisions only on action change — no periodic heartbeat."""
         last_action    = self.store.get("last_manager_action", "")
-        last_log       = self.store.get("last_manager_log", 0.0)
         action_changed = decision.action != last_action
 
         if decision.action == ACTION_SOLAR_OVERFLOW:
-            # Only log solar_overflow on action change; suppress heartbeat repeats.
             if not action_changed:
                 return
             log(
@@ -935,8 +925,7 @@ class Plugin(indigo.PluginBase):
                 for line in decision.reason.split("\n"):
                     indigo.server.log(f"  {line}")
         else:
-            heartbeat = (time.time() - last_log) >= MANAGER_LOG_INTERVAL
-            if not (action_changed or heartbeat):
+            if not action_changed:
                 return
             log(
                 f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
@@ -944,7 +933,6 @@ class Plugin(indigo.PluginBase):
             )
 
         self.store["last_manager_action"] = decision.action
-        self.store["last_manager_log"]    = time.time()
 
     # ================================================================
     # Storm Watch
