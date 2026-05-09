@@ -196,20 +196,26 @@ class OpenMeteoForecast:
         else:
             self._morning_forecast_kwh = 0.0
 
-    def record_accuracy(self, actual_pv_kwh):
+    def record_accuracy(self, actual_pv_kwh, date_str=None):
         """Record today's forecast vs actual PV for bias correction.
 
         Call this at midnight after the daily energy accumulator is finalised.
 
         Args:
             actual_pv_kwh: Actual PV generation today (kWh from Modbus accumulators).
+            date_str:      Date string "YYYY-MM-DD" for the day being recorded.
+                           Pass yesterday's date from _check_midnight to avoid
+                           the off-by-one that occurs when datetime.now() has
+                           already rolled over to the new day.
         """
         if self._morning_forecast_kwh <= 0.0:
             self.logger.debug("[OpenMeteo] No morning forecast captured — skipping record")
             return
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        month_str = datetime.now().strftime("%Y-%m")
+        if date_str is None:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = date_str
+        month_str = today_str[:7]
 
         record = {
             "date":         today_str,

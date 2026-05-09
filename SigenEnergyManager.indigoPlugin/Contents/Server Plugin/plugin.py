@@ -2016,8 +2016,9 @@ class Plugin(indigo.PluginBase):
         # Capture morning forecast for bias correction (00:05 next run)
         self.forecast.capture_morning_forecast()
 
-        # Write accuracy record for yesterday
-        self.forecast.record_accuracy(self.store["pv_daily_kwh"])
+        # Write accuracy record for yesterday (pass date explicitly — datetime.now()
+        # inside record_accuracy would give the new day, stamping records one day ahead)
+        self.forecast.record_accuracy(self.store["pv_daily_kwh"], date_str=yesterday)
 
         # Write daily history ring buffer
         self._write_daily_history(yesterday)

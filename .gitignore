@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 SigenEnergyManager.indigoPlugin/Contents/Packages/
 *.zip
+
+# Claude Code context file — local only
+CLAUDE.md
