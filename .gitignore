@@ -1,5 +1,7 @@
 secrets.py
+IndigoSecrets.py
 **/secrets.py
+**/IndigoSecrets.py
 __pycache__/
 *.pyc
 *.pyo

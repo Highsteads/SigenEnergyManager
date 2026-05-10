@@ -156,3 +156,22 @@ AXLE_API_TOKEN = ""
 #                        VPP event ends).
 DASHBOARD_HOST     = ""
 AXLE_SUPPORT_EMAIL = ""
+
+# ============================
+# Claude Bridge plugin (optional)
+# Required by: Claude Bridge plugin (com.clives.indigoplugin.claudebridge)
+# CLAUDEBRIDGE_BEARER_TOKEN - the IWS bearer token used by the stdio MCP proxy
+# Get it from Indigo: copy the first entry of /Library/Application Support/
+# Perceptive Automation/Indigo 2025.x/Preferences/secrets.json
+# ============================
+CLAUDEBRIDGE_BEARER_TOKEN = ""
+
+# ============================
+# InfluxDB (optional)
+# Required by: Claude Bridge plugin (historical_analysis MCP tools)
+# ============================
+INFLUXDB_HOST     = ""
+INFLUXDB_PORT     = 8086
+INFLUXDB_USERNAME = ""
+INFLUXDB_PASSWORD = ""
+INFLUXDB_DATABASE = ""

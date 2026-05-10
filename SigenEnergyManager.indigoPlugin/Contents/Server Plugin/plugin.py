@@ -25,36 +25,45 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "/Library/Application Support/Perceptive Automation")
+# Master credentials file: IndigoSecrets.py at
+# /Library/Application Support/Perceptive Automation/IndigoSecrets.py
+# (renamed from `secrets.py` on 10-May-2026 — see feedback_secrets_module_shadowing.md
+# for why: avoid colliding with Python's stdlib `secrets` module).
+# Per-key try/except so a missing single key does not blank the others.
 try:
-    from secrets import (
-        OCTOPUS_API_KEY, OCTOPUS_ACCOUNT, OCTOPUS_MPAN, OCTOPUS_SERIAL,
-        AXLE_API_KEY,
-    )
+    from IndigoSecrets import OCTOPUS_API_KEY
 except ImportError:
     OCTOPUS_API_KEY = ""
-    OCTOPUS_ACCOUNT = ""
-    OCTOPUS_MPAN    = ""
-    OCTOPUS_SERIAL  = ""
-    AXLE_API_KEY    = ""
-
-# Optional secrets — keep separate so a missing key doesn't break the bulk import.
 try:
-    from secrets import PUSHOVER_USER_TOKEN
+    from IndigoSecrets import OCTOPUS_ACCOUNT
+except ImportError:
+    OCTOPUS_ACCOUNT = ""
+try:
+    from IndigoSecrets import OCTOPUS_MPAN
+except ImportError:
+    OCTOPUS_MPAN = ""
+try:
+    from IndigoSecrets import OCTOPUS_SERIAL
+except ImportError:
+    OCTOPUS_SERIAL = ""
+try:
+    from IndigoSecrets import AXLE_API_KEY
+except ImportError:
+    AXLE_API_KEY = ""
+try:
+    from IndigoSecrets import PUSHOVER_USER_TOKEN
 except ImportError:
     PUSHOVER_USER_TOKEN = ""
-
 try:
-    from secrets import SIGENERGY_IP
+    from IndigoSecrets import SIGENERGY_IP
 except ImportError:
     SIGENERGY_IP = ""
-
 try:
-    from secrets import DASHBOARD_HOST
+    from IndigoSecrets import DASHBOARD_HOST
 except ImportError:
     DASHBOARD_HOST = ""
-
 try:
-    from secrets import AXLE_SUPPORT_EMAIL
+    from IndigoSecrets import AXLE_SUPPORT_EMAIL
 except ImportError:
     AXLE_SUPPORT_EMAIL = ""
 
