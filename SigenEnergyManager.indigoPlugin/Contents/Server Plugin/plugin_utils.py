@@ -4,8 +4,13 @@
 # Description: Shared utilities for all Indigo plugins (CliveS / Highsteads)
 #              Import via sys.path.insert using the same pattern as secrets.py
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        27-03-2026
-# Version:     1.0
+# Date:        10-05-2026
+# Version:     1.1
+#
+# v1.1 (10-05-2026): Banner width reduced 110 -> 60 chars and label column
+# tightened 28 -> 20 chars.  Indigo prefixes every log line with the plugin
+# name (~30 chars), so a 110-char banner total exceeded most terminal widths
+# and wrapped to two lines per row.
 
 import indigo
 import platform
@@ -39,25 +44,31 @@ def log_startup_banner(plugin_id, display_name, version, extras=None):
             indigo.server.log(f"{pluginDisplayName} v{pluginVersion} starting")
     """
     title = f"Starting {display_name} Plugin"
-    width = 110
-    pad   = (width - len(title) - 2) // 2
-    mid   = f"{'=' * pad} {title} {'=' * (width - pad - len(title) - 2)}"
+    width = 60
+    # Centre the title within the bar; if title is longer than the bar (very
+    # long plugin names) just emit the title on its own line.
+    if len(title) + 4 <= width:
+        pad   = (width - len(title) - 2) // 2
+        mid   = f"{'=' * pad} {title} {'=' * (width - pad - len(title) - 2)}"
+    else:
+        mid   = title
     bar   = "=" * width
+    label_w = 20
 
     indigo.server.log(bar)
     indigo.server.log(mid)
     indigo.server.log(bar)
-    indigo.server.log(f"  {'Plugin Name:':<28} {display_name}")
-    indigo.server.log(f"  {'Plugin Version:':<28} {version}")
-    indigo.server.log(f"  {'Plugin ID:':<28} {plugin_id}")
-    indigo.server.log(f"  {'Indigo Version:':<28} {indigo.server.version}")
-    indigo.server.log(f"  {'Indigo API Version:':<28} {indigo.server.apiVersion}")
-    indigo.server.log(f"  {'Architecture:':<28} {platform.machine()}")
-    indigo.server.log(f"  {'Python Version:':<28} {platform.python_version()}")
-    indigo.server.log(f"  {'macOS Version:':<28} {platform.mac_ver()[0]}")
+    indigo.server.log(f"  {'Plugin Name:':<{label_w}} {display_name}")
+    indigo.server.log(f"  {'Plugin Version:':<{label_w}} {version}")
+    indigo.server.log(f"  {'Plugin ID:':<{label_w}} {plugin_id}")
+    indigo.server.log(f"  {'Indigo Version:':<{label_w}} {indigo.server.version}")
+    indigo.server.log(f"  {'Indigo API Version:':<{label_w}} {indigo.server.apiVersion}")
+    indigo.server.log(f"  {'Architecture:':<{label_w}} {platform.machine()}")
+    indigo.server.log(f"  {'Python Version:':<{label_w}} {platform.python_version()}")
+    indigo.server.log(f"  {'macOS Version:':<{label_w}} {platform.mac_ver()[0]}")
 
     if extras:
         for label, value in extras:
-            indigo.server.log(f"  {label:<28} {value}")
+            indigo.server.log(f"  {label:<{label_w}} {value}")
 
     indigo.server.log(bar)
