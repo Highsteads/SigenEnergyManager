@@ -14,7 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
-| 4.9 | 10-May-2026 | Plugin version is now read dynamically from Info.plist (`self.pluginVersion`) — single source of truth, no separate Python constant. Pushover action calls fixed: action ID `send` (was `sendPushover`), correct prop keys `msgTitle`/`msgBody`/`msgUser`/`msgPriority`/`msgSound`. Implemented `triggerStartProcessing` / `triggerStopProcessing` lifecycle so all custom Indigo trigger events (`emergencyImportTriggered`, `exportStarted/Stopped`, `vppAnnounced/Started/Ended`, `floodPreventionStarted/Stopped`, `powerCutLockoutStarted/Cleared`) now fire correctly via `indigo.trigger.execute(trigger_object)`. Moved hardcoded IPs and the Axle support email to `IndigoSecrets.py`: `SIGENERGY_IP`, `DASHBOARD_HOST`, `AXLE_SUPPORT_EMAIL`, `PUSHOVER_USER_TOKEN`. Each has a PluginConfig fallback and logs an ERROR if neither source is set. Dashboard URL auto-detects the LAN IP via socket when no override is configured. Swallowed-failure log levels promoted from WARNING to ERROR (trigger execute fail, dashboard stop, VPP email, Timeseries DB init/write). `_init_modules()` now initialises forecast/Octopus/Axle before the inverter-IP check so a missing IP only skips Modbus instead of crashing startup. |
+| 4.9 | 10-May-2026 | Plugin version is now read dynamically from Info.plist (`self.pluginVersion`) — single source of truth, no separate Python constant. Pushover action calls fixed: action ID `send` (was `sendPushover`), correct prop keys `msgTitle`/`msgBody`/`msgUser`/`msgPriority`/`msgSound`. Implemented `triggerStartProcessing` / `triggerStopProcessing` lifecycle so all custom Indigo trigger events (`emergencyImportTriggered`, `exportStarted/Stopped`, `vppAnnounced/Started/Ended`, `floodPreventionStarted/Stopped`, `powerCutLockoutStarted/Cleared`) now fire correctly via `indigo.trigger.execute(trigger_object)`. Moved hardcoded IPs and the Axle support email to `secrets.py`: `SIGENERGY_IP`, `DASHBOARD_HOST`, `AXLE_SUPPORT_EMAIL`, `PUSHOVER_USER_TOKEN`. Each has a PluginConfig fallback and logs an ERROR if neither source is set. Dashboard URL auto-detects the LAN IP via socket when no override is configured. Swallowed-failure log levels promoted from WARNING to ERROR (trigger execute fail, dashboard stop, VPP email, Timeseries DB init/write). `_init_modules()` now initialises forecast/Octopus/Axle before the inverter-IP check so a missing IP only skips Modbus instead of crashing startup. |
 | 4.8 | 03-May-2026 | Remove 15-minute heartbeat log — only log on action change (web dashboard covers live status). |
 | 4.7 | 02-May-2026 | Remove Solcast code/variables (Open-Meteo only); raise FLOOD_PREV_FORECAST_MULT 2.0 → 3.0; delete test_overnight.py. |
 | 4.6 | 01-May-2026 | Half-hourly SQLite energy logging for TariffAnalyser feed. |
@@ -62,23 +62,23 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ## Configuration
 
-### Credentials — `IndigoSecrets.py` vs `IndigoSecrets_example.py`
+### Credentials — `secrets.py` vs `secrets_example.py`
 
 There are **two** files involved, and only one of them holds your real values:
 
 | File | Purpose | Contains real data? | Committed to GitHub? |
 |------|---------|---------------------|----------------------|
-| `IndigoSecrets.py` | The **working file** the plugin reads at runtime. Lives at `/Library/Application Support/Perceptive Automation/IndigoSecrets.py`. Keep a backup in a password manager. | YES | **NO** — listed in `.gitignore`, never pushed. |
-| `IndigoSecrets_example.py` | **Template only** — empty placeholders so users know which keys to set. Shipped inside the plugin bundle. | NO | YES — public on GitHub. |
+| `secrets.py` | The **working file** the plugin reads at runtime. Lives at `/Library/Application Support/Perceptive Automation/secrets.py`. Keep a backup in a password manager. | YES | **NO** — listed in `.gitignore`, never pushed. |
+| `secrets_example.py` | **Template only** — empty placeholders so users know which keys to set. Shipped inside the plugin bundle. | NO | YES — public on GitHub. |
 
 **Setup:**
 
-1. If you already have `IndigoSecrets.py`, just add the keys below to it.
-2. If you do not, copy `IndigoSecrets_example.py` (inside the plugin bundle) to
-   `/Library/Application Support/Perceptive Automation/`, rename it to `IndigoSecrets.py`,
+1. If you already have `secrets.py`, just add the keys below to it.
+2. If you do not, copy `secrets_example.py` (inside the plugin bundle) to
+   `/Library/Application Support/Perceptive Automation/`, rename it to `secrets.py`,
    and fill in your values.
-3. Or skip `IndigoSecrets.py` entirely and enter values via the plugin's configuration
-   dialog (Indigo menu → Plugins → Sigenergy Manager → Configure). `IndigoSecrets.py`
+3. Or skip `secrets.py` entirely and enter values via the plugin's configuration
+   dialog (Indigo menu → Plugins → Sigenergy Manager → Configure). `secrets.py`
    wins over the dialog when both are set.
 
 If neither source provides a value the plugin logs an ERROR for the missing item
