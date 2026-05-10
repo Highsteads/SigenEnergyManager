@@ -1,42 +1,158 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 # Filename:    secrets_example.py
-# Description: Template for SigenEnergyManager credentials.
-#              Add the keys below to the MASTER secrets.py at:
+# Description: Template for secrets.py — copy to secrets.py and fill in your values.
+#              secrets.py lives at:
 #                  /Library/Application Support/Perceptive Automation/secrets.py
-#              Do NOT rename this file — it is a template only.
-#              secrets.py is listed in .gitignore and will never be committed.
-#
-#              If you do not yet have a secrets.py:
-#                Copy this file to the path above, rename it to secrets.py,
-#                and fill in your values.
-#
-#              If you already have a secrets.py:
-#                Add just the keys below to your existing file.
-#
+#              It is NEVER committed to git. Keep a backup in a password manager.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        03-04-2026
-# Version:     1.1
+# Date:        24-03-2026
+# Version:     1.0
 
 # ============================================================
+# HOW THIS FILE WORKS
+# ============================================================
+#
+# This is the MASTER credentials template for all CliveS Indigo plugins.
+#
+# WHY IT EXISTS
+# Each plugin needs API keys and passwords to connect to external services.
+# Rather than storing credentials separately in every plugin, or re-entering
+# them each time via the Indigo config dialog, all plugins share a single
+# secrets.py at this version-stable path:
+#
+#     /Library/Application Support/Perceptive Automation/secrets.py
+#
+# This path never changes when Indigo is upgraded — unlike paths inside the
+# Indigo version folder (e.g. .../Indigo 2025.1/...) which change each release.
+#
+# HOW PLUGINS USE IT
+# Each plugin does: sys.path.insert(0, "/Library/Application Support/Perceptive Automation")
+# then: from secrets import KEY_NAME
+# If secrets.py is missing or a key is absent, the plugin falls back to the
+# value entered in its own configuration dialog (Plugins → Plugin Name → Configure).
+#
+# NOTE: Indigo also has a built-in "secrets.json" in its Preferences folder,
+# but that is only for authenticating HTTP requests to Indigo's own web server.
+# It is a flat list of tokens with no names — not suitable for storing plugin
+# credentials. Our secrets.py is a separate, purpose-built solution.
+#
+# FIRST-TIME SETUP
+# Copy this file to:
+#     /Library/Application Support/Perceptive Automation/secrets.py
+# Fill in the values for the plugins you use. You only need the sections for
+# plugins you have installed.
+#
+# SECURITY
+# secrets.py is listed in .gitignore on every plugin repo and will NEVER be
+# committed to git. Keep a backup copy in a password manager.
+#
+# ============================================================
+
+# ============================
+# Anthropic (Claude API)
+# Required by: Claude Bridge plugin
+# ============================
+ANTHROPIC_API_KEY = "sk-ant-..."
+
+# ============================
 # Octopus Energy
-# Your API key: https://octopus.energy/dashboard/new/accounts/personal-details/api-access
-# ============================================================
-OCTOPUS_API_KEY = "your-octopus-api-key-here"
+# Required by: OctopusAccountReader plugin
+# ============================
+OCTOPUS_API_KEY = "sk_live_..."
 OCTOPUS_ACCOUNT = "A-XXXXXXXX"
-OCTOPUS_MPAN    = "1012345678901"   # 13-digit electricity MPAN
-OCTOPUS_SERIAL  = "XXXXXXXX"       # electricity meter serial
+OCTOPUS_MPAN    = ""
+OCTOPUS_SERIAL  = ""
 
-# ============================================================
-# Solcast (Hobbyist plan — 2 sites, 10 API calls/day/site)
-# Register at: https://toolkit.solcast.com.au/register/hobbyist
-# ============================================================
-SOLCAST_API_KEY   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-SOLCAST_SITE_1_ID = "xxxx-xxxx-xxxx-xxxx"   # first rooftop site resource ID
-SOLCAST_SITE_2_ID = "xxxx-xxxx-xxxx-xxxx"   # second rooftop site resource ID
+# ============================
+# Octopus Energy - Gas (optional)
+# ============================
+OCTOPUS_GAS_MPRN   = ""
+OCTOPUS_GAS_SERIAL = ""
 
-# ============================================================
-# Axle VPP (optional — only needed if participating in Axle Virtual Power Plant)
-# ============================================================
-AXLE_API_KEY   = ""   # Bearer token from Axle signup
-AXLE_CLIENT_ID = ""   # Axle client ID (if required)
+# ============================
+# Octopus Energy - Export (optional, add when known)
+# ============================
+# OCTOPUS_EXPORT_MPAN   = ""
+# OCTOPUS_EXPORT_SERIAL = ""
+
+# ============================
+# Home Assistant
+# ============================
+HA_URL   = "http://192.168.x.x:8123"
+HA_TOKEN = ""
+
+# ============================
+# OpenWeatherMap (optional)
+# ============================
+OWM_API_KEY = ""
+
+# ============================
+# EvoHome (optional)
+# ============================
+EVOHOME_USER     = ""
+EVOHOME_PASSWORD = ""
+
+# ============================
+# Pushover (optional)
+# ============================
+PUSHOVER_USER_TOKEN = ""
+
+# ============================
+# MQTT (optional)
+# ============================
+MQTT_BROKER   = "192.168.x.x"
+MQTT_PORT     = 1883
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
+
+# ============================
+# Location
+# Required by: SigenergySolar, weather integrations
+# ============================
+LATITUDE  = 0.0
+LONGITUDE = 0.0
+
+# ============================
+# Sigenergy Inverter (Modbus TCP)
+# Required by: SigenergySolar plugin
+# ============================
+SIGENERGY_IP               = ""        # e.g. 192.168.x.x
+SIGENERGY_PORT             = 502
+SIGENERGY_ADDRESS          = 247
+SIGENERGY_INVERTER_ADDRESS = 1
+
+# ============================
+# Solcast (Solar Forecast API)
+# Required by: SigenergySolar plugin
+# ============================
+SOLCAST_API_KEY = ""
+
+SOLCAST_SITES = [
+    {"name": "Site1", "resource_id": ""},
+    {"name": "Site2", "resource_id": ""},
+]
+
+# ============================
+# Octopus Energy - Export rates
+# ============================
+EXPORT_RATE_P = 15.0    # p/kWh flat export rate
+
+# ============================
+# Axle VPP (optional)
+# Required by: SigenergySolar plugin (Axle VPP feature)
+# ============================
+AXLE_API_TOKEN = ""
+
+# ============================
+# Sigenergy Energy Manager — extras (optional)
+# Required by: SigenEnergyManager plugin
+# ============================
+# DASHBOARD_HOST       — host shown in the "[Web] Dashboard at http://..." log
+#                        line.  Leave blank to auto-detect the LAN IP.
+# AXLE_SUPPORT_EMAIL   — email address used by the VPP "inverter not released"
+#                        escalation alert (sent if Axle has not returned the
+#                        inverter to self-consumption mode 45 minutes after a
+#                        VPP event ends).
+DASHBOARD_HOST     = ""
+AXLE_SUPPORT_EMAIL = ""

@@ -5,7 +5,10 @@
     <Field id="label_modbus" type="label">
         <Label>MODBUS CONNECTION (Sigenergy Inverter)</Label>
     </Field>
-    <Field id="inverterIp" type="textfield" defaultValue="192.168.100.49">
+    <Field id="label_modbus_info" type="label">
+        <Label>The inverter IP can also be set in secrets.py as SIGENERGY_IP (which takes priority over the value below).</Label>
+    </Field>
+    <Field id="inverterIp" type="textfield" defaultValue="">
         <Label>Inverter IP address:</Label>
     </Field>
     <Field id="modbusPort" type="textfield" defaultValue="502">
@@ -119,6 +122,28 @@
     </Field>
     <Field id="axleApiKey" type="textfield" defaultValue="" visibleBindingId="axleEnabled" visibleBindingValue="true">
         <Label>Axle API token (Bearer):</Label>
+    </Field>
+
+    <Field id="separator_pushover" type="separator"/>
+    <Field id="label_pushover" type="label">
+        <Label>PUSHOVER NOTIFICATIONS (credentials in secrets.py take priority)</Label>
+    </Field>
+    <Field id="label_pushover_info" type="label">
+        <Label>Pushover alerts are sent for storm warnings and VPP release failures. The Pushover Indigo plugin must be installed and enabled. Provide the recipient user/group key here OR in secrets.py as PUSHOVER_USER_TOKEN. If neither is set, alerts will be skipped and a warning will be logged.</Label>
+    </Field>
+    <Field id="pushoverUserToken" type="textfield" defaultValue="">
+        <Label>Pushover user/group key:</Label>
+    </Field>
+
+    <Field id="separator_dashboard" type="separator"/>
+    <Field id="label_dashboard" type="label">
+        <Label>WEB DASHBOARD</Label>
+    </Field>
+    <Field id="label_dashboard_info" type="label">
+        <Label>The dashboard runs on this Indigo server. Leave the host blank to auto-detect the LAN IP, or set DASHBOARD_HOST in secrets.py / fill it in below to override (e.g. a hostname or static IP visible to your other devices).</Label>
+    </Field>
+    <Field id="dashboardHost" type="textfield" defaultValue="">
+        <Label>Dashboard host (blank = auto-detect):</Label>
     </Field>
 
     <Field id="separator_debug" type="separator"/>

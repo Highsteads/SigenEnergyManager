@@ -14,14 +14,11 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
-| 4.5 | 30-Apr-2026 | Renamed display name to **Sigenergy Manager** (bundle ID unchanged — no data migration). **Critical fix**: `flood_prev_target_soc` now persisted to pluginPrefs and rehydrated on startup so a mid-pre-drain plugin restart no longer leaves the inverter discharge cutoff register raised while the in-memory flag is empty (which would let `_verify_ems_registers` reset the cutoff and break the drain). **Critical fix**: Modbus throttle now uses an injected sleep callable (`self.sleep`) instead of `time.sleep` so the 1s-per-request protocol delay is interruptible by `StopThread` during plugin shutdown — Indigo no longer hard-kills the plugin during shutdown after a long Modbus poll. Other fixes: Tracker defer schedules at Europe/London midnight (not UTC midnight, was 01:00 BST in summer); Octopus TOU bucketing converts UTC slots to local time before window comparison (fixes 1h-off cheap-window detection in BST); `pytz.localize(is_dst=False)` on dawn-time keys prevents annual `AmbiguousTimeError` crash on the autumn fallback Sunday; Modbus writes now invalidate the connection on `result.isError()` (no more zombie sockets after a failed write); `_check_midnight` uses Europe/London not server-local time; defensive parsing of `powerRestoredTime` clears corrupt prefs values. New: 4 device states on Battery Manager (`floodPrevActive`, `floodPrevTarget`, `powerCutLockoutActive`, `powerCutLockoutRemainingMin`) for visibility. New: 4 trigger events (`floodPreventionStarted`/`Stopped`, `powerCutLockoutStarted`/`Cleared`). `had_import_today` and `export_count_today` daily-history counters now actually wired up (were always 0 before). Refactored `_evaluate_manager` into 6 helper methods. Removed dead code (`VPP_RESERVE_KWH`, `_check_night_export` stub, misleading "deprecated" comment on `ACTION_START_EXPORT`). 51 unit tests, all pass. |
-| 3.1 | 06-Apr-2026 | Energy summary variables (9 `sigen_today_*` vars written every 30 min and at midnight — PV, import, export, consumption, self-sufficiency, peak/min SOC, last decision). Storm watch: polls MeteoAlarm CAP feed every 2h; raises dawn SOC target to 50% (yellow) or 80% (amber/red) and suppresses export during active storm warnings covering Medomsley. Power cut lockout: off-grid→on-grid transition blocks export for 4h. Real-time solar overflow export: battery charged exactly to fill by dusk, all PV surplus above that exported immediately. Inverter IP now from plugin prefs. New: storm_watch.py v1.3. |
-| 3.0.2 | 01-Apr-2026 | Fix: direct edits to .indiPref are overwritten by Indigo on shutdown. Adds startup() migration that raises dawnSocTarget to 15% minimum (5% buffer above 10% health floor), then lets Indigo persist the corrected value. Previously both were 10%, leaving no margin on poor solar nights. |
-| 3.0.1 | 01-Apr-2026 | Solar overflow dawn margin gate: before any daytime surplus export, projected SOC at dawn must be at least 3.5 kWh above dawn target (SOLAR_OVERFLOW_MIN_DAWN_MARGIN). Prevents exporting kWh that earn 12p but cost 20p+ to reimport overnight when the bias-corrected forecast over-inflates remaining solar. |
-| 3.0 | 01-Apr-2026 | Fix: 01-Apr-2026 battery-to-4.2%-SOC incident. Three-part fix: (1) emergency floor check on sunny-day path — even when tomorrow is sunny, import is triggered if raw SOC projection breaches the health floor; (2) discharge cutoff register (40048) verified in _verify_ems_registers() every 15 min and corrected to batteryHealthCutoff (was never written — factory default 5%, not 10%); (3) VPP cutoff flag prevents verify() from interfering with VPP floors. 55 unit tests. |
-| 2.9 | 31-Mar-2026 | Fix: night export (mode 0x06) fired at 14:48 in full daylight because _check_night_export() computed _is_daytime=False when snapshot.dawn_times had no entry for today (Solcast data stale or not yet fetched). With _is_daytime=False the function fell through to export logic, suppressing PV to 0W and discharging battery to grid during daylight. Fixed in battery_manager.py v1.6: if today's dawn time is absent, fall back to clock-based safe window (07:00-21:00 local time) so export is always blocked during daylight regardless of Solcast data availability. |
-| 2.8 | 31-Mar-2026 | Fix: inverter stuck in mode 0x06 (Discharge ESS First) after plugin restart. After restart all store flags are False, so _act_on_decision(ACTION_SELF_CONSUMPTION) only called set_self_consumption() on a True→False transition — never on cold start. Fixed in two places: (1) _verify_ems_registers() now reads actual EMS mode register via new sigenergy_modbus.read_ems_mode() and corrects any mismatch; (2) _act_on_decision() checks emsWorkMode field from live inverter data and forces 0x02 if inverter is in wrong mode despite all store flags being False. |
-| 2.7 | 31-Mar-2026 | Plugin log file: daily rotating log written to plugin data dir (Preferences/Plugins/.../logs/YYYY-MM-DD.log). log() now writes to both Indigo event log and plugin file simultaneously. 14-day retention with automatic purge. File opened/rotated in startup() and on each 10-second tick (no-op unless date has rolled over). Closed cleanly in shutdown(). Enables post-mortem diagnosis without relying solely on Indigo's event log. |
+| 4.9 | 10-May-2026 | Plugin version is now read dynamically from Info.plist (`self.pluginVersion`) — single source of truth, no separate Python constant. Pushover action calls fixed: action ID `send` (was `sendPushover`), correct prop keys `msgTitle`/`msgBody`/`msgUser`/`msgPriority`/`msgSound`. Implemented `triggerStartProcessing` / `triggerStopProcessing` lifecycle so all custom Indigo trigger events (`emergencyImportTriggered`, `exportStarted/Stopped`, `vppAnnounced/Started/Ended`, `floodPreventionStarted/Stopped`, `powerCutLockoutStarted/Cleared`) now fire correctly via `indigo.trigger.execute(trigger_object)`. Moved hardcoded IPs and the Axle support email to `secrets.py`: `SIGENERGY_IP`, `DASHBOARD_HOST`, `AXLE_SUPPORT_EMAIL`, `PUSHOVER_USER_TOKEN`. Each has a PluginConfig fallback and logs an ERROR if neither source is set. Dashboard URL auto-detects the LAN IP via socket when no override is configured. Swallowed-failure log levels promoted from WARNING to ERROR (trigger execute fail, dashboard stop, VPP email, Timeseries DB init/write). `_init_modules()` now initialises forecast/Octopus/Axle before the inverter-IP check so a missing IP only skips Modbus instead of crashing startup. |
+| 4.8 | 03-May-2026 | Remove 15-minute heartbeat log — only log on action change (web dashboard covers live status). |
+| 4.7 | 02-May-2026 | Remove Solcast code/variables (Open-Meteo only); raise FLOOD_PREV_FORECAST_MULT 2.0 → 3.0; delete test_overnight.py. |
+| 4.6 | 01-May-2026 | Half-hourly SQLite energy logging for TariffAnalyser feed. |
+| 4.5 | 30-Apr-2026 | Rename to SigenEnergyManager + critical bug fixes and polish. |
 | 2.6 | 31-Mar-2026 | Solar overflow SOC gate: export now only starts once battery SOC reaches 40%, preventing the algorithm from exporting aggressively while the battery is still low after overnight discharge. Solcast Indigo variables (solcast_today_kwh, solcast_tomorrow_kwh, solcast_last_updated) now populated on every Solcast refresh — were previously always 0.0. P10 forecast data removed from all modules: was dead code never used in any decision logic since v1.3; removes _hourly_p10_today and _hourly_p10_tomorrow from solcast.py, forecast_p10 from ManagerSnapshot, and _sum_tomorrow_forecast() static method from battery_manager.py. P90 also removed. |
 | 2.5 | 30-Mar-2026 | Fix: v2.4 ineffective because dawn_target_pct and health_cutoff_pct are both 10% so changing threshold had no effect. Root cause: when tomorrow is sunny (forecast >= daily consumption) import is never needed regardless of dawn SOC — the inverter's discharge cutoff register (40048) already prevents the battery going below health_cutoff_pct. Import now fully suppressed on sunny days. Only on poor solar days (tomorrow forecast < daily consumption) does the dawn_target buffer apply. |
 | 2.4 | 30-Mar-2026 | Fix: overnight grid import triggered unnecessarily when battery was low but tomorrow has good solar. Import threshold is now solar-aware: if tomorrow's bias-corrected Solcast P50 >= daily consumption, import only triggers if projected dawn SOC would hit the hardware cutoff floor (inverter stops discharging anyway). On poor solar days the full dawn_target buffer is maintained as before. Eliminates small unnecessary top-up imports on sunny days. |
@@ -44,12 +41,13 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ## Requirements
 
-- Indigo 2025.1 or later
+- Indigo 2025.2 or later (Python 3.13)
 - Sigenergy inverter with Modbus TCP enabled (port 502)
-- Python package: `pymodbus` (installed via Indigo's package manager)
-- Optional: Solcast API key (solar forecast)
+- Python packages: `pymodbus>=3.0`, `pytz>=2024.1` (auto-installed from `requirements.txt`)
 - Optional: Octopus Energy API key (tariff-aware import scheduling)
 - Optional: Axle VPP account credentials
+- Optional: Pushover Indigo plugin (storm + VPP alerts)
+- Solar forecast uses Open-Meteo — no API key required
 
 ---
 
@@ -64,30 +62,50 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ## Configuration
 
-### Credentials
+### Credentials — `secrets.py` vs `secrets_example.py`
 
-**If you already have a `secrets.py`** in
-`/Library/Application Support/Perceptive Automation/` add the keys below to it.
-The plugin will pick them up automatically at startup.
+There are **two** files involved, and only one of them holds your real values:
 
-**If you do not have a `secrets.py`** you can either:
-- Copy `secrets_example.py` (included in the plugin bundle) to
-  `/Library/Application Support/Perceptive Automation/`, rename it to `secrets.py`,
-  and fill in your values, **or**
-- Enter your credentials directly in the plugin's configuration dialog
-  (Indigo menu → Plugins → Sigenergy Manager → Configure)
+| File | Purpose | Contains real data? | Committed to GitHub? |
+|------|---------|---------------------|----------------------|
+| `secrets.py` | The **working file** the plugin reads at runtime. Lives at `/Library/Application Support/Perceptive Automation/secrets.py`. Keep a backup in a password manager. | YES | **NO** — listed in `.gitignore`, never pushed. |
+| `secrets_example.py` | **Template only** — empty placeholders so users know which keys to set. Shipped inside the plugin bundle. | NO | YES — public on GitHub. |
 
-All credential fields fall back to the plugin configuration dialog if
-`secrets.py` is absent or a key is missing.
+**Setup:**
+
+1. If you already have `secrets.py`, just add the keys below to it.
+2. If you do not, copy `secrets_example.py` (inside the plugin bundle) to
+   `/Library/Application Support/Perceptive Automation/`, rename it to `secrets.py`,
+   and fill in your values.
+3. Or skip `secrets.py` entirely and enter values via the plugin's configuration
+   dialog (Indigo menu → Plugins → Sigenergy Manager → Configure). `secrets.py`
+   wins over the dialog when both are set.
+
+If neither source provides a value the plugin logs an ERROR for the missing item
+and skips just that feature (e.g. no inverter IP → Modbus skipped, but Octopus
+and Open-Meteo still run).
+
+**Keys read by SigenEnergyManager:**
 
 ```python
-OCTOPUS_API_KEY   = "your-octopus-api-key-here"
-OCTOPUS_ACCOUNT   = "A-XXXXXXXX"
-SOLCAST_SITE_1_ID = "xxxx-xxxx-xxxx-xxxx"
-SOLCAST_SITE_2_ID = "xxxx-xxxx-xxxx-xxxx"
-SOLCAST_API_KEY   = "..."
-AXLE_API_KEY      = ""
-AXLE_CLIENT_ID    = ""
+# Octopus Energy (tariff data)
+OCTOPUS_API_KEY     = "sk_live_..."
+OCTOPUS_ACCOUNT     = "A-XXXXXXXX"
+OCTOPUS_MPAN        = "1300000000000"
+OCTOPUS_SERIAL      = "00X0000000"
+
+# Sigenergy inverter (Modbus)
+SIGENERGY_IP        = "192.168.x.x"
+
+# Axle VPP (optional)
+AXLE_API_KEY        = ""
+AXLE_SUPPORT_EMAIL  = ""   # recipient for VPP "inverter not released" escalation
+
+# Pushover notifications (optional — Pushover Indigo plugin must also be installed)
+PUSHOVER_USER_TOKEN = ""
+
+# Web dashboard (optional — blank = auto-detect LAN IP via socket)
+DASHBOARD_HOST      = ""
 ```
 
 ### Plugin preferences
@@ -181,8 +199,8 @@ The plugin guards against register drift at three layers:
    10000W (inverter maximum) before setting the mode
 2. **On startup** -- both registers are explicitly written to 10000W before any other
    Modbus operation
-3. **Every 15 minutes** -- `_verify_ems_registers()` reads back both registers and
-   the EMS mode register; any drift is corrected and logged with a warning
+3. **Every 15 minutes** -- `_verify_ems_registers()` reads back both registers; if
+   either has drifted it is corrected and logged with a warning
 
 ### Tariff-aware import scheduling
 
@@ -300,12 +318,12 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m unittest test_battery_manager test_sigenergy_modbus -v
 ```
 
-**53 tests** across two test files, all passing without Indigo installed:
+**49 tests** across two test files, all passing without Indigo installed:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_battery_manager.py` | 32 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (9 cases), VPP suppression |
-| `test_sigenergy_modbus.py` | 21 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, night_export sequence, read_discharge_limit/read_charge_limit, export limit validation |
+| `test_battery_manager.py` | 33 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (10 cases), VPP suppression |
+| `test_sigenergy_modbus.py` | 16 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation |
 
 ---
 

@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        03-05-2026
-# Version:     4.8
+# Date:        10-05-2026
+# Version:     4.9
 
 import indigo
 import json
@@ -37,6 +37,27 @@ except ImportError:
     OCTOPUS_SERIAL  = ""
     AXLE_API_KEY    = ""
 
+# Optional secrets — keep separate so a missing key doesn't break the bulk import.
+try:
+    from secrets import PUSHOVER_USER_TOKEN
+except ImportError:
+    PUSHOVER_USER_TOKEN = ""
+
+try:
+    from secrets import SIGENERGY_IP
+except ImportError:
+    SIGENERGY_IP = ""
+
+try:
+    from secrets import DASHBOARD_HOST
+except ImportError:
+    DASHBOARD_HOST = ""
+
+try:
+    from secrets import AXLE_SUPPORT_EMAIL
+except ImportError:
+    AXLE_SUPPORT_EMAIL = ""
+
 try:
     from plugin_utils import log_startup_banner
 except ImportError:
@@ -60,7 +81,9 @@ from web_dashboard import WebDashboard
 # Constants
 # ============================================================
 
-PLUGIN_VERSION     = "4.6"
+# PLUGIN_VERSION is read dynamically from Info.plist by Indigo and passed to
+# Plugin.__init__ as `plugin_version` (exposed as self.pluginVersion).  Do NOT
+# add a hardcoded version constant here — Info.plist is the single source of truth.
 PLUGIN_NAME        = "Sigenergy Manager"
 WEB_DASHBOARD_PORT = 8179
 
@@ -213,6 +236,12 @@ class Plugin(indigo.PluginBase):
         self.manager  = BatteryManager()
         self.axle     = None
 
+        # Indigo trigger registry — populated by triggerStartProcessing/Stop.
+        # Maps trigger.id -> trigger object so _trigger_event can find triggers
+        # whose pluginTypeId matches the event being fired.  Without this
+        # registry, indigo.trigger.execute() has no trigger object to fire.
+        self.event_triggers = {}
+
         # Latest data from each module
         self.latest_inverter_data = {}
         self.latest_forecast_data = {}
@@ -308,7 +337,7 @@ class Plugin(indigo.PluginBase):
 
     def startup(self):
         _ensure_plugin_log(self.data_dir)
-        log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} starting")
+        log(f"{PLUGIN_NAME} v{self.pluginVersion} starting")
 
         # ── Pref migrations ──────────────────────────────────────────────────
         # v3.0: raise dawnSocTarget minimum to 15% so there is a real buffer
@@ -360,9 +389,10 @@ class Plugin(indigo.PluginBase):
         try:
             self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT)
             self.web_dashboard.start()
-            log(f"[Web] Dashboard at http://192.168.100.160:{WEB_DASHBOARD_PORT}")
+            host = self._resolve_dashboard_host()
+            log(f"[Web] Dashboard at http://{host}:{WEB_DASHBOARD_PORT}")
         except Exception as exc:
-            log(f"[Web] Dashboard failed to start: {exc}", level="WARNING")
+            log(f"[Web] Dashboard failed to start: {exc}", level="ERROR")
 
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
@@ -371,7 +401,7 @@ class Plugin(indigo.PluginBase):
                 self.web_dashboard.stop()
                 log("[Web] Dashboard stopped")
             except Exception as exc:
-                log(f"[Web] Dashboard stop error: {exc}", level="WARNING")
+                log(f"[Web] Dashboard stop error: {exc}", level="ERROR")
         global _plugin_log_fh
         if _plugin_log_fh is not None:
             try:
@@ -938,21 +968,73 @@ class Plugin(indigo.PluginBase):
     # Storm Watch
     # ================================================================
 
+    def _resolve_pushover_user(self):
+        """Return the Pushover user/group key, preferring secrets.py over PluginConfig.
+
+        Returns "" and logs an ERROR (once per call) if neither source is set.
+        Callers should treat "" as "skip alert".
+        """
+        token = PUSHOVER_USER_TOKEN or self.pluginPrefs.get("pushoverUserToken", "")
+        if not token:
+            log(
+                "[Pushover] No user/group key configured. Set PUSHOVER_USER_TOKEN in "
+                "secrets.py or fill in 'Pushover user/group key' under Plugins -> "
+                "Sigenergy Manager -> Configure. Alert skipped.",
+                level="ERROR",
+            )
+        return token
+
+    def _resolve_dashboard_host(self):
+        """Resolve the host shown in the dashboard URL log line.
+
+        Order of precedence: DASHBOARD_HOST in secrets.py, then dashboardHost
+        in PluginConfig, then auto-detect via socket.  Auto-detect is the silent
+        default — no warning needed, since the dashboard binds to all interfaces
+        regardless and the URL is purely a convenience log line.
+        """
+        host = DASHBOARD_HOST or self.pluginPrefs.get("dashboardHost", "")
+        if host:
+            return host
+        try:
+            import socket
+            # UDP connect to a public address (no packets sent) — tells the OS
+            # which local interface IP would route outbound traffic.
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                host = s.getsockname()[0]
+            finally:
+                s.close()
+        except Exception as exc:
+            log(f"[Web] Could not auto-detect LAN IP ({exc}); falling back to localhost", level="WARNING")
+            host = "localhost"
+        return host
+
     def _send_pushover(self, title, message, priority="0"):
-        """Send a Pushover notification. Called from the main plugin thread."""
+        """Send a Pushover notification. Called from the main plugin thread.
+
+        Uses correct action ID "send" with msg* keys per the Pushover Indigo
+        plugin (io.thechad.indigoplugin.pushover).  Priority is a string per
+        the plugin's API.  Sound defaults to "vibrate" per CliveS preference.
+        """
+        user = self._resolve_pushover_user()
+        if not user:
+            return
         try:
             pushover = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
             if pushover and pushover.isEnabled():
-                pushover.executeAction("sendPushover", props={
-                    "title":    title,
-                    "message":  message,
-                    "priority": priority,
+                pushover.executeAction("send", props={
+                    "msgTitle":    title,
+                    "msgBody":     message,
+                    "msgUser":     user,
+                    "msgPriority": str(priority),
+                    "msgSound":    "vibrate",
                 })
-                log(f"[Storm] Pushover sent: {title}")
+                log(f"[Pushover] sent: {title}")
             else:
-                log("[Storm] Pushover plugin not enabled — alert not sent", level="WARNING")
+                log("[Pushover] plugin not enabled — alert not sent", level="ERROR")
         except Exception as exc:
-            log(f"[Storm] Pushover send failed: {exc}", level="WARNING")
+            log(f"[Pushover] send failed: {exc}", level="ERROR")
 
     def _check_storm_watch(self):
         """
@@ -1790,25 +1872,23 @@ class Plugin(indigo.PluginBase):
             f"</body></html>"
         )
 
-        # Pushover alert
-        try:
-            pushover = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
-            if pushover and pushover.isEnabled():
-                pushover.executeAction("sendPushover", props={
-                    "title":    subject,
-                    "message":  plain,
-                    "priority": "1",   # high priority
-                })
-                log("[VPP] Pushover alert sent")
-        except Exception as e:
-            log(f"[VPP] Pushover alert failed: {e}", level="WARNING")
+        # Pushover alert (uses corrected helper — handles secrets/config + skip-with-warning)
+        self._send_pushover(subject, plain, priority="1")
 
-        # Email to Axle support
-        try:
-            indigo.server.sendEmailTo("axle@strudwick.co.uk", subject=subject, body=html)
-            log("[VPP] Email alert sent to axle@strudwick.co.uk")
-        except Exception as e:
-            log(f"[VPP] Email alert failed: {e}", level="WARNING")
+        # Email to Axle support — address comes from secrets.py (AXLE_SUPPORT_EMAIL)
+        # so it can be overridden per install without touching plugin code.
+        if AXLE_SUPPORT_EMAIL:
+            try:
+                indigo.server.sendEmailTo(AXLE_SUPPORT_EMAIL, subject=subject, body=html)
+                log(f"[VPP] Email alert sent to {AXLE_SUPPORT_EMAIL}")
+            except Exception as e:
+                log(f"[VPP] Email alert failed: {e}", level="ERROR")
+        else:
+            log(
+                "[VPP] AXLE_SUPPORT_EMAIL not set in secrets.py — VPP release "
+                "email alert skipped. Add the address to secrets.py to enable.",
+                level="ERROR",
+            )
 
     def _start_vpp_precharge(self, event):
         """Assess SOC 30 min before VPP event; raise discharge cutoff; no grid import.
@@ -2095,12 +2175,39 @@ class Plugin(indigo.PluginBase):
     # Trigger Events
     # ================================================================
 
+    def triggerStartProcessing(self, trigger):
+        """Indigo lifecycle: called when a trigger configured against this
+        plugin is enabled.  Store the trigger object so _trigger_event() can
+        fire it later via indigo.trigger.execute().
+        """
+        self.event_triggers[trigger.id] = trigger
+        if self.debug:
+            log(f"[Trigger] Registered: id={trigger.id} type={trigger.pluginTypeId}")
+
+    def triggerStopProcessing(self, trigger):
+        """Indigo lifecycle: called when a trigger is disabled or deleted."""
+        self.event_triggers.pop(trigger.id, None)
+        if self.debug:
+            log(f"[Trigger] Unregistered: id={trigger.id} type={trigger.pluginTypeId}")
+
     def _trigger_event(self, event_id):
-        """Fire an Indigo custom trigger event."""
-        try:
-            indigo.trigger.execute(event_id)
-        except Exception as e:
-            self.logger.debug(f"Trigger event {event_id}: {e}")
+        """Fire all registered Indigo triggers whose pluginTypeId matches event_id.
+
+        indigo.trigger.execute() requires a trigger object (NOT a string event ID),
+        and indigo.server.fireEvent() does not exist.  We iterate self.event_triggers
+        (populated by triggerStartProcessing) and fire every matching one.
+        """
+        fired = 0
+        for trigger in self.event_triggers.values():
+            if trigger.pluginTypeId == event_id:
+                try:
+                    indigo.trigger.execute(trigger)
+                    fired += 1
+                except Exception as e:
+                    log(f"[Trigger] execute failed for {event_id} (id={trigger.id}): {e}", level="ERROR")
+        if fired == 0 and self.debug:
+            # Not an error — user may simply have no triggers wired to this event.
+            log(f"[Trigger] No triggers configured for event '{event_id}'")
 
     # ================================================================
     # Device State Updates
@@ -2284,7 +2391,7 @@ class Plugin(indigo.PluginBase):
             con.close()
             log(f"[Timeseries] DB ready: {db_path}")
         except Exception as exc:
-            log(f"[Timeseries] DB init failed: {exc}", level="WARNING")
+            log(f"[Timeseries] DB init failed: {exc}", level="ERROR")
 
     def _log_halfhourly_to_db(self):
         """Append one half-hourly slot to energy_timeseries.db.
@@ -2365,7 +2472,7 @@ class Plugin(indigo.PluginBase):
             con.commit()
             con.close()
         except Exception as exc:
-            log(f"[Timeseries] Write failed: {exc}", level="WARNING")
+            log(f"[Timeseries] Write failed: {exc}", level="ERROR")
 
         # Advance anchors
         self.store["hh_anchor_pv_kwh"]     = cur_pv
@@ -2886,7 +2993,47 @@ class Plugin(indigo.PluginBase):
 
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
-        inv_ip     = prefs.get("inverterIp", "192.168.100.49")
+        # Solar forecast (Open-Meteo — all 4 arrays, no API key needed).
+        # Initialised before Modbus so that downstream callers (startup, etc.)
+        # always have a forecast object available even if the Modbus IP is not
+        # yet configured.
+        self.forecast = OpenMeteoForecast(
+            data_dir=self.data_dir,
+            logger=self.logger,
+        )
+
+        # Octopus
+        self.octopus = OctopusAPI(
+            api_key=api_key,
+            account_id=account_id,
+            mpan=mpan,
+            serial=serial,
+            region=region,
+            data_dir=self.data_dir,
+            logger=self.logger,
+        )
+
+        # Axle VPP
+        self.axle = AxleAPI(api_token=axle_key) if axle_key else None
+
+        # Inverter IP: secrets.py wins over PluginConfig.  If neither is set,
+        # log an ERROR and skip Modbus init only — the rest of the plugin can
+        # still run for development/diagnostic use.
+        inv_ip     = SIGENERGY_IP or prefs.get("inverterIp", "")
+        if not inv_ip:
+            log(
+                "[Config] No inverter IP configured. Set SIGENERGY_IP in secrets.py "
+                "or fill in 'Inverter IP address' under Plugins -> Sigenergy Manager -> "
+                "Configure. Modbus connection will not start until this is set.",
+                level="ERROR",
+            )
+            log(
+                f"[Init] Modbus=NOT CONFIGURED, "
+                f"Octopus={'OK' if api_key else 'not configured'}, "
+                f"Solar=Open-Meteo (4 arrays), "
+                f"Axle={'OK' if axle_key else 'disabled'}"
+            )
+            return
         inv_port   = int(prefs.get("modbusPort", 502))
         plant_addr = int(prefs.get("plantAddress", 247))
         inv_addr   = int(prefs.get("inverterSlaveId", 1))
@@ -2916,26 +3063,6 @@ class Plugin(indigo.PluginBase):
             if prefs.get("exportEnabled", False):
                 dno_startup_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
                 self.modbus.set_export_limit(dno_startup_w)
-
-        # Solar forecast (Open-Meteo — all 4 arrays, no API key needed)
-        self.forecast = OpenMeteoForecast(
-            data_dir=self.data_dir,
-            logger=self.logger,
-        )
-
-        # Octopus
-        self.octopus = OctopusAPI(
-            api_key=api_key,
-            account_id=account_id,
-            mpan=mpan,
-            serial=serial,
-            region=region,
-            data_dir=self.data_dir,
-            logger=self.logger,
-        )
-
-        # Axle VPP
-        self.axle = AxleAPI(api_token=axle_key) if axle_key else None
 
         log(
             f"[Init] Modbus={inv_ip}:{inv_port}, "
