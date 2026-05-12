@@ -95,6 +95,13 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 @keyframes flow-rev{to{stroke-dashoffset:12}}
 .flow-fwd{animation:flow-fwd .7s linear infinite}
 .flow-rev{animation:flow-rev .7s linear infinite}
+/* --- charts (v5.2) --- */
+.chart-card{grid-column:1 / -1}
+.chart-tabs{display:flex;gap:6px;margin-bottom:10px}
+.chart-tab{background:#0a1020;color:#94a3b8;border:1px solid #1e2d3d;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit}
+.chart-tab.active{background:#14291b;color:#34d399;border-color:#166534}
+.chart-wrap{position:relative;height:200px;margin-bottom:14px}
+.chart-wrap:last-child{margin-bottom:0}
 /* --- responsive --- */
 @media(max-width:680px){
   .main{grid-template-columns:1fr}
@@ -258,6 +265,26 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
     </section>
 
   </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <!-- Charts row (v5.2) -->
+  <section class="card chart-card">
+    <h2>Last 24 hours</h2>
+    <div class="chart-tabs">
+      <button class="chart-tab active" data-range="24">24h</button>
+      <button class="chart-tab" data-range="48">48h</button>
+      <button class="chart-tab" data-range="168">7d</button>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-soc"></canvas></div>
+    <div class="chart-wrap"><canvas id="chart-energy"></canvas></div>
+  </section>
+
+  <section class="card chart-card">
+    <h2>Daily totals (last 30 days)</h2>
+    <div class="chart-wrap"><canvas id="chart-daily"></canvas></div>
+  </section>
+
 </main>
 
 <script>
@@ -495,8 +522,146 @@ async function fetchStatus() {
   }
 }
 
+/* ============================================================
+   Charts (v5.2) — Chart.js via CDN
+   ============================================================ */
+
+let socChart = null, energyChart = null, dailyChart = null;
+let currentRange = 24;
+
+const CHART_COLORS = {
+  soc:    '#34d399',
+  pv:     '#fbbf24',
+  imp:    '#f87171',
+  exp:    '#22d3ee',
+  home:   '#a78bfa',
+  grid:   '#94a3b8',
+};
+
+const CHART_BASE = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 200 },
+  interaction: { mode: 'index', intersect: false },
+  scales: {
+    x: { ticks: { color: '#64748b', maxRotation: 0, autoSkipPadding: 20 },
+         grid: { color: 'rgba(100,116,139,0.08)' } },
+    y: { ticks: { color: '#64748b' },
+         grid: { color: 'rgba(100,116,139,0.12)' } },
+  },
+  plugins: {
+    legend: { labels: { color: '#cbd5e1', font: { size: 11 } } },
+    tooltip: { backgroundColor: '#0f1724', borderColor: '#1e2d3d',
+               borderWidth: 1, titleColor: '#7dd3fc',
+               bodyColor: '#e2e8f0', padding: 8 },
+  },
+};
+
+function fmtT(iso) {
+  // ISO "2026-05-12T18:30:00" -> "Mon 14:30" or "14:30"
+  const d = new Date(iso.replace(' ', 'T'));
+  if (isNaN(d)) return iso.slice(11, 16);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) {
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }
+  return d.toLocaleDateString([], {weekday:'short'}) + ' ' +
+         d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+async function refreshCharts() {
+  try {
+    const r = await fetch('/api/history?hours=' + currentRange);
+    if (!r.ok) return;
+    const d = await r.json();
+    const slots = d.slots || [];
+    const labels = slots.map(s => fmtT(s.t));
+    const socEnd = slots.map(s => s.soc_end);
+    const pv     = slots.map(s => s.pv_kwh);
+    const imp    = slots.map(s => -s.import_kwh);   // negative = inflow
+    const exp    = slots.map(s => s.export_kwh);
+    const home   = slots.map(s => -s.home_kwh);     // negative = consumption
+
+    if (socChart) socChart.destroy();
+    socChart = new Chart(document.getElementById('chart-soc'), {
+      type: 'line',
+      data: { labels, datasets: [{
+        label: 'Battery SOC %', data: socEnd,
+        borderColor: CHART_COLORS.soc, backgroundColor: 'rgba(52,211,153,0.15)',
+        fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2,
+      }] },
+      options: { ...CHART_BASE,
+        scales: { ...CHART_BASE.scales,
+          y: { ...CHART_BASE.scales.y, min: 0, max: 100,
+               title: { display: true, text: 'SOC %', color: '#94a3b8' } },
+        } }
+    });
+
+    if (energyChart) energyChart.destroy();
+    energyChart = new Chart(document.getElementById('chart-energy'), {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: 'Solar',  data: pv,   backgroundColor: CHART_COLORS.pv },
+        { label: 'Export', data: exp,  backgroundColor: CHART_COLORS.exp },
+        { label: 'Import (in)', data: imp,  backgroundColor: CHART_COLORS.imp },
+        { label: 'Home (use)',  data: home, backgroundColor: CHART_COLORS.home },
+      ] },
+      options: { ...CHART_BASE,
+        scales: { ...CHART_BASE.scales,
+          x: { ...CHART_BASE.scales.x, stacked: true },
+          y: { ...CHART_BASE.scales.y, stacked: true,
+               title: { display: true, text: 'kWh per slot', color: '#94a3b8' } },
+        } }
+    });
+  } catch(e) { /* silently ignore — charts will reappear next refresh */ }
+}
+
+async function refreshDailyChart() {
+  try {
+    const r = await fetch('/api/daily?days=30');
+    if (!r.ok) return;
+    const d = await r.json();
+    const records = d.records || [];
+    const labels = records.map(r => r.date.slice(5));   // MM-DD
+    const pv     = records.map(r => r.pv_kwh);
+    const imp    = records.map(r => r.grid_import_kwh);
+    const exp    = records.map(r => r.grid_export_kwh);
+    const home   = records.map(r => r.home_kwh);
+
+    if (dailyChart) dailyChart.destroy();
+    dailyChart = new Chart(document.getElementById('chart-daily'), {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: 'Solar',  data: pv,   backgroundColor: CHART_COLORS.pv },
+        { label: 'Export', data: exp,  backgroundColor: CHART_COLORS.exp },
+        { label: 'Import', data: imp,  backgroundColor: CHART_COLORS.imp },
+        { label: 'Home',   data: home, backgroundColor: CHART_COLORS.home },
+      ] },
+      options: { ...CHART_BASE,
+        scales: { ...CHART_BASE.scales,
+          y: { ...CHART_BASE.scales.y,
+               title: { display: true, text: 'kWh per day', color: '#94a3b8' } },
+        } }
+    });
+  } catch(e) { /* silently ignore */ }
+}
+
+document.querySelectorAll('.chart-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentRange = parseInt(btn.dataset.range, 10);
+    refreshCharts();
+  });
+});
+
 fetchStatus();
 startCountdown();
+// Charts refresh independently — every 5 minutes is plenty
+refreshCharts();
+refreshDailyChart();
+setInterval(refreshCharts, 5 * 60 * 1000);
+setInterval(refreshDailyChart, 30 * 60 * 1000);
 </script>
 </body>
 </html>"""
@@ -522,15 +687,57 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     _plugin_ref = None
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", _DASHBOARD_BYTES)
 
-        elif self.path == "/api/status":
+        elif path == "/api/status":
             if self._plugin_ref is None:
                 body = b'{"error":"plugin not ready"}'
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_data()
+                    body = json.dumps(data).encode()
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}).encode()
+            self._send(200, "application/json", body)
+
+        elif path == "/api/history":
+            # Half-hourly slots for the last N hours (default 24h, max 168h).
+            # Reads from the plugin's energy_timeseries.db SQLite store.
+            hours = 24
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for kv in qs.split("&"):
+                if kv.startswith("hours="):
+                    try:
+                        hours = max(1, min(168, int(kv.split("=", 1)[1])))
+                    except ValueError:
+                        pass
+            if self._plugin_ref is None:
+                body = b'{"error":"plugin not ready"}'
+            else:
+                try:
+                    data = self._plugin_ref.get_dashboard_history(hours=hours)
+                    body = json.dumps(data).encode()
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}).encode()
+            self._send(200, "application/json", body)
+
+        elif path == "/api/daily":
+            # Daily totals for the last N days (default 30, max 365)
+            days = 30
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for kv in qs.split("&"):
+                if kv.startswith("days="):
+                    try:
+                        days = max(1, min(365, int(kv.split("=", 1)[1])))
+                    except ValueError:
+                        pass
+            if self._plugin_ref is None:
+                body = b'{"error":"plugin not ready"}'
+            else:
+                try:
+                    data = self._plugin_ref.get_dashboard_daily(days=days)
                     body = json.dumps(data).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()

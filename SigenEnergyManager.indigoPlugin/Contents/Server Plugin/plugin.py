@@ -7,7 +7,22 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.1
+# Version:     5.2
+# Changes:     v5.2 (12-05-2026) — three small additions:
+#   • Web dashboard charts (Chart.js via CDN). New 24h/48h/7d SOC + energy
+#     stacked-bar charts, and a 30-day daily totals bar chart. Backed by two
+#     new endpoints: /api/history?hours=N (half-hourly slots from SQLite) and
+#     /api/daily?days=N (daily_history.json).
+#   • Weekly tar.gz backup of the data dir at Monday midnight. Backs up
+#     accumulators.json, daily_history.json, soh_history.json,
+#     home_load_profile.json, forecast_accuracy.json, energy_timeseries.db
+#     and the openmeteo combined cache. Retains the 8 most recent (~2 months).
+#   • Auto-update notifier: GitHub releases API check on startup, daily-cached
+#     in pluginPrefs.lastUpdateCheck. Logs an INFO line if a newer plugin
+#     version is published. Silent on network failure.
+#   • Also: fixed double-count bug in Show Today's Energy Summary +
+#     Show Manager Status — both used correctedTodayKwh (whole-day forecast)
+#     labelled as "remaining". Now read remainingTodayKwh.
 # Changes:     v5.1 (12-05-2026) — site config consolidation:
 #   • New shared sigen_site_config.json published to Python Scripts/ on every
 #     plugin start and every PluginConfig save. Companion optimiser script reads
@@ -471,6 +486,12 @@ class Plugin(indigo.PluginBase):
         # always uses the same numbers as the plugin (no constant drift).
         self._write_site_config()
 
+        # Auto-update check (best-effort, daily-cached, fully silent on failure).
+        try:
+            self._check_for_update()
+        except Exception as exc:
+            self.logger.debug(f"[Update] check error: {exc}")
+
     def _write_site_config(self):
         """Write a shared site_config.json that companion scripts can read.
 
@@ -770,6 +791,69 @@ class Plugin(indigo.PluginBase):
             }
         except Exception as exc:
             return {"error": str(exc), "timestamp": datetime.now().strftime("%H:%M:%S")}
+
+    def get_dashboard_history(self, hours=24):
+        """Return half-hourly slots for the last N hours from the SQLite store.
+
+        Used by the dashboard's /api/history endpoint to plot SOC and energy
+        flows over time.  Returns a JSON-serialisable dict:
+            {"hours": N, "slots": [{"t","soc_start","soc_end","pv_kwh",
+                                    "import_kwh","export_kwh","home_kwh",
+                                    "action"}, ...]}
+        """
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        if not os.path.exists(db_path):
+            return {"hours": hours, "slots": []}
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+        con = None
+        slots = []
+        try:
+            con = sqlite3.connect(db_path, timeout=5.0)
+            cur = con.execute(
+                """SELECT slot_start, slot_end,
+                          battery_soc_start_pct, battery_soc_end_pct,
+                          pv_kwh, grid_import_kwh, grid_export_kwh, home_kwh,
+                          manager_action
+                     FROM halfhourly
+                    WHERE slot_end >= ?
+                 ORDER BY slot_end ASC""",
+                (cutoff,),
+            )
+            for row in cur.fetchall():
+                slots.append({
+                    "t":          row[1],
+                    "soc_start":  row[2],
+                    "soc_end":    row[3],
+                    "pv_kwh":     row[4],
+                    "import_kwh": row[5],
+                    "export_kwh": row[6],
+                    "home_kwh":   row[7],
+                    "action":     row[8] or "",
+                })
+        except sqlite3.Error as exc:
+            self.logger.debug(f"[Dashboard] history query failed: {exc}")
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
+        return {"hours": hours, "slots": slots}
+
+    def get_dashboard_daily(self, days=30):
+        """Return per-day totals for the last N days from daily_history.json.
+
+        Used by /api/daily for the longer-range bar charts.
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        if not os.path.exists(path):
+            return {"days": days, "records": []}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            return {"days": days, "records": []}
+        return {"days": days, "records": records[-days:]}
 
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
@@ -2469,6 +2553,15 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"Accuracy summary skipped: {exc}")
 
+        # Weekly data-directory backup — once a week on Monday's midnight task.
+        # Cheap insurance against accumulator/SoH/daily_history corruption.
+        try:
+            today_dt = datetime.strptime(today, "%Y-%m-%d")
+            if today_dt.weekday() == 0:
+                self._backup_data_dir(today)
+        except (ValueError, OSError) as exc:
+            self.logger.debug(f"[Backup] Skipped: {exc}")
+
         # Battery State-of-Health snapshot — once a week, on Monday's midnight task.
         # LFP cells typically lose ~0.3%/year of capacity in normal cycling; anything
         # faster is worth flagging.  Cheap to compute and stored as a small JSON ring
@@ -2547,6 +2640,133 @@ class Plugin(indigo.PluginBase):
         self.store["had_import_today"]   = False
         self.store["export_count_today"] = 0
         self.store["had_vpp_today"]      = False
+
+    # ================================================================
+    # Data directory backup (weekly, Monday midnight)
+    # ================================================================
+
+    def _backup_data_dir(self, date_str):
+        """Write a tar.gz of the small JSON / SQLite files in the data dir.
+
+        Cheap protection against accumulator / SoH / daily_history corruption.
+        Backups go to a sibling 'data_backup/' folder; only the 8 most recent
+        are kept (~2 months of weekly snapshots).
+        """
+        import tarfile
+        files_to_backup = [
+            "accumulators.json",
+            "daily_history.json",
+            "home_load_profile.json",
+            "soh_history.json",
+            "forecast_accuracy.json",
+            "energy_timeseries.db",
+            "openmeteo_combined_cache.json",
+        ]
+        backup_dir = os.path.join(self.data_dir, "data_backup")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning(f"[Backup] Cannot create backup dir: {exc}")
+            return
+
+        tar_name = f"sigen_data_{date_str}.tar.gz"
+        tar_path = os.path.join(backup_dir, tar_name)
+        added = 0
+        try:
+            with tarfile.open(tar_path, "w:gz") as tar:
+                for fname in files_to_backup:
+                    fpath = os.path.join(self.data_dir, fname)
+                    if os.path.exists(fpath):
+                        tar.add(fpath, arcname=fname)
+                        added += 1
+            size_kb = os.path.getsize(tar_path) / 1024.0
+            log(f"[Backup] Wrote {tar_name} ({added} files, {size_kb:.1f} KB)")
+        except OSError as exc:
+            self.logger.warning(f"[Backup] Failed: {exc}")
+            return
+
+        # Retention: keep the 8 most recent tarballs.  Sort by filename which
+        # embeds an ISO date, so lexicographic sort = chronological.
+        try:
+            existing = sorted(
+                fn for fn in os.listdir(backup_dir)
+                if fn.startswith("sigen_data_") and fn.endswith(".tar.gz")
+            )
+            for fn in existing[:-8]:
+                try:
+                    os.remove(os.path.join(backup_dir, fn))
+                    self.logger.debug(f"[Backup] Pruned old backup {fn}")
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    # ================================================================
+    # Auto-update notifier (GitHub releases)
+    # ================================================================
+
+    def _check_for_update(self):
+        """Hit the GitHub releases API once per day and log if a newer plugin
+        version is available.  Best-effort — silent if offline or rate-limited.
+
+        Stores the last-check timestamp in pluginPrefs so a plugin restart
+        doesn't re-query within 24h.  Compares the GitHub tag's leading
+        version digits (so 'v5.2' / 'v5.2.0' / '5.2' all parse equivalently).
+        """
+        last_check_str = self.pluginPrefs.get("lastUpdateCheck", "")
+        try:
+            last_check = datetime.fromisoformat(last_check_str)
+        except (ValueError, TypeError):
+            last_check = datetime.min
+        if (datetime.now() - last_check).total_seconds() < 86400:
+            return   # already checked within the last 24 hours
+
+        import urllib.request
+        import urllib.error
+
+        url = ("https://api.github.com/repos/Highsteads/SigenEnergyManager/"
+               "releases/latest")
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": f"SigenEnergyManager/{self.pluginVersion}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+            self.logger.debug(f"[Update] Check failed (silent): {exc}")
+            return
+
+        latest_raw = (payload.get("tag_name") or payload.get("name") or "").strip()
+        if not latest_raw:
+            return
+
+        # Strip a leading 'v' / 'V' and any non-version suffix
+        clean = latest_raw.lstrip("vV").split(" ", 1)[0]
+
+        def _parse(s):
+            try:
+                return tuple(int(x) for x in s.split(".")[:3])
+            except (ValueError, AttributeError):
+                return ()
+
+        latest_tuple  = _parse(clean)
+        current_tuple = _parse(self.pluginVersion)
+        if not latest_tuple or not current_tuple:
+            return
+
+        if latest_tuple > current_tuple:
+            log(
+                f"[Update] New plugin version available: {latest_raw} "
+                f"(running {self.pluginVersion}). "
+                f"See {payload.get('html_url', 'https://github.com/Highsteads/SigenEnergyManager/releases')}"
+            )
+        else:
+            self.logger.debug(
+                f"[Update] Plugin is up to date ({self.pluginVersion})"
+            )
+
+        self.pluginPrefs["lastUpdateCheck"] = datetime.now().isoformat()
 
     # ================================================================
     # Battery State-of-Health tracking
