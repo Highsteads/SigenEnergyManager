@@ -6,7 +6,7 @@
         <Label>MODBUS CONNECTION (Sigenergy Inverter)</Label>
     </Field>
     <Field id="label_modbus_info" type="label">
-        <Label>The inverter IP can also be set in secrets.py as SIGENERGY_IP (which takes priority over the value below).</Label>
+        <Label>The inverter IP can also be set in IndigoSecrets.py as SIGENERGY_IP (which takes priority over the value below).</Label>
     </Field>
     <Field id="inverterIp" type="textfield" defaultValue="">
         <Label>Inverter IP address:</Label>
@@ -39,7 +39,7 @@
 
     <Field id="separator_octopus" type="separator"/>
     <Field id="label_octopus" type="label">
-        <Label>OCTOPUS ENERGY (credentials in secrets.py take priority)</Label>
+        <Label>OCTOPUS ENERGY (credentials in IndigoSecrets.py take priority)</Label>
     </Field>
     <Field id="octopusApiKey" type="textfield" defaultValue="">
         <Label>Octopus API key (sk_live_...):</Label>
@@ -115,7 +115,7 @@
 
     <Field id="separator_vpp" type="separator"/>
     <Field id="label_vpp" type="label">
-        <Label>AXLE VPP (credentials in secrets.py take priority)</Label>
+        <Label>AXLE VPP (credentials in IndigoSecrets.py take priority)</Label>
     </Field>
     <Field id="axleEnabled" type="checkbox" defaultValue="false">
         <Label>Enable Axle VPP monitoring:</Label>
@@ -126,10 +126,10 @@
 
     <Field id="separator_pushover" type="separator"/>
     <Field id="label_pushover" type="label">
-        <Label>PUSHOVER NOTIFICATIONS (credentials in secrets.py take priority)</Label>
+        <Label>PUSHOVER NOTIFICATIONS (credentials in IndigoSecrets.py take priority)</Label>
     </Field>
     <Field id="label_pushover_info" type="label">
-        <Label>Pushover alerts are sent for storm warnings and VPP release failures. The Pushover Indigo plugin must be installed and enabled. Provide the recipient user/group key here OR in secrets.py as PUSHOVER_USER_TOKEN. If neither is set, alerts will be skipped and a warning will be logged.</Label>
+        <Label>Pushover alerts are sent for storm warnings and VPP release failures. The Pushover Indigo plugin must be installed and enabled. Provide the recipient user/group key here OR in IndigoSecrets.py as PUSHOVER_USER_TOKEN. If neither is set, alerts will be skipped and a warning will be logged.</Label>
     </Field>
     <Field id="pushoverUserToken" type="textfield" defaultValue="">
         <Label>Pushover user/group key:</Label>
@@ -140,7 +140,7 @@
         <Label>WEB DASHBOARD</Label>
     </Field>
     <Field id="label_dashboard_info" type="label">
-        <Label>The dashboard runs on this Indigo server. Leave the host blank to auto-detect the LAN IP, or set DASHBOARD_HOST in secrets.py / fill it in below to override (e.g. a hostname or static IP visible to your other devices).</Label>
+        <Label>The dashboard runs on this Indigo server. Leave the host blank to auto-detect the LAN IP, or set DASHBOARD_HOST in IndigoSecrets.py / fill it in below to override (e.g. a hostname or static IP visible to your other devices).</Label>
     </Field>
     <Field id="dashboardHost" type="textfield" defaultValue="">
         <Label>Dashboard host (blank = auto-detect):</Label>

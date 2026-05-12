@@ -48,7 +48,7 @@ class AxleAPI:
         """Initialise the Axle API client.
 
         Args:
-            api_token: Bearer token from Axle signup (stored in secrets.py).
+            api_token: Bearer token from Axle signup (stored in IndigoSecrets.py).
         """
         self.api_token = api_token
         self.logger    = logging.getLogger("SigenEnergyManager.AxleAPI")
@@ -83,7 +83,7 @@ class AxleAPI:
 
             if response.status_code == 401:
                 self.logger.error(
-                    "Axle API authentication failed - check AXLE_API_KEY in secrets.py"
+                    "Axle API authentication failed - check AXLE_API_KEY in IndigoSecrets.py"
                 )
                 return None
 
