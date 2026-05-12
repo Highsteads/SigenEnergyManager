@@ -268,6 +268,38 @@ header h1{
 .fc-tip .fc-tip-unit{color:#64748b;font-size:10px;font-weight:500;margin-left:1px}
 .fc-bar{cursor:pointer}
 .fc-bar rect:first-child{transition:opacity .12s ease}
+/* Help tooltip on forecast-meta labels (v5.12) — explains what each number means */
+.fc-meta-item{
+  cursor:help;
+  position:relative;
+  border-bottom:1px dotted rgba(125,211,252,0.30);
+  padding-bottom:1px;
+  transition:color .15s ease, border-color .15s ease;
+}
+.fc-meta-item:hover{
+  color:#cbd5e1;
+  border-bottom-color:rgba(125,211,252,0.60);
+}
+.help-tip{
+  position:fixed;pointer-events:none;z-index:60;
+  max-width:300px;
+  background:rgba(15,23,36,0.95);
+  backdrop-filter:blur(10px) saturate(160%);
+  -webkit-backdrop-filter:blur(10px) saturate(160%);
+  border:1px solid rgba(125,211,252,0.35);
+  border-radius:10px;padding:10px 12px;
+  box-shadow:0 12px 32px rgba(0,0,0,0.45);
+  opacity:0;transform:translateY(4px);
+  transition:opacity .18s ease, transform .18s ease;
+  font-size:12px;line-height:1.45;color:#cbd5e1;
+}
+.help-tip.help-tip-show{opacity:1;transform:translateY(0)}
+.help-tip .help-tip-title{
+  color:#7dd3fc;font-weight:600;font-size:11px;
+  letter-spacing:.4px;text-transform:uppercase;
+  margin-bottom:6px;
+  text-shadow:0 0 10px rgba(125,211,252,0.30);
+}
 /* Sparkline (SOC card) — 24h trend */
 .spark-wrap{margin-top:12px;height:36px;position:relative}
 .spark-wrap svg{width:100%;height:100%;display:block}
@@ -384,10 +416,10 @@ header h1{
   <section class="card forecast-card">
     <h2>Solar Forecast &#8212; Today</h2>
     <div class="fc-meta">
-      <span>Today: <strong id="fc-today">&#8212;</strong> kWh</span>
-      <span>Tomorrow: <strong id="fc-tmrw">&#8212;</strong> kWh</span>
-      <span>Remaining: <strong id="fc-rem">&#8212;</strong> kWh</span>
-      <span>Bias factor: <strong id="fc-bias">&#8212;</strong></span>
+      <span class="fc-meta-item" data-help-title="Today's forecast" data-help="Bias-corrected solar production estimate for the whole of today (sunrise to sunset), in kWh. Comes from Open-Meteo using your roof's tilt and azimuth for each PV string, with a self-learned correction factor applied based on past forecast-vs-actual accuracy.">Today: <strong id="fc-today">&#8212;</strong> kWh</span>
+      <span class="fc-meta-item" data-help-title="Tomorrow's forecast" data-help="Bias-corrected solar production estimate for tomorrow, in kWh. The battery manager uses this to decide whether tonight's flood-prevention export is worthwhile and how much grid charging (if any) to schedule overnight.">Tomorrow: <strong id="fc-tmrw">&#8212;</strong> kWh</span>
+      <span class="fc-meta-item" data-help-title="Remaining today" data-help="Sum of forecasted production from the current hour through dusk, in kWh. Updates every refresh — drops as the day progresses and grows briefly if a sunny patch is forecast for the next hour.">Remaining: <strong id="fc-rem">&#8212;</strong> kWh</span>
+      <span class="fc-meta-item" data-help-title="Bias correction factor" data-help="Self-learned multiplier the plugin applies to the raw Open-Meteo numbers based on past accuracy.  1.00 = forecast was dead-on. >1.00 = forecast tends to under-predict (boost it up). <1.00 = over-predict (knock it down). Adjusts automatically each midnight.">Bias factor: <strong id="fc-bias">&#8212;</strong></span>
     </div>
     <svg id="fc-svg" viewBox="0 0 756 80" xmlns="http://www.w3.org/2000/svg">
       <text x="378" y="40" text-anchor="middle" fill="#374151" font-size="13">Loading forecast...</text>
@@ -655,6 +687,45 @@ function renderForecast(hourly) {
   out += `<line x1="6" y1="${chartH}" x2="750" y2="${chartH}" stroke="#1e2d3d" stroke-width="1"/>`;
   svg.innerHTML = out;
   _wireForecastTooltip();
+}
+
+/* Wire up explanatory tooltips on any element with data-help (v5.12).
+   Used on the forecast-meta labels (Today / Tomorrow / Remaining /
+   Bias factor) but reusable for any future help-tip needs. */
+function _wireHelpTips() {
+  let tip = document.getElementById('help-tip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'help-tip';
+    tip.className = 'help-tip';
+    document.body.appendChild(tip);
+  }
+  const showTip = (e) => {
+    const el = e.currentTarget;
+    const title = el.dataset.helpTitle || '';
+    const body  = el.dataset.help || '';
+    tip.innerHTML = (title ? '<div class="help-tip-title">' + title + '</div>' : '') + body;
+    tip.classList.add('help-tip-show');
+    moveTip(e);
+  };
+  const moveTip = (e) => {
+    const r = tip.getBoundingClientRect();
+    const margin = 12;
+    let x = e.clientX + 14;
+    let y = e.clientY + 14;
+    if (x + r.width  > window.innerWidth  - margin) x = window.innerWidth  - r.width  - margin;
+    if (y + r.height > window.innerHeight - margin) y = e.clientY - r.height - 14;
+    tip.style.left = Math.max(margin, x) + 'px';
+    tip.style.top  = Math.max(margin, y) + 'px';
+  };
+  const hideTip = () => tip.classList.remove('help-tip-show');
+  document.querySelectorAll('[data-help]').forEach(el => {
+    if (el.dataset._helpWired) return;
+    el.dataset._helpWired = '1';
+    el.addEventListener('mouseenter', showTip);
+    el.addEventListener('mousemove',  moveTip);
+    el.addEventListener('mouseleave', hideTip);
+  });
 }
 
 /* Custom floating tooltip for the hourly-forecast bars (v5.10). */
@@ -1262,6 +1333,7 @@ document.querySelectorAll('.chart-tab').forEach(btn => {
 
 fetchStatus();
 startCountdown();
+_wireHelpTips();
 // Charts refresh independently — every 5 minutes is plenty
 refreshCharts();
 refreshDailyChart();
