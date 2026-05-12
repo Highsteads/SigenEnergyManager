@@ -248,6 +248,26 @@ header h1{
   transition:stroke-dashoffset .8s cubic-bezier(.2,.7,.3,1), stroke .4s ease;
   filter:drop-shadow(0 0 6px rgba(52,211,153,0.55));
 }
+/* Forecast bar tooltip (v5.10) — floating panel on hover */
+.fc-tip{
+  position:fixed;pointer-events:none;z-index:50;
+  background:rgba(15,23,36,0.92);
+  backdrop-filter:blur(8px) saturate(160%);
+  -webkit-backdrop-filter:blur(8px) saturate(160%);
+  border:1px solid rgba(125,211,252,0.30);
+  border-radius:8px;padding:6px 10px;
+  box-shadow:0 8px 24px rgba(0,0,0,0.40);
+  opacity:0;transform:translateY(4px);
+  transition:opacity .15s ease, transform .15s ease;
+  font-size:11px;line-height:1.3;
+  min-width:90px;
+}
+.fc-tip.fc-tip-show{opacity:1;transform:translateY(0)}
+.fc-tip .fc-tip-time{color:#94a3b8;font-size:10px;letter-spacing:.4px}
+.fc-tip .fc-tip-kwh{color:#fbbf24;font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;text-shadow:0 0 10px rgba(251,191,36,0.35)}
+.fc-tip .fc-tip-unit{color:#64748b;font-size:10px;font-weight:500;margin-left:1px}
+.fc-bar{cursor:pointer}
+.fc-bar rect:first-child{transition:opacity .12s ease}
 /* Sparkline (SOC card) — 24h trend */
 .spark-wrap{margin-top:12px;height:36px;position:relative}
 .spark-wrap svg{width:100%;height:100%;display:block}
@@ -369,8 +389,8 @@ header h1{
       <span>Remaining: <strong id="fc-rem">&#8212;</strong> kWh</span>
       <span>Bias factor: <strong id="fc-bias">&#8212;</strong></span>
     </div>
-    <svg id="fc-svg" viewBox="0 0 756 130" xmlns="http://www.w3.org/2000/svg">
-      <text x="378" y="70" text-anchor="middle" fill="#374151" font-size="13">Loading forecast...</text>
+    <svg id="fc-svg" viewBox="0 0 756 80" xmlns="http://www.w3.org/2000/svg">
+      <text x="378" y="40" text-anchor="middle" fill="#374151" font-size="13">Loading forecast...</text>
     </svg>
   </section>
 
@@ -600,13 +620,14 @@ function setFlow(id, watts, forwardPositive) {
 function renderForecast(hourly) {
   const svg = document.getElementById('fc-svg');
   const entries = Object.entries(hourly).sort((a,b)=>a[0].localeCompare(b[0]));
-  if (!entries.length) { svg.innerHTML = '<text x="378" y="70" text-anchor="middle" fill="#374151" font-size="13">No forecast data</text>'; return; }
+  if (!entries.length) { svg.innerHTML = '<text x="378" y="40" text-anchor="middle" fill="#374151" font-size="13">No forecast data</text>'; return; }
   const maxWh  = Math.max(...entries.map(e=>e[1]), 1);
   const now    = new Date();
   const curHr  = now.getHours();
   const n      = entries.length;
   const bw     = Math.floor(740 / n) - 2;
-  const chartH = 100;
+  const chartH = 56;     // v5.10: was 100 — chart now ~60% shorter
+  const labelY = 74;     // hour labels just below the axis
   let out = '';
   entries.forEach(([key,wh], i) => {
     const hr  = parseInt(key.split(':')[0]);
@@ -617,18 +638,71 @@ function renderForecast(hourly) {
     const past   = hr < curHr;
     const curr   = hr === curHr;
     const col    = curr ? '#fbbf24' : '#34d399';
-    const opac   = past ? '0.35' : '1';
-    out += `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${col}" opacity="${opac}" rx="2"/>`;
+    const opac   = past ? '0.32' : '1';
+    // data-* attributes power the custom HTML tooltip; <title> gives a
+    // free browser tooltip as fallback for accessibility / non-JS clients
+    out +=
+      `<g class="fc-bar" data-hr="${hr}" data-kwh="${kwh.toFixed(2)}" data-curr="${curr ? '1':'0'}">`
+      + `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${col}" opacity="${opac}" rx="2"/>`
+      // invisible wider hit-area so mouse-over targeting is easy even for tiny bars
+      + `<rect x="${x-1}" y="0" width="${bw+2}" height="${chartH}" fill="transparent"/>`
+      + `<title>${hr.toString().padStart(2,'0')}:00 — ${kwh.toFixed(2)} kWh</title>`
+      + `</g>`;
+    // sparse hour labels (every 2nd hour) at the bottom
     if (hr % 2 === 0) {
-      out += `<text x="${x+bw/2}" y="118" text-anchor="middle" fill="#4b5563" font-size="9">${hr}</text>`;
-    }
-    if (!past && kwh >= 0.2) {
-      out += `<text x="${x+bw/2}" y="${y-3}" text-anchor="middle" fill="${curr?'#fbbf24':'#6ee7b7'}" font-size="8">${kwh.toFixed(1)}</text>`;
+      out += `<text x="${x+bw/2}" y="${labelY}" text-anchor="middle" fill="#64748b" font-size="9">${hr}</text>`;
     }
   });
   // x-axis line
   out += `<line x1="6" y1="${chartH}" x2="750" y2="${chartH}" stroke="#1e2d3d" stroke-width="1"/>`;
   svg.innerHTML = out;
+  _wireForecastTooltip();
+}
+
+/* Custom floating tooltip for the hourly-forecast bars (v5.10). */
+function _wireForecastTooltip() {
+  const svg = document.getElementById('fc-svg');
+  let tip = document.getElementById('fc-tip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'fc-tip';
+    tip.className = 'fc-tip';
+    document.body.appendChild(tip);
+  }
+  const showTip = (e) => {
+    const g = e.currentTarget;
+    const hr   = g.dataset.hr;
+    const kwh  = g.dataset.kwh;
+    const curr = g.dataset.curr === '1';
+    const hrStr = hr.padStart(2,'0') + ':00';
+    tip.innerHTML =
+      '<div class="fc-tip-time">' + hrStr + (curr ? ' (now)' : '') + '</div>'
+      + '<div class="fc-tip-kwh">' + kwh + ' <span class="fc-tip-unit">kWh</span></div>';
+    tip.classList.add('fc-tip-show');
+    // Highlight the hovered bar
+    svg.querySelectorAll('.fc-bar rect:first-child').forEach(r => r.setAttribute('data-orig-opacity', r.getAttribute('opacity') || '1'));
+    const targetRect = g.querySelector('rect');
+    if (targetRect) targetRect.setAttribute('opacity', '1');
+  };
+  const moveTip = (e) => {
+    const x = e.clientX + 12;
+    const y = e.clientY - 10;
+    tip.style.left = Math.min(window.innerWidth - 160, x) + 'px';
+    tip.style.top  = Math.max(8, y - 60) + 'px';
+  };
+  const hideTip = (e) => {
+    tip.classList.remove('fc-tip-show');
+    // Restore original opacities
+    svg.querySelectorAll('.fc-bar rect:first-child').forEach(r => {
+      const orig = r.getAttribute('data-orig-opacity');
+      if (orig) r.setAttribute('opacity', orig);
+    });
+  };
+  svg.querySelectorAll('.fc-bar').forEach(g => {
+    g.addEventListener('mouseenter', showTip);
+    g.addEventListener('mousemove',  moveTip);
+    g.addEventListener('mouseleave', hideTip);
+  });
 }
 
 function updateAlerts(d) {

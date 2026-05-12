@@ -7,7 +7,14 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.9
+# Version:     5.10
+# Changes:     v5.10 (12-05-2026) — compact forecast chart with hover tips:
+#   • Hourly forecast SVG shrunk from 130px to 80px high (~60% shorter).
+#   • kWh labels above each bar removed (less visual noise).
+#   • Hover any bar to see a custom floating tooltip with the hour and
+#     exact kWh value, with glassmorphism panel + glow.
+#   • Bars highlighted on hover for clear visual feedback.
+#   • Native SVG <title> retained as accessibility / no-JS fallback.
 # Changes:     v5.9 (12-05-2026) — live polling + dashboard cadence:
 #   • Modbus poll interval is now actually wired up to PluginConfig
 #     (was hardcoded). Default lowered 60s -> 10s so the dashboard sees
