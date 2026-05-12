@@ -14,6 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.1 | 12-May-2026 | Site config consolidation. Plugin now publishes `sigen_site_config.json` to the Python Scripts folder on every startup and every PluginConfig save. The companion `openmeteo_battery_optimiser.py` script (v2.7) reads it so battery / inverter / tariff / resilience / flood-prevention values always match the plugin. Fixes a real drift bug: optimiser had `FLOOD_PREV_FORECAST_MULT = 4.0` while plugin used `3.0` — could give "no pre-drain" advisory while the plugin actually pre-drained. New `siteArraysJson` PluginConfig field — per-array PV specs as a JSON list (`{name, tilt, azimuth, kwp, shade}`), strict-shape parsed at startup with ERROR log on bad JSON (falls back to built-in default 4-array config). |
 | 5.0 | 12-May-2026 | Major hardening + feature pass. Threading lock around shared state; web dashboard thread/socket cleanup on shutdown; SQLite connections timeout=5.0 + try/finally; Octopus rate-limit tracker (warn >80/hr, hard-stop >95/hr); Modbus writes are read-back-verified; JSON parse guards on every `response.json()`; Kraken token cleared on any failure path; `battery_manager.evaluate()` refactored (`_check_overrides` / `_check_resilience_buffer`) and the dead v4.0 night-export branch removed; site coordinates moved to PluginConfig (`siteLatitude`/`siteLongitude`); variable folder ID cached; `_ensure_plugin_log` throttled to hourly; `ServerApiVersion` bumped 3.0 → 3.8 (Indigo 2025.2 native); pymodbus pinned `>=3.0,<4.0`; EMS mode 0x07 ("AI Mode") added; Axle `forecast_dispatch_kwh` / `estimated_revenue_p` surfaced when present; auto-calibrated weekday/weekend kWh from live consumption profile; new menu items **Run Self-Test** and **Show Power Cut Log**; dashboard adds `tomorrow_surplus_kwh`, `tomorrow_revenue_gbp`, `forecast_accuracy`, `power_cut`; weekly battery State-of-Health snapshot with degradation warnings; power-cut event log; variable-driven pause/resume via `sigen_manager_paused`; Pushover quiet hours + configurable sound; 7-day rolling forecast MAPE summary at midnight. Companion `openmeteo_battery_optimiser.py` script rewrote 20:00 / 01:45 Pushover messages in full prose. `getActionConfigUiValues` now pre-populates Force-Import / Force-Export dialogs with live values. |
 | 4.9 | 10-May-2026 | Plugin version is now read dynamically from Info.plist (`self.pluginVersion`) — single source of truth, no separate Python constant. Pushover action calls fixed: action ID `send` (was `sendPushover`), correct prop keys `msgTitle`/`msgBody`/`msgUser`/`msgPriority`/`msgSound`. Implemented `triggerStartProcessing` / `triggerStopProcessing` lifecycle so all custom Indigo trigger events (`emergencyImportTriggered`, `exportStarted/Stopped`, `vppAnnounced/Started/Ended`, `floodPreventionStarted/Stopped`, `powerCutLockoutStarted/Cleared`) now fire correctly via `indigo.trigger.execute(trigger_object)`. Moved hardcoded IPs and the Axle support email to `IndigoSecrets.py`: `SIGENERGY_IP`, `DASHBOARD_HOST`, `AXLE_SUPPORT_EMAIL`, `PUSHOVER_USER_TOKEN`. Each has a PluginConfig fallback and logs an ERROR if neither source is set. Dashboard URL auto-detects the LAN IP via socket when no override is configured. Swallowed-failure log levels promoted from WARNING to ERROR (trigger execute fail, dashboard stop, VPP email, Timeseries DB init/write). `_init_modules()` now initialises forecast/Octopus/Axle before the inverter-IP check so a missing IP only skips Modbus instead of crashing startup. |
 | 4.8 | 03-May-2026 | Remove 15-minute heartbeat log — only log on action change (web dashboard covers live status). |
@@ -118,17 +119,62 @@ DASHBOARD_HOST      = ""
 | Plant slave address | Modbus slave address for plant data (default 247) |
 | Inverter slave address | Modbus slave address for inverter data (default 1) |
 | Poll interval | Inverter data poll frequency in seconds (default 60) |
+| **Site latitude** *(v5.0)* | Degrees N for Open-Meteo forecast (default 54.882) |
+| **Site longitude** *(v5.0)* | Degrees E, negative for W (default -1.818) |
+| **PV array specs (JSON)** *(v5.1)* | Optional JSON list of `{name, tilt, azimuth, kwp, shade}` — leave blank to use the built-in 4-array default. Bad JSON falls back to the default and logs an ERROR. |
 | Battery capacity (kWh) | Total usable battery capacity (default 35.04) |
 | Battery efficiency | Round-trip efficiency 0-100% (default 94) |
 | Inverter max kW | Inverter rated output power -- sets battery discharge ceiling (default 10) |
-| Dawn SOC target (%) | Minimum SOC required at next solar dawn (default 10%) |
-| Battery health cutoff (%) | Hardware discharge floor (default 10%) |
+| Dawn SOC target (%) | Summer resilience buffer — minimum SOC kept overnight on flat-rate tariffs (default 10%) |
+| Winter buffer (%) *(v4.x)* | Higher overnight floor for Oct-Mar (default 20%) |
+| Battery health cutoff (%) | Hardware discharge floor (default 1%) |
+| Weekday kWh / Weekend kWh | Daily consumption estimate (auto-calibrated from live inverter data in v5.0+; user values only used until the 48-slot profile is populated) |
 | Export enabled | Enable grid export (requires active export MPAN) |
 | Max export kW | DNO export cap — used at startup to initialise the export limit register (default 4 kW) |
 | VPP (Axle) enabled | Enable Axle Virtual Power Plant integration |
+| **Pushover sound** *(v5.0)* | Sound for storm + VPP alerts (default `vibrate`; full Pushover sound list available) |
+| **Pushover quiet hours** *(v5.0)* | Start / End times (HH:MM). INFO-priority alerts are suppressed during this window; HIGH-priority (storm amber/red, VPP release failure) always fire. |
+| Dashboard host | Blank = auto-detect LAN IP; otherwise hostname / IP visible to other devices |
+| Show debug logging | Verbose log output |
 
 Note: Octopus tariff type (Tracker/Go/Flux/iGo/iFlux/Agile) is detected
 automatically from your Octopus account -- no manual selection required.
+
+### Shared site config — `sigen_site_config.json` *(v5.1)*
+
+The plugin publishes a small JSON file every startup and every PluginConfig save:
+
+```
+/Library/Application Support/Perceptive Automation/Python Scripts/sigen_site_config.json
+```
+
+It contains the battery / inverter / tariff / resilience / flood-prevention values
+the plugin is currently using. The companion `openmeteo_battery_optimiser.py`
+script (used by the 20:00 EVENING and 01:45 OVERNIGHT scheduled Pushover messages)
+reads this file at runtime instead of hardcoding its own copies — so the plugin
+and the advisory script can no longer drift apart on tunable thresholds.
+
+If the file is absent (fresh install, or the script is being used without the
+plugin) the script falls back to a built-in copy of the same defaults. Bad JSON
+is treated the same as "absent".
+
+### Companion script — `openmeteo_battery_optimiser.py`
+
+Lives at:
+
+```
+/Library/Application Support/Perceptive Automation/Python Scripts/openmeteo_battery_optimiser.py
+```
+
+Driven by two Indigo schedules — `openmeteo_battery_optimiser At 20:00` and
+`openmeteo_battery_optimiser At 01:45`. Sends a friendly full-prose Pushover
+message describing tonight's plan (EVENING) and a short overnight check-in
+(OVERNIGHT). Advisory only — all actual battery control is in the plugin.
+
+Reads:
+- `openmeteo_forecast.json` (published by the plugin's forecast module)
+- `octopus_consumption_profile.json` (published by the plugin's Octopus module)
+- `sigen_site_config.json` (published by the plugin, v5.1+)
 
 ---
 
@@ -306,9 +352,72 @@ oscillated around 80%.
 |------|---------|
 | Battery Manager | Main control device -- one per system |
 | Inverter Monitor | Real-time PV, battery, grid, home power readings |
-| Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) |
+| Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) — *note: v4.7 removed Solcast, this is now Open-Meteo backed* |
 | Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
 | Axle VPP | VPP event state machine and SOC management |
+
+---
+
+## Menu items
+
+Available from Indigo: **Plugins → Sigenergy Manager** menu.
+
+| Item | What it does |
+|------|--------------|
+| Refresh All Data Now | Forces an immediate forecast + Octopus rates + manager re-evaluation |
+| Show Manager Status | Prints current manager decision, snapshot and tariff data |
+| Show Daily History (Last 7 Days) | Reads the 365-day ring buffer and prints the last 7 days |
+| Show Current Tariff Rates | Prints today / tomorrow rates (import + export) |
+| Show VPP Status | Axle VPP state machine summary |
+| Show VPP Export Summary | Cumulative VPP earnings since plugin install |
+| Show Today's Energy Summary | PV / Import / Export / Home / SOC peaks for today |
+| **Run Self-Test** *(v5.0)* | Verifies Modbus / Octopus / Open-Meteo / Axle / Pushover / secrets resolution in one report |
+| **Show Power Cut Log** *(v5.0)* | Last 20 grid-status transitions (rolling 100-entry log) |
+| Toggle Debug Logging | Quick on/off without opening the prefs dialog |
+| Show Plugin Info | Re-prints the startup banner (version, paths, API version) |
+
+## Indigo variables created by the plugin
+
+| Variable | Folder | Purpose |
+|----------|--------|---------|
+| `sigen_manager_paused` *(v5.0)* | Sigenergy | Set to `true` / `1` / `yes` / `on` from any Indigo automation to pause the battery manager; set back to `false` to resume. The manager device's `managerStatus` state mirrors this. |
+| `battery_optimiser_status` | Sigenergy | Status line from the optimiser script (`EVENING 20:00 | Tracker | …`) |
+| `battery_import_kw` / `battery_import_kwh` | Sigenergy | Plan from the optimiser script |
+| various `sigen_*` / `elec_*` | Sigenergy | Energy summary values written every 30 min |
+
+## Custom events
+
+Custom Indigo triggers that fire from the plugin (use **New Trigger** → **Plugin Event**):
+
+| Event ID | Fires when |
+|----------|-----------|
+| `emergencyImportTriggered` | Battery cannot reach dawn — grid import initiated |
+| `exportStarted` / `exportStopped` | Battery export to grid starts / stops |
+| `vppAnnounced` / `vppStarted` / `vppEnded` | Axle VPP event lifecycle |
+| `floodPreventionStarted` / `floodPreventionStopped` | Overnight pre-drain export lifecycle |
+| `powerCutLockoutStarted` / `powerCutLockoutCleared` | 4-hour export lockout after grid restoration |
+
+## Web dashboard
+
+Local HTTP dashboard runs on port **8179** by default. Visit
+`http://<your-indigo-host>:8179/` for a live view. The JSON API at
+`/api/status` returns:
+
+| Section | Contains |
+|---------|----------|
+| `battery` | SOC, power |
+| `solar` | Today / tomorrow kWh, bias factor, remaining today, **tomorrow surplus kWh**, **tomorrow revenue £**, **export rate p** *(v5.0)* |
+| `grid` | Power, status |
+| `home` | Load watts |
+| `decision` | Manager action + reason |
+| `tariff` | Name, product code, today/tomorrow p |
+| `today_summary` | PV, import, export, home, peak/min SOC, self-sufficiency % |
+| `vpp` | State machine status |
+| `storm` | Current MeteoAlarm level |
+| `flags` | export_active, solar_overflow_active, import_active, modbus_connected |
+| `hourly_forecast` | Per-hour kWh today |
+| **`power_cut`** *(v5.0)* | Last 10 transitions, `ongoing`, `lockout_active` |
+| **`forecast_accuracy`** *(v5.0)* | 7-day rolling MAPE, mean factor, over/under counts |
 
 ---
 
@@ -319,12 +428,12 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m unittest test_battery_manager test_sigenergy_modbus -v
 ```
 
-**49 tests** across two test files, all passing without Indigo installed:
+**72 tests** across two test files, all passing without Indigo installed:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_battery_manager.py` | 33 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), staged export hysteresis, night export (10 cases), VPP suppression |
-| `test_sigenergy_modbus.py` | 16 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation |
+| `test_battery_manager.py` | 51 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (multiple cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
+| `test_sigenergy_modbus.py` | 21 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation, write-back verification |
 
 ---
 
@@ -341,4 +450,4 @@ Developed and tested on:
 
 ## Author
 
-CliveS & Claude Sonnet 4.6 -- Medomsley, County Durham, England
+CliveS & Claude (Sonnet 4.6 / Opus 4.7) -- Medomsley, County Durham, England
