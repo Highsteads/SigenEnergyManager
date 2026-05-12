@@ -41,7 +41,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 ## Requirements
 
-- Indigo 2025.2 or later (Python 3.13)
+- Indigo 2022.1 or later (Python 3.10+)
 - Sigenergy inverter with Modbus TCP enabled (port 502)
 - Python packages: `pymodbus>=3.0`, `pytz>=2024.1` (auto-installed from `requirements.txt`)
 - Optional: Octopus Energy API key (tariff-aware import scheduling)
