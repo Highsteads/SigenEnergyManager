@@ -3824,6 +3824,28 @@ class Plugin(indigo.PluginBase):
         log("Self-test complete.")
         return True
 
+    def menuOpenDashboard(self):
+        """Menu: Open the web dashboard in the default browser.
+
+        Note: this opens the browser on the Indigo SERVER. If the Indigo
+        client is running on a different Mac, the dashboard will appear on
+        the server's screen, not the client's.  The URL is also logged so
+        it can be clicked from the event log on any client.
+        """
+        host = self._resolve_dashboard_host()
+        url  = f"http://{host}:{WEB_DASHBOARD_PORT}/"
+        log(f"[Menu] Web dashboard: {url}")
+        try:
+            import webbrowser
+            opened = webbrowser.open(url, new=2)
+            if not opened:
+                log("[Menu] Could not auto-open browser — open the URL above manually",
+                    level="WARNING")
+        except Exception as exc:
+            log(f"[Menu] Browser launch failed ({exc}) — open the URL above manually",
+                level="WARNING")
+        return True
+
     def menuShowPowerCutLog(self):
         """Menu: Show the last 20 grid-status transitions from the in-memory log."""
         events = self.store.get("power_cut_events", []) or []
