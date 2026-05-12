@@ -7,7 +7,24 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.5
+# Version:     5.6
+# Changes:     v5.6 (12-05-2026) — calendar-month breakdown on the dashboard:
+#   • New "<year> calendar months" card — Jan-Dec table for the current
+#     calendar year, same five economics columns as the period card. Each
+#     month row shows total + per-day average; current month flagged
+#     "(partial)"; months with no data show "—".
+#   • Year-total footer row sums every populated month.
+#   • Year selector tabs (one button per year with any data, always
+#     including current year) — click switches the calendar card to a
+#     historical year without disturbing the rest of the dashboard.
+#     Backed by new endpoints /api/calendar?year=YYYY and /api/years.
+#   • daily_history.json retention bumped from 365 to 3650 days (~10
+#     years) so prior years aren't lost. Each record is ~250 bytes so
+#     10 years ≈ 1 MB JSON — negligible.
+#   • Periodic /api/status refresh only updates the calendar card if the
+#     user is viewing the current year — historical-year selections are
+#     preserved across the auto-refresh tick.
+#   • New `economics.calendar_months` block in /api/status (current year).
 # Changes:     v5.5 (12-05-2026) — period totals on the dashboard:
 #   • New "Period totals" card under the bottom row, listing Week / Month /
 #     Year roll-ups of all five economics fields (solar benefit, net grid,
@@ -809,11 +826,16 @@ class Plugin(indigo.PluginBase):
                 export_rate_p          = export_rate_p,
                 fallback_import_rate_p = import_rate_p,
             )
+            calendar_months = self._calendar_months_summary(
+                export_rate_p          = export_rate_p,
+                fallback_import_rate_p = import_rate_p,
+            )
             economics = {
-                "today":          today_econ,
-                "yesterday":      yesterday_econ,
-                "yesterday_date": yesterday_date,
-                "periods":        periods,
+                "today":           today_econ,
+                "yesterday":       yesterday_econ,
+                "yesterday_date":  yesterday_date,
+                "periods":         periods,
+                "calendar_months": calendar_months,
             }
 
             return {
@@ -1025,6 +1047,107 @@ class Plugin(indigo.PluginBase):
             "year":  aggregate(year_recs),
         }
 
+    def _calendar_months_summary(self, export_rate_p, fallback_import_rate_p,
+                                  year=None):
+        """Per-month economics for Jan-Dec of `year` (default: current year).
+
+        Returns a list of 12 dicts in calendar order, each containing the
+        same shape as _period_economics_summary's aggregate (days, totals,
+        averages).  Months with no records report days=0 and None values
+        so the dashboard can render "—".
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            records = []
+        try:
+            import pytz
+            now_local = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("Europe/London"))
+        except Exception:
+            now_local = datetime.now()
+        if year is None:
+            year = now_local.year
+
+        # Group records by calendar month string ("YYYY-MM")
+        by_month = {f"{year:04d}-{m:02d}": [] for m in range(1, 13)}
+        for r in records:
+            d = r.get("date") or ""
+            m_key = d[:7]
+            if m_key in by_month:
+                by_month[m_key].append(r)
+
+        # Reuse the aggregate maths from the period summary
+        def aggregate(subset):
+            if not subset:
+                return {
+                    "days": 0,
+                    "import_total_gbp":   None, "export_total_gbp":   None,
+                    "no_solar_total_gbp": None, "net_total_gbp":      None,
+                    "benefit_total_gbp":  None,
+                    "import_avg_gbp":     None, "export_avg_gbp":     None,
+                    "no_solar_avg_gbp":   None, "net_avg_gbp":        None,
+                    "benefit_avg_gbp":    None,
+                }
+            total_imp_p = total_exp_p = 0.0
+            total_no_solar_p = total_net_p = total_benefit_p = 0.0
+            counted = 0
+            for r in subset:
+                home  = float(r.get("home_kwh",        0) or 0)
+                imp_k = float(r.get("grid_import_kwh", 0) or 0)
+                exp_k = float(r.get("grid_export_kwh", 0) or 0)
+                try:
+                    ir = float(r.get("rate_today_p") or 0)
+                except (TypeError, ValueError):
+                    ir = 0
+                if ir <= 0 and fallback_import_rate_p is not None:
+                    ir = fallback_import_rate_p
+                if ir <= 0:
+                    continue
+                er = export_rate_p
+                imp_p   = imp_k * ir
+                exp_p   = exp_k * er
+                no_sol  = home  * ir
+                net     = exp_p - imp_p
+                benefit = no_sol - imp_p + exp_p
+                total_imp_p      += imp_p
+                total_exp_p      += exp_p
+                total_no_solar_p += no_sol
+                total_net_p      += net
+                total_benefit_p  += benefit
+                counted += 1
+            if counted == 0:
+                return aggregate([])
+            def _g(p):  return round(p / 100.0,           2)
+            def _ga(p): return round(p / 100.0 / counted, 2)
+            return {
+                "days":                counted,
+                "import_total_gbp":    _g(total_imp_p),
+                "export_total_gbp":    _g(total_exp_p),
+                "no_solar_total_gbp":  _g(total_no_solar_p),
+                "net_total_gbp":       _g(total_net_p),
+                "benefit_total_gbp":   _g(total_benefit_p),
+                "import_avg_gbp":      _ga(total_imp_p),
+                "export_avg_gbp":      _ga(total_exp_p),
+                "no_solar_avg_gbp":    _ga(total_no_solar_p),
+                "net_avg_gbp":         _ga(total_net_p),
+                "benefit_avg_gbp":     _ga(total_benefit_p),
+            }
+
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        result = []
+        for m in range(1, 13):
+            key = f"{year:04d}-{m:02d}"
+            entry = aggregate(by_month[key])
+            entry["month_key"] = key
+            entry["month_name"] = month_names[m - 1]
+            entry["partial"]   = (m == now_local.month and year == now_local.year)
+            result.append(entry)
+        return {"year": year, "months": result}
+
     def _yesterday_economics(self, export_rate_p, fallback_import_rate_p):
         """Read yesterday's totals from daily_history.json and compute economics.
 
@@ -1064,6 +1187,62 @@ class Plugin(indigo.PluginBase):
             ),
             date_str,
         )
+
+    def get_dashboard_calendar(self, year):
+        """Return calendar_months summary for a specific year.
+
+        Backs the /api/calendar?year=YYYY endpoint so the dashboard's year
+        selector can fetch historical years on demand instead of dumping
+        every year into every /api/status response.
+        """
+        try:
+            yi = int(year)
+        except (TypeError, ValueError):
+            yi = datetime.now().year
+        # Resolve export rate same as in get_dashboard_data
+        export_rate_p = 12.0
+        try:
+            rates_export = float((self.latest_rates_data or {}).get("export_rate_p", 0.0))
+            if rates_export > 0:
+                export_rate_p = rates_export
+        except (TypeError, ValueError):
+            pass
+        # Best-effort current import rate for fallback
+        fallback_rate = None
+        try:
+            t = (self.latest_rates_data or {}).get("tracker", {}) or {}
+            r = float(t.get("today_p") or 0.0)
+            if r > 0:
+                fallback_rate = r
+        except (TypeError, ValueError):
+            pass
+        if fallback_rate is None:
+            try:
+                if "elec_unit_rate_p" in indigo.variables:
+                    r = float(indigo.variables["elec_unit_rate_p"].value or 0.0)
+                    if r > 0:
+                        fallback_rate = r
+            except (TypeError, ValueError, KeyError):
+                pass
+        return self._calendar_months_summary(
+            export_rate_p          = export_rate_p,
+            fallback_import_rate_p = fallback_rate,
+            year                   = yi,
+        )
+
+    def get_dashboard_years(self):
+        """Return the sorted list of years that have at least one daily record."""
+        path = os.path.join(self.data_dir, "daily_history.json")
+        if not os.path.exists(path):
+            return {"years": []}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            return {"years": []}
+        years = sorted({(r.get("date") or "")[:4] for r in records
+                        if (r.get("date") or "")[:4].isdigit()})
+        return {"years": years}
 
     def get_dashboard_history(self, hours=24):
         """Return half-hourly slots for the last N hours from the SQLite store.
@@ -2921,8 +3100,11 @@ class Plugin(indigo.PluginBase):
             pass
 
         records.append(record)
-        if len(records) > 365:
-            records = records[-365:]
+        # Retention bumped from 365 -> 3650 days (~10 years) in v5.6 so the
+        # dashboard can offer a year selector for multi-year history.  Each
+        # record is ~250 bytes, so 10 years = ~1 MB of JSON — fine.
+        if len(records) > 3650:
+            records = records[-3650:]
 
         try:
             with open(path, "w", encoding="utf-8") as f:

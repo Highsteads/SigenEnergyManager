@@ -360,6 +360,41 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
     </table>
   </section>
 
+  <!-- Calendar-month totals (v5.6) -->
+  <section class="card period-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h2 style="margin-bottom:0"><span id="cal-year">&#8212;</span> calendar months</h2>
+      <div class="chart-tabs" id="cal-year-tabs"></div>
+    </div>
+    <table class="period-table">
+      <thead>
+        <tr>
+          <th>Month</th>
+          <th>Days</th>
+          <th>Solar benefit</th>
+          <th>Net grid</th>
+          <th>Without solar</th>
+          <th>Import paid</th>
+          <th>Export earned</th>
+        </tr>
+      </thead>
+      <tbody id="cal-tbody">
+        <tr><td colspan="7" class="muted">&#8212;</td></tr>
+      </tbody>
+      <tfoot>
+        <tr id="cal-total-row" style="border-top:2px solid #1e2d3d;font-weight:600">
+          <td>Year total</td>
+          <td class="tdays" id="cal-total-days">&#8212;</td>
+          <td id="cal-total-benefit">&#8212;</td>
+          <td id="cal-total-net">&#8212;</td>
+          <td id="cal-total-nosolar">&#8212;</td>
+          <td id="cal-total-import">&#8212;</td>
+          <td id="cal-total-export">&#8212;</td>
+        </tr>
+      </tfoot>
+    </table>
+  </section>
+
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
   <!-- Charts row (v5.2) -->
@@ -655,10 +690,125 @@ function update(d) {
     }).join('');
   }
 
+  let _calCurrentYear = null;
+  let _calYearsLoaded = false;
+
+  async function _loadYearTabs() {
+    if (_calYearsLoaded) return;
+    _calYearsLoaded = true;
+    try {
+      const r = await fetch('/api/years');
+      if (!r.ok) return;
+      const d = await r.json();
+      const years = (d.years || []).slice();
+      // Always include the current year even if not in the data set
+      const cy = new Date().getFullYear().toString();
+      if (years.indexOf(cy) === -1) years.push(cy);
+      years.sort();
+      const wrap = document.getElementById('cal-year-tabs');
+      if (!wrap) return;
+      wrap.innerHTML = years.map(y =>
+        '<button class="chart-tab" data-year="' + y + '">' + y + '</button>'
+      ).join('');
+      wrap.querySelectorAll('.chart-tab').forEach(btn => {
+        btn.addEventListener('click', () => _switchCalYear(btn.dataset.year));
+      });
+      _setActiveCalTab(_calCurrentYear || cy);
+    } catch (e) { /* silent */ }
+  }
+
+  function _setActiveCalTab(year) {
+    document.querySelectorAll('#cal-year-tabs .chart-tab').forEach(b => {
+      if (b.dataset.year === year) b.classList.add('active');
+      else b.classList.remove('active');
+    });
+  }
+
+  async function _switchCalYear(year) {
+    _calCurrentYear = year;
+    _setActiveCalTab(year);
+    try {
+      const r = await fetch('/api/calendar?year=' + encodeURIComponent(year));
+      if (!r.ok) return;
+      const d = await r.json();
+      _renderCalendarMonths(d);
+    } catch (e) { /* silent */ }
+  }
+
+  function _renderCalendarMonths(cal) {
+    if (!cal || !cal.months) return;
+    if (_calCurrentYear === null) _calCurrentYear = String(cal.year);
+    _loadYearTabs();   // populate tabs on first render
+    document.getElementById('cal-year').textContent = cal.year;
+    const tbody = document.getElementById('cal-tbody');
+    if (!tbody) return;
+    const cell = (total, avg, posNeg) => {
+      if (total === null || total === undefined) return '<td class="muted">—</td>';
+      const cls = posNeg ? (total < 0 ? 'period-neg' : 'period-pos') : '';
+      const totStr = (total < 0 ? '−£' : '£') + Math.abs(total).toFixed(2);
+      const avgStr = (avg === null || avg === undefined) ? ''
+        : '<span class="avg">' + (avg < 0 ? '−£' : '£') + Math.abs(avg).toFixed(2) + '/day</span>';
+      return '<td class="' + cls + '">' + totStr + avgStr + '</td>';
+    };
+    tbody.innerHTML = cal.months.map(m => {
+      const days = m.days || 0;
+      if (!days) {
+        return '<tr><td>' + m.month_name + '</td>'
+             + '<td class="tdays">0</td>'
+             + '<td colspan="5" class="muted">&#8212;</td></tr>';
+      }
+      const partialFlag = m.partial ? ' <span class="muted">(partial)</span>' : '';
+      return '<tr>'
+        + '<td>' + m.month_name + partialFlag + '</td>'
+        + '<td class="tdays">' + days + '</td>'
+        + cell(m.benefit_total_gbp,  m.benefit_avg_gbp,  true)
+        + cell(m.net_total_gbp,      m.net_avg_gbp,      true)
+        + cell(m.no_solar_total_gbp, m.no_solar_avg_gbp, false)
+        + cell(m.import_total_gbp,   m.import_avg_gbp,   false)
+        + cell(m.export_total_gbp,   m.export_avg_gbp,   false)
+        + '</tr>';
+    }).join('');
+
+    // Year totals (sum of month totals)
+    let totDays = 0, totBen = 0, totNet = 0, totNoSol = 0, totImp = 0, totExp = 0;
+    let any = false;
+    cal.months.forEach(m => {
+      if (!m.days) return;
+      any = true;
+      totDays  += m.days;
+      totBen   += m.benefit_total_gbp   || 0;
+      totNet   += m.net_total_gbp       || 0;
+      totNoSol += m.no_solar_total_gbp  || 0;
+      totImp   += m.import_total_gbp    || 0;
+      totExp   += m.export_total_gbp    || 0;
+    });
+    document.getElementById('cal-total-days').textContent = any ? totDays : '0';
+    const fmtG = (v, posNeg) => {
+      if (!any) return '—';
+      const cls = posNeg ? (v < 0 ? 'period-neg' : 'period-pos') : '';
+      const s = (v < 0 ? '−£' : '£') + Math.abs(v).toFixed(2);
+      return '<span class="' + cls + '">' + s + '</span>';
+    };
+    document.getElementById('cal-total-benefit').innerHTML  = fmtG(totBen,   true);
+    document.getElementById('cal-total-net').innerHTML      = fmtG(totNet,   true);
+    document.getElementById('cal-total-nosolar').innerHTML  = fmtG(totNoSol, false);
+    document.getElementById('cal-total-import').innerHTML   = fmtG(totImp,   false);
+    document.getElementById('cal-total-export').innerHTML   = fmtG(totExp,   false);
+  }
+
   if (d.economics) {
     _renderEconomics('eco-',   d.economics.today);
     _renderEconomics('eco-y-', d.economics.yesterday);
     _renderPeriods(d.economics.periods);
+    // Only auto-refresh the calendar card if the user is viewing the
+    // current year. If they've switched to a historical year, leave their
+    // manual selection alone.
+    const incomingYear = d.economics.calendar_months && d.economics.calendar_months.year;
+    if (_calCurrentYear === null || String(incomingYear) === _calCurrentYear) {
+      _renderCalendarMonths(d.economics.calendar_months);
+    } else {
+      _loadYearTabs();   // still keep the year-tab list fresh
+    }
     // Yesterday's date label
     const dateEl = document.getElementById('eco-y-date');
     if (d.economics.yesterday_date) {
@@ -895,6 +1045,35 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_history(hours=hours)
+                    body = json.dumps(data).encode()
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}).encode()
+            self._send(200, "application/json", body)
+
+        elif path == "/api/calendar":
+            # Calendar-months summary for a specific year (default: current).
+            year = ""
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            for kv in qs.split("&"):
+                if kv.startswith("year="):
+                    year = kv.split("=", 1)[1]
+            if self._plugin_ref is None:
+                body = b'{"error":"plugin not ready"}'
+            else:
+                try:
+                    data = self._plugin_ref.get_dashboard_calendar(year or "")
+                    body = json.dumps(data).encode()
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}).encode()
+            self._send(200, "application/json", body)
+
+        elif path == "/api/years":
+            # List of years with at least one daily-history record.
+            if self._plugin_ref is None:
+                body = b'{"error":"plugin not ready"}'
+            else:
+                try:
+                    data = self._plugin_ref.get_dashboard_years()
                     body = json.dumps(data).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
