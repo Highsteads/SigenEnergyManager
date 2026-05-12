@@ -7,7 +7,21 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.6
+# Version:     5.7
+# Changes:     v5.7 (12-05-2026) — true day-by-day rates + forever retention:
+#   • daily_history.json retention: cap removed entirely. Records are kept
+#     forever (~280 bytes each — 50 years of daily data is < 6 MB).
+#   • Each daily record now persists both `rate_today_p` (import rate) AND
+#     `export_rate_p` (export rate that was live on that day). Historical
+#     economics now value every day at the exact pence/kWh it was paid /
+#     earned on — future export-tariff changes will NOT retroactively
+#     re-value past days at the new rate.
+#   • All three roll-up paths (today, yesterday, period totals, calendar
+#     months) prefer the per-record export_rate_p; live/current rate is
+#     only the fallback for older records that pre-date this change.
+#   • Existing 43 records back-filled with export_rate_p=12.0 (Octopus
+#     Outgoing has been flat 12p since 26-Mar-2026; all current records
+#     fall after that date).
 # Changes:     v5.6 (12-05-2026) — calendar-month breakdown on the dashboard:
 #   • New "<year> calendar months" card — Jan-Dec table for the current
 #     calendar year, same five economics columns as the period card. Each
@@ -1003,7 +1017,14 @@ class Plugin(indigo.PluginBase):
                     ir = fallback_import_rate_p
                 if ir <= 0:
                     continue   # skip days with no rate info
-                er = export_rate_p
+                # Prefer per-record export rate (saved from v5.7 onwards);
+                # older records fall back to the live/current export rate.
+                try:
+                    er = float(r.get("export_rate_p") or 0)
+                except (TypeError, ValueError):
+                    er = 0
+                if er <= 0:
+                    er = export_rate_p
                 imp_p   = imp_k * ir
                 exp_p   = exp_k * er
                 no_sol  = home  * ir
@@ -1177,13 +1198,22 @@ class Plugin(indigo.PluginBase):
             pass
         if rate_p is None:
             rate_p = fallback_import_rate_p   # may also be None
+        # Use yesterday's own saved export rate if present (v5.7+);
+        # fall back to today's live export rate for older records.
+        yest_export_p = export_rate_p
+        try:
+            er = float(yest.get("export_rate_p") or 0.0)
+            if er > 0:
+                yest_export_p = er
+        except (TypeError, ValueError):
+            pass
         return (
             self._compute_daily_economics(
                 home_kwh      = float(yest.get("home_kwh",       0.0) or 0.0),
                 import_kwh    = float(yest.get("grid_import_kwh", 0.0) or 0.0),
                 export_kwh    = float(yest.get("grid_export_kwh", 0.0) or 0.0),
                 import_rate_p = rate_p,
-                export_rate_p = export_rate_p,
+                export_rate_p = yest_export_p,
             ),
             date_str,
         )
@@ -3066,7 +3096,26 @@ class Plugin(indigo.PluginBase):
         self._save_accumulators()
 
     def _write_daily_history(self, date_str):
-        """Append today's totals to the 365-day ring buffer."""
+        """Append today's totals to the all-time daily history.
+
+        Persists both the import rate (`rate_today_p`) and the export rate
+        (`export_rate_p`) on every record so that historical economics roll-ups
+        use the exact rate that was in effect on each day rather than today's
+        live rate.  Without this, a future export-rate change would
+        retroactively re-value every past day at the new rate.
+        """
+        # Capture the export rate as it stood on this day.  Falls back to
+        # 12p (Octopus Outgoing flat from 26-Mar-2026) if the live feed
+        # hasn't published a value yet.
+        try:
+            export_rate_p = float(
+                (self.latest_rates_data or {}).get("export_rate_p", 0.0)
+            )
+            if export_rate_p <= 0:
+                export_rate_p = 12.0
+        except (TypeError, ValueError):
+            export_rate_p = 12.0
+
         record = {
             "date":                 date_str,
             "month":                date_str[:7],
@@ -3084,7 +3133,8 @@ class Plugin(indigo.PluginBase):
             "peak_soc":   round(self.store["peak_soc"], 1),
             "min_soc":    round(self.store["min_soc"], 1),
             "tariff":     self.latest_rates_data.get("tariff_info", {}).get("tariff_key", "?"),
-            "rate_today_p": self.latest_rates_data.get("tracker", {}).get("today_p"),
+            "rate_today_p":   self.latest_rates_data.get("tracker", {}).get("today_p"),
+            "export_rate_p":  round(export_rate_p, 4),
             "import_events": 1 if self.store.get("had_import_today", False) else 0,
             "export_events": self.store.get("export_count_today", 0),
             "vpp_event":  self.store.get("had_vpp_today", False),
@@ -3100,11 +3150,9 @@ class Plugin(indigo.PluginBase):
             pass
 
         records.append(record)
-        # Retention bumped from 365 -> 3650 days (~10 years) in v5.6 so the
-        # dashboard can offer a year selector for multi-year history.  Each
-        # record is ~250 bytes, so 10 years = ~1 MB of JSON — fine.
-        if len(records) > 3650:
-            records = records[-3650:]
+        # Retention: keep every record indefinitely (v5.7).  Each record is
+        # ~280 bytes; even 50 years of daily data is < 6 MB JSON.  The user
+        # explicitly asked to never lose history.  No pruning.
 
         try:
             with open(path, "w", encoding="utf-8") as f:
