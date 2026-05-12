@@ -29,7 +29,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{
-  background:#040712;
+  background:
+    linear-gradient(135deg,#0a0e22 0%,#0d1a34 30%,#0a1f2e 70%,#15102a 100%);
+  background-attachment:fixed;
   color:#e2e8f0;
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   font-size:14px;
@@ -37,14 +39,14 @@ body{
   position:relative;
   overflow-x:hidden;
 }
-/* Animated radial-gradient backdrop — soft drifting glow */
+/* Animated radial-gradient overlay — bolder glow, much more visible */
 body::before{
   content:'';
   position:fixed;inset:0;
   background:
-    radial-gradient(900px 600px at 18% 22%, rgba(125,211,252,0.10), transparent 60%),
-    radial-gradient(800px 600px at 82% 78%, rgba(52,211,153,0.08),  transparent 60%),
-    radial-gradient(700px 500px at 50% 100%, rgba(167,139,250,0.06), transparent 60%);
+    radial-gradient(900px 600px at 18% 22%, rgba(125,211,252,0.28), transparent 55%),
+    radial-gradient(800px 600px at 82% 78%, rgba(167,139,250,0.22), transparent 55%),
+    radial-gradient(700px 500px at 50% 100%, rgba(52,211,153,0.18), transparent 55%);
   animation:bg-drift 28s ease-in-out infinite alternate;
   pointer-events:none;z-index:-1;
 }
@@ -168,23 +170,23 @@ header h1{
 .chart-wrap:last-child{margin-bottom:0}
 /* --- v5.8 glamour pass: glass cards, glow numbers, hover, pulses --- */
 .card{
-  background:rgba(15,23,36,0.55) !important;
-  backdrop-filter:blur(14px) saturate(140%);
-  -webkit-backdrop-filter:blur(14px) saturate(140%);
-  border:1px solid rgba(125,211,252,0.10) !important;
+  background:rgba(15,23,36,0.42) !important;
+  backdrop-filter:blur(18px) saturate(160%);
+  -webkit-backdrop-filter:blur(18px) saturate(160%);
+  border:1px solid rgba(125,211,252,0.18) !important;
   border-radius:14px !important;
   box-shadow:
-    0 4px 24px rgba(0,0,0,0.20),
-    inset 0 0 0 1px rgba(255,255,255,0.02);
+    0 8px 32px rgba(0,0,0,0.30),
+    inset 0 0 0 1px rgba(255,255,255,0.04);
   transition:transform .25s ease, box-shadow .25s ease, border-color .25s ease;
 }
 .card:hover{
-  transform:translateY(-2px);
-  border-color:rgba(125,211,252,0.22) !important;
+  transform:translateY(-3px);
+  border-color:rgba(125,211,252,0.40) !important;
   box-shadow:
-    0 12px 36px rgba(0,0,0,0.32),
-    0 0 28px rgba(125,211,252,0.06),
-    inset 0 0 0 1px rgba(255,255,255,0.04);
+    0 18px 42px rgba(0,0,0,0.36),
+    0 0 36px rgba(125,211,252,0.12),
+    inset 0 0 0 1px rgba(255,255,255,0.06);
 }
 .card h2{
   font-size:11px !important;
