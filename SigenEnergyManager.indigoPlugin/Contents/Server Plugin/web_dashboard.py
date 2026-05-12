@@ -61,8 +61,7 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 .fc-meta strong{color:#e2e8f0}
 #fc-svg{width:100%;height:auto}
 /* --- bottom row --- */
-.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media(max-width:980px){.bottom-row{grid-template-columns:1fr 1fr}}
+.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
 .dl{display:flex;flex-direction:column;gap:6px}
 .dl-item{display:flex;justify-content:space-between;align-items:baseline;font-size:13px}
 .dl-item .dk{color:#94a3b8}
@@ -272,7 +271,7 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 
     <!-- Today's Cost / Economics (v5.3) -->
     <section class="card">
-      <h2>Today&#8217;s Cost</h2>
+      <h2>Today&#8217;s Cost (so far)</h2>
       <div class="eco-rate" id="eco-benefit">&#8212;</div>
       <div class="eco-sub">benefit from solar today</div>
       <div class="eco-divider"></div>
@@ -295,6 +294,33 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
         </div>
       </div>
       <div class="eco-sub muted" id="eco-rates">&#8212;</div>
+    </section>
+
+    <!-- Yesterday's Cost (v5.4) -->
+    <section class="card">
+      <h2>Yesterday <span class="eco-sub" id="eco-y-date" style="display:inline">&nbsp;</span></h2>
+      <div class="eco-rate" id="eco-y-benefit">&#8212;</div>
+      <div class="eco-sub">benefit from solar yesterday</div>
+      <div class="eco-divider"></div>
+      <div class="dl">
+        <div class="dl-item">
+          <span class="dk grid-import">Import paid</span>
+          <span class="dv" id="eco-y-import">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk grid-export">Export earned</span>
+          <span class="dv" id="eco-y-export">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk muted">Net grid</span>
+          <span class="dv" id="eco-y-net">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk muted">Without solar</span>
+          <span class="dv" id="eco-y-nosolar">&#8212;</span>
+        </div>
+      </div>
+      <div class="eco-sub muted" id="eco-y-rates">&#8212;</div>
     </section>
 
   </div>
@@ -531,33 +557,52 @@ function update(d) {
     document.getElementById('tar-tmrw').textContent = d.tariff.tomorrow_p !== null ? d.tariff.tomorrow_p : 'TBD';
   }
 
-  // Today's economics (v5.3)
-  if (d.economics) {
-    const fmt = (v) => {
-      if (v === null || v === undefined) return '\u2014';
-      const sign = v < 0 ? '\u2212' : '';
-      return sign + '\u00a3' + Math.abs(v).toFixed(2);
-    };
-    const benefitEl = document.getElementById('eco-benefit');
-    if (d.economics.solar_benefit_gbp === null) {
+  // Today's + Yesterday's economics (v5.3 / v5.4)
+  function _fmtGbp(v) {
+    if (v === null || v === undefined) return '\u2014';
+    const sign = v < 0 ? '\u2212' : '';
+    return sign + '\u00a3' + Math.abs(v).toFixed(2);
+  }
+  function _renderEconomics(prefix, econ) {
+    if (!econ) return;
+    const benefitEl = document.getElementById(prefix + 'benefit');
+    if (econ.solar_benefit_gbp === null) {
       benefitEl.textContent = '\u2014';
       benefitEl.classList.remove('eco-neg');
     } else {
-      benefitEl.textContent = fmt(d.economics.solar_benefit_gbp);
-      if (d.economics.solar_benefit_gbp < 0) benefitEl.classList.add('eco-neg');
+      benefitEl.textContent = _fmtGbp(econ.solar_benefit_gbp);
+      if (econ.solar_benefit_gbp < 0) benefitEl.classList.add('eco-neg');
       else benefitEl.classList.remove('eco-neg');
     }
-    document.getElementById('eco-import').textContent  = fmt(d.economics.import_cost_gbp);
-    document.getElementById('eco-export').textContent  = fmt(d.economics.export_revenue_gbp);
-    const netEl = document.getElementById('eco-net');
-    netEl.textContent = fmt(d.economics.net_today_gbp);
-    netEl.style.color = d.economics.net_today_gbp !== null && d.economics.net_today_gbp < 0
+    document.getElementById(prefix + 'import').textContent  = _fmtGbp(econ.import_cost_gbp);
+    document.getElementById(prefix + 'export').textContent  = _fmtGbp(econ.export_revenue_gbp);
+    const netEl = document.getElementById(prefix + 'net');
+    netEl.textContent = _fmtGbp(econ.net_today_gbp);
+    netEl.style.color = econ.net_today_gbp !== null && econ.net_today_gbp < 0
       ? '#f87171' : '#34d399';
-    document.getElementById('eco-nosolar').textContent = fmt(d.economics.no_solar_cost_gbp);
+    document.getElementById(prefix + 'nosolar').textContent = _fmtGbp(econ.no_solar_cost_gbp);
     const ratesParts = [];
-    if (d.economics.import_rate_p !== null) ratesParts.push('Import ' + d.economics.import_rate_p + 'p');
-    if (d.economics.export_rate_p !== null) ratesParts.push('Export ' + d.economics.export_rate_p + 'p');
-    document.getElementById('eco-rates').textContent = ratesParts.join('  /  ');
+    if (econ.import_rate_p !== null) ratesParts.push('Import ' + econ.import_rate_p + 'p');
+    if (econ.export_rate_p !== null) ratesParts.push('Export ' + econ.export_rate_p + 'p');
+    document.getElementById(prefix + 'rates').textContent = ratesParts.join('  /  ');
+  }
+  if (d.economics) {
+    _renderEconomics('eco-',   d.economics.today);
+    _renderEconomics('eco-y-', d.economics.yesterday);
+    // Yesterday's date label
+    const dateEl = document.getElementById('eco-y-date');
+    if (d.economics.yesterday_date) {
+      const dt = new Date(d.economics.yesterday_date + 'T12:00:00');
+      if (!isNaN(dt)) {
+        dateEl.textContent = '(' + dt.toLocaleDateString([], {
+          weekday: 'short', day: 'numeric', month: 'short'
+        }) + ')';
+      } else {
+        dateEl.textContent = '(' + d.economics.yesterday_date + ')';
+      }
+    } else {
+      dateEl.textContent = '';
+    }
   }
 
   updateAlerts(d);

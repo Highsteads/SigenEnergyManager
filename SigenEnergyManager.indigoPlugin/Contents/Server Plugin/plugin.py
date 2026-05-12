@@ -7,7 +7,27 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.3
+# Version:     5.4
+# Changes:     v5.4 (12-05-2026) — dashboard yesterday economics:
+#   • New "Yesterday" card alongside "Today's Cost" — same five fields
+#     (import paid, export earned, net, without-solar, headline benefit)
+#     for a full-day reading, since today's view is partial until midnight.
+#   • Reads daily_history.json's most recent entry; uses the saved
+#     rate_today_p (falls back to today's live rate if older entries lack it).
+#   • Refactored economics calc into a shared `_compute_daily_economics`
+#     helper so today and yesterday use identical maths.
+#   • /api/status `economics` block restructured to:
+#       {"today": {...}, "yesterday": {...}, "yesterday_date": "YYYY-MM-DD"}.
+#   • Bottom-row grid switched to auto-fit/minmax so it now accommodates
+#     5 cards (Decision / Today Summary / Tariff / Today Cost / Yesterday)
+#     without media-query gymnastics.
+#   • BUG FIX: home_daily_kwh was being overwritten with 0 when the inverter's
+#     register 30092 reset at its midnight (which can race the plugin's local
+#     midnight handler). Every record in daily_history.json had home_kwh ~= 0
+#     instead of the true ~15-20 kWh. The accumulator now ignores a sudden
+#     drop in the inverter counter and lets _check_midnight reset the store
+#     value at the right moment. Going forward, the daily history will be
+#     accurate; existing past records cannot be retroactively corrected.
 # Changes:     v5.3 (12-05-2026) — daily economics on the dashboard:
 #   • New "Today's Cost" card showing import paid, export earned, net today,
 #     what the day would have cost without solar, and the headline solar
@@ -763,38 +783,22 @@ class Plugin(indigo.PluginBase):
                 except (TypeError, ValueError, KeyError):
                     pass
 
-            if import_rate_p is None:
-                economics = {
-                    "import_rate_p":      None,
-                    "export_rate_p":      round(export_rate_p, 2),
-                    "import_cost_gbp":    None,
-                    "export_revenue_gbp": None,
-                    "no_solar_cost_gbp":  None,
-                    "net_today_gbp":      None,
-                    "solar_benefit_gbp":  None,
-                }
-            else:
-                export_kwh_today = float(self.store.get("grid_export_daily_kwh", 0.0))
-                # All values in pence first, then converted to GBP
-                import_cost_p    = import_kwh        * import_rate_p
-                export_rev_p     = export_kwh_today  * export_rate_p
-                no_solar_cost_p  = home_kwh          * import_rate_p
-                net_today_p      = export_rev_p - import_cost_p
-                # "Solar benefit" = what the day would have cost without solar
-                # MINUS what it actually netted to (import - export).
-                # Equivalent to: (home_kwh - import_kwh) × import_rate + export
-                solar_benefit_p  = no_solar_cost_p - import_cost_p + export_rev_p
-                def _gbp(p):
-                    return round(p / 100.0, 2)
-                economics = {
-                    "import_rate_p":      round(import_rate_p, 2),
-                    "export_rate_p":      round(export_rate_p, 2),
-                    "import_cost_gbp":    _gbp(import_cost_p),
-                    "export_revenue_gbp": _gbp(export_rev_p),
-                    "no_solar_cost_gbp":  _gbp(no_solar_cost_p),
-                    "net_today_gbp":      _gbp(net_today_p),
-                    "solar_benefit_gbp":  _gbp(solar_benefit_p),
-                }
+            today_econ = self._compute_daily_economics(
+                home_kwh      = home_kwh,
+                import_kwh    = import_kwh,
+                export_kwh    = float(self.store.get("grid_export_daily_kwh", 0.0)),
+                import_rate_p = import_rate_p,
+                export_rate_p = export_rate_p,
+            )
+            yesterday_econ, yesterday_date = self._yesterday_economics(
+                export_rate_p          = export_rate_p,
+                fallback_import_rate_p = import_rate_p,
+            )
+            economics = {
+                "today":          today_econ,
+                "yesterday":      yesterday_econ,
+                "yesterday_date": yesterday_date,
+            }
 
             return {
                 "timestamp":  datetime.now().strftime("%H:%M:%S"),
@@ -870,6 +874,82 @@ class Plugin(indigo.PluginBase):
             }
         except Exception as exc:
             return {"error": str(exc), "timestamp": datetime.now().strftime("%H:%M:%S")}
+
+    @staticmethod
+    def _compute_daily_economics(home_kwh, import_kwh, export_kwh,
+                                 import_rate_p, export_rate_p):
+        """Return the economics dict for a single day's energy figures.
+
+        All four kWh values are non-negative floats.  import_rate_p and
+        export_rate_p are pence per kWh (positive).  Either rate being None
+        produces a None-result dict so the caller can render "—".
+        """
+        if import_rate_p is None or export_rate_p is None:
+            return {
+                "import_rate_p":      import_rate_p,
+                "export_rate_p":      export_rate_p,
+                "import_cost_gbp":    None,
+                "export_revenue_gbp": None,
+                "no_solar_cost_gbp":  None,
+                "net_today_gbp":      None,
+                "solar_benefit_gbp":  None,
+            }
+        import_cost_p   = import_kwh * import_rate_p
+        export_rev_p    = export_kwh * export_rate_p
+        no_solar_cost_p = home_kwh   * import_rate_p
+        net_p           = export_rev_p - import_cost_p
+        benefit_p       = no_solar_cost_p - import_cost_p + export_rev_p
+        def _gbp(p):
+            return round(p / 100.0, 2)
+        return {
+            "import_rate_p":      round(float(import_rate_p), 2),
+            "export_rate_p":      round(float(export_rate_p), 2),
+            "import_cost_gbp":    _gbp(import_cost_p),
+            "export_revenue_gbp": _gbp(export_rev_p),
+            "no_solar_cost_gbp":  _gbp(no_solar_cost_p),
+            "net_today_gbp":      _gbp(net_p),
+            "solar_benefit_gbp":  _gbp(benefit_p),
+        }
+
+    def _yesterday_economics(self, export_rate_p, fallback_import_rate_p):
+        """Read yesterday's totals from daily_history.json and compute economics.
+
+        Returns (economics_dict, date_str) or (None-econ-dict, "").
+        Uses the rate_today_p recorded in yesterday's history entry; falls
+        back to today's live rate if that field is empty (older entries
+        pre-rate-recording).
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        if not os.path.exists(path):
+            return self._compute_daily_economics(0, 0, 0, None, None), ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            return self._compute_daily_economics(0, 0, 0, None, None), ""
+        if not records:
+            return self._compute_daily_economics(0, 0, 0, None, None), ""
+        yest = records[-1]
+        date_str = yest.get("date", "")
+        rate_p   = None
+        try:
+            r = float(yest.get("rate_today_p") or 0.0)
+            if r > 0:
+                rate_p = r
+        except (TypeError, ValueError):
+            pass
+        if rate_p is None:
+            rate_p = fallback_import_rate_p   # may also be None
+        return (
+            self._compute_daily_economics(
+                home_kwh      = float(yest.get("home_kwh",       0.0) or 0.0),
+                import_kwh    = float(yest.get("grid_import_kwh", 0.0) or 0.0),
+                export_kwh    = float(yest.get("grid_export_kwh", 0.0) or 0.0),
+                import_rate_p = rate_p,
+                export_rate_p = export_rate_p,
+            ),
+            date_str,
+        )
 
     def get_dashboard_history(self, hours=24):
         """Return half-hourly slots for the last N hours from the SQLite store.
@@ -1168,9 +1248,30 @@ class Plugin(indigo.PluginBase):
         interval_h = MODBUS_POLL_INTERVAL / 3600.0   # fallback: hours per poll
 
         # --- Home daily: read directly from 30092 (resets at midnight) ---
+        # The inverter's daily counter may reset at a slightly different
+        # moment than _check_midnight (its clock could be UTC, BST, or
+        # vendor-default), creating a window where a poll captures the
+        # post-reset 0 while our store still represents yesterday — and
+        # _write_daily_history then snapshots 0 as yesterday's home_kwh.
+        # Confirmed bug on 12-May-2026: every prior day in daily_history.json
+        # had home_kwh ~= 0 despite real consumption ~15-20 kWh/day.
+        #
+        # Defence: a sudden DROP in the inverter's daily counter (while our
+        # store has accumulated > 2 kWh) is treated as the inverter's reset
+        # and ignored.  _check_midnight runs in the same _tick and will reset
+        # our store value cleanly when the local date rolls over.
         home_direct = data.get("homeDailyDirectKwh")
         if home_direct is not None:
-            self.store["home_daily_kwh"] = home_direct
+            current = self.store.get("home_daily_kwh", 0.0)
+            if (home_direct + 1.0) < current and current > 2.0:
+                self.logger.debug(
+                    f"[Energy] Suspected inverter daily reset detected — "
+                    f"home_direct={home_direct:.2f} < store={current:.2f}. "
+                    f"Holding store value until _check_midnight runs."
+                )
+                # Hold value; _check_midnight will reset cleanly on date change
+            else:
+                self.store["home_daily_kwh"] = home_direct
         else:
             self.store["home_daily_kwh"] += (
                 max(0, data.get("homePowerWatts", 0)) * interval_h / 1000.0
