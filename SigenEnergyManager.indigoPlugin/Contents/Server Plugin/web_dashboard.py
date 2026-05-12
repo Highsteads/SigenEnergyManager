@@ -100,6 +100,18 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 .eco-rate.eco-neg{color:#f87171}
 .eco-sub{font-size:11px;color:#64748b;margin-top:2px}
 .eco-divider{height:1px;background:#1e2d3d;margin:8px 0}
+/* --- period totals table (v5.5) --- */
+.period-card{grid-column:1 / -1}
+.period-table{width:100%;border-collapse:collapse;font-size:12px}
+.period-table th{text-align:right;color:#64748b;font-weight:500;padding:6px 8px;border-bottom:1px solid #1e2d3d;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.period-table th:first-child{text-align:left}
+.period-table td{text-align:right;padding:8px;border-bottom:1px solid #0f1724;color:#e2e8f0}
+.period-table td:first-child{text-align:left;color:#cbd5e1;font-weight:600}
+.period-table td.tdays{color:#64748b;font-size:11px}
+.period-table tr:last-child td{border-bottom:none}
+.period-pos{color:#34d399}
+.period-neg{color:#f87171}
+.period-table .avg{color:#94a3b8;font-size:11px;display:block}
 /* --- charts (v5.2) --- */
 .chart-card{grid-column:1 / -1}
 .chart-tabs{display:flex;gap:6px;margin-bottom:10px}
@@ -324,6 +336,29 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
     </section>
 
   </div>
+
+  <!-- Period totals (v5.5) -->
+  <section class="card period-card">
+    <h2>Period totals (and per-day average)</h2>
+    <table class="period-table">
+      <thead>
+        <tr>
+          <th>Period</th>
+          <th>Days</th>
+          <th>Solar benefit</th>
+          <th>Net grid</th>
+          <th>Without solar</th>
+          <th>Import paid</th>
+          <th>Export earned</th>
+        </tr>
+      </thead>
+      <tbody id="period-tbody">
+        <tr><td>Week (last 7d)</td><td colspan="6" class="muted">&#8212;</td></tr>
+        <tr><td>Month (so far)</td><td colspan="6" class="muted">&#8212;</td></tr>
+        <tr><td>Year (last 365d)</td><td colspan="6" class="muted">&#8212;</td></tr>
+      </tbody>
+    </table>
+  </section>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
@@ -586,9 +621,44 @@ function update(d) {
     if (econ.export_rate_p !== null) ratesParts.push('Export ' + econ.export_rate_p + 'p');
     document.getElementById(prefix + 'rates').textContent = ratesParts.join('  /  ');
   }
+  function _renderPeriods(periods) {
+    if (!periods) return;
+    const tbody = document.getElementById('period-tbody');
+    if (!tbody) return;
+    const labels = [
+      ['week',  'Week (last 7d)'],
+      ['month', 'Month (so far)'],
+      ['year',  'Year (last 365d)'],
+    ];
+    const cell = (total, avg, posNeg) => {
+      if (total === null || total === undefined) return '<td class="muted">—</td>';
+      const cls = posNeg ? (total < 0 ? 'period-neg' : 'period-pos') : '';
+      const totStr = (total < 0 ? '−£' : '£') + Math.abs(total).toFixed(2);
+      const avgStr = (avg === null || avg === undefined) ? ''
+        : '<span class="avg">' + (avg < 0 ? '−£' : '£') + Math.abs(avg).toFixed(2) + '/day</span>';
+      return '<td class="' + cls + '">' + totStr + avgStr + '</td>';
+    };
+    tbody.innerHTML = labels.map(([key, label]) => {
+      const p = periods[key] || {};
+      const days = (p.days != null) ? p.days : 0;
+      if (!days) return '<tr><td>' + label + '</td><td class="tdays">0</td>'
+        + '<td colspan="5" class="muted">no data</td></tr>';
+      return '<tr>'
+        + '<td>' + label + '</td>'
+        + '<td class="tdays">' + days + '</td>'
+        + cell(p.benefit_total_gbp,  p.benefit_avg_gbp,  true)
+        + cell(p.net_total_gbp,      p.net_avg_gbp,      true)
+        + cell(p.no_solar_total_gbp, p.no_solar_avg_gbp, false)
+        + cell(p.import_total_gbp,   p.import_avg_gbp,   false)
+        + cell(p.export_total_gbp,   p.export_avg_gbp,   false)
+        + '</tr>';
+    }).join('');
+  }
+
   if (d.economics) {
     _renderEconomics('eco-',   d.economics.today);
     _renderEconomics('eco-y-', d.economics.yesterday);
+    _renderPeriods(d.economics.periods);
     // Yesterday's date label
     const dateEl = document.getElementById('eco-y-date');
     if (d.economics.yesterday_date) {

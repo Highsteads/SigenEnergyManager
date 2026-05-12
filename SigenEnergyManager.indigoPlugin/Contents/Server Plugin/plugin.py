@@ -7,7 +7,18 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.4
+# Version:     5.5
+# Changes:     v5.5 (12-05-2026) — period totals on the dashboard:
+#   • New "Period totals" card under the bottom row, listing Week / Month /
+#     Year roll-ups of all five economics fields (solar benefit, net grid,
+#     without-solar, import paid, export earned). Each cell shows the
+#     period total as the headline number and the per-day average underneath.
+#   • Window definitions: Week = last 7 days; Month = current calendar
+#     month so far (variable day count); Year = last 365 days.
+#   • Each historical day is valued at its own saved rate_today_p (Tracker
+#     rates change daily); export rate is assumed flat 12p across history
+#     (Octopus Outgoing 12p has been live since 26-Mar-2026).
+#   • New `economics.periods` block in /api/status with totals + averages.
 # Changes:     v5.4 (12-05-2026) — dashboard yesterday economics:
 #   • New "Yesterday" card alongside "Today's Cost" — same five fields
 #     (import paid, export earned, net, without-solar, headline benefit)
@@ -794,10 +805,15 @@ class Plugin(indigo.PluginBase):
                 export_rate_p          = export_rate_p,
                 fallback_import_rate_p = import_rate_p,
             )
+            periods = self._period_economics_summary(
+                export_rate_p          = export_rate_p,
+                fallback_import_rate_p = import_rate_p,
+            )
             economics = {
                 "today":          today_econ,
                 "yesterday":      yesterday_econ,
                 "yesterday_date": yesterday_date,
+                "periods":        periods,
             }
 
             return {
@@ -909,6 +925,104 @@ class Plugin(indigo.PluginBase):
             "no_solar_cost_gbp":  _gbp(no_solar_cost_p),
             "net_today_gbp":      _gbp(net_p),
             "solar_benefit_gbp":  _gbp(benefit_p),
+        }
+
+    def _period_economics_summary(self, export_rate_p, fallback_import_rate_p):
+        """Roll up weekly / monthly / yearly economics from daily_history.json.
+
+        Each window returns:
+          {"days": N, "import_total_gbp", "export_total_gbp",
+           "no_solar_total_gbp", "net_total_gbp", "benefit_total_gbp",
+           "benefit_avg_gbp", "no_solar_avg_gbp", "net_avg_gbp",
+           "import_avg_gbp", "export_avg_gbp"}
+
+        Each daily record uses its own saved `rate_today_p` (the import rate
+        on that day) — Tracker rates change daily so historical days mustn't
+        all be valued at today's rate.  Export rate is assumed flat 12p
+        across history (Octopus Outgoing 12p has been live since 26-Mar-2026,
+        which is when this system started exporting).
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            records = []
+        try:
+            import pytz
+            today = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("Europe/London")).date()
+        except Exception:
+            today = datetime.now().date()
+
+        def aggregate(subset):
+            if not subset:
+                return {
+                    "days": 0,
+                    "import_total_gbp":   None, "export_total_gbp":   None,
+                    "no_solar_total_gbp": None, "net_total_gbp":      None,
+                    "benefit_total_gbp":  None,
+                    "import_avg_gbp":     None, "export_avg_gbp":     None,
+                    "no_solar_avg_gbp":   None, "net_avg_gbp":        None,
+                    "benefit_avg_gbp":    None,
+                }
+            total_imp_p = total_exp_p = 0.0
+            total_no_solar_p = total_net_p = total_benefit_p = 0.0
+            counted = 0
+            for r in subset:
+                home  = float(r.get("home_kwh",        0) or 0)
+                imp_k = float(r.get("grid_import_kwh", 0) or 0)
+                exp_k = float(r.get("grid_export_kwh", 0) or 0)
+                try:
+                    ir = float(r.get("rate_today_p") or 0)
+                except (TypeError, ValueError):
+                    ir = 0
+                if ir <= 0 and fallback_import_rate_p is not None:
+                    ir = fallback_import_rate_p
+                if ir <= 0:
+                    continue   # skip days with no rate info
+                er = export_rate_p
+                imp_p   = imp_k * ir
+                exp_p   = exp_k * er
+                no_sol  = home  * ir
+                net     = exp_p - imp_p
+                benefit = no_sol - imp_p + exp_p
+                total_imp_p      += imp_p
+                total_exp_p      += exp_p
+                total_no_solar_p += no_sol
+                total_net_p      += net
+                total_benefit_p  += benefit
+                counted += 1
+            if counted == 0:
+                return aggregate([])   # all rate-less, treat as empty
+            def _g(p):  return round(p / 100.0,           2)
+            def _ga(p): return round(p / 100.0 / counted, 2)
+            return {
+                "days":                counted,
+                "import_total_gbp":    _g(total_imp_p),
+                "export_total_gbp":    _g(total_exp_p),
+                "no_solar_total_gbp":  _g(total_no_solar_p),
+                "net_total_gbp":       _g(total_net_p),
+                "benefit_total_gbp":   _g(total_benefit_p),
+                "import_avg_gbp":      _ga(total_imp_p),
+                "export_avg_gbp":      _ga(total_exp_p),
+                "no_solar_avg_gbp":    _ga(total_no_solar_p),
+                "net_avg_gbp":         _ga(total_net_p),
+                "benefit_avg_gbp":     _ga(total_benefit_p),
+            }
+
+        # Window selectors
+        wk_cutoff   = (today - timedelta(days=7)).isoformat()
+        yr_cutoff   = (today - timedelta(days=365)).isoformat()
+        month_pref  = today.strftime("%Y-%m")
+        week_recs   = [r for r in records if (r.get("date") or "") >= wk_cutoff]
+        month_recs  = [r for r in records if (r.get("date") or "").startswith(month_pref)]
+        year_recs   = [r for r in records if (r.get("date") or "") >= yr_cutoff]
+
+        return {
+            "week":  aggregate(week_recs),
+            "month": aggregate(month_recs),
+            "year":  aggregate(year_recs),
         }
 
     def _yesterday_economics(self, export_rate_p, fallback_import_rate_p):
