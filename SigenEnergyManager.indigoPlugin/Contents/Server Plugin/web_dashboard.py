@@ -621,34 +621,32 @@ function renderForecast(hourly) {
   const svg = document.getElementById('fc-svg');
   const entries = Object.entries(hourly).sort((a,b)=>a[0].localeCompare(b[0]));
   if (!entries.length) { svg.innerHTML = '<text x="378" y="40" text-anchor="middle" fill="#374151" font-size="13">No forecast data</text>'; return; }
-  const maxWh  = Math.max(...entries.map(e=>e[1]), 1);
+  // Values from /api/status hourly_forecast are ALREADY in kWh (plugin
+  // converts from Wh in get_dashboard_data).  Pre-v5.11 code re-divided
+  // by 1000 here making every tooltip read 0.00 — confirmed bug.
+  const maxK   = Math.max(...entries.map(e=>e[1]), 0.1);
   const now    = new Date();
   const curHr  = now.getHours();
   const n      = entries.length;
   const bw     = Math.floor(740 / n) - 2;
-  const chartH = 56;     // v5.10: was 100 — chart now ~60% shorter
-  const labelY = 74;     // hour labels just below the axis
+  const chartH = 56;
+  const labelY = 74;
   let out = '';
-  entries.forEach(([key,wh], i) => {
+  entries.forEach(([key, kwh], i) => {
     const hr  = parseInt(key.split(':')[0]);
-    const kwh = (wh/1000);
-    const bh  = Math.max(1, Math.round((wh/maxWh)*chartH));
+    const bh  = Math.max(1, Math.round((kwh/maxK)*chartH));
     const x   = 8 + i*(bw+2);
     const y   = chartH - bh;
     const past   = hr < curHr;
     const curr   = hr === curHr;
     const col    = curr ? '#fbbf24' : '#34d399';
     const opac   = past ? '0.32' : '1';
-    // data-* attributes power the custom HTML tooltip; <title> gives a
-    // free browser tooltip as fallback for accessibility / non-JS clients
     out +=
       `<g class="fc-bar" data-hr="${hr}" data-kwh="${kwh.toFixed(2)}" data-curr="${curr ? '1':'0'}">`
       + `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${col}" opacity="${opac}" rx="2"/>`
-      // invisible wider hit-area so mouse-over targeting is easy even for tiny bars
       + `<rect x="${x-1}" y="0" width="${bw+2}" height="${chartH}" fill="transparent"/>`
       + `<title>${hr.toString().padStart(2,'0')}:00 — ${kwh.toFixed(2)} kWh</title>`
       + `</g>`;
-    // sparse hour labels (every 2nd hour) at the bottom
     if (hr % 2 === 0) {
       out += `<text x="${x+bw/2}" y="${labelY}" text-anchor="middle" fill="#64748b" font-size="9">${hr}</text>`;
     }
