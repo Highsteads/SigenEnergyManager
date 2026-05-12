@@ -61,7 +61,8 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 .fc-meta strong{color:#e2e8f0}
 #fc-svg{width:100%;height:auto}
 /* --- bottom row --- */
-.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media(max-width:980px){.bottom-row{grid-template-columns:1fr 1fr}}
 .dl{display:flex;flex-direction:column;gap:6px}
 .dl-item{display:flex;justify-content:space-between;align-items:baseline;font-size:13px}
 .dl-item .dk{color:#94a3b8}
@@ -95,6 +96,11 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 @keyframes flow-rev{to{stroke-dashoffset:12}}
 .flow-fwd{animation:flow-fwd .7s linear infinite}
 .flow-rev{animation:flow-rev .7s linear infinite}
+/* --- economics card (v5.3) --- */
+.eco-rate{font-size:20px;font-weight:700;color:#34d399}
+.eco-rate.eco-neg{color:#f87171}
+.eco-sub{font-size:11px;color:#64748b;margin-top:2px}
+.eco-divider{height:1px;background:#1e2d3d;margin:8px 0}
 /* --- charts (v5.2) --- */
 .chart-card{grid-column:1 / -1}
 .chart-tabs{display:flex;gap:6px;margin-bottom:10px}
@@ -262,6 +268,33 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
       <div class="tariff-sub" id="tar-name">&#8212;</div>
       <div class="tariff-sub muted" id="tar-code">&#8212;</div>
       <div class="tariff-tmrw">Tomorrow: <span id="tar-tmrw">&#8212;</span>p</div>
+    </section>
+
+    <!-- Today's Cost / Economics (v5.3) -->
+    <section class="card">
+      <h2>Today&#8217;s Cost</h2>
+      <div class="eco-rate" id="eco-benefit">&#8212;</div>
+      <div class="eco-sub">benefit from solar today</div>
+      <div class="eco-divider"></div>
+      <div class="dl">
+        <div class="dl-item">
+          <span class="dk grid-import">Import paid</span>
+          <span class="dv" id="eco-import">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk grid-export">Export earned</span>
+          <span class="dv" id="eco-export">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk muted">Net grid today</span>
+          <span class="dv" id="eco-net">&#8212;</span>
+        </div>
+        <div class="dl-item">
+          <span class="dk muted">Without solar</span>
+          <span class="dv" id="eco-nosolar">&#8212;</span>
+        </div>
+      </div>
+      <div class="eco-sub muted" id="eco-rates">&#8212;</div>
     </section>
 
   </div>
@@ -496,6 +529,35 @@ function update(d) {
     document.getElementById('tar-name').textContent = d.tariff.name || '\u2014';
     document.getElementById('tar-code').textContent = d.tariff.product_code || '';
     document.getElementById('tar-tmrw').textContent = d.tariff.tomorrow_p !== null ? d.tariff.tomorrow_p : 'TBD';
+  }
+
+  // Today's economics (v5.3)
+  if (d.economics) {
+    const fmt = (v) => {
+      if (v === null || v === undefined) return '\u2014';
+      const sign = v < 0 ? '\u2212' : '';
+      return sign + '\u00a3' + Math.abs(v).toFixed(2);
+    };
+    const benefitEl = document.getElementById('eco-benefit');
+    if (d.economics.solar_benefit_gbp === null) {
+      benefitEl.textContent = '\u2014';
+      benefitEl.classList.remove('eco-neg');
+    } else {
+      benefitEl.textContent = fmt(d.economics.solar_benefit_gbp);
+      if (d.economics.solar_benefit_gbp < 0) benefitEl.classList.add('eco-neg');
+      else benefitEl.classList.remove('eco-neg');
+    }
+    document.getElementById('eco-import').textContent  = fmt(d.economics.import_cost_gbp);
+    document.getElementById('eco-export').textContent  = fmt(d.economics.export_revenue_gbp);
+    const netEl = document.getElementById('eco-net');
+    netEl.textContent = fmt(d.economics.net_today_gbp);
+    netEl.style.color = d.economics.net_today_gbp !== null && d.economics.net_today_gbp < 0
+      ? '#f87171' : '#34d399';
+    document.getElementById('eco-nosolar').textContent = fmt(d.economics.no_solar_cost_gbp);
+    const ratesParts = [];
+    if (d.economics.import_rate_p !== null) ratesParts.push('Import ' + d.economics.import_rate_p + 'p');
+    if (d.economics.export_rate_p !== null) ratesParts.push('Export ' + d.economics.export_rate_p + 'p');
+    document.getElementById('eco-rates').textContent = ratesParts.join('  /  ');
   }
 
   updateAlerts(d);

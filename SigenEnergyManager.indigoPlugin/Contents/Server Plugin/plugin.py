@@ -7,7 +7,15 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.2
+# Version:     5.3
+# Changes:     v5.3 (12-05-2026) — daily economics on the dashboard:
+#   • New "Today's Cost" card showing import paid, export earned, net today,
+#     what the day would have cost without solar, and the headline solar
+#     benefit (£) — i.e. counterfactual cost minus actual net cost.
+#   • New `economics` block in /api/status — all values in GBP, plus the
+#     import/export pence rates used in the calculation.
+#   • Also: new menu item "Open Web Dashboard" — logs the URL (clickable
+#     from any Indigo client) and best-effort browser launch on the server.
 # Changes:     v5.2 (12-05-2026) — three small additions:
 #   • Web dashboard charts (Chart.js via CDN). New 24h/48h/7d SOC + energy
 #     stacked-bar charts, and a 30-day daily totals bar chart. Backed by two
@@ -718,6 +726,76 @@ class Plugin(indigo.PluginBase):
                 pass
             tomorrow_revenue_gbp = round(tomorrow_surplus * export_rate_p / 100.0, 2)
 
+            # ---- Today's economics ----
+            # All four numbers — actual import cost, export revenue, what the
+            # home would have cost on grid alone, and the net financial benefit
+            # of having solar today.  None if no import rate is known yet.
+            #
+            # Prefer the tariffMonitor device state (always populated from the
+            # Octopus refresh cycle) over latest_rates_data which is empty for
+            # ~30 minutes after a plugin restart.
+            import_rate_p = None
+            try:
+                r = float(tracker.get("today_p") or 0.0)
+                if r > 0:
+                    import_rate_p = r
+            except (TypeError, ValueError):
+                pass
+            if import_rate_p is None:
+                tariff_dev = self._find_device("tariffMonitor")
+                if tariff_dev:
+                    try:
+                        r = float(tariff_dev.states.get("rateToday", "") or 0.0)
+                        if r > 0:
+                            import_rate_p = r
+                    except (TypeError, ValueError):
+                        pass
+            if import_rate_p is None:
+                # Final fallback: the elec_unit_rate_p Indigo variable, which
+                # is written every 30 minutes by _write_energy_summary_variables
+                # and persists across plugin restarts (unlike device states,
+                # which deviceStartComm clears to "Initialising").
+                try:
+                    if "elec_unit_rate_p" in indigo.variables:
+                        r = float(indigo.variables["elec_unit_rate_p"].value or 0.0)
+                        if r > 0:
+                            import_rate_p = r
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+            if import_rate_p is None:
+                economics = {
+                    "import_rate_p":      None,
+                    "export_rate_p":      round(export_rate_p, 2),
+                    "import_cost_gbp":    None,
+                    "export_revenue_gbp": None,
+                    "no_solar_cost_gbp":  None,
+                    "net_today_gbp":      None,
+                    "solar_benefit_gbp":  None,
+                }
+            else:
+                export_kwh_today = float(self.store.get("grid_export_daily_kwh", 0.0))
+                # All values in pence first, then converted to GBP
+                import_cost_p    = import_kwh        * import_rate_p
+                export_rev_p     = export_kwh_today  * export_rate_p
+                no_solar_cost_p  = home_kwh          * import_rate_p
+                net_today_p      = export_rev_p - import_cost_p
+                # "Solar benefit" = what the day would have cost without solar
+                # MINUS what it actually netted to (import - export).
+                # Equivalent to: (home_kwh - import_kwh) × import_rate + export
+                solar_benefit_p  = no_solar_cost_p - import_cost_p + export_rev_p
+                def _gbp(p):
+                    return round(p / 100.0, 2)
+                economics = {
+                    "import_rate_p":      round(import_rate_p, 2),
+                    "export_rate_p":      round(export_rate_p, 2),
+                    "import_cost_gbp":    _gbp(import_cost_p),
+                    "export_revenue_gbp": _gbp(export_rev_p),
+                    "no_solar_cost_gbp":  _gbp(no_solar_cost_p),
+                    "net_today_gbp":      _gbp(net_today_p),
+                    "solar_benefit_gbp":  _gbp(solar_benefit_p),
+                }
+
             return {
                 "timestamp":  datetime.now().strftime("%H:%M:%S"),
                 "battery": {
@@ -781,6 +859,7 @@ class Plugin(indigo.PluginBase):
                     {"days": 0, "mape_pct": 0.0, "mean_factor": 1.0,
                      "over_count": 0, "under_count": 0}
                 ),
+                "economics": economics,
                 "flags": {
                     "export_active":         self.store.get("export_active",         False),
                     "solar_overflow_active": self.store.get("solar_overflow_active", False),
