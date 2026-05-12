@@ -126,6 +126,40 @@ class OctopusAPI:
         self._kraken_token     = None
         self._kraken_token_at  = 0.0
 
+        # Rate-limit tracker.  Octopus permits roughly 100 requests/hour per
+        # endpoint family.  We're nowhere near that under normal poll cadence
+        # (every 30 min), but multiple plugin reloads in quick succession can
+        # spike the count.  When the rolling hourly window passes
+        # _RATE_LIMIT_WARN we log a WARNING; above _RATE_LIMIT_HARD we short
+        # the request and let the caller fall back to cache.
+        self._request_log       = []     # list of monotonic timestamps
+        self._RATE_LIMIT_WINDOW = 3600   # seconds
+        self._RATE_LIMIT_WARN   = 80     # log warning above this
+        self._RATE_LIMIT_HARD   = 95     # refuse new requests above this
+
+    def _record_request(self):
+        """Note a single API call for the rate-limit tracker.  Returns True if
+        the request is permitted, False if we're at the hard cap (caller
+        should bail and use cached data)."""
+        now = time.time()
+        cutoff = now - self._RATE_LIMIT_WINDOW
+        # Prune older entries
+        self._request_log = [t for t in self._request_log if t >= cutoff]
+        count = len(self._request_log)
+        if count >= self._RATE_LIMIT_HARD:
+            self.logger.warning(
+                f"[Octopus] Rate-limit guard: {count} requests in last hour "
+                f"(cap {self._RATE_LIMIT_HARD}). Skipping this call — using cache."
+            )
+            return False
+        if count >= self._RATE_LIMIT_WARN and (count - self._RATE_LIMIT_WARN) % 5 == 0:
+            self.logger.warning(
+                f"[Octopus] Rate-limit approaching: {count} requests in last hour "
+                f"(soft cap {self._RATE_LIMIT_WARN}). Consider increasing poll intervals."
+            )
+        self._request_log.append(now)
+        return True
+
     # ================================================================
     # Public: Tariff Detection
     # ================================================================
@@ -567,15 +601,31 @@ class OctopusAPI:
             )
             if not response.ok:
                 self.logger.debug(f"Kraken token request failed: HTTP {response.status_code}")
+                self._kraken_token = None       # invalidate any stale cache
                 return None
-            token = response.json().get("data", {}).get("obtainKrakenToken", {}).get("token")
+            try:
+                payload = response.json()
+            except ValueError as e:
+                self.logger.debug(f"Kraken token malformed JSON: {e}")
+                self._kraken_token = None
+                return None
+            token = (payload or {}).get("data", {}).get("obtainKrakenToken", {}).get("token")
             if token:
                 self._kraken_token    = token
                 self._kraken_token_at = now
                 self.logger.debug("Kraken token obtained")
+            else:
+                # Empty/null token means auth failed — purge any stale cache so
+                # subsequent calls don't keep sending a token that won't work.
+                self._kraken_token = None
             return token
-        except Exception as e:
-            self.logger.debug(f"Kraken token error: {e}")
+        except (requests.Timeout, requests.ConnectionError) as e:
+            self.logger.debug(f"Kraken token network error: {e}")
+            self._kraken_token = None
+            return None
+        except requests.RequestException as e:
+            self.logger.debug(f"Kraken token request error: {e}")
+            self._kraken_token = None
             return None
 
     def _detect_tariff_from_kraken(self):
@@ -618,8 +668,13 @@ class OctopusAPI:
                 self.logger.debug(f"Kraken tariff query failed: HTTP {response.status_code}")
                 return None
 
+            try:
+                payload = response.json()
+            except ValueError as e:
+                self.logger.debug(f"Kraken tariff query malformed JSON: {e}")
+                return None
             agreements = (
-                response.json()
+                (payload or {})
                 .get("data", {})
                 .get("account", {})
                 .get("electricityAgreements", [])
@@ -882,6 +937,9 @@ class OctopusAPI:
         """HTTP GET with optional Basic auth. Returns parsed JSON or raises."""
         if not REQUESTS_AVAILABLE:
             raise OctopusApiError("requests library not available")
+
+        if not self._record_request():
+            raise OctopusApiError("Rate-limit guard active — request skipped")
 
         headers = {"Accept": "application/json"}
         if authenticated:

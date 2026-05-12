@@ -41,6 +41,16 @@
         <CallbackMethod>menuToggleDebug</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuSelfTest">
+        <Name>Run Self-Test (Check All Subsystems)</Name>
+        <CallbackMethod>menuSelfTest</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="menuShowPowerCutLog">
+        <Name>Show Power Cut Log</Name>
+        <CallbackMethod>menuShowPowerCutLog</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuSeparator1" isSeparator="true"/>
 
     <MenuItem id="showPluginInfo">

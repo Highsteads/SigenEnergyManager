@@ -560,10 +560,10 @@ class TestNightExport(unittest.TestCase):
 
         self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
-    def test_legacy_export_active_stopped_immediately(self):
-        """v3.x export_active=True with no flood_prev context → ACTION_STOP_EXPORT."""
-        today_str    = datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    def test_legacy_export_active_ignored(self):
+        """Legacy export_active=True without flood_prev context: no longer treated
+        as a v3.x "stop export" override (removed in v5.0). Evaluator now falls
+        through to normal 24h sufficiency logic instead of forcibly stopping."""
         snapshot = _make_snapshot(
             soc_pct                = 75.0,
             export_enabled         = True,
@@ -575,7 +575,10 @@ class TestNightExport(unittest.TestCase):
         )
         decision = self.bm.evaluate(snapshot)
 
-        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
+        # The deprecated ACTION_STOP_EXPORT migration path is gone.  Decision
+        # should be one of the normal evaluator outcomes (self-consumption,
+        # overflow, scheduled import etc.), never the legacy stop signal.
+        self.assertNotEqual(decision.action, ACTION_STOP_EXPORT)
 
     def test_poor_forecast_gives_self_consumption(self):
         """Poor solar forecast → no export at all; system stays in self-consumption."""
@@ -834,8 +837,11 @@ class TestFloodPrevention(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
 
-    def test_legacy_export_still_stopped_immediately(self):
-        """export_active=True but flood_prev_target_soc=0 → legacy v3.x export → stop."""
+    def test_legacy_export_active_no_longer_forces_stop(self):
+        """v5.0+: export_active=True with flood_prev_target_soc=0 no longer
+        triggers the legacy ACTION_STOP_EXPORT migration path. The evaluator
+        falls through and may issue start_export for flood prevention if the
+        forecast supports it."""
         snapshot = _make_snapshot(
             soc_pct                = 80.0,
             export_enabled         = True,
@@ -846,7 +852,7 @@ class TestFloodPrevention(unittest.TestCase):
         )
         decision = self.bm.evaluate(snapshot)
 
-        self.assertEqual(decision.action, ACTION_STOP_EXPORT)
+        self.assertNotEqual(decision.action, ACTION_STOP_EXPORT)
 
 
 class TestTrackerMidnightLocal(unittest.TestCase):

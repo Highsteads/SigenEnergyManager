@@ -584,5 +584,11 @@ class WebDashboard:
                 self._server.shutdown()
             except Exception:
                 pass
+            try:
+                self._server.server_close()
+            except Exception:
+                pass
             self._server = None
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
         self._thread = None

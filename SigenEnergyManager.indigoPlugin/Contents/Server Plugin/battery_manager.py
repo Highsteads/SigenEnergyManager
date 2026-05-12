@@ -226,74 +226,36 @@ class BatteryManager:
     """
 
     def evaluate(self, snapshot: ManagerSnapshot) -> Decision:
-        """Main entry point — evaluate system state and return a decision."""
-        # VPP takes precedence — suspend all manager actions
-        if snapshot.vpp_active:
-            return Decision(
-                action = ACTION_SELF_CONSUMPTION,
-                reason = "VPP event active — Axle has control",
-            )
+        """Main entry point — evaluate system state and return a decision.
 
-        # Handle active exports: distinguish flood prevention (v4.4) from legacy v3.x
-        if snapshot.export_active:
-            if snapshot.flood_prev_target_soc > 0:
-                # Flood prevention pre-drain is running — check whether to continue or stop
-                balance = self._calculate_24h_balance(snapshot)
-                return self._continue_flood_prevention(snapshot, balance)
-            else:
-                # Legacy v3.x night export — stop immediately (disabled in v4.0)
-                return Decision(
-                    action      = ACTION_STOP_EXPORT,
-                    reason      = "Night export disabled in v4.0 — returning to self-consumption",
-                    dawn_viable = True,
-                )
+        Decision flow (first match wins):
+          1. Overrides     — VPP / active flood-prevention export
+          2. Resilience    — flat-rate tariff overnight power-cut floor
+          3. Flood prep    — overnight pre-drain before very sunny day
+          4. Import        — tomorrow won't reach sufficiency without grid
+          5. Overflow      — daytime export when surplus exceeds DNO cap
+          6. Self-consume  — nothing else applies
+        """
+        # 1. Overrides — VPP suspension or already-running flood prevention
+        override = self._check_overrides(snapshot)
+        if override is not None:
+            return override
 
-        # Calculate 24-hour sufficiency balance
+        # 24h sufficiency calc used by every later branch
         balance = self._calculate_24h_balance(snapshot)
 
-        # ── Resilience buffer (flat-rate tariffs only) ───────────────────────
-        # On Tracker/Flexible there is no rate benefit in pre-charging the battery
-        # for tomorrow (grid passthrough is more efficient at the same price).
-        # The ONE reason to import on a flat-rate tariff is power-cut resilience:
-        # keep the battery at dawn_target_pct (default 10%) so the house can run
-        # for several hours if the grid fails overnight.
-        #
-        # Import stops at dawn_target_pct (+2% overshoot to prevent cycling).
-        # During daytime, solar recharges the battery naturally — no import needed.
-        _flat_rate = snapshot.tariff.tariff_key in (TARIFF_TRACKER, TARIFF_FLEXIBLE)
-        if (_flat_rate
-                and not balance.is_daytime
-                and snapshot.current_soc_pct < snapshot.dawn_target_pct):
-            buffer_pct    = snapshot.dawn_target_pct          # default 10%
-            buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
-            cap_kwh       = snapshot.capacity_kwh
-            deficit_kwh   = (buffer_pct - snapshot.current_soc_pct) / 100.0 * cap_kwh
-            rate_str      = (f"{snapshot.tariff.today_rate_p:.2f}p/kWh"
-                             if snapshot.tariff.today_rate_p else "")
-            return Decision(
-                action          = ACTION_START_IMPORT,
-                reason          = (
-                    f"Resilience buffer: {snapshot.current_soc_pct:.1f}% below "
-                    f"{buffer_pct:.0f}% minimum — importing {deficit_kwh:.1f} kWh "
-                    f"to {buffer_target:.0f}% for power-cut protection "
-                    f"(Tracker flat rate {rate_str}, solar recharges from dawn)"
-                ),
-                power_watts     = 10000,
-                target_soc_pct  = buffer_target,
-                dawn_viable     = True,
-                soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
-            )
+        # 2. Resilience buffer (flat-rate tariffs only)
+        resilience = self._check_resilience_buffer(snapshot, balance)
+        if resilience is not None:
+            return resilience
 
-        # ── Flood prevention: overnight pre-drain on high-SOC + very sunny forecast ─
-        # Pre-drain to FLOOD_PREV_TARGET_PCT so the battery has headroom to absorb
-        # peak solar all day. Without this, a near-full battery at 09:00 fills within
-        # a few hours at peak PV, cutting off the DNO-capped export prematurely.
+        # 3. Overnight flood prevention pre-drain (only if export enabled)
         if snapshot.export_enabled and not balance.is_daytime:
             flood = self._check_flood_prevention(snapshot, balance)
             if flood is not None:
                 return flood
 
-        # Import takes priority: ensure tomorrow is covered before exporting today
+        # 4. Import takes priority: ensure tomorrow is covered before exporting today
         if balance.import_needed:
             decision = self._plan_import(snapshot, balance)
             # Only flag dawn as not viable when we're actually importing.
@@ -305,13 +267,13 @@ class BatteryManager:
             decision.import_kwh      = balance.import_kwh_grid
             return decision
 
-        # Daytime solar overflow: export surplus PV that would otherwise be clipped
+        # 5. Daytime solar overflow: export surplus PV that would otherwise be clipped
         if snapshot.export_enabled:
             overflow = self._check_solar_overflow(snapshot, balance)
             if overflow is not None:
                 return overflow
 
-        # Release charge cap if previously applied but conditions no longer hold
+        # 5b. Release a previously-applied overflow cap if conditions no longer hold
         if snapshot.solar_overflow_active:
             return Decision(
                 action          = ACTION_SELF_CONSUMPTION,
@@ -324,6 +286,7 @@ class BatteryManager:
                 soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
             )
 
+        # 6. Default: nothing to do, sit on self-consumption
         return Decision(
             action          = ACTION_SELF_CONSUMPTION,
             reason          = (
@@ -331,6 +294,74 @@ class BatteryManager:
                 f"tomorrow: {balance.available_tomorrow_kwh:.1f} kWh avail, "
                 f"need {balance.tomorrow_need_kwh:.1f} kWh"
             ),
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+        )
+
+    # ------------------------------------------------------------------
+    # evaluate() decision branches — extracted for readability
+    # ------------------------------------------------------------------
+
+    def _check_overrides(self, snapshot: ManagerSnapshot):
+        """Return a Decision if a higher-priority override applies, else None.
+
+        Two overrides:
+          - VPP active: Axle has control, manager must stand down.
+          - Flood-prevention export already running: continue or stop based on
+            the live 24h balance (managed by _continue_flood_prevention).
+
+        The v3.x legacy "night export" branch was retired in v4.0 — any
+        export_active state without a flood_prev_target_soc is treated as the
+        flood-prevention path, since v4.x has no other reason to export
+        overnight.
+        """
+        if snapshot.vpp_active:
+            return Decision(
+                action = ACTION_SELF_CONSUMPTION,
+                reason = "VPP event active — Axle has control",
+            )
+        if snapshot.export_active and snapshot.flood_prev_target_soc > 0:
+            balance = self._calculate_24h_balance(snapshot)
+            return self._continue_flood_prevention(snapshot, balance)
+        return None
+
+    def _check_resilience_buffer(self, snapshot: ManagerSnapshot,
+                                 balance: SufficiencyBalance):
+        """Flat-rate-tariff overnight power-cut floor — return Decision or None.
+
+        On Tracker/Flexible there is no rate benefit to pre-charging the
+        battery for tomorrow (grid passthrough is just as cheap and avoids the
+        ~6% AC/DC/AC round-trip loss).  The ONE reason to import overnight on
+        a flat-rate tariff is power-cut resilience: keep at least
+        dawn_target_pct so the house can ride out an outage for several hours.
+
+        Import stops at dawn_target_pct + 2% (overshoot prevents cycling).
+        Returns None when not applicable (non-flat tariff, daytime, or
+        battery already above the floor).
+        """
+        if snapshot.tariff.tariff_key not in (TARIFF_TRACKER, TARIFF_FLEXIBLE):
+            return None
+        if balance.is_daytime:
+            return None
+        if snapshot.current_soc_pct >= snapshot.dawn_target_pct:
+            return None
+
+        buffer_pct    = snapshot.dawn_target_pct          # default 10%
+        buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
+        cap_kwh       = snapshot.capacity_kwh
+        deficit_kwh   = (buffer_pct - snapshot.current_soc_pct) / 100.0 * cap_kwh
+        rate_str      = (f"{snapshot.tariff.today_rate_p:.2f}p/kWh"
+                         if snapshot.tariff.today_rate_p else "")
+        return Decision(
+            action          = ACTION_START_IMPORT,
+            reason          = (
+                f"Resilience buffer: {snapshot.current_soc_pct:.1f}% below "
+                f"{buffer_pct:.0f}% minimum — importing {deficit_kwh:.1f} kWh "
+                f"to {buffer_target:.0f}% for power-cut protection "
+                f"(flat rate {rate_str}, solar recharges from dawn)"
+            ),
+            power_watts     = 10000,
+            target_soc_pct  = buffer_target,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )

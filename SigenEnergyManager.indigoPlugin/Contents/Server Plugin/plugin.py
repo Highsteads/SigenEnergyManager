@@ -6,8 +6,35 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
+# Date:        12-05-2026
+# Version:     5.0
+# Changes:     v5.0 (12-05-2026) — major hardening and feature pass:
+#   • Threading lock around self.store (tick + action callbacks)
+#   • Web dashboard now joins thread + server_close on shutdown
+#   • SQLite timeseries connections use timeout=5.0 + try/finally
+#   • Octopus rate-limit tracker (warns >80/hr, hard-stops >95/hr)
+#   • Modbus writes are read-back-verified (warns on mismatch)
+#   • JSON parse guards on every response.json() in Octopus / Open-Meteo / Axle
+#   • Kraken token cleared on any failure path so stale tokens cannot persist
+#   • battery_manager.evaluate() refactored — _check_overrides /
+#     _check_resilience_buffer extracted, dead v4.0 night-export branch removed
+#   • Site coordinates moved to PluginConfig (siteLatitude / siteLongitude)
+#   • Variable folder ID cached after first lookup
+#   • _ensure_plugin_log throttled to hourly (was every tick)
+#   • ServerApiVersion bumped 3.0 -> 3.8 (Indigo 2025.2 native)
+#   • pymodbus pinned to >=3.0,<4.0
+#   • EMS mode 0x07 ("AI Mode") added to decode table
+#   • Axle: forecast_dispatch_kwh / estimated_revenue_p surfaced when present
+#   • Auto-calibrated weekday/weekend kWh from live inverter consumption profile
+#   • New menu items: Run Self-Test, Show Power Cut Log
+#   • Dashboard: tomorrow_surplus_kwh, tomorrow_revenue_gbp, forecast_accuracy
+#   • Battery State-of-Health weekly snapshot + degradation warnings
+#   • Power cut event log (rolling 100, surfaced via menu + dashboard)
+#   • Variable-driven pause/resume via sigen_manager_paused
+#   • Pushover quiet hours + configurable sound
+#   • Forecast accuracy 7-day MAPE rolling summary
 # Date:        10-05-2026
-# Version:     4.9
+# Version:     4.9 (prior)
 
 import indigo
 import json
@@ -16,11 +43,12 @@ import os
 import platform
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
-# Secrets (from master IndigoSecrets.py - never committed to git)
+# Secrets (from master secrets.py - never committed to git)
 # ============================================================
 
 sys.path.insert(0, os.getcwd())
@@ -260,6 +288,14 @@ class Plugin(indigo.PluginBase):
         # Web dashboard server (started in startup, stopped in shutdown)
         self.web_dashboard        = None
 
+        # Reentrant lock for self.store. Indigo's runConcurrentThread runs in a
+        # background thread while action callbacks, menu items, deviceUpdated and
+        # device-config submissions all run on the main thread.  Without a lock,
+        # a composite read-modify-write on store (e.g. _act_on_decision flipping
+        # flags while an action callback is also writing) can race.  RLock so the
+        # tick can call _act_on_decision which can call _trigger_event etc.
+        self._state_lock = threading.RLock()
+
         # Poll timers
         self.store                   = {}   # mutable state dict (replaces globals)
         self.store["last_modbus"]    = 0.0
@@ -321,6 +357,12 @@ class Plugin(indigo.PluginBase):
 
         # Power cut detection
         self.store["grid_status_prev"] = "On-grid"  # previous poll's gridStatus
+        # Rolling log of grid-status transitions (most recent 100 entries).
+        # Each entry is a human-readable string with timestamp + transition +
+        # duration of the outage when it ends.  Surfaced via menuShowPowerCutLog
+        # and the web dashboard /api/status.
+        self.store["power_cut_events"]      = []
+        self.store["power_cut_started_at"]  = None
 
         # Solar overflow state (daytime charge-cap export)
         self.store["solar_overflow_active"]      = False
@@ -403,6 +445,60 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             log(f"[Web] Dashboard failed to start: {exc}", level="ERROR")
 
+        # Subscribe to variable changes so an external automation (or the
+        # Indigo client UI) can toggle pause via the `sigen_manager_paused`
+        # variable.  Creating the variable on startup means users discover the
+        # control without having to read the docs.
+        try:
+            indigo.variables.subscribeToChanges()
+            self._ensure_pause_variable()
+        except Exception as exc:
+            log(f"[Startup] Variable subscription failed: {exc}", level="ERROR")
+
+    def _ensure_pause_variable(self):
+        """Create `sigen_manager_paused` in the Sigenergy folder if it doesn't
+        already exist.  The current paused state is mirrored in.  Indigo
+        variables are always strings — "true" / "false" lower-case."""
+        if "sigen_manager_paused" in indigo.variables:
+            return
+        folder_id = self._sigenergy_folder_id()
+        try:
+            indigo.variable.create(
+                "sigen_manager_paused",
+                value="false",
+                folder=folder_id,
+            )
+            log("[Setup] Created variable 'sigen_manager_paused' — set to 'true' "
+                "to pause the battery manager from anywhere in Indigo.")
+        except Exception as exc:
+            log(f"[Setup] Cannot create pause variable: {exc}", level="WARNING")
+
+    def variableUpdated(self, orig_var, new_var):
+        """Indigo callback when any subscribed variable changes value.
+
+        Picks up `sigen_manager_paused` toggles and mirrors them into
+        self.store["manager_paused"].  Plain string compare; accepts the usual
+        truthy strings ('true', '1', 'yes', 'on').
+        """
+        super().variableUpdated(orig_var, new_var)
+        if new_var.name != "sigen_manager_paused":
+            return
+        with self._state_lock:
+            new_value = str(new_var.value).strip().lower()
+            paused = new_value in ("true", "1", "yes", "on", "paused")
+            if self.store.get("manager_paused", False) != paused:
+                self.store["manager_paused"] = paused
+                log(
+                    f"[Variable] Manager {'paused' if paused else 'resumed'} "
+                    f"via sigen_manager_paused = {new_var.value!r}"
+                )
+                dev = self._find_device("batteryManager")
+                if dev:
+                    dev.updateStateOnServer(
+                        "managerStatus",
+                        value="Paused" if paused else "Running",
+                    )
+
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
         if self.web_dashboard:
@@ -467,6 +563,24 @@ class Plugin(indigo.PluginBase):
             else:
                 self_suff = 100.0
 
+            # Tomorrow revenue estimate: surplus solar × export rate.
+            # Surplus is the optimistic forecast minus expected daily need
+            # (auto-calibrated from inverter data, see _build_manager_snapshot).
+            # Export rate defaults to 12p (Octopus Outgoing flat) — overridden if
+            # the rates_data feed publishes a different export rate.
+            tomorrow_solar = float(fcast.get("correctedTomorrowKwh", 0.0))
+            profile        = self.store.get("consumption_profile", []) or []
+            tomorrow_need  = sum(profile) if len(profile) == 48 else 22.0
+            tomorrow_surplus = max(0.0, tomorrow_solar - tomorrow_need)
+            export_rate_p  = 12.0
+            try:
+                rates_export = float(rates.get("export_rate_p", 0.0))
+                if rates_export > 0:
+                    export_rate_p = rates_export
+            except (TypeError, ValueError):
+                pass
+            tomorrow_revenue_gbp = round(tomorrow_surplus * export_rate_p / 100.0, 2)
+
             return {
                 "timestamp":  datetime.now().strftime("%H:%M:%S"),
                 "battery": {
@@ -479,6 +593,9 @@ class Plugin(indigo.PluginBase):
                     "tomorrow_kwh":   round(fcast.get("correctedTomorrowKwh",  0.0), 1),
                     "bias_factor":    round(fcast.get("biasFactor",            1.0), 3),
                     "remaining_kwh":  round(fcast.get("remainingTodayKwh",     0.0), 1),
+                    "tomorrow_surplus_kwh":  round(tomorrow_surplus, 1),
+                    "tomorrow_revenue_gbp":  tomorrow_revenue_gbp,
+                    "export_rate_p":         round(export_rate_p, 2),
                 },
                 "grid": {
                     "power_w": grid_w,
@@ -516,6 +633,17 @@ class Plugin(indigo.PluginBase):
                 "storm": {
                     "level": self.store.get("storm_level", "none"),
                 },
+                "power_cut": {
+                    "events":  (self.store.get("power_cut_events", []) or [])[-10:],
+                    "ongoing": self.store.get("power_cut_started_at") is not None,
+                    "lockout_active": self.store.get("power_cut_lockout_active", False),
+                },
+                "forecast_accuracy": (
+                    self.forecast.get_accuracy_summary(window_days=7)
+                    if self.forecast else
+                    {"days": 0, "mape_pct": 0.0, "mean_factor": 1.0,
+                     "over_count": 0, "under_count": 0}
+                ),
                 "flags": {
                     "export_active":         self.store.get("export_active",         False),
                     "solar_overflow_active": self.store.get("solar_overflow_active", False),
@@ -606,60 +734,70 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _tick(self, now):
-        """Called every 10 seconds. Dispatches all timed tasks."""
-        _ensure_plugin_log(self.data_dir)  # no-op unless date has rolled over
-        # 1. Modbus poll
-        if now - self.store["last_modbus"] >= MODBUS_POLL_INTERVAL:
-            self._poll_modbus()
-            self.store["last_modbus"] = now
+        """Called every 10 seconds. Dispatches all timed tasks.
 
-        # 2. Solar forecast (before manager so decision always has fresh data)
-        if now - self.store["last_forecast"] >= FORECAST_FETCH_INTERVAL:
-            self._refresh_forecast()
-            self.store["last_forecast"] = now
+        Holds _state_lock for the duration of the tick so action callbacks
+        running on the main thread cannot interleave with store mutations.
+        """
+        with self._state_lock:
+            # Date rotation only needs checking every ~hour (Phase 4C).  Skipping
+            # the per-tick filesystem stat avoids 8,640 redundant calls/day.
+            if now - self.store.get("last_log_check", 0.0) >= 3600.0:
+                _ensure_plugin_log(self.data_dir)
+                self.store["last_log_check"] = now
 
-        # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
-        if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
-            self._evaluate_manager()
-            self.store["last_manager"] = now
+            # 1. Modbus poll
+            if now - self.store["last_modbus"] >= MODBUS_POLL_INTERVAL:
+                self._poll_modbus()
+                self.store["last_modbus"] = now
 
-        # 4. Octopus rates
-        if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
-            self._refresh_octopus_rates()
-            self.store["last_octopus"] = now
+            # 2. Solar forecast (before manager so decision always has fresh data)
+            if now - self.store["last_forecast"] >= FORECAST_FETCH_INTERVAL:
+                self._refresh_forecast()
+                self.store["last_forecast"] = now
 
-        # 5. Consumption profile (daily)
-        if now - self.store["last_profile"] >= OCTOPUS_PROFILE_INTERVAL:
-            self._refresh_consumption_profile()
-            self.store["last_profile"] = now
+            # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
+            if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
+                self._evaluate_manager()
+                self.store["last_manager"] = now
 
-        # 6. VPP polling (adaptive)
-        vpp_interval = self._vpp_poll_interval()
-        if now - self.store["last_vpp"] >= vpp_interval:
-            self._poll_vpp()
-            self.store["last_vpp"] = now
+            # 4. Octopus rates
+            if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
+                self._refresh_octopus_rates()
+                self.store["last_octopus"] = now
 
-        # 7. Accumulator save
-        if now - self.store["last_acc_save"] >= ACCUMULATOR_SAVE_INTERVAL:
-            self._save_accumulators()
-            self.store["last_acc_save"] = now
+            # 5. Consumption profile (daily)
+            if now - self.store["last_profile"] >= OCTOPUS_PROFILE_INTERVAL:
+                self._refresh_consumption_profile()
+                self.store["last_profile"] = now
 
-        # 8. Daily midnight tasks
-        self._check_midnight()
+            # 6. VPP polling (adaptive)
+            vpp_interval = self._vpp_poll_interval()
+            if now - self.store["last_vpp"] >= vpp_interval:
+                self._poll_vpp()
+                self.store["last_vpp"] = now
 
-        # 9. Check scheduled import
-        self._check_scheduled_import()
+            # 7. Accumulator save
+            if now - self.store["last_acc_save"] >= ACCUMULATOR_SAVE_INTERVAL:
+                self._save_accumulators()
+                self.store["last_acc_save"] = now
 
-        # 10. Storm watch (every 2 hours)
-        if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
-            self._check_storm_watch()
-            self.store["last_storm_watch"] = now
+            # 8. Daily midnight tasks
+            self._check_midnight()
 
-        # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
-        if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
-            self._log_halfhourly_to_db()
-            self._write_energy_summary_variables()
-            self.store["last_energy_var"] = now
+            # 9. Check scheduled import
+            self._check_scheduled_import()
+
+            # 10. Storm watch (every 2 hours)
+            if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
+                self._check_storm_watch()
+                self.store["last_storm_watch"] = now
+
+            # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
+            if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
+                self._log_halfhourly_to_db()
+                self._write_energy_summary_variables()
+                self.store["last_energy_var"] = now
 
     # ================================================================
     # Modbus Polling
@@ -677,14 +815,47 @@ class Plugin(indigo.PluginBase):
 
         self.latest_inverter_data = data
 
-        # Detect Off-grid → On-grid transition (power cut recovery)
+        # Detect grid-status transitions in either direction so the power-cut
+        # log captures both the start and end of every outage.
         new_grid_status  = data.get("gridStatus", "On-grid")
         prev_grid_status = self.store.get("grid_status_prev", "On-grid")
-        if prev_grid_status != "On-grid" and new_grid_status == "On-grid":
-            restored_at = datetime.now(timezone.utc)
-            self.store["power_restored_time"]  = restored_at
+        now_utc          = datetime.now(timezone.utc)
+        if prev_grid_status == "On-grid" and new_grid_status != "On-grid":
+            # Outage started
+            self.store["power_cut_started_at"] = now_utc
+            event_str = (
+                f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC — grid LOST "
+                f"({new_grid_status})"
+            )
+            self.store["power_cut_events"].append(event_str)
+            # Cap log at 100 entries to bound memory
+            if len(self.store["power_cut_events"]) > 100:
+                self.store["power_cut_events"] = self.store["power_cut_events"][-100:]
+            log(f"[PowerCut] Grid lost — entering {new_grid_status} mode",
+                level="WARNING")
+        elif prev_grid_status != "On-grid" and new_grid_status == "On-grid":
+            # Outage ended
+            started = self.store.get("power_cut_started_at")
+            duration_str = ""
+            if started:
+                seconds = (now_utc - started).total_seconds()
+                if seconds < 120:
+                    duration_str = f" (duration {seconds:.0f}s)"
+                elif seconds < 3600:
+                    duration_str = f" (duration {seconds/60:.1f} min)"
+                else:
+                    duration_str = f" (duration {seconds/3600:.1f} h)"
+            event_str = (
+                f"{now_utc.strftime('%Y-%m-%d %H:%M')} UTC — grid RESTORED"
+                f"{duration_str}"
+            )
+            self.store["power_cut_events"].append(event_str)
+            if len(self.store["power_cut_events"]) > 100:
+                self.store["power_cut_events"] = self.store["power_cut_events"][-100:]
+            self.store["power_cut_started_at"]  = None
+            self.store["power_restored_time"]   = now_utc
             self.store["power_cut_lockout_active"] = True
-            self.pluginPrefs["powerRestoredTime"] = restored_at.isoformat()
+            self.pluginPrefs["powerRestoredTime"]  = now_utc.isoformat()
             log(
                 f"[PowerCut] Grid restored after outage — export locked for "
                 f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution",
@@ -887,6 +1058,28 @@ class Plugin(indigo.PluginBase):
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
         """Construct the immutable snapshot passed to manager.evaluate()."""
         prefs = self.pluginPrefs
+
+        # Auto-calibrated daily consumption — once the 48-slot profile has
+        # enough real readings, its total daily kWh is a better estimate than
+        # the static weekday/weekend prefs (which were originally hand-tuned).
+        # Prefs still win when they're set to a non-default value, so the user
+        # can override the auto-derived figure if they want.  Detection of
+        # "user set a custom value" is approximate — any value differing from
+        # the documented default by > 1 kWh is treated as user-intent.
+        profile      = self.store.get("consumption_profile", []) or []
+        live_daily   = sum(profile) if len(profile) == 48 else 0.0
+        weekday_pref = float(prefs.get("weekdayKwh", 22.0))
+        weekend_pref = float(prefs.get("weekendKwh", 30.0))
+        if live_daily >= 5.0:    # plausibility floor — ignore wildly low partial profiles
+            weekday_user_override = abs(weekday_pref - 22.0) > 1.0
+            weekend_user_override = abs(weekend_pref - 30.0) > 1.0
+            if not weekday_user_override:
+                weekday_pref = round(live_daily, 1)
+            if not weekend_user_override:
+                # Weekend tends to be ~30% higher in CliveS' data — preserve
+                # ratio if the user hasn't customised it.
+                weekend_pref = round(live_daily * 1.30, 1)
+
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
             capacity_kwh       = float(prefs.get("batteryCapacityKwh", 35.04)),
@@ -895,8 +1088,8 @@ class Plugin(indigo.PluginBase):
             health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 1)),
             export_enabled     = export_enabled,
             max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
-            weekday_kwh        = float(prefs.get("weekdayKwh", 22.0)),
-            weekend_kwh        = float(prefs.get("weekendKwh", 30.0)),
+            weekday_kwh        = weekday_pref,
+            weekend_kwh        = weekend_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
@@ -978,7 +1171,7 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _resolve_pushover_user(self):
-        """Return the Pushover user/group key, preferring IndigoSecrets.py over PluginConfig.
+        """Return the Pushover user/group key, preferring secrets.py over PluginConfig.
 
         Returns "" and logs an ERROR (once per call) if neither source is set.
         Callers should treat "" as "skip alert".
@@ -987,7 +1180,7 @@ class Plugin(indigo.PluginBase):
         if not token:
             log(
                 "[Pushover] No user/group key configured. Set PUSHOVER_USER_TOKEN in "
-                "IndigoSecrets.py or fill in 'Pushover user/group key' under Plugins -> "
+                "secrets.py or fill in 'Pushover user/group key' under Plugins -> "
                 "Sigenergy Manager -> Configure. Alert skipped.",
                 level="ERROR",
             )
@@ -996,7 +1189,7 @@ class Plugin(indigo.PluginBase):
     def _resolve_dashboard_host(self):
         """Resolve the host shown in the dashboard URL log line.
 
-        Order of precedence: DASHBOARD_HOST in IndigoSecrets.py, then dashboardHost
+        Order of precedence: DASHBOARD_HOST in secrets.py, then dashboardHost
         in PluginConfig, then auto-detect via socket.  Auto-detect is the silent
         default — no warning needed, since the dashboard binds to all interfaces
         regardless and the URL is purely a convenience log line.
@@ -1019,16 +1212,51 @@ class Plugin(indigo.PluginBase):
             host = "localhost"
         return host
 
+    def _is_in_quiet_hours(self):
+        """True if the current local time falls within the configured Pushover
+        quiet-hours window.  Window may straddle midnight (e.g. 22:00 → 07:00).
+        Blank/invalid config returns False so alerts always send."""
+        start_str = (self.pluginPrefs.get("pushoverQuietStart") or "").strip()
+        end_str   = (self.pluginPrefs.get("pushoverQuietEnd")   or "").strip()
+        if not start_str or not end_str:
+            return False
+        try:
+            sh, sm = [int(x) for x in start_str.split(":")]
+            eh, em = [int(x) for x in end_str.split(":")]
+        except (ValueError, AttributeError):
+            return False
+        try:
+            import pytz
+            now = datetime.now(pytz.timezone("Europe/London"))
+        except Exception:
+            now = datetime.now()
+        now_min   = now.hour * 60 + now.minute
+        start_min = sh * 60 + sm
+        end_min   = eh * 60 + em
+        if start_min <= end_min:
+            return start_min <= now_min < end_min
+        # straddles midnight
+        return now_min >= start_min or now_min < end_min
+
     def _send_pushover(self, title, message, priority="0"):
         """Send a Pushover notification. Called from the main plugin thread.
 
-        Uses correct action ID "send" with msg* keys per the Pushover Indigo
-        plugin (io.thechad.indigoplugin.pushover).  Priority is a string per
-        the plugin's API.  Sound defaults to "vibrate" per CliveS preference.
+        Honours the configured sound (pluginPrefs.pushoverSound, default
+        'vibrate') and quiet-hours window.  HIGH-priority alerts (priority>=1)
+        always send regardless of quiet hours so storm amber/red and VPP
+        release failures are never silenced.
         """
         user = self._resolve_pushover_user()
         if not user:
             return
+        try:
+            priority_int = int(priority)
+        except (TypeError, ValueError):
+            priority_int = 0
+        if priority_int < 1 and self._is_in_quiet_hours():
+            log(f"[Pushover] suppressed (quiet hours): {title}")
+            return
+        sound = self.pluginPrefs.get("pushoverSound", "vibrate") or "vibrate"
         try:
             pushover = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
             if pushover and pushover.isEnabled():
@@ -1037,7 +1265,7 @@ class Plugin(indigo.PluginBase):
                     "msgBody":     message,
                     "msgUser":     user,
                     "msgPriority": str(priority),
-                    "msgSound":    "vibrate",
+                    "msgSound":    sound,
                 })
                 log(f"[Pushover] sent: {title}")
             else:
@@ -1884,7 +2112,7 @@ class Plugin(indigo.PluginBase):
         # Pushover alert (uses corrected helper — handles secrets/config + skip-with-warning)
         self._send_pushover(subject, plain, priority="1")
 
-        # Email to Axle support — address comes from IndigoSecrets.py (AXLE_SUPPORT_EMAIL)
+        # Email to Axle support — address comes from secrets.py (AXLE_SUPPORT_EMAIL)
         # so it can be overridden per install without touching plugin code.
         if AXLE_SUPPORT_EMAIL:
             try:
@@ -1894,8 +2122,8 @@ class Plugin(indigo.PluginBase):
                 log(f"[VPP] Email alert failed: {e}", level="ERROR")
         else:
             log(
-                "[VPP] AXLE_SUPPORT_EMAIL not set in IndigoSecrets.py — VPP release "
-                "email alert skipped. Add the address to IndigoSecrets.py to enable.",
+                "[VPP] AXLE_SUPPORT_EMAIL not set in secrets.py — VPP release "
+                "email alert skipped. Add the address to secrets.py to enable.",
                 level="ERROR",
             )
 
@@ -2112,6 +2340,30 @@ class Plugin(indigo.PluginBase):
         # Write daily history ring buffer
         self._write_daily_history(yesterday)
 
+        # Forecast accuracy: log the rolling 7-day summary so trends are
+        # visible without having to read the JSON file.
+        try:
+            summary = self.forecast.get_accuracy_summary(window_days=7)
+            if summary["days"] > 0:
+                log(
+                    f"[Forecast] 7-day accuracy: MAPE {summary['mape_pct']:.1f}%  "
+                    f"mean factor {summary['mean_factor']:.2f}  "
+                    f"(over: {summary['over_count']}, under: {summary['under_count']})"
+                )
+        except Exception as exc:
+            self.logger.debug(f"Accuracy summary skipped: {exc}")
+
+        # Battery State-of-Health snapshot — once a week, on Monday's midnight task.
+        # LFP cells typically lose ~0.3%/year of capacity in normal cycling; anything
+        # faster is worth flagging.  Cheap to compute and stored as a small JSON ring
+        # buffer in data_dir.
+        try:
+            today_dt = datetime.strptime(today, "%Y-%m-%d")
+            if today_dt.weekday() == 0:   # Monday
+                self._record_battery_soh_snapshot(today)
+        except (ValueError, OSError) as exc:
+            self.logger.debug(f"SoH snapshot skipped: {exc}")
+
         # Write final daily totals to Indigo variables before reset
         self._write_energy_summary_variables()
         self.store["last_energy_var"] = time.time()
@@ -2179,6 +2431,67 @@ class Plugin(indigo.PluginBase):
         self.store["had_import_today"]   = False
         self.store["export_count_today"] = 0
         self.store["had_vpp_today"]      = False
+
+    # ================================================================
+    # Battery State-of-Health tracking
+    # ================================================================
+
+    def _record_battery_soh_snapshot(self, date_str):
+        """Append a weekly SoH snapshot to soh_history.json (data_dir).
+
+        Logs a WARNING if SoH has dropped by more than 2 percentage points in
+        the last year, or more than 1 point in the last 4 weeks — either
+        indicates faster-than-expected degradation for LFP chemistry and is
+        worth investigating (cell imbalance, BMS calibration drift, etc.).
+        """
+        inv = self.latest_inverter_data or {}
+        soh = float(inv.get("batterySoh", 0.0) or 0.0)
+        if soh <= 0.0:
+            self.logger.debug("[SoH] No batterySoh reading yet — snapshot skipped")
+            return
+
+        path = os.path.join(self.data_dir, "soh_history.json")
+        records = []
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+        except (OSError, ValueError):
+            records = []
+
+        records.append({"date": date_str, "soh": round(soh, 2)})
+        # Keep ~5 years of weekly snapshots (260 entries)
+        if len(records) > 260:
+            records = records[-260:]
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(records, f)
+        except OSError as exc:
+            self.logger.warning(f"[SoH] Cannot persist soh_history.json: {exc}")
+
+        # Degradation checks — compare against 4-weeks and 52-weeks ago.
+        def _lookup(n_weeks_ago):
+            if len(records) < n_weeks_ago + 1:
+                return None
+            return records[-(n_weeks_ago + 1)].get("soh")
+
+        prev_month = _lookup(4)
+        prev_year  = _lookup(52)
+        log(f"[SoH] Weekly snapshot: {soh:.1f}% "
+            f"(4w ago: {prev_month if prev_month is not None else 'n/a'},  "
+            f"52w ago: {prev_year if prev_year is not None else 'n/a'})")
+        if prev_month is not None and (prev_month - soh) > 1.0:
+            log(
+                f"[SoH] WARNING: capacity dropped {prev_month - soh:.1f}% in 4 weeks. "
+                f"LFP norm is < 0.1%/4 weeks — investigate BMS / cell balance.",
+                level="WARNING",
+            )
+        if prev_year is not None and (prev_year - soh) > 2.0:
+            log(
+                f"[SoH] WARNING: capacity dropped {prev_year - soh:.1f}% in 52 weeks. "
+                f"Expected LFP degradation is ~0.3%/year — consider raising with installer.",
+                level="WARNING",
+            )
 
     # ================================================================
     # Trigger Events
@@ -2341,15 +2654,30 @@ class Plugin(indigo.PluginBase):
         dev.updateStatesOnServer(states)
 
     def _sigenergy_folder_id(self) -> int:
-        """Return the Sigenergy variable folder ID, or 0 (root) if not found."""
+        """Return the Sigenergy variable folder ID, or 0 (root) if not found.
+
+        Result is cached on the instance after the first successful lookup so
+        the half-hourly variable-write path doesn't re-scan every folder.
+        The cache is invalidated when the folder cannot be resolved and again
+        on plugin restart (instance is fresh).
+        """
+        cached = getattr(self, "_sigen_folder_id_cache", None)
+        if cached is not None:
+            return cached
+        result = 0
         try:
             for fid in indigo.variables.folders:
                 f = indigo.variables.folders[fid]
                 if f.name.lower() in ("sigenergy", "sigen energy", "sigen"):
-                    return f.id
+                    result = f.id
+                    break
         except Exception:
-            pass
-        return 0
+            result = 0
+        # Only cache successful hits — a 0 result means "create on first write"
+        # and we want a future call (after the folder has been created) to find it.
+        if result:
+            self._sigen_folder_id_cache = result
+        return result
 
     def _ensure_var(self, name: str, folder_id: int) -> int:
         """
@@ -2378,8 +2706,9 @@ class Plugin(indigo.PluginBase):
     def _init_timeseries_db(self):
         """Create energy_timeseries.db in data_dir if it does not already exist."""
         db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        con = None
         try:
-            con = sqlite3.connect(db_path)
+            con = sqlite3.connect(db_path, timeout=5.0)
             con.execute("""
                 CREATE TABLE IF NOT EXISTS halfhourly (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2397,10 +2726,15 @@ class Plugin(indigo.PluginBase):
                 )
             """)
             con.commit()
-            con.close()
             log(f"[Timeseries] DB ready: {db_path}")
-        except Exception as exc:
+        except sqlite3.Error as exc:
             log(f"[Timeseries] DB init failed: {exc}", level="ERROR")
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
 
     def _log_halfhourly_to_db(self):
         """Append one half-hourly slot to energy_timeseries.db.
@@ -2464,8 +2798,9 @@ class Plugin(indigo.PluginBase):
         if self.latest_decision:
             action = str(self.latest_decision.action)
 
+        con = None
         try:
-            con = sqlite3.connect(db_path)
+            con = sqlite3.connect(db_path, timeout=5.0)
             con.execute(
                 """INSERT OR IGNORE INTO halfhourly
                    (slot_start, slot_end,
@@ -2479,9 +2814,14 @@ class Plugin(indigo.PluginBase):
                  tracker_p, action)
             )
             con.commit()
-            con.close()
-        except Exception as exc:
+        except sqlite3.Error as exc:
             log(f"[Timeseries] Write failed: {exc}", level="ERROR")
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
 
         # Advance anchors
         self.store["hh_anchor_pv_kwh"]     = cur_pv
@@ -2603,71 +2943,118 @@ class Plugin(indigo.PluginBase):
         dev.updateStatesOnServer(states)
 
     # ================================================================
+    # Action dialog pre-population (Indigo getActionConfigUiValues)
+    # ================================================================
+
+    def getActionConfigUiValues(self, plugin_props, type_id, dev_id):
+        """Pre-fill action dialogs with live values where useful.
+
+        For Force Grid Import: defaults the target SOC to current SOC + 20%
+        (clamped to 95%), so the slider opens at a sensible "top-up by ~20%"
+        position rather than a static 80%.
+
+        For Force Grid Export: defaults the kW field to the configured DNO
+        export limit (4 kW by default) rather than a hardcoded 4.0.
+
+        Any user-saved values in plugin_props take precedence — we only
+        write a key when the user hasn't already set it.
+        """
+        values = indigo.Dict(plugin_props) if plugin_props else indigo.Dict()
+        errors = indigo.Dict()
+        try:
+            inv = self.latest_inverter_data or {}
+            soc = float(inv.get("batterySoc", 0.0))
+            if type_id == "forceGridImport":
+                if not values.get("targetSocPct"):
+                    suggested = int(min(95, max(20, round(soc + 20))))
+                    values["targetSocPct"] = str(suggested)
+                if not values.get("powerKw"):
+                    values["powerKw"] = str(
+                        float(self.pluginPrefs.get("inverterMaxKw", "10.0"))
+                    )
+            elif type_id == "forceExport":
+                if not values.get("powerKw"):
+                    values["powerKw"] = str(
+                        float(self.pluginPrefs.get("maxExportKw", "4.0"))
+                    )
+        except Exception as exc:
+            self.logger.debug(f"getActionConfigUiValues fallback: {exc}")
+        return (values, errors)
+
+    # ================================================================
     # Indigo Action Callbacks
     # ================================================================
 
     def actionForceGridImport(self, action):
         """Action: Force immediate grid import."""
-        props     = action.props
-        power_kw  = float(props.get("powerKw", 10.0))
-        target_soc = float(props.get("targetSocPct", 80.0))
-        log(f"[Action] Force grid import: {power_kw}kW to {target_soc:.0f}% SOC")
-        if self.modbus and self.modbus.force_charge(int(power_kw * 1000)):
-            self.store["import_active"]     = True
-            self.store["import_target_soc"] = target_soc
-            self.store["export_active"]     = False
+        with self._state_lock:
+            props     = action.props
+            power_kw  = float(props.get("powerKw", 10.0))
+            target_soc = float(props.get("targetSocPct", 80.0))
+            log(f"[Action] Force grid import: {power_kw}kW to {target_soc:.0f}% SOC")
+            if self.modbus and self.modbus.force_charge(int(power_kw * 1000)):
+                self.store["import_active"]     = True
+                self.store["import_target_soc"] = target_soc
+                self.store["export_active"]     = False
 
     def actionForceExport(self, action):
         """Action: Force immediate grid export."""
-        inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-        log("[Action] Force export: night_export mode")
-        if self.modbus and self.modbus.night_export(inv_max_w):
-            self.store["export_active"]  = True
-            self.store["import_active"]  = False
+        with self._state_lock:
+            inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+            log("[Action] Force export: night_export mode")
+            if self.modbus and self.modbus.night_export(inv_max_w):
+                self.store["export_active"]  = True
+                self.store["import_active"]  = False
 
     def actionSetSelfConsumption(self, action):
         """Action: Return to self-consumption mode."""
-        log("[Action] Set self-consumption mode")
-        if self.modbus:
-            self.modbus.set_self_consumption()
-            self.store["import_active"] = False
-            self.store["export_active"] = False
+        with self._state_lock:
+            log("[Action] Set self-consumption mode")
+            if self.modbus:
+                self.modbus.set_self_consumption()
+                self.store["import_active"] = False
+                self.store["export_active"] = False
 
     def actionReturnToLocalEms(self, action):
         """Action: Disable Remote EMS and return to local inverter control."""
-        log("[Action] Return to local EMS control")
-        if self.modbus:
-            self.modbus.return_to_local()
-            self.store["import_active"] = False
-            self.store["export_active"] = False
+        with self._state_lock:
+            log("[Action] Return to local EMS control")
+            if self.modbus:
+                self.modbus.return_to_local()
+                self.store["import_active"] = False
+                self.store["export_active"] = False
 
     def actionPauseManager(self, action):
         """Action: Pause battery manager."""
-        log("[Action] Battery manager paused")
-        self.store["manager_paused"] = True
-        dev = self._find_device("batteryManager")
-        if dev:
-            dev.updateStateOnServer("managerStatus", value="Paused")
+        with self._state_lock:
+            log("[Action] Battery manager paused")
+            self.store["manager_paused"] = True
+            dev = self._find_device("batteryManager")
+            if dev:
+                dev.updateStateOnServer("managerStatus", value="Paused")
 
     def actionResumeManager(self, action):
         """Action: Resume battery manager."""
-        log("[Action] Battery manager resumed")
-        self.store["manager_paused"] = False
-        dev = self._find_device("batteryManager")
-        if dev:
-            dev.updateStateOnServer("managerStatus", value="Running")
+        with self._state_lock:
+            log("[Action] Battery manager resumed")
+            self.store["manager_paused"] = False
+            dev = self._find_device("batteryManager")
+            if dev:
+                dev.updateStateOnServer("managerStatus", value="Running")
 
     def actionRefreshForecast(self, action):
         """Action: Manual solar forecast refresh (Open-Meteo)."""
-        log("[Action] Manual solar forecast refresh")
-        self._refresh_forecast(force=True)
-        self.store["last_forecast"] = time.time()
+        with self._state_lock:
+            log("[Action] Manual solar forecast refresh")
+            self._refresh_forecast(force=True)
+            self.store["last_forecast"] = time.time()
 
     def actionRefreshOctopus(self, action):
         """Action: Manual Octopus rates refresh."""
-        log("[Action] Manual Octopus rates refresh")
-        self._refresh_octopus_rates(force=True)
-        self.store["last_octopus"] = time.time()
+        with self._state_lock:
+            log("[Action] Manual Octopus rates refresh")
+            self._refresh_octopus_rates(force=True)
+            self.store["last_octopus"] = time.time()
 
     # ================================================================
     # Indigo Menu Callbacks
@@ -2974,6 +3361,130 @@ class Plugin(indigo.PluginBase):
         log(f"[Menu] Debug logging {state}")
         return True
 
+    def menuSelfTest(self):
+        """Menu: Run a quick health check across every subsystem.
+
+        Logs a single block summarising secrets resolution, Modbus connect,
+        Octopus auth, Open-Meteo reachability and Axle auth.  Each line is
+        an explicit OK/FAIL so configuration problems surface without log
+        digging.  Read-only — no side effects beyond a fresh forecast/rates
+        fetch and a Modbus connect check.
+        """
+        log("=" * 56)
+        log("Plugin self-test")
+        log("=" * 56)
+
+        # Secrets
+        secrets_status = []
+        for name, value in (
+            ("OCTOPUS_API_KEY",     OCTOPUS_API_KEY),
+            ("OCTOPUS_ACCOUNT",     OCTOPUS_ACCOUNT),
+            ("OCTOPUS_MPAN",        OCTOPUS_MPAN),
+            ("OCTOPUS_SERIAL",      OCTOPUS_SERIAL),
+            ("AXLE_API_KEY",        AXLE_API_KEY),
+            ("PUSHOVER_USER_TOKEN", PUSHOVER_USER_TOKEN),
+            ("SIGENERGY_IP",        SIGENERGY_IP),
+        ):
+            secrets_status.append(
+                f"  {name:<22}: {'SET' if value else 'missing (using PluginConfig)'}"
+            )
+        log("Secrets (from IndigoSecrets.py):")
+        for line in secrets_status:
+            log(line)
+
+        # Modbus
+        log("Modbus inverter:")
+        if not self.modbus:
+            log("  FAIL — Modbus not initialised (no inverter IP configured)",
+                level="ERROR")
+        else:
+            try:
+                ok = bool(self.modbus.connected) or self.modbus.connect()
+                if ok and self.modbus.connected:
+                    inv = self.latest_inverter_data or {}
+                    soc = inv.get("batterySoc", "unknown")
+                    log(f"  OK — connected, SOC {soc}%")
+                else:
+                    log("  FAIL — cannot connect to inverter", level="ERROR")
+            except Exception as exc:
+                log(f"  FAIL — {exc}", level="ERROR")
+
+        # Octopus
+        log("Octopus API:")
+        if not self.octopus or not self.octopus.api_key:
+            log("  SKIP — no Octopus API key configured")
+        else:
+            try:
+                t = self.octopus.get_current_tariff(force=False)
+                if t:
+                    log(f"  OK — tariff {t.get('display_name', 'unknown')} "
+                        f"({t.get('tariff_code', '')})")
+                else:
+                    log("  FAIL — could not detect tariff (auth or network)",
+                        level="ERROR")
+            except Exception as exc:
+                log(f"  FAIL — {exc}", level="ERROR")
+
+        # Open-Meteo
+        log("Open-Meteo forecast:")
+        try:
+            data = self.latest_forecast_data
+            if data and data.get("correctedTomorrowKwh") is not None:
+                log(f"  OK — tomorrow {data.get('correctedTomorrowKwh', 0):.1f} kWh "
+                    f"(cache age {data.get('cache_age_hours', 0):.1f}h)")
+            else:
+                log("  WARN — no forecast cached yet — try Menu > Refresh All Data Now",
+                    level="WARNING")
+        except Exception as exc:
+            log(f"  FAIL — {exc}", level="ERROR")
+
+        # Axle
+        log("Axle VPP:")
+        if not self.axle:
+            log("  SKIP — Axle integration disabled or no API key")
+        else:
+            try:
+                event = self.axle.get_next_event()
+                if event:
+                    start = _local_time(event["start_time"], "%H:%M %d/%m")
+                    log(f"  OK — next event {start} ({event.get('import_export')})")
+                else:
+                    log("  OK — connected, no event scheduled")
+            except Exception as exc:
+                log(f"  FAIL — {exc}", level="ERROR")
+
+        # Pushover
+        log("Pushover plugin:")
+        try:
+            po = indigo.server.getPlugin("io.thechad.indigoplugin.pushover")
+            if po and po.isEnabled():
+                user = self._resolve_pushover_user()
+                log(f"  OK — plugin enabled, user token "
+                    f"{'set' if user else 'NOT SET'}")
+            else:
+                log("  WARN — Pushover plugin not enabled (storm/VPP alerts skipped)",
+                    level="WARNING")
+        except Exception as exc:
+            log(f"  WARN — {exc}", level="WARNING")
+
+        log("=" * 56)
+        log("Self-test complete.")
+        return True
+
+    def menuShowPowerCutLog(self):
+        """Menu: Show the last 20 grid-status transitions from the in-memory log."""
+        events = self.store.get("power_cut_events", []) or []
+        if not events:
+            log("[PowerCut] No grid outages have been observed since plugin start.")
+            return True
+        log("=" * 56)
+        log("Power cut log — last 20 grid-status transitions")
+        log("=" * 56)
+        for ev in events[-20:]:
+            log(f"  {ev}")
+        log("=" * 56)
+        return True
+
     # ================================================================
     # Plugin Preferences Callback
     # ================================================================
@@ -2993,7 +3504,7 @@ class Plugin(indigo.PluginBase):
         """Initialise all module instances from current preferences."""
         prefs = self.pluginPrefs
 
-        # Resolve credentials: IndigoSecrets.py wins over PluginConfig
+        # Resolve credentials: secrets.py wins over PluginConfig
         api_key    = OCTOPUS_API_KEY or prefs.get("octopusApiKey", "")
         account_id = OCTOPUS_ACCOUNT or prefs.get("octopusAccount", "")
         mpan       = OCTOPUS_MPAN    or prefs.get("octopusMpan", "")
@@ -3006,9 +3517,22 @@ class Plugin(indigo.PluginBase):
         # Initialised before Modbus so that downstream callers (startup, etc.)
         # always have a forecast object available even if the Modbus IP is not
         # yet configured.
+        # Site coordinates are taken from PluginConfig if the user has set
+        # them, otherwise the module-level defaults (Highsteads, Medomsley)
+        # are used.  Array specs remain in source for v5 — a per-array UI is
+        # on the v6 roadmap.
+        def _as_float(value, fallback):
+            try:
+                return float(value) if value not in (None, "") else fallback
+            except (TypeError, ValueError):
+                return fallback
+        site_lat = _as_float(prefs.get("siteLatitude"),  None)
+        site_lon = _as_float(prefs.get("siteLongitude"), None)
         self.forecast = OpenMeteoForecast(
             data_dir=self.data_dir,
             logger=self.logger,
+            latitude=site_lat,
+            longitude=site_lon,
         )
 
         # Octopus
@@ -3025,13 +3549,13 @@ class Plugin(indigo.PluginBase):
         # Axle VPP
         self.axle = AxleAPI(api_token=axle_key) if axle_key else None
 
-        # Inverter IP: IndigoSecrets.py wins over PluginConfig.  If neither is set,
+        # Inverter IP: secrets.py wins over PluginConfig.  If neither is set,
         # log an ERROR and skip Modbus init only — the rest of the plugin can
         # still run for development/diagnostic use.
         inv_ip     = SIGENERGY_IP or prefs.get("inverterIp", "")
         if not inv_ip:
             log(
-                "[Config] No inverter IP configured. Set SIGENERGY_IP in IndigoSecrets.py "
+                "[Config] No inverter IP configured. Set SIGENERGY_IP in secrets.py "
                 "or fill in 'Inverter IP address' under Plugins -> Sigenergy Manager -> "
                 "Configure. Modbus connection will not start until this is set.",
                 level="ERROR",

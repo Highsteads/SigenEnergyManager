@@ -96,6 +96,7 @@ REMOTE_EMS_MODES = {
     0x04: "Charge PV First",
     0x05: "Discharge PV First",
     0x06: "Discharge ESS First",
+    0x07: "AI Mode",            # Sigenergy AI-optimised mode (firmware >= 1.4.x)
 }
 
 PLANT_RUNNING_STATES = {
@@ -538,8 +539,16 @@ class SigenergyModbus:
     # Low-Level Write Primitives
     # ================================================================
 
-    def _write_single_register(self, register, value, slave=None):
-        """Write a single 16-bit register (function 0x06)."""
+    def _write_single_register(self, register, value, slave=None, verify=True):
+        """Write a single 16-bit register (function 0x06).
+
+        verify=True (default) reads the register back ~150ms later and logs a
+        WARNING if the inverter did not accept the value.  Some Sigenergy
+        firmware revisions silently ignore writes to certain registers under
+        specific EMS modes — verification catches this drift.  Set verify=False
+        for high-frequency writes (e.g. solar overflow cap) where the extra
+        Modbus round trip is unwelcome.
+        """
         if slave is None:
             slave = self.plant_address
         if not self._connected:
@@ -555,7 +564,6 @@ class SigenergyModbus:
                 # and subsequent writes silently fail.
                 self._connected = False
                 return False
-            return True
         except (ModbusException, ConnectionException) as e:
             self.logger.error(f"Modbus write error reg {register} (slave {slave}): {e}")
             self._connected = False
@@ -565,8 +573,30 @@ class SigenergyModbus:
             self._connected = False
             return False
 
-    def _write_uint32_registers(self, register, value, slave=None):
-        """Write a 32-bit unsigned value to two consecutive registers (function 0x10)."""
+        if verify:
+            # Brief delay to let the inverter latch the new value before reading back.
+            time.sleep(0.15)
+            try:
+                readback = self._read_uint16(register, slave=slave)
+            except Exception as e:
+                self.logger.debug(f"Write-back verify read error for reg {register}: {e}")
+                return True   # treat as success — write itself was accepted
+            if readback is None:
+                self.logger.debug(f"Write-back verify could not read reg {register}")
+                return True
+            if int(readback) != int(value):
+                self.logger.warning(
+                    f"Write-back mismatch: reg {register} wrote {value}, reads {readback} "
+                    f"— inverter may have rejected or clamped the value"
+                )
+        return True
+
+    def _write_uint32_registers(self, register, value, slave=None, verify=True):
+        """Write a 32-bit unsigned value to two consecutive registers (function 0x10).
+
+        verify=True (default) reads the pair back ~150ms later and logs a
+        WARNING on mismatch.  See _write_single_register for rationale.
+        """
         if slave is None:
             slave = self.plant_address
         if not self._connected:
@@ -586,7 +616,6 @@ class SigenergyModbus:
                 # Mark connection invalid so the next operation reconnects.
                 self._connected = False
                 return False
-            return True
         except (ModbusException, ConnectionException) as e:
             self.logger.error(f"Modbus write error regs {register}-{register+1} (slave {slave}): {e}")
             self._connected = False
@@ -595,6 +624,23 @@ class SigenergyModbus:
             self.logger.error(f"Unexpected write error regs {register}-{register+1} (slave {slave}): {e}")
             self._connected = False
             return False
+
+        if verify:
+            time.sleep(0.15)
+            try:
+                readback = self._read_uint32(register, slave=slave)
+            except Exception as e:
+                self.logger.debug(f"Write-back verify read error for regs {register}: {e}")
+                return True
+            if readback is None:
+                self.logger.debug(f"Write-back verify could not read regs {register}")
+                return True
+            if int(readback) != int(value):
+                self.logger.warning(
+                    f"Write-back mismatch: regs {register}-{register+1} wrote {value}, "
+                    f"reads {readback} — inverter may have rejected or clamped the value"
+                )
+        return True
 
     # ================================================================
     # Remote EMS Control
@@ -631,8 +677,10 @@ class SigenergyModbus:
     def set_charge_limit(self, watts, quiet=False):
         """Set ESS max charging power (registers 40032-40033, watts).
 
-        quiet=True suppresses the INFO log — used during solar overflow
-        cap adjustments where the Manager summary already logs the change.
+        quiet=True suppresses the INFO log AND the read-back verification —
+        used during solar overflow cap adjustments where the Manager summary
+        already logs the change and the high-frequency call doesn't justify
+        the extra Modbus round trip.
         """
         if watts < 0:
             self.logger.error(f"Invalid charge limit: {watts}W (must be >= 0)")
@@ -641,7 +689,7 @@ class SigenergyModbus:
             self.logger.info(f"Setting ESS max charge limit: {watts}W")
         else:
             self.logger.debug(f"Setting ESS max charge limit: {watts}W")
-        return self._write_uint32_registers(HOLD_ESS_MAX_CHARGE, watts)
+        return self._write_uint32_registers(HOLD_ESS_MAX_CHARGE, watts, verify=not quiet)
 
     def set_discharge_limit(self, watts):
         """Set ESS max discharging power (registers 40034-40035, watts)."""

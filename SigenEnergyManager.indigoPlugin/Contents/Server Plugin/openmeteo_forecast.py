@@ -103,16 +103,28 @@ class OpenMeteoForecast:
     so the battery optimiser script receives up-to-date Open-Meteo data.
     """
 
-    def __init__(self, data_dir, logger=None):
+    def __init__(self, data_dir, logger=None, latitude=None, longitude=None, arrays=None):
         """Initialise the Open-Meteo forecast client.
 
         Args:
-            data_dir: Directory for cache and accuracy record files
-                      (Preferences/Plugins/.../com.clives.indigoplugin.sigenergy-energy-manager/)
-            logger:   Optional logger instance.
+            data_dir:  Directory for cache and accuracy record files
+                       (Preferences/Plugins/.../com.clives.indigoplugin.sigenergy-energy-manager/).
+            logger:    Optional logger instance.
+            latitude:  Site latitude in degrees N (defaults to module LATITUDE,
+                       i.e. Highsteads, Medomsley).
+            longitude: Site longitude in degrees E (negative for W).  Defaults to
+                       module LONGITUDE.
+            arrays:    List of array config dicts (see ARRAYS in this module for
+                       the expected shape: name/tilt/azimuth/kwp/shade).  None
+                       falls back to the module ARRAYS for back-compat — a
+                       future plugin release will expose per-array config in
+                       PluginConfig.xml.
         """
         self.data_dir = data_dir
         self.logger   = logger or logging.getLogger("SigenEnergyManager.OpenMeteo")
+        self.latitude  = LATITUDE  if latitude  is None else float(latitude)
+        self.longitude = LONGITUDE if longitude is None else float(longitude)
+        self.arrays    = ARRAYS    if arrays    is None else list(arrays)
 
         # In-memory cache: last successfully combined forecast dict
         self._cached_forecast = None
@@ -256,6 +268,44 @@ class OpenMeteoForecast:
             f"{self._correction_factor:.3f}"
         )
 
+    def get_accuracy_summary(self, window_days=7):
+        """Return a dict summarising forecast accuracy over the last N days.
+
+        Useful for surfacing on the dashboard or in a self-test report.
+        Returns:
+            {"days": int, "mape_pct": float, "mean_factor": float,
+             "over_count": int, "under_count": int}
+            All values may be 0 if no records exist yet.
+        """
+        records = self._load_accuracy_records()[-window_days:]
+        if not records:
+            return {
+                "days": 0, "mape_pct": 0.0, "mean_factor": 1.0,
+                "over_count": 0, "under_count": 0,
+            }
+        deltas = []
+        factors = []
+        over = under = 0
+        for r in records:
+            f_kwh = float(r.get("forecast_kwh") or 0.0)
+            a_kwh = float(r.get("actual_kwh")   or 0.0)
+            if f_kwh > 0.1:
+                deltas.append(abs(a_kwh - f_kwh) / f_kwh)
+                factors.append(a_kwh / f_kwh)
+                if a_kwh > f_kwh:
+                    under += 1   # forecast under-predicted
+                elif a_kwh < f_kwh:
+                    over += 1    # forecast over-predicted
+        mape = (sum(deltas) / len(deltas) * 100.0) if deltas else 0.0
+        mean_factor = (sum(factors) / len(factors)) if factors else 1.0
+        return {
+            "days":        len(records),
+            "mape_pct":    round(mape, 1),
+            "mean_factor": round(mean_factor, 3),
+            "over_count":  over,
+            "under_count": under,
+        }
+
     # ================================================================
     # API Calls — 4 separate requests, one per array
     # ================================================================
@@ -280,7 +330,7 @@ class OpenMeteoForecast:
         hourly_raw = {}
         arrays_ok  = 0
 
-        for array_cfg in ARRAYS:
+        for array_cfg in self.arrays:
             gti_data = self._fetch_array(array_cfg)
             if gti_data is None:
                 self.logger.warning(
@@ -304,9 +354,9 @@ class OpenMeteoForecast:
         if arrays_ok == 0:
             return None
 
-        if arrays_ok < len(ARRAYS):
+        if arrays_ok < len(self.arrays):
             self.logger.warning(
-                f"[OpenMeteo] Only {arrays_ok}/{len(ARRAYS)} arrays fetched"
+                f"[OpenMeteo] Only {arrays_ok}/{len(self.arrays)} arrays fetched"
             )
 
         # Apply inverter cap and split into today / tomorrow buckets
@@ -396,8 +446,8 @@ class OpenMeteoForecast:
                 return cached.get("data", [])
 
         params = {
-            "latitude":   LATITUDE,
-            "longitude":  LONGITUDE,
+            "latitude":   self.latitude,
+            "longitude":  self.longitude,
             "hourly":     "global_tilted_irradiance",
             "tilt":       array_cfg["tilt"],
             "azimuth":    array_cfg["azimuth"],
@@ -422,7 +472,15 @@ class OpenMeteoForecast:
                     return cached.get("data", [])
                 return None
 
-            data   = response.json()
+            try:
+                data = response.json()
+            except ValueError as e:
+                self.logger.error(
+                    f"[OpenMeteo] Malformed JSON for {array_cfg['name']}: {e}"
+                )
+                if cached:
+                    return cached.get("data", [])
+                return None
             hourly = data.get("hourly", {})
             times  = hourly.get("time", [])
             gti    = hourly.get("global_tilted_irradiance", [])

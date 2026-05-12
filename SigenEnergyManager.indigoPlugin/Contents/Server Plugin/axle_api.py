@@ -48,7 +48,7 @@ class AxleAPI:
         """Initialise the Axle API client.
 
         Args:
-            api_token: Bearer token from Axle signup (stored in IndigoSecrets.py).
+            api_token: Bearer token from Axle signup (stored in secrets.py).
         """
         self.api_token = api_token
         self.logger    = logging.getLogger("SigenEnergyManager.AxleAPI")
@@ -83,7 +83,7 @@ class AxleAPI:
 
             if response.status_code == 401:
                 self.logger.error(
-                    "Axle API authentication failed - check AXLE_API_KEY in IndigoSecrets.py"
+                    "Axle API authentication failed - check AXLE_API_KEY in secrets.py"
                 )
                 return None
 
@@ -97,7 +97,11 @@ class AxleAPI:
                 )
                 return None
 
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as e:
+                self.logger.error(f"Axle API malformed JSON response: {e}")
+                return None
 
             if not data:
                 self.logger.info("Axle poll: no event scheduled (null response)")
@@ -126,12 +130,32 @@ class AxleAPI:
                 f"{_s} - {_e} BST ({duration_hrs:.1f}h)"
             )
 
+            # Optional fields added to Axle's API in Apr 2026:
+            #   forecast_dispatch_kwh — Axle's expected battery dispatch for the
+            #                           event (used by the dashboard to surface
+            #                           "expected VPP earnings tomorrow").
+            #   estimated_revenue_p   — pence at Axle's contracted rate.
+            # Both are absent on older API responses; default to None so callers
+            # can render "—" gracefully rather than misreport zero.
+            forecast_kwh = data.get("forecast_dispatch_kwh")
+            estimated_p  = data.get("estimated_revenue_p")
+            try:
+                forecast_kwh = float(forecast_kwh) if forecast_kwh is not None else None
+            except (TypeError, ValueError):
+                forecast_kwh = None
+            try:
+                estimated_p  = float(estimated_p) if estimated_p is not None else None
+            except (TypeError, ValueError):
+                estimated_p  = None
+
             return {
-                "start_time":    start_time,
-                "end_time":      end_time,
-                "import_export": data.get("import_export", "export"),
-                "duration_hrs":  duration_hrs,
-                "raw":           data,
+                "start_time":             start_time,
+                "end_time":               end_time,
+                "import_export":          data.get("import_export", "export"),
+                "duration_hrs":           duration_hrs,
+                "forecast_dispatch_kwh":  forecast_kwh,
+                "estimated_revenue_p":    estimated_p,
+                "raw":                    data,
             }
 
         except requests.exceptions.ConnectionError:
