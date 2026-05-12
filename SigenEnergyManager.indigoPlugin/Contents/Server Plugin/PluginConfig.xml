@@ -34,13 +34,19 @@
         <Label>SOLAR FORECAST (Open-Meteo — no API key required)</Label>
     </Field>
     <Field id="label_forecast_info" type="label">
-        <Label>All 4 arrays are modelled using Open-Meteo free GTI data (10,000 calls/day limit). Set your site coordinates below; array specs (tilt, azimuth, kWp, shade) currently come from openmeteo_forecast.py — a per-array config UI is on the v6 roadmap.</Label>
+        <Label>Arrays are modelled using Open-Meteo free GTI data (10,000 calls/day limit). Set your site coordinates and array specs below. The arrays field expects a JSON list — leave blank to use the built-in default (4 arrays, Highsteads).</Label>
     </Field>
     <Field id="siteLatitude" type="textfield" defaultValue="54.882">
         <Label>Site latitude (degrees N, e.g. 54.882):</Label>
     </Field>
     <Field id="siteLongitude" type="textfield" defaultValue="-1.818">
         <Label>Site longitude (degrees E, negative for W, e.g. -1.818):</Label>
+    </Field>
+    <Field id="siteArraysJson" type="textfield" defaultValue="">
+        <Label>PV array specs (JSON list of {name, tilt, azimuth, kwp, shade}, blank = defaults):</Label>
+    </Field>
+    <Field id="siteArraysInfo" type="label">
+        <Label>Example (one line per array, paste as a single JSON line): [{"name":"South","tilt":34,"azimuth":-13,"kwp":4.275,"shade":0.86},{"name":"West","tilt":32,"azimuth":77,"kwp":2.850,"shade":0.85}]. tilt=degrees from horizontal (0=flat, 90=vertical), azimuth=Open-Meteo convention (0=South, 90=West, -90=East, 180=North). If the JSON fails to parse, the built-in default is used and an ERROR is logged.</Label>
     </Field>
 
     <Field id="separator_octopus" type="separator"/>

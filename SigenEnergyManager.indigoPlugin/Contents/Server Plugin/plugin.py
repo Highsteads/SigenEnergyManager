@@ -7,7 +7,17 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.0
+# Version:     5.1
+# Changes:     v5.1 (12-05-2026) — site config consolidation:
+#   • New shared sigen_site_config.json published to Python Scripts/ on every
+#     plugin start and every PluginConfig save. Companion optimiser script reads
+#     it so battery / inverter / flood-prevention values can no longer drift.
+#   • Fixes confirmed drift bug: optimiser FLOOD_PREV_FORECAST_MULT was 4.0
+#     while plugin used 3.0 — could give "no pre-drain" advisory while the
+#     plugin actually pre-drained.
+#   • PluginConfig: new siteArraysJson field — per-array specs as JSON list,
+#     strict-shape parsed at startup with ERROR log on bad JSON (falls back to
+#     built-in ARRAYS).
 # Changes:     v5.0 (12-05-2026) — major hardening and feature pass:
 #   • Threading lock around self.store (tick + action callbacks)
 #   • Web dashboard now joins thread + server_close on shutdown
@@ -109,6 +119,8 @@ from battery_manager  import (
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_SOLAR_OVERFLOW, SOLAR_OVERFLOW_CAP_DEADBAND_W,
+    FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
+    FLOOD_PREV_FORECAST_MULT,
 )
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
@@ -454,6 +466,110 @@ class Plugin(indigo.PluginBase):
             self._ensure_pause_variable()
         except Exception as exc:
             log(f"[Startup] Variable subscription failed: {exc}", level="ERROR")
+
+        # Write the shared site_config.json so the companion optimiser script
+        # always uses the same numbers as the plugin (no constant drift).
+        self._write_site_config()
+
+    def _write_site_config(self):
+        """Write a shared site_config.json that companion scripts can read.
+
+        The optimiser script (Python Scripts/openmeteo_battery_optimiser.py)
+        used to hardcode duplicates of every site constant — a maintenance
+        hazard that caused FLOOD_PREV_FORECAST_MULT to drift (script had 4.0
+        while the plugin had 3.0).  Now the plugin is the single source of
+        truth: every plugin start, and every PluginConfig save, writes this
+        JSON to a stable path.  The script reads it with fallbacks to its
+        existing constants in case the file is missing.
+
+        Written to the Python Scripts folder — same place the optimiser
+        already reads openmeteo_forecast.json from, so no extra plumbing.
+        """
+        prefs = self.pluginPrefs
+        try:
+            capacity   = float(prefs.get("batteryCapacityKwh", "35.04"))
+        except (TypeError, ValueError):
+            capacity = 35.04
+        try:
+            efficiency = float(prefs.get("batteryEfficiency", "94")) / 100.0
+        except (TypeError, ValueError):
+            efficiency = 0.94
+        try:
+            inv_kw     = float(prefs.get("inverterMaxKw",   "10.0"))
+        except (TypeError, ValueError):
+            inv_kw     = 10.0
+        try:
+            export_kw  = float(prefs.get("maxExportKw",     "4.0"))
+        except (TypeError, ValueError):
+            export_kw  = 4.0
+        try:
+            dawn_pct   = float(prefs.get("dawnSocTarget",   "10"))
+        except (TypeError, ValueError):
+            dawn_pct   = 10.0
+        try:
+            winter_pct = float(prefs.get("winterBufferPct", "20"))
+        except (TypeError, ValueError):
+            winter_pct = 20.0
+        try:
+            health_pct = float(prefs.get("batteryHealthCutoff", "1"))
+        except (TypeError, ValueError):
+            health_pct = 1.0
+        try:
+            site_lat   = float(prefs.get("siteLatitude",   "54.882"))
+        except (TypeError, ValueError):
+            site_lat   = 54.882
+        try:
+            site_lon   = float(prefs.get("siteLongitude", "-1.818"))
+        except (TypeError, ValueError):
+            site_lon   = -1.818
+
+        # Export rate — best-effort lookup from latest_rates_data; default 12p.
+        try:
+            export_rate_p = float(self.latest_rates_data.get("export_rate_p", 0.0))
+            if export_rate_p <= 0:
+                export_rate_p = 12.0
+        except (TypeError, ValueError):
+            export_rate_p = 12.0
+
+        data = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_by": f"SigenEnergyManager v{self.pluginVersion}",
+            "battery": {
+                "capacity_kwh":       capacity,
+                "efficiency":         efficiency,
+                "health_cutoff_pct":  health_pct,
+            },
+            "inverter": {
+                "max_kw":         inv_kw,
+                "max_export_kw":  export_kw,
+            },
+            "tariff": {
+                "export_rate_p": export_rate_p,
+            },
+            "resilience": {
+                "summer_pct":           dawn_pct,
+                "winter_pct":           winter_pct,
+                "power_cut_buffer_kwh": 3.5,
+            },
+            "flood_prevention": {
+                "soc_threshold_pct": FLOOD_PREV_SOC_THRESHOLD_PCT,
+                "target_pct":        FLOOD_PREV_TARGET_PCT,
+                "forecast_mult":     FLOOD_PREV_FORECAST_MULT,
+            },
+            "site": {
+                "latitude":  site_lat,
+                "longitude": site_lon,
+                "timezone":  "Europe/London",
+            },
+        }
+        path = ("/Library/Application Support/Perceptive Automation/"
+                "Python Scripts/sigen_site_config.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.logger.debug(f"[SiteConfig] Wrote shared config to {path}")
+        except OSError as exc:
+            self.logger.warning(f"[SiteConfig] Cannot write {path}: {exc}")
 
     def _ensure_pause_variable(self):
         """Create `sigen_manager_paused` in the Sigenergy folder if it doesn't
@@ -3495,6 +3611,10 @@ class Plugin(indigo.PluginBase):
         self.debug = values_dict.get("showDebugInfo", False)
         log("[Prefs] Plugin preferences updated - reinitialising modules")
         self._init_modules()
+        # Re-publish the shared site config so the optimiser script picks up
+        # any tariff / battery / inverter changes immediately rather than
+        # waiting for the next plugin restart.
+        self._write_site_config()
 
     # ================================================================
     # Initialisation Helpers
@@ -3528,11 +3648,46 @@ class Plugin(indigo.PluginBase):
                 return fallback
         site_lat = _as_float(prefs.get("siteLatitude"),  None)
         site_lon = _as_float(prefs.get("siteLongitude"), None)
+        # Optional per-array JSON override.  Strict shape check — every entry
+        # must declare all 5 required keys (name, tilt, azimuth, kwp, shade)
+        # with the right types.  Bad JSON falls back to the module default
+        # ARRAYS and is logged at ERROR level so the user notices.
+        arrays_override = None
+        arrays_raw = (prefs.get("siteArraysJson") or "").strip()
+        if arrays_raw:
+            try:
+                parsed = json.loads(arrays_raw)
+                if not isinstance(parsed, list) or not parsed:
+                    raise ValueError("expected a non-empty JSON list")
+                cleaned = []
+                for i, entry in enumerate(parsed):
+                    if not isinstance(entry, dict):
+                        raise ValueError(f"array #{i+1} is not an object")
+                    for key in ("name", "tilt", "azimuth", "kwp", "shade"):
+                        if key not in entry:
+                            raise ValueError(f"array #{i+1} missing '{key}'")
+                    cleaned.append({
+                        "name":    str(entry["name"]),
+                        "tilt":    float(entry["tilt"]),
+                        "azimuth": float(entry["azimuth"]),
+                        "kwp":     float(entry["kwp"]),
+                        "shade":   float(entry["shade"]),
+                    })
+                arrays_override = cleaned
+                log(f"[Config] Loaded {len(cleaned)} PV array(s) from PluginConfig "
+                    f"siteArraysJson override.")
+            except (ValueError, TypeError) as exc:
+                log(
+                    f"[Config] siteArraysJson parse failed ({exc}) — falling back "
+                    f"to built-in default ARRAYS. Fix the JSON in PluginConfig.",
+                    level="ERROR",
+                )
         self.forecast = OpenMeteoForecast(
             data_dir=self.data_dir,
             logger=self.logger,
             latitude=site_lat,
             longitude=site_lon,
+            arrays=arrays_override,
         )
 
         # Octopus
