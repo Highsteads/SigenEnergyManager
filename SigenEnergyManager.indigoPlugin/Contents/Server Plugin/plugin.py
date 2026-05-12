@@ -7,7 +7,24 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.7
+# Version:     5.8
+# Changes:     v5.8 (12-05-2026) — dashboard glamour pass:
+#   • Glassmorphism: cards now have semi-transparent backgrounds with
+#     14px backdrop blur over a soft drifting radial-gradient backdrop
+#     (slow 28s drift). Cards lift on hover with a subtle outer glow.
+#   • Headline numbers (SOC %, solar benefit £, tariff rate) get a coloured
+#     text-shadow glow that matches the value — green for SOC / benefit,
+#     amber for tariff, red when benefit goes negative.
+#   • Smooth number transitions: SOC % and solar benefit £ tween between
+#     old and new values with a 700ms easeOutCubic instead of snapping.
+#   • Live-pulse: header timestamp now leads with a green pulsing dot to
+#     show the data is fresh.
+#   • Cards fade-in on initial page load (staggered 50ms apart).
+#   • SOC ring stroke now eases between values with a soft glow filter.
+#   • Sparkline added to the SOC card — last 24h SOC trend with low/high
+#     caption, gradient-filled SVG, glow on the line.
+#   • Skeleton shimmer class available for any future "loading" placeholders.
+#   • Tabular numbers everywhere KPIs live to stop digit jitter.
 # Changes:     v5.7 (12-05-2026) — true day-by-day rates + forever retention:
 #   • daily_history.json retention: cap removed entirely. Records are kept
 #     forever (~280 bytes each — 50 years of daily data is < 6 MB).

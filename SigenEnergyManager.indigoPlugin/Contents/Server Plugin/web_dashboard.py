@@ -28,12 +28,59 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <title>Sigenergy Monitor</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#080d14;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#0f1724;border-bottom:1px solid #1e2d3d}
-header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
+body{
+  background:#040712;
+  color:#e2e8f0;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-size:14px;
+  min-height:100vh;
+  position:relative;
+  overflow-x:hidden;
+}
+/* Animated radial-gradient backdrop — soft drifting glow */
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background:
+    radial-gradient(900px 600px at 18% 22%, rgba(125,211,252,0.10), transparent 60%),
+    radial-gradient(800px 600px at 82% 78%, rgba(52,211,153,0.08),  transparent 60%),
+    radial-gradient(700px 500px at 50% 100%, rgba(167,139,250,0.06), transparent 60%);
+  animation:bg-drift 28s ease-in-out infinite alternate;
+  pointer-events:none;z-index:-1;
+}
+@keyframes bg-drift{
+  0%   { transform:translate(0,0)         scale(1);     opacity:1; }
+  50%  { transform:translate(-30px,20px)  scale(1.04);  opacity:0.95; }
+  100% { transform:translate(30px,-25px)  scale(1.06);  opacity:1; }
+}
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;
+  background:rgba(15,23,36,0.55);
+  backdrop-filter:blur(14px) saturate(140%);
+  -webkit-backdrop-filter:blur(14px) saturate(140%);
+  border-bottom:1px solid rgba(125,211,252,0.10);
+  position:sticky;top:0;z-index:10;
+}
+header h1{
+  font-size:16px;font-weight:600;
+  color:#7dd3fc;letter-spacing:.3px;
+  text-shadow:0 0 14px rgba(125,211,252,0.35);
+}
 .hdr-right{text-align:right;line-height:1.6}
-.hdr-right .ts{font-size:13px;color:#94a3b8}
-.hdr-right .cdwn{font-size:11px;color:#4b5563}
+.hdr-right .ts{font-size:13px;color:#cbd5e1;font-variant-numeric:tabular-nums}
+.hdr-right .ts::before{
+  content:'●';
+  display:inline-block;
+  color:#34d399;
+  margin-right:7px;
+  animation:live-pulse 2.4s ease-in-out infinite;
+}
+@keyframes live-pulse{
+  0%,100% { opacity:1;    text-shadow:0 0 12px rgba(52,211,153,0.85); }
+  50%     { opacity:0.45; text-shadow:0 0 4px  rgba(52,211,153,0.20); }
+}
+.hdr-right .cdwn{font-size:11px;color:#64748b;font-variant-numeric:tabular-nums}
 #alert-bar{display:none;padding:8px 16px;font-size:13px;font-weight:500;background:#7c2d12;border-bottom:1px solid #991b1b;color:#fca5a5}
 #alert-bar.warn{background:#713f12;border-color:#92400e;color:#fcd34d}
 .main{padding:12px;display:grid;gap:12px;grid-template-columns:1fr 1fr;grid-template-rows:auto}
@@ -119,6 +166,92 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
 .chart-tab.active{background:#14291b;color:#34d399;border-color:#166534}
 .chart-wrap{position:relative;height:200px;margin-bottom:14px}
 .chart-wrap:last-child{margin-bottom:0}
+/* --- v5.8 glamour pass: glass cards, glow numbers, hover, pulses --- */
+.card{
+  background:rgba(15,23,36,0.55) !important;
+  backdrop-filter:blur(14px) saturate(140%);
+  -webkit-backdrop-filter:blur(14px) saturate(140%);
+  border:1px solid rgba(125,211,252,0.10) !important;
+  border-radius:14px !important;
+  box-shadow:
+    0 4px 24px rgba(0,0,0,0.20),
+    inset 0 0 0 1px rgba(255,255,255,0.02);
+  transition:transform .25s ease, box-shadow .25s ease, border-color .25s ease;
+}
+.card:hover{
+  transform:translateY(-2px);
+  border-color:rgba(125,211,252,0.22) !important;
+  box-shadow:
+    0 12px 36px rgba(0,0,0,0.32),
+    0 0 28px rgba(125,211,252,0.06),
+    inset 0 0 0 1px rgba(255,255,255,0.04);
+}
+.card h2{
+  font-size:11px !important;
+  color:#94a3b8 !important;
+  text-transform:uppercase;letter-spacing:.9px;
+}
+/* Headline number glows */
+.soc-info .soc-pct{
+  text-shadow:0 0 26px rgba(52,211,153,0.50), 0 0 12px rgba(52,211,153,0.30);
+}
+.eco-rate{
+  text-shadow:0 0 24px rgba(52,211,153,0.45), 0 0 10px rgba(52,211,153,0.25);
+  transition:text-shadow .35s ease, color .25s ease;
+}
+.eco-rate.eco-neg{
+  text-shadow:0 0 24px rgba(248,113,113,0.45), 0 0 10px rgba(248,113,113,0.25);
+}
+.tariff-rate{
+  text-shadow:0 0 20px rgba(251,191,36,0.40), 0 0 10px rgba(251,191,36,0.20);
+}
+.stat-box .sb-val{
+  font-variant-numeric:tabular-nums;
+  text-shadow:0 0 12px rgba(125,211,252,0.18);
+}
+/* Action badge — slightly stronger */
+.action-badge{box-shadow:0 0 18px rgba(0,0,0,0.30) inset, 0 0 12px currentColor}
+.action-badge.action-self{box-shadow:0 0 14px rgba(52,211,153,0.20)}
+.action-badge.action-overflow{box-shadow:0 0 14px rgba(163,230,53,0.20)}
+.action-badge.action-export{box-shadow:0 0 14px rgba(34,211,238,0.22)}
+.action-badge.action-import{box-shadow:0 0 14px rgba(248,113,113,0.22)}
+/* Tabular numbers everywhere — stops digit jitter on ticking values */
+.soc-pct, .eco-rate, .tariff-rate, .sb-val, .dl-item .dv,
+.period-table td{ font-variant-numeric:tabular-nums; }
+/* Subtle fade-in for cards on load */
+.card{ animation:card-in .55s cubic-bezier(.18,.78,.30,1.05) both; }
+.card:nth-child(2){ animation-delay:.05s; }
+.card:nth-child(3){ animation-delay:.10s; }
+.card:nth-child(4){ animation-delay:.15s; }
+.card:nth-child(5){ animation-delay:.20s; }
+@keyframes card-in{
+  from{ opacity:0; transform:translateY(8px); }
+  to  { opacity:1; transform:translateY(0); }
+}
+/* Skeleton shimmer for empty/unloaded cells */
+.skel{
+  display:inline-block;
+  background:linear-gradient(90deg,#1e2d3d 0%, #2a3d50 50%, #1e2d3d 100%);
+  background-size:200% 100%;
+  animation:skel-shim 1.4s linear infinite;
+  border-radius:4px;color:transparent;
+  min-width:3em;
+}
+@keyframes skel-shim{
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+/* SOC ring — animate stroke transition + subtle glow filter */
+#soc-ring{
+  transition:stroke-dashoffset .8s cubic-bezier(.2,.7,.3,1), stroke .4s ease;
+  filter:drop-shadow(0 0 6px rgba(52,211,153,0.55));
+}
+/* Sparkline (SOC card) — 24h trend */
+.spark-wrap{margin-top:12px;height:36px;position:relative}
+.spark-wrap svg{width:100%;height:100%;display:block}
+.spark-wrap path.spark-fill{fill:url(#spark-grad)}
+.spark-wrap path.spark-line{fill:none;stroke:#34d399;stroke-width:1.5;filter:drop-shadow(0 0 4px rgba(52,211,153,0.6))}
+.spark-cap{font-size:10px;color:#64748b;margin-top:4px;text-align:right;letter-spacing:.4px;font-variant-numeric:tabular-nums}
 /* --- responsive --- */
 @media(max-width:680px){
   .main{grid-template-columns:1fr}
@@ -199,6 +332,8 @@ header h1{font-size:16px;font-weight:600;color:#7dd3fc;letter-spacing:.3px}
           <div class="bat-pw" id="soc-pw">&#8212;</div>
         </div>
       </div>
+      <div class="spark-wrap"><svg id="spark-soc" viewBox="0 0 200 36" preserveAspectRatio="none"></svg></div>
+      <div class="spark-cap" id="spark-soc-cap">&#8212;</div>
     </div>
 
     <div class="card">
@@ -531,7 +666,7 @@ function update(d) {
   const ring = document.getElementById('soc-ring');
   ring.style.strokeDashoffset = offset;
   ring.style.stroke = soc >= 60 ? '#34d399' : soc >= 30 ? '#fbbf24' : '#f87171';
-  document.getElementById('soc-pct').textContent  = soc.toFixed(1) + '%';
+  tweenNumber(document.getElementById('soc-pct'), soc, {decimals:1, suffix:'%', duration:700});
   document.getElementById('soc-pct').style.color  = ring.style.stroke;
   const batW = d.battery ? d.battery.power_w : 0;
   const batDir = batW > 30 ? 'Charging ' : batW < -30 ? 'Discharging ' : 'Idle';
@@ -640,8 +775,12 @@ function update(d) {
       benefitEl.textContent = '\u2014';
       benefitEl.classList.remove('eco-neg');
     } else {
-      benefitEl.textContent = _fmtGbp(econ.solar_benefit_gbp);
-      if (econ.solar_benefit_gbp < 0) benefitEl.classList.add('eco-neg');
+      // Smooth tween on the headline \u00a3 figure
+      const v = econ.solar_benefit_gbp;
+      const prefixChar = v < 0 ? '\u2212\u00a3' : '\u00a3';
+      tweenNumber(benefitEl, Math.abs(v),
+                  {decimals:2, prefix:prefixChar, duration:700});
+      if (v < 0) benefitEl.classList.add('eco-neg');
       else benefitEl.classList.remove('eco-neg');
     }
     document.getElementById(prefix + 'import').textContent  = _fmtGbp(econ.import_cost_gbp);
@@ -850,6 +989,34 @@ async function fetchStatus() {
 }
 
 /* ============================================================
+   v5.8: smooth number transitions for headline values
+   ============================================================ */
+function tweenNumber(el, target, opts) {
+  opts = opts || {};
+  const decimals = opts.decimals || 0;
+  const prefix   = opts.prefix   || '';
+  const suffix   = opts.suffix   || '';
+  const dur      = opts.duration || 600;
+  if (!el) return;
+  const from = parseFloat(el.dataset._val || '0');
+  const to   = (target === null || target === undefined || isNaN(target)) ? 0 : Number(target);
+  el.dataset._val = String(to);
+  if (Math.abs(to - from) < 0.005) {
+    el.textContent = prefix + to.toFixed(decimals) + suffix;
+    return;
+  }
+  const t0 = performance.now();
+  function step(t) {
+    const p = Math.min(1, (t - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    const cur = from + (to - from) * eased;
+    el.textContent = prefix + cur.toFixed(decimals) + suffix;
+    if (p < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+/* ============================================================
    Charts (v5.2) — Chart.js via CDN
    ============================================================ */
 
@@ -896,12 +1063,49 @@ function fmtT(iso) {
          d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
 
+function _renderSocSparkline(slots) {
+  const svg = document.getElementById('spark-soc');
+  if (!svg) return;
+  // Always show the latest 24h regardless of currentRange
+  const recent = slots.slice(-48);   // 48 half-hourly slots = 24h
+  if (!recent.length) {
+    svg.innerHTML = '';
+    document.getElementById('spark-soc-cap').textContent = '—';
+    return;
+  }
+  const W = 200, H = 36, P = 1;
+  const ys = recent.map(s => (s.soc_end == null ? 0 : s.soc_end));
+  const lo = 0, hi = 100;
+  const xStep = (W - 2*P) / Math.max(1, recent.length - 1);
+  const yMap = v => H - P - ((v - lo) / (hi - lo)) * (H - 2*P);
+  let line = '';
+  recent.forEach((s, i) => {
+    const x = P + i * xStep;
+    const y = yMap(ys[i]);
+    line += (i ? ' L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1);
+  });
+  const fill = line + ' L' + (W - P).toFixed(1) + ' ' + (H - P) +
+                      ' L' + P + ' ' + (H - P) + ' Z';
+  svg.innerHTML =
+    '<defs><linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%"  stop-color="rgba(52,211,153,0.45)"/>' +
+      '<stop offset="100%" stop-color="rgba(52,211,153,0.0)"/>' +
+    '</linearGradient></defs>' +
+    '<path class="spark-fill" d="' + fill + '"/>' +
+    '<path class="spark-line" d="' + line + '"/>';
+  const lo24 = Math.min(...ys).toFixed(0);
+  const hi24 = Math.max(...ys).toFixed(0);
+  document.getElementById('spark-soc-cap').textContent =
+    'last 24h  low ' + lo24 + '%   high ' + hi24 + '%';
+}
+
 async function refreshCharts() {
   try {
     const r = await fetch('/api/history?hours=' + currentRange);
     if (!r.ok) return;
     const d = await r.json();
     const slots = d.slots || [];
+    _renderSocSparkline(slots);
     const labels = slots.map(s => fmtT(s.t));
     const socEnd = slots.map(s => s.soc_end);
     const pv     = slots.map(s => s.pv_kwh);
