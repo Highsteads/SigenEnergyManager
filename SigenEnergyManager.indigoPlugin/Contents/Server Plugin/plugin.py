@@ -3230,14 +3230,20 @@ class Plugin(indigo.PluginBase):
             imp_today  = self.store.get("grid_import_daily_kwh", 0.0)
             exp_today  = self.store.get("grid_export_daily_kwh", 0.0)
             home_today = self.store.get("home_daily_kwh", 0.0)
-            fcst_remain  = fcast.states.get("correctedTodayKwh", "?") if fcast else "?"
+            # Use remainingTodayKwh (now -> dusk), NOT correctedTodayKwh
+            # (whole-day forecast) — same double-count bug as the Today
+            # Energy Summary, fixed here at the same time.
+            fcst_remain  = fcast.states.get("remainingTodayKwh", "?") if fcast else "?"
             fcst_tmrw    = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
             try:
-                fcst_expected_total = round(pv_today + float(fcst_remain), 1)
+                remain_val          = float(fcst_remain)
+                fcst_expected_total = round(pv_today + max(0.0, remain_val), 1)
+                fcst_remain_str     = f"{remain_val:.1f}"
             except (ValueError, TypeError):
                 fcst_expected_total = "?"
+                fcst_remain_str     = str(fcst_remain)
             log(f"[Status] Solar:    {pv_w}W now  |  {pv_today:.2f} kWh today"
-                f"  |  {fcst_remain} kWh forecast remaining  |  {fcst_expected_total} kWh expected total")
+                f"  |  {fcst_remain_str} kWh forecast remaining  |  {fcst_expected_total} kWh expected total")
             log(f"[Status] Grid:     {grid_str}  |  Import today {imp_today:.2f} kWh"
                 f"  |  Export today {exp_today:.2f} kWh")
             log(f"[Status] Home:     {home_w}W now  |  {home_today:.2f} kWh today"
@@ -3425,9 +3431,17 @@ class Plugin(indigo.PluginBase):
         viable   = mgr.states.get("dawnViable", "?") if mgr else "?"
         soc_dawn = mgr.states.get("socAtDawn", "?") if mgr else "?"
 
-        fcast       = self._find_device("solarForecast")
-        fcst_today  = fcast.states.get("correctedTodayKwh", "?") if fcast else "?"
-        fcst_tmrw   = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
+        fcast         = self._find_device("solarForecast")
+        # correctedTodayKwh is the WHOLE-day bias-corrected forecast.  For the
+        # "remaining today" line we need remainingTodayKwh which the forecast
+        # module computes as the sum from now -> dusk.  Using
+        # correctedTodayKwh here caused a real double-count bug surfaced on
+        # 12-May-2026 (87.8 kWh expected total for a 14.25 kWp array — physically
+        # impossible).  fcst_today retained for compatibility but not used in
+        # the summary line below.
+        fcst_today    = fcast.states.get("correctedTodayKwh",  "?") if fcast else "?"
+        fcst_remain   = fcast.states.get("remainingTodayKwh", "?") if fcast else "?"
+        fcst_tmrw     = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
 
         tariff  = self._find_device("tariffMonitor")
         t_name  = tariff.states.get("tariffActive", "?") if tariff else "?"
@@ -3441,10 +3455,13 @@ class Plugin(indigo.PluginBase):
 
         log(f"[Today] ======= Energy Summary: {today} =======")
         try:
-            expected_total = round(pv + float(fcst_today), 1)
+            remaining_val  = float(fcst_remain)
+            expected_total = round(pv + max(0.0, remaining_val), 1)
+            remain_str     = f"{remaining_val:.1f}"
         except (ValueError, TypeError):
             expected_total = "?"
-        log(f"[Today] Solar generation:    {pv:.2f} kWh  (+{fcst_today} kWh remaining = {expected_total} kWh expected total)")
+            remain_str     = str(fcst_remain)
+        log(f"[Today] Solar generation:    {pv:.2f} kWh  (+{remain_str} kWh remaining = {expected_total} kWh expected total)")
         log(f"[Today] Home consumption:    {home:.2f} kWh")
         log(f"[Today] Grid import:         {imp:.2f} kWh{import_note}")
         log(f"[Today] Grid export:         {exp:.2f} kWh{export_note}")
