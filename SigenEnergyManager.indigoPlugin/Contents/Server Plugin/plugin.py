@@ -7,7 +7,19 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        12-05-2026
-# Version:     5.8
+# Version:     5.9
+# Changes:     v5.9 (12-05-2026) — live polling + dashboard cadence:
+#   • Modbus poll interval is now actually wired up to PluginConfig
+#     (was hardcoded). Default lowered 60s -> 10s so the dashboard sees
+#     fresh data within ~10s of any change. Range 5-600s. Watt-integration
+#     fallback in _accumulate_daily_energy uses the live value too.
+#   • PluginConfig dropdown gained 5/10/15s options at the top with clear
+#     "live" labelling; 30/60/120s remain for low-traffic setups.
+#   • Dashboard auto-refresh tightened 30s -> 5s. Number tweens (added in
+#     v5.8) now appear visibly continuous as PV/grid/battery watts shift.
+#   • One-time pref migration: existing installs sitting on the legacy 60s
+#     or 120s default get bumped to 10s on next startup; users who chose
+#     30s explicitly are left alone.
 # Changes:     v5.8 (12-05-2026) — dashboard glamour pass:
 #   • Glassmorphism: cards now have semi-transparent backgrounds with
 #     14px backdrop blur over a soft drifting radial-gradient backdrop
@@ -243,9 +255,14 @@ WEB_DASHBOARD_PORT = 8179
 # in that time-slot (one reading per day during that 30-min window).
 HOME_PROFILE_MIN_READINGS = 5
 
-# Polling intervals (seconds)
-MODBUS_POLL_INTERVAL      = 60
-MANAGER_EVAL_INTERVAL     = 60    # evaluate every Modbus poll cycle
+# Polling intervals (seconds).
+# MODBUS_POLL_INTERVAL is the default fallback when no value is in pluginPrefs;
+# the actual interval used at runtime is `self.modbus_poll_s`, set in
+# _init_modules from pluginPrefs.pollInterval.  Wiring up the pref was added
+# in v5.9 — previously the constant was used everywhere and the PluginConfig
+# `pollInterval` field had no effect.
+MODBUS_POLL_INTERVAL      = 10
+MANAGER_EVAL_INTERVAL     = 60    # evaluation cadence — independent of poll cadence
 FORECAST_FETCH_INTERVAL   = 1800  # 30 minutes (Open-Meteo: 10,000 calls/day free)
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
@@ -515,6 +532,19 @@ class Plugin(indigo.PluginBase):
             log(
                 f"[Migration] dawnSocTarget raised from {_dawn_target:.0f}% to 15% "
                 f"(minimum recommended to buffer above 10% health floor)"
+            )
+        # v5.9: Modbus poll cadence default lowered 60s -> 10s for live
+        # dashboard updates.  Existing installs sitting on the legacy 60s
+        # default (or higher) are bumped to 10s.  If the user has explicitly
+        # chosen 5/15/30 they are left alone — only the legacy defaults are
+        # migrated.
+        _poll_legacy = self.pluginPrefs.get("pollInterval", "")
+        if _poll_legacy in ("60", "120"):
+            self.pluginPrefs["pollInterval"] = "10"
+            log(
+                f"[Migration] Modbus poll interval bumped from {_poll_legacy}s -> 10s "
+                f"for live dashboard. Change back via Plugins -> Sigenergy Manager -> "
+                f"Configure if you prefer slower polling."
             )
 
         self._init_modules()
@@ -1446,7 +1476,7 @@ class Plugin(indigo.PluginBase):
                 self.store["last_log_check"] = now
 
             # 1. Modbus poll
-            if now - self.store["last_modbus"] >= MODBUS_POLL_INTERVAL:
+            if now - self.store["last_modbus"] >= getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL):
                 self._poll_modbus()
                 self.store["last_modbus"] = now
 
@@ -1585,7 +1615,9 @@ class Plugin(indigo.PluginBase):
 
         If a register read fails the fallback is watt-integration (original method).
         """
-        interval_h = MODBUS_POLL_INTERVAL / 3600.0   # fallback: hours per poll
+        interval_h = getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL) / 3600.0
+        # ^ fallback: hours per poll, used only when the inverter's direct daily
+        # registers are unavailable and we fall through to watt-integration.
 
         # --- Home daily: read directly from 30092 (resets at midnight) ---
         # The inverter's daily counter may reset at a slightly different
@@ -4523,6 +4555,14 @@ class Plugin(indigo.PluginBase):
             )
             return
         inv_port   = int(prefs.get("modbusPort", 502))
+        # Modbus poll interval — read from pluginPrefs (v5.9), clamped to a
+        # safe range. Sigenergy spec allows ~1s; 5s gives plenty of headroom.
+        try:
+            self.modbus_poll_s = max(5, min(600, int(prefs.get("pollInterval",
+                                                               MODBUS_POLL_INTERVAL))))
+        except (TypeError, ValueError):
+            self.modbus_poll_s = MODBUS_POLL_INTERVAL
+        log(f"[Init] Modbus poll interval: {self.modbus_poll_s}s")
         plant_addr = int(prefs.get("plantAddress", 247))
         inv_addr   = int(prefs.get("inverterSlaveId", 1))
 

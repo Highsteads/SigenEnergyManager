@@ -20,11 +20,14 @@
     <Field id="inverterSlaveId" type="textfield" defaultValue="1">
         <Label>Inverter slave address (default 1):</Label>
     </Field>
-    <Field id="pollInterval" type="menu" defaultValue="60">
+    <Field id="pollInterval" type="menu" defaultValue="10">
         <Label>Modbus poll interval:</Label>
         <List>
+            <Option value="5">5 seconds (very live — for active dashboard viewing)</Option>
+            <Option value="10">10 seconds (live — recommended for dashboard use)</Option>
+            <Option value="15">15 seconds</Option>
             <Option value="30">30 seconds</Option>
-            <Option value="60">60 seconds (recommended)</Option>
+            <Option value="60">60 seconds (low-traffic)</Option>
             <Option value="120">120 seconds</Option>
         </List>
     </Field>

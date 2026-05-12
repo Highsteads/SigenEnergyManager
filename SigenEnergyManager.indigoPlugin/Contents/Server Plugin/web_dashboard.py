@@ -969,17 +969,17 @@ function update(d) {
   updateAlerts(d);
 }
 
-let countdown = 30;
+let countdown = 5;
 function startCountdown() {
   setInterval(() => {
     countdown--;
     document.getElementById('cdwn').textContent = countdown;
-    if (countdown <= 0) { countdown = 30; fetchStatus(); }
+    if (countdown <= 0) { countdown = 5; fetchStatus(); }
   }, 1000);
 }
 
 async function fetchStatus() {
-  countdown = 30;
+  countdown = 5;
   try {
     const r = await fetch('/api/status');
     if (!r.ok) throw new Error('HTTP ' + r.status);
