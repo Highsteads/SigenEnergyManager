@@ -455,6 +455,55 @@
                 <TriggerLabel>VPP export changed</TriggerLabel>
                 <ControlPageLabel>Last VPP Export (kWh)</ControlPageLabel>
             </State>
+            <!-- Last VPP event summary (populated by _summarise_vpp_event
+                 at each event's end, v5.18.2+). Lets the user see at a
+                 glance whether Axle's strategy is doing the right thing
+                 without having to read the JSONL file. -->
+            <State id="lastVppDate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last VPP event date changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Event Date</ControlPageLabel>
+            </State>
+            <State id="lastVppExportKwh">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Last VPP export changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Export (kWh)</ControlPageLabel>
+            </State>
+            <State id="lastVppPvKwh">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Last VPP PV changed</TriggerLabel>
+                <ControlPageLabel>Last VPP PV Produced (kWh)</ControlPageLabel>
+            </State>
+            <State id="lastVppMinPvW">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Last VPP min PV changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Min PV (W)</ControlPageLabel>
+            </State>
+            <State id="lastVppMaxBatteryDischargeW">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Last VPP max battery discharge changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Max Battery Discharge (W)</ControlPageLabel>
+            </State>
+            <State id="lastVppPeakGridExportW">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Last VPP peak grid export changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Peak Grid Export (W)</ControlPageLabel>
+            </State>
+            <State id="lastVppPvSurvived">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Last VPP PV survival changed</TriggerLabel>
+                <ControlPageLabel>Last VPP PV Survived</ControlPageLabel>
+            </State>
+            <State id="lastVppEmsModes">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last VPP EMS modes changed</TriggerLabel>
+                <ControlPageLabel>Last VPP EMS Modes Observed</ControlPageLabel>
+            </State>
+            <State id="lastVppLogPath">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last VPP log path changed</TriggerLabel>
+                <ControlPageLabel>Last VPP JSONL Path</ControlPageLabel>
+            </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last update changed</TriggerLabel>

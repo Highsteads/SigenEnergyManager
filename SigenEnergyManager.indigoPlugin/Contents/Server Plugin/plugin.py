@@ -6,8 +6,34 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        14-05-2026
-# Version:     5.18.1
+# Date:        14-05-2026 (v5.18.2)
+# Version:     5.18.2
+# Changes:     v5.18.2 (14-05-2026) — VPP event post-mortem: states + Pushover.
+#   • New _summarise_vpp_event() parses the per-event JSONL file at the
+#     VPP_ACTIVE -> COOLING_OFF transition and computes:
+#       export_kwh, pv_kwh (avg watts * duration), min_pv_w, max battery
+#       discharge W, peak grid export W, "PV survived" flag (min_pv_w > 100),
+#       and the set of distinct emsWorkMode strings observed.
+#   • Nine new states on the axleVppMonitor device (Devices.xml):
+#       lastVppDate, lastVppExportKwh, lastVppPvKwh, lastVppMinPvW,
+#       lastVppMaxBatteryDischargeW, lastVppPeakGridExportW,
+#       lastVppPvSurvived (Boolean), lastVppEmsModes, lastVppLogPath.
+#     Lets the user spot at a glance whether Axle's strategy worked
+#     without having to read the JSONL file.
+#   • Pushover at event end carries the headline numbers AND a pre-formed
+#     "Ask Claude" block listing the JSONL path and four pointed questions
+#     the user can paste straight into Claude Code for analysis. Priority 0
+#     (vibrate, respects quiet hours).
+#   • One concise grep-able summary line goes to the Indigo Event Log; the
+#     per-minute snapshots remain JSONL-only (no log noise).
+#   • Summariser is best-effort: any failure logs WARNING but never blocks
+#     the COOLING_OFF state machine.
+#   • COMPANION: a daily scheduled Claude task ('vpp-event-morning-analysis')
+#     is intended to read the newest JSONL each morning and produce a
+#     written analysis (mode/registers/limits Axle used, can we copy it?).
+#     The prompt is preserved in this commit's notes; create with
+#     mcp__scheduled-tasks__create_scheduled_task when next interactive.
+#
 # Changes:     v5.18.1 (14-05-2026) — quiet the VPP event log.
 #   • Per-minute VPP/Axle snapshots moved OUT of the Indigo Event Log
 #     and INTO a per-event JSONL file under <data_dir>/vpp_events/,
@@ -2994,6 +3020,14 @@ class Plugin(indigo.PluginBase):
                     f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
                     f"Waiting for Axle to release the inverter back to plugin control..."
                 )
+                # v5.18.2: post-event summary -> axleVppMonitor states +
+                # Pushover with the headline numbers and a ready-to-paste
+                # Claude prompt pointing at the JSONL file.  Best-effort:
+                # any failure here must not block the cool-off state machine.
+                try:
+                    self._summarise_vpp_event(event)
+                except Exception as _exc:
+                    log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
 
         elif current_state == VPP_COOLING_OFF:
             # Axle API may still return the event briefly after it ends
@@ -3099,6 +3133,150 @@ class Plugin(indigo.PluginBase):
                 fh.write(_json.dumps(record) + "\n")
         except Exception:
             pass   # snapshot is best-effort, never raise during active event
+
+    def _summarise_vpp_event(self, event):
+        """Parse the per-event JSONL file we just closed, compute summary
+        stats, write them to the axleVppMonitor device states, and fire a
+        Pushover with the headline numbers plus a pre-formed Claude prompt
+        the user can paste straight into Claude Code.
+
+        Called once, at the VPP_ACTIVE -> COOLING_OFF transition.  Best-effort:
+        never raise — any failure here must not interfere with the cool-off
+        state machine.
+        """
+        import json as _json
+        try:
+            path = self._vpp_event_log_path(event)
+        except Exception:
+            path = ""
+
+        # Parse all snapshot records out of the JSONL file
+        snapshots   = []
+        announce    = None
+        ended       = None
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = _json.loads(line)
+                        except Exception:
+                            continue
+                        rtype = rec.get("type")
+                        if rtype == "snapshot":
+                            snapshots.append(rec)
+                        elif rtype == "announcement":
+                            announce = rec
+                        elif rtype == "event_ended":
+                            ended = rec
+            except Exception as exc:
+                log(f"[VPP] Could not parse event log {path}: {exc}",
+                    level="WARNING")
+
+        def _to_float(v, default=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        # ----- core summary stats ----------------------------------------
+        export_kwh   = _to_float((ended or {}).get("export_kwh", 0.0))
+        pv_watts     = [_to_float(s.get("pv_w"))      for s in snapshots]
+        bat_watts    = [_to_float(s.get("battery_w")) for s in snapshots]
+        grid_watts   = [_to_float(s.get("grid_w"))    for s in snapshots]
+        ems_strings  = [s.get("ems_work_mode")        for s in snapshots
+                        if s.get("ems_work_mode")]
+
+        min_pv_w           = int(min(pv_watts))                  if pv_watts   else 0
+        # battery discharging = negative watts; "max discharge" is most negative magnitude
+        max_bat_dis_w      = int(-min(bat_watts))                if bat_watts  else 0
+        # grid exporting = negative watts; "peak export" is most negative magnitude
+        peak_grid_export_w = int(-min(grid_watts))               if grid_watts else 0
+
+        # PV "survived" = at no point did PV collapse to ~0 W during the
+        # window (Axle's clever trick is to keep PV running while battery
+        # exports — our naive mode 0x06 path curtailed PV to 0).  Threshold
+        # of 100W tolerates the very last snapshot at event-end.
+        pv_survived        = bool(pv_watts) and min_pv_w > 100
+
+        # rough PV produced over the window: avg watts * hours
+        try:
+            duration_hrs = float(event.get("duration_hrs", 0.0))
+        except Exception:
+            duration_hrs = 0.0
+        if pv_watts:
+            avg_pv_w = sum(pv_watts) / len(pv_watts)
+            pv_kwh   = (avg_pv_w * duration_hrs) / 1000.0
+        else:
+            pv_kwh = 0.0
+
+        ems_modes_seen = sorted({m for m in ems_strings if m})
+        ems_modes_str  = ", ".join(ems_modes_seen) if ems_modes_seen else "(unknown)"
+
+        # ----- write summary to axleVppMonitor states --------------------
+        try:
+            dev = self._find_device("axleVppMonitor")
+            if dev:
+                event_date = ""
+                try:
+                    st = event.get("start_time")
+                    if hasattr(st, "strftime"):
+                        event_date = _local_time(st, "%Y-%m-%d %H:%M")
+                    else:
+                        event_date = str(st)
+                except Exception:
+                    pass
+                dev.updateStatesOnServer([
+                    {"key": "lastVppDate",                 "value": event_date},
+                    {"key": "lastVppExportKwh",            "value": round(export_kwh, 2)},
+                    {"key": "lastVppPvKwh",                "value": round(pv_kwh,     2)},
+                    {"key": "lastVppMinPvW",               "value": min_pv_w},
+                    {"key": "lastVppMaxBatteryDischargeW", "value": max_bat_dis_w},
+                    {"key": "lastVppPeakGridExportW",      "value": peak_grid_export_w},
+                    {"key": "lastVppPvSurvived",           "value": pv_survived},
+                    {"key": "lastVppEmsModes",             "value": ems_modes_str},
+                    {"key": "lastVppLogPath",              "value": path or ""},
+                ])
+        except Exception as exc:
+            log(f"[VPP] Could not update axleVppMonitor summary states: {exc}",
+                level="WARNING")
+
+        # ----- Pushover: headline numbers + pre-formed Claude prompt -----
+        pv_status = "PV stayed alive" if pv_survived else "PV collapsed"
+        title = f"Axle VPP done — {export_kwh:.2f} kWh exported"
+        body_lines = [
+            f"Export:   {export_kwh:.2f} kWh",
+            f"PV:       {pv_kwh:.2f} kWh ({pv_status}; min {min_pv_w} W)",
+            f"Battery:  peak discharge {max_bat_dis_w} W",
+            f"Grid:     peak export {peak_grid_export_w} W",
+            f"EMS:      {ems_modes_str}",
+            "",
+            "── Ask Claude ──",
+            "Read the latest VPP JSONL file at",
+            f"  {path}",
+            "and tell me:",
+            "  1. Did Axle keep PV running through battery export, and how?",
+            "  2. What EMS mode + register values did Axle use?",
+            "  3. Can SigenEnergyManager replicate this via Modbus, or",
+            "     do we still need to release Remote EMS for Axle?",
+            "  4. Recommended changes to _vpp_transition / _verify_ems_registers.",
+        ]
+        body = "\n".join(body_lines)
+        try:
+            self._send_pushover(title, body, priority="0")
+        except Exception as exc:
+            log(f"[VPP] Pushover summary send failed: {exc}", level="WARNING")
+
+        # Also log the headline to the Indigo Event Log so the user has a
+        # single grep-able line for each event.  No JSONL spam, just the
+        # one-liner.
+        log(f"[VPP] Summary: {export_kwh:.2f} kWh exported, "
+            f"PV {pv_kwh:.2f} kWh ({pv_status}), "
+            f"peak grid export {peak_grid_export_w} W, "
+            f"EMS modes: {ems_modes_str}. Log: {path}")
 
     def _vpp_check_axle_release(self):
         """Check if Axle has released the inverter and reinstate Remote EMS.
