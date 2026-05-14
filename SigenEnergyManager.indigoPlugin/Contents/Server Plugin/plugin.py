@@ -7,7 +7,26 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        14-05-2026
-# Version:     5.16
+# Version:     5.17
+# Changes:     v5.17 (14-05-2026) — DAYTIME VPP fix follow-up.
+#   • v5.16 fixed the export-stops-at-event-start bug by setting mode 0x06
+#     (Discharge ESS First) for the VPP window. Export resumed at 4 kW,
+#     but PV dropped to 0 W (curtailed by the inverter — mode 0x06 makes
+#     the battery do all the discharge, and with grid capped at 4 kW
+#     there is nowhere for PV to go, so the MPPT shuts down).
+#   • For daytime VPP the right mode is 0x02 (Max Self Consumption) with
+#     charge_limit pinned to 0 W. PV can't be diverted to charge the
+#     battery, so PV exits via the AC side and exports to grid; battery
+#     only discharges if PV is insufficient to meet (home + grid_cap).
+#     Net effect: 4 kW grid export from PV (free), battery preserved
+#     for later, no PV curtailment.
+#   • Modbus sequence in _vpp_transition(VPP_ACTIVE):
+#       set_self_consumption()  → mode 0x02, charge/discharge limits 10kW
+#       set_charge_limit(0)     → battery can't absorb PV
+#   • _verify_ems_registers maintains both registers throughout the event.
+#   • Log line updated: "PV exports to grid, battery fills any shortfall
+#     (no PV curtailment)".
+#
 # Changes:     v5.16 (14-05-2026) — VPP event handoff fix.  CRITICAL.
 #   • Symptom (14-May-2026 morning VPP event): pre-export started correctly
 #     at 07:56 with mode 0x06 (Discharge ESS First) — battery exporting.  At
@@ -2467,16 +2486,27 @@ class Plugin(indigo.PluginBase):
         _vpp_state      = self.store.get("vpp_state", VPP_IDLE)
         _pre_exporting  = self.store.get("vpp_pre_export_active", False)
         if _vpp_state == VPP_ACTIVE:
-            # Plugin-driven export: ensure mode 0x06 stays set through the event
+            # Plugin-driven export, daytime-aware: mode 0x02 + charge_limit=0
+            # → PV exports to grid first, battery fills any shortfall, no PV
+            # curtailment. Maintain both registers in case something else
+            # touches them during the event.
             actual_mode = self.modbus.read_ems_mode()
-            if actual_mode is not None and actual_mode != 0x06:
+            if actual_mode is not None and actual_mode != 0x02:
                 mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
                 log(
                     f"[Verify] VPP-active EMS mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
-                    f"expected=Discharge ESS First — correcting",
+                    f"expected=Max Self Consumption — correcting",
                     level="WARNING",
                 )
-                self.modbus.set_remote_ems_mode(0x06)
+                self.modbus.set_remote_ems_mode(0x02)
+            actual_charge_w = self.modbus.read_charge_limit()
+            if actual_charge_w is not None and actual_charge_w > 100:
+                log(
+                    f"[Verify] VPP-active charge limit drift: inverter={actual_charge_w}W "
+                    f"expected=0W (no charging during VPP) — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_charge_limit(0)
         elif _vpp_state != VPP_COOLING_OFF and not _pre_exporting:
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
@@ -3190,27 +3220,29 @@ class Plugin(indigo.PluginBase):
             log(f"[VPP] State: {old_state} -> {new_state}")
 
         # On entry to VPP_ACTIVE we keep Remote EMS locked to the plugin and
-        # drive the export ourselves with mode 0x06 (Discharge ESS First) for
-        # the full event window. Axle measures the export via the smart meter
-        # and credits us for it — they do not need to send Modbus commands.
-        # (Prior to v5.5 the transition called set_self_consumption() which
-        # silently cancelled the pre-export and left the battery charging from
-        # PV instead of exporting; see VPP event log 14-May-2026.)
+        # drive the export ourselves. For DAYTIME events we want PV to flow
+        # to the grid first (so we don't waste PV) and the battery to fill
+        # only any shortfall — so we use mode 0x02 (Max Self Consumption)
+        # with charge_limit pinned to 0 (battery can't absorb PV → PV exits
+        # via the AC side instead → grid). Mode 0x06 would force battery
+        # discharge AND curtail PV when grid cap is reached, wasting PV.
+        # (Prior to v5.16 the transition called set_self_consumption() which
+        # cancelled the pre-export entirely; v5.16 used night_export (0x06)
+        # which kept export going but curtailed PV. This v5.17 approach
+        # keeps export AND lets PV through.)
         if new_state == VPP_ACTIVE:
             if self.store.get("solar_overflow_active"):
                 log("[VPP] Clearing solar overflow cap for VPP event window")
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
             if self.modbus and self.modbus.connected:
-                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-                # Idempotent: if pre-export already set mode 0x06 this is a no-op;
-                # in the late-detection path (no pre-export) this starts the export.
-                if self.modbus.night_export(inv_max_w):
-                    log("[VPP] Discharge mode 0x06 confirmed for active VPP window — "
-                        "plugin will maintain export through event")
+                ok1 = self.modbus.set_self_consumption()    # mode 0x02 + reset limits
+                ok2 = self.modbus.set_charge_limit(0)       # pin charge to 0 → PV must exit AC
+                if ok1 and ok2:
+                    log("[VPP] Active: mode 0x02 + charge_limit=0 — PV exports to grid, "
+                        "battery fills any shortfall (no PV curtailment)")
                 else:
-                    log("[VPP] WARNING: night_export() failed at VPP_ACTIVE entry — "
-                        "export may not start; check Modbus connection", level="ERROR")
+                    log("[VPP] WARNING: VPP active mode setup failed — check Modbus", level="ERROR")
 
     # ================================================================
     # Midnight Tasks
