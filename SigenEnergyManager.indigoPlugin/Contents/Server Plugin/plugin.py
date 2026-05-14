@@ -7,7 +7,41 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        14-05-2026
-# Version:     5.17
+# Version:     5.18
+# Changes:     v5.18 (14-05-2026) — TRUE Axle handoff via Remote EMS release.
+#   • v5.16 + v5.17 were both stop-gap measures that had the plugin drive
+#     the export through mode selection (0x06 or 0x02+charge_limit=0).
+#     Both held Remote EMS enabled, which BLOCKED Axle's cloud channel
+#     and forced us to pick among simple Modbus modes that can't do what
+#     Axle's cloud can (e.g. simultaneous battery discharge + PV charge).
+#   • v5.18 properly releases Remote EMS at T-5min before event start
+#     via modbus.disable_remote_ems(). With Remote EMS off the inverter
+#     follows Sigenergy's cloud commands directly — Axle now controls
+#     the inverter the way other Axle+Sigenergy users see, including
+#     keeping PV running through battery export.
+#   • Pre-export step (T-4min mode 0x06) removed — replaced by the early
+#     T-5min release so Axle has lead-time to dispatch.
+#   • Minute-by-minute countdown spam ("[VPP] Event in N min - preparing"
+#     every minute from 60 min out) removed. Single T-10min warning
+#     instead. T-30min pre-charge trigger unchanged.
+#   • New >>> RELEASED CONTROL TO AXLE <<< marker at T-5min, and
+#     >>> REGAINED CONTROL <<< marker when Axle releases the inverter
+#     in COOLING_OFF. Easy to grep.
+#   • _log_vpp_snapshot() fires once per minute during VPP_ACTIVE,
+#     dumping SOC / PV / battery / home / grid power + EMS mode +
+#     charge/discharge limits. Lets us see exactly what Axle is doing
+#     for post-event analysis.
+#   • Full event-detail dump on announcement (every field Axle's API
+#     returned) — useful for learning what the dispatch metadata
+#     contains.
+#   • Verify loop reverted to skip during VPP_ACTIVE/COOLING_OFF: the
+#     plugin is in observe-only mode for those states; any write would
+#     fight Axle.
+#   • COOLING_OFF logic unchanged — _vpp_check_axle_release() watches
+#     for emsWorkMode containing "Self" (the inverter falls back to
+#     Max Self Consumption when Axle finishes), then re-enables Remote
+#     EMS and logs REGAINED CONTROL.
+#
 # Changes:     v5.17 (14-05-2026) — DAYTIME VPP fix follow-up.
 #   • v5.16 fixed the export-stops-at-event-start bug by setting mode 0x06
 #     (Discharge ESS First) for the VPP window. Export resumed at 4 kW,
@@ -557,8 +591,11 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_last_export_kwh"]   = 0.0   # export kWh during last completed event
         self.store["vpp_cooling_start"]     = 0.0   # time.time() when COOLING_OFF entered
         self.store["vpp_release_alerted"]   = False # True once 45-min alert has been sent
-        self.store["vpp_pre_export_active"] = False # True while plugin is pre-exporting
+        self.store["vpp_pre_export_active"] = False # True while plugin is pre-exporting (legacy, v5.17-)
         self.store["vpp_charge_stopped"]    = False # True once pre-charge import has ended
+        self.store["vpp_10min_warning_sent"] = False # T-10min warning latched
+        self.store["vpp_remote_ems_released"] = False # True from T-5min until handback completes
+        self.store["vpp_last_snapshot_at"]   = 0.0    # time.time() of last detailed snapshot log
 
         # Scheduled import state
         self.store["import_active"]          = False
@@ -2478,36 +2515,13 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Skip ONLY during VPP_COOLING_OFF: the plugin is waiting for Axle to
-        # release control and we don't want to fight any handback sequence.
-        # During VPP_ACTIVE the plugin drives the export itself (Remote EMS lock
-        # would block Axle's cloud commands anyway), so maintain mode 0x06
-        # actively. Skip during pre-export for the same reason.
-        _vpp_state      = self.store.get("vpp_state", VPP_IDLE)
-        _pre_exporting  = self.store.get("vpp_pre_export_active", False)
-        if _vpp_state == VPP_ACTIVE:
-            # Plugin-driven export, daytime-aware: mode 0x02 + charge_limit=0
-            # → PV exports to grid first, battery fills any shortfall, no PV
-            # curtailment. Maintain both registers in case something else
-            # touches them during the event.
-            actual_mode = self.modbus.read_ems_mode()
-            if actual_mode is not None and actual_mode != 0x02:
-                mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
-                log(
-                    f"[Verify] VPP-active EMS mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
-                    f"expected=Max Self Consumption — correcting",
-                    level="WARNING",
-                )
-                self.modbus.set_remote_ems_mode(0x02)
-            actual_charge_w = self.modbus.read_charge_limit()
-            if actual_charge_w is not None and actual_charge_w > 100:
-                log(
-                    f"[Verify] VPP-active charge limit drift: inverter={actual_charge_w}W "
-                    f"expected=0W (no charging during VPP) — correcting",
-                    level="WARNING",
-                )
-                self.modbus.set_charge_limit(0)
-        elif _vpp_state != VPP_COOLING_OFF and not _pre_exporting:
+        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle has the inverter
+        # via Sigenergy's cloud channel (Remote EMS released at T-5min).
+        # Plugin must not write to any EMS register during these states or
+        # we'd fight Axle's commands. _vpp_check_axle_release() handles the
+        # handback when Axle returns control.
+        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -2845,6 +2859,8 @@ class Plugin(indigo.PluginBase):
 
         if current_state == VPP_IDLE and hours_to_start > 0:
             self.store["vpp_event"] = event
+            self.store["vpp_10min_warning_sent"]  = False  # latched per event
+            self.store["vpp_remote_ems_released"] = False
             # Discharge cutoff is NOT raised here — it is raised at pre-charge time
             # (30 min before event). Raising it at announcement (up to 24h early)
             # locks the battery below the floor if SOC is low, causing unnecessary
@@ -2856,6 +2872,19 @@ class Plugin(indigo.PluginBase):
                 f"[VPP] Event announced: {_local_time(start_time)} - "
                 f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
             )
+            # Dump every field Axle gave us about the event — useful for
+            # learning what Axle is actually doing during the window.
+            try:
+                import json as _json
+                detail_lines = ["[VPP] Full event detail from Axle API:"]
+                for k in sorted(event.keys()):
+                    v = event[k]
+                    if hasattr(v, "isoformat"):
+                        v = v.isoformat()
+                    detail_lines.append(f"    {k:<28} = {v}")
+                log("\n".join(detail_lines))
+            except Exception as exc:
+                log(f"[VPP] (could not dump full event detail: {exc})", level="WARNING")
 
         elif current_state == VPP_IDLE and hours_to_start <= 0 and now < end_time:
             # Axle published the event late — it's already under way.
@@ -2873,73 +2902,77 @@ class Plugin(indigo.PluginBase):
             self._trigger_event("vppStarted")
 
         elif current_state == VPP_ANNOUNCED:
-            if hours_to_start <= 1.0:
-                log(f"[VPP] Event in {hours_to_start * 60:.0f} min - preparing")
+            # Single T-10min warning instead of the old minute-by-minute spam.
+            # Fires once when we cross 10 min; latched via vpp_10min_warning_sent.
+            if hours_to_start <= 10.0 / 60.0 and not self.store.get("vpp_10min_warning_sent"):
+                log(f"[VPP] Event in 10 minutes — Axle handover at T-5min, "
+                    f"event window {_local_time(start_time)}-{_local_time(end_time)}")
+                self.store["vpp_10min_warning_sent"] = True
+            # Existing pre-charge trigger at T-30min (unchanged)
             if hours_to_start <= 0.5:
                 self._start_vpp_precharge(event)
 
         elif current_state == VPP_PRE_CHARGING:
-            required_soc      = self.store["vpp_pre_charge_soc"]
-            current_soc       = self.latest_inverter_data.get("batterySoc", 0.0)
-            pre_export_active = self.store.get("vpp_pre_export_active", False)
-            charge_stopped    = self.store.get("vpp_charge_stopped", False)
-            soc_ready         = current_soc >= required_soc
+            required_soc       = self.store["vpp_pre_charge_soc"]
+            current_soc        = self.latest_inverter_data.get("batterySoc", 0.0)
+            charge_stopped     = self.store.get("vpp_charge_stopped",   False)
+            remote_ems_released = self.store.get("vpp_remote_ems_released", False)
+            soc_ready          = current_soc >= required_soc
 
             # Step 1: stop charging once SOC target is reached (fire once only)
-            if soc_ready and not pre_export_active and not charge_stopped:
+            if soc_ready and not charge_stopped and not remote_ems_released:
                 if self.modbus:
                     self.modbus.set_self_consumption()
                 self.store["vpp_charge_stopped"] = True
                 log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= {required_soc:.0f}% target. Holding.")
 
-            # Step 2: pre-export — start exporting VPP_PRE_EXPORT_MINUTES before event.
-            # Axle pays on smart meter readings during their window, not dispatch commands.
-            # Starting export early ensures the full event window is captured even when
-            # Axle's dispatch command arrives late (e.g. 08:30 event, command at 08:45).
-            if (soc_ready and not pre_export_active
+            # Step 2: release Remote EMS at T-5min so Axle's cloud commands can
+            # reach the inverter early (in case their dispatch arrives before
+            # event start). Replaces the old "pre-export" hack which fought
+            # Axle for control over the inverter mode register.
+            if (not remote_ems_released
                     and 0 < hours_to_start <= VPP_PRE_EXPORT_MINUTES / 60.0):
-                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
-                if self.modbus and self.modbus.night_export(inv_max_w):
-                    self.store["vpp_pre_export_active"] = True
+                if self.modbus and self.modbus.disable_remote_ems():
+                    self.store["vpp_remote_ems_released"] = True
                     log(
-                        f"[VPP] Pre-export started {int(hours_to_start * 60 + 0.5)} min "
-                        f"before event (SOC {current_soc:.0f}%) — "
-                        f"capturing full metered window from event start"
+                        f"[VPP] >>> RELEASED CONTROL TO AXLE <<<  T-{int(hours_to_start * 60 + 0.5)}min, "
+                        f"SOC {current_soc:.0f}%. Sigenergy cloud now drives the inverter; "
+                        f"plugin will monitor only until event end."
                     )
+                else:
+                    log("[VPP] WARNING: disable_remote_ems() returned False — "
+                        "plugin still holds the inverter lock; Axle may not be able to dispatch.",
+                        level="ERROR")
 
-            # Step 3: event window open — hand over to Axle
+            # Step 3: event window open — transition to ACTIVE (Axle already in
+            # control from T-5min; this is just state-machine bookkeeping)
             if hours_to_start <= 0:
-                # Record export baseline at the moment the paid window opens.
-                # Export may already be running from pre-export above; Axle's own
-                # command will confirm the same mode — no conflict.
                 self.store["vpp_export_start_kwh"]  = self.store["grid_export_daily_kwh"]
-                self.store["vpp_pre_export_active"] = False
                 self.store["vpp_charge_stopped"]    = False
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
-                log(f"[VPP] Event ACTIVE - Axle has control (export already running)"
-                    if pre_export_active else
-                    f"[VPP] Event ACTIVE - Axle has control")
+                log(f"[VPP] Event window now OPEN — Axle has been in control since T-5min")
 
         elif current_state == VPP_ACTIVE:
+            # Periodic detailed snapshot — every poll cycle while active, so the
+            # plugin captures what Axle is doing for post-hoc analysis.
+            self._log_vpp_snapshot(event)
             if now >= end_time:
-                # Time-based end — close the export window cleanly. Since the
-                # plugin drove the discharge with mode 0x06 throughout the event,
-                # it now has to actively return the inverter to Max Self
-                # Consumption — there is no Axle "release" to wait for.
+                # Time-based end — Axle has been driving the inverter, no
+                # Modbus writes needed here. _vpp_check_axle_release() in
+                # COOLING_OFF watches for Axle to hand the inverter back
+                # and re-enables Remote EMS when it does.
                 vpp_export = (self.store["grid_export_daily_kwh"]
                               - self.store.get("vpp_export_start_kwh", 0.0))
                 self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
                 self.store["vpp_cooling_start"]   = time.time()
-                if self.modbus and self.modbus.connected:
-                    self.modbus.set_self_consumption()
-                    log("[VPP] Event window closed — returned to Max Self Consumption")
                 self._vpp_transition(VPP_COOLING_OFF)
                 self.store["vpp_active"] = False
                 self._trigger_event("vppEnded")
                 log(
-                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh."
+                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
+                    f"Waiting for Axle to release the inverter back to plugin control..."
                 )
 
         elif current_state == VPP_COOLING_OFF:
@@ -2947,6 +2980,49 @@ class Plugin(indigo.PluginBase):
             self._vpp_check_axle_release()
 
         self._update_vpp_device()
+
+    def _log_vpp_snapshot(self, event):
+        """Detailed inverter snapshot during VPP_ACTIVE — fires at most once
+        per minute regardless of poll cadence so the log isn't drowned. Tells
+        us exactly what Axle is doing minute-by-minute: PV / battery / home /
+        grid power flows, EMS mode, charge/discharge limits, SOC.
+        """
+        now_ts = time.time()
+        if now_ts - self.store.get("vpp_last_snapshot_at", 0) < 55:
+            return
+        self.store["vpp_last_snapshot_at"] = now_ts
+
+        try:
+            inv = self.latest_inverter_data or {}
+            soc       = inv.get("batterySoc",      "?")
+            pv_w      = inv.get("pvPowerWatts",    "?")
+            bat_w     = inv.get("batteryPowerWatts","?")
+            home_w    = inv.get("homePowerWatts",   "?")
+            grid_w    = inv.get("gridPowerWatts",   "?")
+            ems_str   = inv.get("emsWorkMode",      "?")
+            ems_mode  = self.modbus.read_ems_mode()        if self.modbus and self.modbus.connected else None
+            chg_lim   = self.modbus.read_charge_limit()    if self.modbus and self.modbus.connected else None
+            dis_lim   = self.modbus.read_discharge_limit() if self.modbus and self.modbus.connected else None
+
+            mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
+            mode_label = f"0x{ems_mode:02X}/{mode_names.get(ems_mode, '?')}" if ems_mode is not None else "?"
+
+            # Time inside the event window (mm:ss since event start)
+            try:
+                start = event["start_time"]
+                now_dt = datetime.now(timezone.utc)
+                elapsed = (now_dt - start).total_seconds()
+                t_label = f"T+{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+            except Exception:
+                t_label = "T+??"
+
+            log(
+                f"[VPP/Axle] {t_label}  "
+                f"SOC={soc}%  PV={pv_w}W  Bat={bat_w}W  Home={home_w}W  Grid={grid_w}W  "
+                f"EMS='{ems_str}' mode={mode_label}  ChgLim={chg_lim}W  DisLim={dis_lim}W"
+            )
+        except Exception as exc:
+            log(f"[VPP/Axle] snapshot failed: {exc}", level="WARNING")
 
     def _vpp_check_axle_release(self):
         """Check if Axle has released the inverter and reinstate Remote EMS.
@@ -2997,18 +3073,24 @@ class Plugin(indigo.PluginBase):
             )
         else:
             log(
-                f"[VPP] Axle released inverter (EMS now: '{ems_mode}') - "
-                f"reinstating Remote EMS (Max Self Consumption)"
+                f"[VPP] Axle released inverter (EMS now: '{ems_mode}')"
             )
 
         if self.modbus:
             self.modbus.set_self_consumption()
 
+        log(
+            "[VPP] >>> REGAINED CONTROL <<<  Remote EMS re-enabled, "
+            "Max Self Consumption restored. Plugin back to normal operation."
+        )
+
         self._restore_discharge_cutoff()
         self._vpp_transition(VPP_IDLE)
-        self.store["vpp_event"]           = None
-        self.store["vpp_release_alerted"] = False   # reset for next event
-        self.store["had_vpp_today"]       = True
+        self.store["vpp_event"]                = None
+        self.store["vpp_release_alerted"]      = False   # reset for next event
+        self.store["vpp_10min_warning_sent"]   = False
+        self.store["vpp_remote_ems_released"]  = False
+        self.store["had_vpp_today"]            = True
 
     def _send_vpp_release_alert(self, elapsed_min, ems_mode):
         """Send Pushover + email when Axle has not released the inverter on time."""
@@ -3219,30 +3301,22 @@ class Plugin(indigo.PluginBase):
         if self.debug:
             log(f"[VPP] State: {old_state} -> {new_state}")
 
-        # On entry to VPP_ACTIVE we keep Remote EMS locked to the plugin and
-        # drive the export ourselves. For DAYTIME events we want PV to flow
-        # to the grid first (so we don't waste PV) and the battery to fill
-        # only any shortfall — so we use mode 0x02 (Max Self Consumption)
-        # with charge_limit pinned to 0 (battery can't absorb PV → PV exits
-        # via the AC side instead → grid). Mode 0x06 would force battery
-        # discharge AND curtail PV when grid cap is reached, wasting PV.
-        # (Prior to v5.16 the transition called set_self_consumption() which
-        # cancelled the pre-export entirely; v5.16 used night_export (0x06)
-        # which kept export going but curtailed PV. This v5.17 approach
-        # keeps export AND lets PV through.)
+        # On entry to VPP_ACTIVE we do NOTHING to the inverter. Axle's cloud
+        # commands have been driving it since T-5min (when PRE_CHARGING
+        # released Remote EMS). Plugin's job during this state is observe +
+        # log only. The verify loop already skips during VPP_ACTIVE so it
+        # won't fight Axle.
+        # (Prior models — v5.15 cancelled export, v5.16 used mode 0x06 which
+        # curtailed PV, v5.17 used 0x02+charge_limit=0 which broke in
+        # winter — all failed because Remote EMS was kept enabled, blocking
+        # Axle's cloud channel. v5.18 properly releases the lock.)
         if new_state == VPP_ACTIVE:
             if self.store.get("solar_overflow_active"):
-                log("[VPP] Clearing solar overflow cap for VPP event window")
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
-            if self.modbus and self.modbus.connected:
-                ok1 = self.modbus.set_self_consumption()    # mode 0x02 + reset limits
-                ok2 = self.modbus.set_charge_limit(0)       # pin charge to 0 → PV must exit AC
-                if ok1 and ok2:
-                    log("[VPP] Active: mode 0x02 + charge_limit=0 — PV exports to grid, "
-                        "battery fills any shortfall (no PV curtailment)")
-                else:
-                    log("[VPP] WARNING: VPP active mode setup failed — check Modbus", level="ERROR")
+            log("[VPP] >>> VPP WINDOW ACTIVE <<<  plugin in observe-only mode; "
+                "Axle has full inverter control via Sigenergy cloud. "
+                "Detailed snapshot will follow on each Modbus poll.")
 
     # ================================================================
     # Midnight Tasks
