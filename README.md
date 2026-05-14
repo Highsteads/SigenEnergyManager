@@ -14,6 +14,9 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.18.2 | 14-May-2026 | **VPP event post-mortem.** At VPP_ACTIVE → COOLING_OFF the plugin parses the per-event JSONL file just closed and writes nine new summary states to the `axleVppMonitor` device (`lastVppDate`, `lastVppExportKwh`, `lastVppPvKwh`, `lastVppMinPvW`, `lastVppMaxBatteryDischargeW`, `lastVppPeakGridExportW`, `lastVppPvSurvived`, `lastVppEmsModes`, `lastVppLogPath`). Pushover at event end carries the headline numbers AND a pre-formed *Ask Claude* block — JSONL path + four pointed questions ready to paste into Claude Code for analysis. One concise summary line goes to the Indigo Event Log; per-minute snapshots remain JSONL-only. Best-effort: summary failure WARNs but never blocks cool-off. |
+| 5.18.1 | 14-May-2026 | **Quiet VPP event log.** Per-minute VPP snapshots moved out of the Indigo Event Log and into a per-event JSONL file at `<data_dir>/vpp_events/<YYYY-MM-DD_HHMM>.jsonl`. Each file: one `announcement` record (every field Axle's API returned), one `snapshot` record per minute (SOC, PV/battery/home/grid W, EMS mode + register, charge/discharge limits, plant state), one `event_ended` record (final export kWh). Event Log keeps only the key markers: announced / T-10min / RELEASED / WINDOW ACTIVE / event ended / REGAINED. |
+| 5.18 | 14-May-2026 | **TRUE Axle handoff via Remote EMS release.** v5.16+v5.17 were stop-gap measures that had the plugin drive the export through Modbus mode selection (0x06 or 0x02+charge_limit=0) — both held Remote EMS enabled, blocking Axle's cloud channel and forcing us to pick among simple modes that can't do what Axle's cloud can (e.g. simultaneous battery discharge + PV charge). v5.18 properly releases Remote EMS at T-5min via `modbus.disable_remote_ems()`. With Remote EMS off the inverter follows Sigenergy's cloud commands directly — Axle now controls the inverter the way other Axle+Sigenergy users see, including keeping PV running through battery export. Pre-export step (T-4min mode 0x06) removed. Minute-by-minute countdown spam replaced by a single T-10min warning. New `>>> RELEASED CONTROL TO AXLE <<<` and `>>> REGAINED CONTROL <<<` markers for greppability. `_vpp_check_axle_release()` watches `emsWorkMode` for the "Self" string at event end and re-enables Remote EMS the moment Axle hands back. Verify loop skips writes during VPP_ACTIVE/COOLING_OFF (observe-only). |
 | 5.2 | 12-May-2026 | Three small additions. **Web dashboard charts** via Chart.js (CDN): 24h/48h/7d SOC line + stacked energy bars (PV / export / import / home) and a 30-day daily totals chart. Backed by new `/api/history?hours=N` (half-hourly slots from SQLite) and `/api/daily?days=N` (from `daily_history.json`) endpoints. **Weekly data-dir backup** — every Monday midnight, tar.gz of `accumulators.json`, `daily_history.json`, `soh_history.json`, `home_load_profile.json`, `forecast_accuracy.json`, `energy_timeseries.db` and the openmeteo combined cache to `data_dir/data_backup/`. Retains 8 most recent (~2 months). **Auto-update notifier** — checks GitHub releases on startup (daily-cached in `pluginPrefs.lastUpdateCheck`), logs an INFO line if a newer plugin version is available. Silent on network failure. Also fixed a double-count bug in **Show Today's Energy Summary** and **Show Manager Status**: both used `correctedTodayKwh` (whole-day forecast) labelled as "kWh remaining" — they now use `remainingTodayKwh` (now → dusk). |
 | 5.1 | 12-May-2026 | Site config consolidation. Plugin now publishes `sigen_site_config.json` to the Python Scripts folder on every startup and every PluginConfig save. The companion `openmeteo_battery_optimiser.py` script (v2.7) reads it so battery / inverter / tariff / resilience / flood-prevention values always match the plugin. Fixes a real drift bug: optimiser had `FLOOD_PREV_FORECAST_MULT = 4.0` while plugin used `3.0` — could give "no pre-drain" advisory while the plugin actually pre-drained. New `siteArraysJson` PluginConfig field — per-array PV specs as a JSON list (`{name, tilt, azimuth, kwp, shade}`), strict-shape parsed at startup with ERROR log on bad JSON (falls back to built-in default 4-array config). |
 | 5.0 | 12-May-2026 | Major hardening + feature pass. Threading lock around shared state; web dashboard thread/socket cleanup on shutdown; SQLite connections timeout=5.0 + try/finally; Octopus rate-limit tracker (warn >80/hr, hard-stop >95/hr); Modbus writes are read-back-verified; JSON parse guards on every `response.json()`; Kraken token cleared on any failure path; `battery_manager.evaluate()` refactored (`_check_overrides` / `_check_resilience_buffer`) and the dead v4.0 night-export branch removed; site coordinates moved to PluginConfig (`siteLatitude`/`siteLongitude`); variable folder ID cached; `_ensure_plugin_log` throttled to hourly; `ServerApiVersion` bumped 3.0 → 3.8 (Indigo 2025.2 native); pymodbus pinned `>=3.0,<4.0`; EMS mode 0x07 ("AI Mode") added; Axle `forecast_dispatch_kwh` / `estimated_revenue_p` surfaced when present; auto-calibrated weekday/weekend kWh from live consumption profile; new menu items **Run Self-Test** and **Show Power Cut Log**; dashboard adds `tomorrow_surplus_kwh`, `tomorrow_revenue_gbp`, `forecast_accuracy`, `power_cut`; weekly battery State-of-Health snapshot with degradation warnings; power-cut event log; variable-driven pause/resume via `sigen_manager_paused`; Pushover quiet hours + configurable sound; 7-day rolling forecast MAPE summary at midnight. Companion `openmeteo_battery_optimiser.py` script rewrote 20:00 / 01:45 Pushover messages in full prose. `getActionConfigUiValues` now pre-populates Force-Import / Force-Export dialogs with live values. |
@@ -261,9 +264,52 @@ The plugin guards against register drift at three layers:
 
 ### VPP (Axle) integration
 
-Full 5-state machine: IDLE -> SCHEDULED -> PRE_CHARGING -> ACTIVE -> COOLING_OFF.
-The plugin pre-charges the battery to cover the event export plus the configured dawn
-reserve. After the event, the discharge cutoff register is restored to the health floor.
+Full 5-state machine: `IDLE` → `ANNOUNCED` → `PRE_CHARGING` → `ACTIVE` → `COOLING_OFF`.
+
+**Pre-event (v5.18+ behaviour):**
+- On announcement, the plugin raises the discharge cutoff register (40048) to a floor of
+  `dawn_target + full event export energy` so the battery reserve is protected from
+  the moment Axle dispatches the event.
+- The plugin pre-charges the battery to cover the event export plus the configured
+  dawn reserve.
+- A single `T-10min` warning is logged. Minute-by-minute countdown spam is gone.
+
+**Handoff to Axle (v5.18 — the right model):**
+- **T-5min:** the plugin calls `modbus.disable_remote_ems()` to release Remote EMS.
+  Axle controls the inverter via Sigenergy's cloud channel; the plugin is observe-only
+  through the window. This is what enables Axle's "PV stays alive while battery
+  exports" trick — something none of the plugin's single-Modbus-mode paths could do.
+- A `>>> RELEASED CONTROL TO AXLE <<<` marker is written to the Event Log.
+
+**During the event (v5.18.1+ data capture, v5.18.2+ post-mortem):**
+- Per-minute snapshots are appended to a per-event JSONL file at
+  `<data_dir>/vpp_events/<YYYY-MM-DD_HHMM>.jsonl`. Each file contains one
+  `announcement` record (every field Axle's API returned), one `snapshot` per
+  minute (SOC, PV/battery/home/grid W, EMS mode + register, charge/discharge
+  limits, plant state) and one `event_ended` record at close.
+- The Indigo Event Log stays clean — only the key state markers appear.
+- The verify loop skips Modbus writes during `VPP_ACTIVE`/`VPP_COOLING_OFF` so the
+  plugin can never fight Axle's commands.
+
+**Event end (v5.18.2):**
+- The plugin parses the JSONL file it just closed and writes nine summary states
+  to the `axleVppMonitor` device: `lastVppDate`, `lastVppExportKwh`, `lastVppPvKwh`,
+  `lastVppMinPvW`, `lastVppMaxBatteryDischargeW`, `lastVppPeakGridExportW`,
+  `lastVppPvSurvived` (true if PV never collapsed below 100 W), `lastVppEmsModes`
+  (set of EMS strings Axle used), `lastVppLogPath`.
+- A single concise summary line is logged to the Indigo Event Log.
+- A Pushover is sent carrying the headline numbers AND a pre-formed *Ask Claude*
+  block — JSONL path plus four pointed questions (Did Axle keep PV running through
+  battery export, and how? What EMS mode + register values did Axle use? Can the
+  plugin replicate this via Modbus? Recommended changes to `_vpp_transition` /
+  `_verify_ems_registers`). Paste straight into Claude Code for analysis.
+
+**Cool-off:**
+- `_vpp_check_axle_release()` watches `emsWorkMode` for the `"Self"` string
+  (Axle always reverts to Max Self Consumption when it finishes). The moment we
+  see it, Remote EMS is re-enabled and a `>>> REGAINED CONTROL <<<` marker is
+  logged. Alert thresholds: Pushover + email at 45 min, force re-enable at 60 min.
+- The discharge cutoff register is restored to the health floor.
 
 ---
 
@@ -355,7 +401,7 @@ oscillated around 80%.
 | Inverter Monitor | Real-time PV, battery, grid, home power readings |
 | Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) — *note: v4.7 removed Solcast, this is now Open-Meteo backed* |
 | Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
-| Axle VPP | VPP event state machine and SOC management |
+| Axle VPP | VPP event state machine, SOC management, and v5.18.2 post-event summary states (`lastVpp*`) |
 
 ---
 
