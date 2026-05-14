@@ -7,7 +7,23 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        14-05-2026
-# Version:     5.18
+# Version:     5.18.1
+# Changes:     v5.18.1 (14-05-2026) — quiet the VPP event log.
+#   • Per-minute VPP/Axle snapshots moved OUT of the Indigo Event Log
+#     and INTO a per-event JSONL file under <data_dir>/vpp_events/,
+#     filename derived from the event start time (e.g.
+#     2026-05-15_0800.jsonl). One JSON line per minute during the
+#     window plus an "announcement" line at the start and an
+#     "event_ended" line at the close. Lets the file be parsed after
+#     the event (eg `jq -c 'select(.type=="snapshot")' file.jsonl`)
+#     to see exactly what Axle did with the inverter — without
+#     drowning the live log.
+#   • Indigo Event Log during an event now only carries the key state
+#     markers: announced, T-10min warning, T-5min RELEASED CONTROL,
+#     VPP WINDOW ACTIVE, event ended, REGAINED CONTROL.
+#   • _write_vpp_event_header() writes every field Axle's API returned
+#     to the JSONL file once at announcement time.
+#
 # Changes:     v5.18 (14-05-2026) — TRUE Axle handoff via Remote EMS release.
 #   • v5.16 + v5.17 were both stop-gap measures that had the plugin drive
 #     the export through mode selection (0x06 or 0x02+charge_limit=0).
@@ -2872,19 +2888,11 @@ class Plugin(indigo.PluginBase):
                 f"[VPP] Event announced: {_local_time(start_time)} - "
                 f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
             )
-            # Dump every field Axle gave us about the event — useful for
-            # learning what Axle is actually doing during the window.
-            try:
-                import json as _json
-                detail_lines = ["[VPP] Full event detail from Axle API:"]
-                for k in sorted(event.keys()):
-                    v = event[k]
-                    if hasattr(v, "isoformat"):
-                        v = v.isoformat()
-                    detail_lines.append(f"    {k:<28} = {v}")
-                log("\n".join(detail_lines))
-            except Exception as exc:
-                log(f"[VPP] (could not dump full event detail: {exc})", level="WARNING")
+            # Persist every field Axle's API returned to per-event JSONL file
+            # under <data_dir>/vpp_events/. Read after the event with eg
+            #   jq -c 'select(.type=="announcement")' <file>
+            # to inspect the dispatch metadata.
+            self._write_vpp_event_header(event)
 
         elif current_state == VPP_IDLE and hours_to_start <= 0 and now < end_time:
             # Axle published the event late — it's already under way.
@@ -2970,6 +2978,18 @@ class Plugin(indigo.PluginBase):
                 self._vpp_transition(VPP_COOLING_OFF)
                 self.store["vpp_active"] = False
                 self._trigger_event("vppEnded")
+                # Record the wrap-up record in the per-event JSONL file
+                try:
+                    import json as _json
+                    path = self._vpp_event_log_path(event)
+                    with open(path, "a", encoding="utf-8") as fh:
+                        fh.write(_json.dumps({
+                            "type":          "event_ended",
+                            "logged_at":     datetime.now(timezone.utc).isoformat(),
+                            "export_kwh":    round(vpp_export, 3),
+                        }) + "\n")
+                except Exception:
+                    pass
                 log(
                     f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
                     f"Waiting for Axle to release the inverter back to plugin control..."
@@ -2981,12 +3001,63 @@ class Plugin(indigo.PluginBase):
 
         self._update_vpp_device()
 
-    def _log_vpp_snapshot(self, event):
-        """Detailed inverter snapshot during VPP_ACTIVE — fires at most once
-        per minute regardless of poll cadence so the log isn't drowned. Tells
-        us exactly what Axle is doing minute-by-minute: PV / battery / home /
-        grid power flows, EMS mode, charge/discharge limits, SOC.
+    def _vpp_event_log_path(self, event):
+        """Return per-event JSONL file path under <data_dir>/vpp_events/.
+
+        Filename derived from event start_time, e.g. 2026-05-15_0800.jsonl.
+        Used both at announcement (to write the event header) and during
+        VPP_ACTIVE (to append per-minute snapshots). Designed so the file
+        can be read after the event to see exactly what Axle did with the
+        inverter — without flooding the Indigo Event Log.
         """
+        try:
+            start = event.get("start_time")
+            if hasattr(start, "strftime"):
+                stamp = start.strftime("%Y-%m-%d_%H%M")
+            else:
+                stamp = str(start).replace(":", "")[:13]
+        except Exception:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+        dir_path = os.path.join(self.data_dir, "vpp_events")
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(dir_path, f"{stamp}.jsonl")
+
+    def _write_vpp_event_header(self, event):
+        """Write the announcement record (every field Axle returned) to the
+        per-event JSONL file. Called once when the event transitions to
+        VPP_ANNOUNCED."""
+        import json as _json
+        path = self._vpp_event_log_path(event)
+        record = {"type": "announcement",
+                  "logged_at": datetime.now(timezone.utc).isoformat()}
+        try:
+            for k, v in event.items():
+                if hasattr(v, "isoformat"):
+                    v = v.isoformat()
+                try:
+                    _json.dumps(v)
+                    record[k] = v
+                except (TypeError, ValueError):
+                    record[k] = str(v)
+        except Exception:
+            pass
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(record) + "\n")
+            log(f"[VPP] Event log: {path}")
+        except Exception as exc:
+            log(f"[VPP] Could not write event header: {exc}", level="WARNING")
+
+    def _log_vpp_snapshot(self, event):
+        """Append one per-minute snapshot of inverter state to the per-event
+        JSONL file. Captures everything we'd need to reconstruct what Axle
+        did: power flows, EMS mode + limits, SOC. NOT logged to the Indigo
+        Event Log — that stays clean.
+        """
+        import json as _json
         now_ts = time.time()
         if now_ts - self.store.get("vpp_last_snapshot_at", 0) < 55:
             return
@@ -2994,35 +3065,40 @@ class Plugin(indigo.PluginBase):
 
         try:
             inv = self.latest_inverter_data or {}
-            soc       = inv.get("batterySoc",      "?")
-            pv_w      = inv.get("pvPowerWatts",    "?")
-            bat_w     = inv.get("batteryPowerWatts","?")
-            home_w    = inv.get("homePowerWatts",   "?")
-            grid_w    = inv.get("gridPowerWatts",   "?")
-            ems_str   = inv.get("emsWorkMode",      "?")
-            ems_mode  = self.modbus.read_ems_mode()        if self.modbus and self.modbus.connected else None
-            chg_lim   = self.modbus.read_charge_limit()    if self.modbus and self.modbus.connected else None
-            dis_lim   = self.modbus.read_discharge_limit() if self.modbus and self.modbus.connected else None
+            ems_mode = self.modbus.read_ems_mode()        if self.modbus and self.modbus.connected else None
+            chg_lim  = self.modbus.read_charge_limit()    if self.modbus and self.modbus.connected else None
+            dis_lim  = self.modbus.read_discharge_limit() if self.modbus and self.modbus.connected else None
 
-            mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
-            mode_label = f"0x{ems_mode:02X}/{mode_names.get(ems_mode, '?')}" if ems_mode is not None else "?"
-
-            # Time inside the event window (mm:ss since event start)
             try:
                 start = event["start_time"]
                 now_dt = datetime.now(timezone.utc)
                 elapsed = (now_dt - start).total_seconds()
-                t_label = f"T+{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
             except Exception:
-                t_label = "T+??"
+                elapsed = None
 
-            log(
-                f"[VPP/Axle] {t_label}  "
-                f"SOC={soc}%  PV={pv_w}W  Bat={bat_w}W  Home={home_w}W  Grid={grid_w}W  "
-                f"EMS='{ems_str}' mode={mode_label}  ChgLim={chg_lim}W  DisLim={dis_lim}W"
-            )
-        except Exception as exc:
-            log(f"[VPP/Axle] snapshot failed: {exc}", level="WARNING")
+            record = {
+                "type":               "snapshot",
+                "logged_at":          datetime.now(timezone.utc).isoformat(),
+                "event_elapsed_secs": elapsed,
+                "soc_pct":            inv.get("batterySoc"),
+                "pv_w":               inv.get("pvPowerWatts"),
+                "battery_w":          inv.get("batteryPowerWatts"),
+                "home_w":             inv.get("homePowerWatts"),
+                "grid_w":             inv.get("gridPowerWatts"),
+                "ems_work_mode":      inv.get("emsWorkMode"),
+                "ems_mode_register":  ems_mode,
+                "charge_limit_w":     chg_lim,
+                "discharge_limit_w":  dis_lim,
+                "grid_status":        inv.get("gridStatus"),
+                "battery_temp_c":     inv.get("batteryTempC"),
+                "battery_cell_v":     inv.get("batteryCellVoltage"),
+                "plant_state":        inv.get("plantRunningState"),
+            }
+            path = self._vpp_event_log_path(event)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(record) + "\n")
+        except Exception:
+            pass   # snapshot is best-effort, never raise during active event
 
     def _vpp_check_axle_release(self):
         """Check if Axle has released the inverter and reinstate Remote EMS.
@@ -3315,8 +3391,7 @@ class Plugin(indigo.PluginBase):
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
             log("[VPP] >>> VPP WINDOW ACTIVE <<<  plugin in observe-only mode; "
-                "Axle has full inverter control via Sigenergy cloud. "
-                "Detailed snapshot will follow on each Modbus poll.")
+                "Axle has full inverter control via Sigenergy cloud.")
 
     # ================================================================
     # Midnight Tasks
