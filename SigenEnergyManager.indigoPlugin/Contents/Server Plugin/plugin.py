@@ -6,8 +6,77 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        12-05-2026
-# Version:     5.10
+# Date:        14-05-2026
+# Version:     5.16
+# Changes:     v5.16 (14-05-2026) — VPP event handoff fix.  CRITICAL.
+#   • Symptom (14-May-2026 morning VPP event): pre-export started correctly
+#     at 07:56 with mode 0x06 (Discharge ESS First) — battery exporting.  At
+#     08:00:55 the plugin's _vpp_transition(VPP_ACTIVE) called
+#     set_self_consumption() to "clear solar overflow cap before handing
+#     control to Axle".  That call switched the inverter from mode 0x06 back
+#     to 0x02 (Max Self Consumption), STOPPING the export.  Axle then could
+#     not override because Remote EMS was still locked to the plugin — so
+#     for the rest of the event the battery charged from PV (4 kW) instead
+#     of exporting.  Result: 0 kWh exported during the paid VPP window when
+#     ~10 kWh should have flowed.
+#   • Root cause: the plugin used to assume Axle would take Modbus control
+#     after the transition and drive the discharge itself.  In practice Axle
+#     uses Sigenergy's cloud channel, which is blocked while Remote EMS
+#     holds the lock.  The "handoff" model never worked end-to-end.
+#   • Fix: switch to plugin-driven export through the VPP window.  Axle
+#     measures via the smart meter, not by sending commands.  Specifically:
+#       1. _vpp_transition(VPP_ACTIVE) now calls night_export() (mode 0x06,
+#          10 kW discharge limit) instead of set_self_consumption() —
+#          idempotent if pre-export already set the mode; rescues the
+#          late-detection path where pre-export never ran.
+#       2. _verify_ems_registers() now actively maintains mode 0x06 during
+#          VPP_ACTIVE (was previously skipping all writes, allowing drift
+#          if anything else touched register 40031).
+#       3. VPP_ACTIVE -> VPP_COOLING_OFF entry now calls set_self_consumption()
+#          to cleanly close the export and return to Max Self Consumption.
+#          The "waiting for Axle to release" log line is gone; there is no
+#          handback to wait for in the plugin-driven model.
+#   • Backward-compatibility: VPP_COOLING_OFF logic (_vpp_check_axle_release)
+#     left intact — it'll see "Self Consumption" in emsWorkMode immediately
+#     after our explicit set_self_consumption() and complete the cool-off
+#     phase in normal time.
+#   • Test plan: at next VPP event, expect mode 0x06 to persist from
+#     pre-export through event end with no gap; grid should be exporting
+#     at ~10 kW with battery discharging; at event end, mode returns to
+#     0x02 and normal self-consumption resumes.
+#
+# Changes:     v5.15 (13-05-2026) — publish auto-calibrated consumption
+#              profile in sigen_site_config.json:
+#   • _write_site_config() now includes a "consumption" block with
+#     hourly weekday/weekend kWh derived from the 48-slot inverter
+#     profile (only when 48 valid slots are accumulated).
+#   • _refresh_consumption_profile() republishes the site_config after
+#     each refresh so the JSON stays current.
+#   • Lets openmeteo_battery_optimiser.py (v2.10+) replace its old
+#     Octopus-grid-only profile (~11 kWh/day, wrong) with the plugin's
+#     real-load profile (~22 kWh/day, right).
+#   • Background: the Octopus smart-meter export only sees grid imports,
+#     so for a solar+battery house it massively under-counts true home
+#     consumption.  This is the root cause of yesterday's incident.
+# Changes:     v5.14 (13-05-2026) — expose tomorrow solar/need on
+#              BatteryManager device:
+#   • New Devices.xml states tomorrowSolarKwh and tomorrowNeedKwh published
+#     every manager tick by _update_manager_device, computed from snapshot
+#     using the SAME logic battery_manager._calculate_24h_balance() uses
+#     (tomorrow_weekday + weekday_kwh/weekend_kwh).
+#   • Lets external scripts (openmeteo_battery_optimiser.py v2.9+) read the
+#     plugin's actual flood-prevention inputs instead of computing their own
+#     and ending up with a different ratio.
+#   • Background: 12-May-2026 the optimiser's 20:00 Pushover promised an
+#     overnight pre-drain export (40 kWh solar / 11 kWh typical = 3.6x),
+#     but at 00:27 the plugin's internal view was 63 kWh / 22.4 kWh = 2.81x
+#     — just below the 3.0x FLOOD_PREV_FORECAST_MULT gate. No export ran.
+#     Both sides used the same constant; the inputs differed because the
+#     plugin's auto-calibrated weekday_kwh (~22) is biased high by spring
+#     heating-on data still in its rolling 48-slot profile, while the
+#     script used a May seasonal value (~11). Aligning their inputs is
+#     cheaper and lower-risk than retuning the calibration.
+# Changes:     v5.13 (12-05-2026) — help tooltips on every static label.
 # Changes:     v5.10 (12-05-2026) — compact forecast chart with hover tips:
 #   • Hourly forecast SVG shrunk from 130px to 80px high (~60% shorter).
 #   • kWh labels above each bar removed (less visual noise).
@@ -177,6 +246,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # Secrets (from master secrets.py - never committed to git)
@@ -676,6 +746,42 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             export_rate_p = 12.0
 
+        # v5.15: publish the auto-calibrated consumption profile so the
+        # optimiser script uses the SAME real-inverter-derived numbers the
+        # plugin uses, instead of its older Octopus-grid-import-only file.
+        # The Octopus profile under-counts true home consumption because it
+        # only sees what the grid imports — everything covered by solar or
+        # battery during the day is invisible to the smart meter.  For a
+        # solar+battery house this dragged the script's daily total down
+        # to ~11 kWh when actual usage is ~22 kWh, causing the script to
+        # promise overnight exports the plugin then declined (confirmed
+        # 12/13-May-2026 incident).
+        profile_48 = self.store.get("consumption_profile", []) or []
+        consumption_block = None
+        if len(profile_48) == 48:
+            # Aggregate half-hourly slots into hourly: hour H = slot 2H + slot 2H+1
+            hourly_wd = {
+                str(h): round(profile_48[2 * h] + profile_48[2 * h + 1], 4)
+                for h in range(24)
+            }
+            daily_wd = round(sum(profile_48), 2)
+            # Match plugin's _build_manager_snapshot weekend ratio (1.30x)
+            hourly_we = {
+                str(h): round(float(hourly_wd[str(h)]) * 1.30, 4)
+                for h in range(24)
+            }
+            daily_we = round(daily_wd * 1.30, 2)
+            consumption_block = {
+                "source":           "sigen_inverter_48slot",
+                "daily_kwh_weekday": daily_wd,
+                "daily_kwh_weekend": daily_we,
+                "weekend_multiplier": 1.30,
+                "hourly_kwh": {
+                    "weekday": hourly_wd,
+                    "weekend": hourly_we,
+                },
+            }
+
         data = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "generated_by": f"SigenEnergyManager v{self.pluginVersion}",
@@ -707,6 +813,11 @@ class Plugin(indigo.PluginBase):
                 "timezone":  "Europe/London",
             },
         }
+        # Only include the consumption block when we have a real 48-slot
+        # profile so script callers can distinguish "plugin published" from
+        # "fall back to local file".
+        if consumption_block is not None:
+            data["consumption"] = consumption_block
         path = ("/Library/Application Support/Perceptive Automation/"
                 "Python Scripts/sigen_site_config.json")
         try:
@@ -2348,16 +2459,25 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle has control of the inverter
-        # and may have changed register 40031. Writing to it during this window could
-        # fight Axle's firmware or confuse the inverter during the handback sequence.
-        # _vpp_check_axle_release() reinstates Remote EMS once Axle has fully released.
-        # Also skip while vpp_pre_export_active: the plugin has intentionally set the
-        # inverter to 0x06 (Discharge ESS First) a few minutes before the event window
-        # opens — correcting it back to Self Consumption would cancel the pre-export.
+        # Skip ONLY during VPP_COOLING_OFF: the plugin is waiting for Axle to
+        # release control and we don't want to fight any handback sequence.
+        # During VPP_ACTIVE the plugin drives the export itself (Remote EMS lock
+        # would block Axle's cloud commands anyway), so maintain mode 0x06
+        # actively. Skip during pre-export for the same reason.
         _vpp_state      = self.store.get("vpp_state", VPP_IDLE)
         _pre_exporting  = self.store.get("vpp_pre_export_active", False)
-        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF) and not _pre_exporting:
+        if _vpp_state == VPP_ACTIVE:
+            # Plugin-driven export: ensure mode 0x06 stays set through the event
+            actual_mode = self.modbus.read_ems_mode()
+            if actual_mode is not None and actual_mode != 0x06:
+                mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
+                log(
+                    f"[Verify] VPP-active EMS mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
+                    f"expected=Discharge ESS First — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_remote_ems_mode(0x06)
+        elif _vpp_state != VPP_COOLING_OFF and not _pre_exporting:
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -2560,6 +2680,16 @@ class Plugin(indigo.PluginBase):
                 f"({real_slots}/48 slots from real data, "
                 f"{48 - real_slots} using default)"
             )
+            # v5.15: republish sigen_site_config.json so the optimiser
+            # script picks up the freshly-calibrated profile on its next run.
+            # Wrapped in its own try so a write failure here doesn't mask
+            # the profile-refresh success.
+            try:
+                self._write_site_config()
+            except Exception as exc:
+                self.logger.warning(
+                    f"[Profile] Could not republish site_config after refresh: {exc}"
+                )
         except Exception as e:
             log(f"[Profile] Refresh error: {e}", level="ERROR")
 
@@ -2764,17 +2894,22 @@ class Plugin(indigo.PluginBase):
 
         elif current_state == VPP_ACTIVE:
             if now >= end_time:
-                # Time-based end — record export and begin waiting for Axle release
+                # Time-based end — close the export window cleanly. Since the
+                # plugin drove the discharge with mode 0x06 throughout the event,
+                # it now has to actively return the inverter to Max Self
+                # Consumption — there is no Axle "release" to wait for.
                 vpp_export = (self.store["grid_export_daily_kwh"]
                               - self.store.get("vpp_export_start_kwh", 0.0))
                 self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
                 self.store["vpp_cooling_start"]   = time.time()
+                if self.modbus and self.modbus.connected:
+                    self.modbus.set_self_consumption()
+                    log("[VPP] Event window closed — returned to Max Self Consumption")
                 self._vpp_transition(VPP_COOLING_OFF)
                 self.store["vpp_active"] = False
                 self._trigger_event("vppEnded")
                 log(
-                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
-                    f"Waiting for Axle to release inverter..."
+                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh."
                 )
 
         elif current_state == VPP_COOLING_OFF:
@@ -3054,16 +3189,28 @@ class Plugin(indigo.PluginBase):
         if self.debug:
             log(f"[VPP] State: {old_state} -> {new_state}")
 
-        # When entering ACTIVE, release any solar_overflow charge cap.
-        # Axle needs full control of the charge/discharge registers; leaving a
-        # reduced charge cap in place caused a 2kW grid import on 10-Apr-2026
-        # as Axle cleared it and _verify_ems_registers() wrote it back 1s later.
-        if new_state == VPP_ACTIVE and self.store.get("solar_overflow_active"):
-            log("[VPP] Clearing solar overflow cap before handing control to Axle")
+        # On entry to VPP_ACTIVE we keep Remote EMS locked to the plugin and
+        # drive the export ourselves with mode 0x06 (Discharge ESS First) for
+        # the full event window. Axle measures the export via the smart meter
+        # and credits us for it — they do not need to send Modbus commands.
+        # (Prior to v5.5 the transition called set_self_consumption() which
+        # silently cancelled the pre-export and left the battery charging from
+        # PV instead of exporting; see VPP event log 14-May-2026.)
+        if new_state == VPP_ACTIVE:
+            if self.store.get("solar_overflow_active"):
+                log("[VPP] Clearing solar overflow cap for VPP event window")
+                self.store["solar_overflow_active"]       = False
+                self.store["solar_overflow_charge_cap_w"] = 0
             if self.modbus and self.modbus.connected:
-                self.modbus.set_self_consumption()
-            self.store["solar_overflow_active"]       = False
-            self.store["solar_overflow_charge_cap_w"] = 0
+                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+                # Idempotent: if pre-export already set mode 0x06 this is a no-op;
+                # in the late-detection path (no pre-export) this starts the export.
+                if self.modbus.night_export(inv_max_w):
+                    log("[VPP] Discharge mode 0x06 confirmed for active VPP window — "
+                        "plugin will maintain export through event")
+                else:
+                    log("[VPP] WARNING: night_export() failed at VPP_ACTIVE entry — "
+                        "export may not start; check Modbus connection", level="ERROR")
 
     # ================================================================
     # Midnight Tasks
@@ -3527,6 +3674,22 @@ class Plugin(indigo.PluginBase):
                 _hours_left  = max(0.0, POWER_CUT_LOCKOUT_HOURS - _hours_since)
                 lockout_remain_min = str(int(round(_hours_left * 60)))
 
+        # v5.14: Compute tomorrow's solar/need using the *same* logic
+        # battery_manager._calculate_24h_balance() uses (lines 405-406 of
+        # battery_manager.py) so external scripts that read these states
+        # can never disagree with the plugin's flood-prevention gate.
+        # The 12-May-2026 incident: optimiser script said "export will
+        # happen" (40 kWh vs 11 kWh = 3.6x) but plugin saw 63 kWh vs 22 kWh
+        # = 2.81x, just under the 3.0x gate -> no export ran.
+        try:
+            _local_now = snapshot.now.astimezone(ZoneInfo("Europe/London"))
+        except Exception:
+            _local_now = snapshot.now
+        _tomorrow_weekday  = (_local_now.date() + timedelta(days=1)).weekday()
+        _tomorrow_need_kwh = (snapshot.weekend_kwh if _tomorrow_weekday >= 5
+                              else snapshot.weekday_kwh)
+        _tomorrow_solar_kwh = snapshot.corrected_tomorrow_kwh
+
         states = [
             {"key": "managerStatus",       "value": "Running" if not self.store["vpp_active"] else "VPP Active"},
             {"key": "currentAction",       "value": action_display},
@@ -3546,6 +3709,8 @@ class Plugin(indigo.PluginBase):
             {"key": "tariffActive",        "value": snapshot.tariff.tariff_key},
             {"key": "rateToday",           "value": str(snapshot.tariff.today_rate_p or "")},
             {"key": "rateTomorrow",        "value": str(snapshot.tariff.tomorrow_rate_p or "")},
+            {"key": "tomorrowSolarKwh",    "value": round(_tomorrow_solar_kwh, 2)},
+            {"key": "tomorrowNeedKwh",     "value": round(_tomorrow_need_kwh, 1)},
             {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
         dev.updateStatesOnServer(states)

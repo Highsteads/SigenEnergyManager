@@ -234,6 +234,24 @@
                 <TriggerLabel>Tomorrow rate changed</TriggerLabel>
                 <ControlPageLabel>Rate Tomorrow (p/kWh)</ControlPageLabel>
             </State>
+            <!-- Tomorrow's solar forecast vs need - exposed so external
+                 scripts (openmeteo_battery_optimiser.py) can read the same
+                 numbers the plugin uses in its flood-prevention gate.
+                 Without these, the script computed locally with a different
+                 daily-consumption value (May ~11 kWh) while the plugin used
+                 its auto-calibrated weekday_kwh (~22 kWh), so the script
+                 promised an overnight export the plugin then declined.
+                 Added v5.14 (13-May-2026). -->
+            <State id="tomorrowSolarKwh">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Tomorrow solar forecast changed</TriggerLabel>
+                <ControlPageLabel>Tomorrow Solar (kWh)</ControlPageLabel>
+            </State>
+            <State id="tomorrowNeedKwh">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Tomorrow need changed</TriggerLabel>
+                <ControlPageLabel>Tomorrow Need (kWh)</ControlPageLabel>
+            </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last update changed</TriggerLabel>
