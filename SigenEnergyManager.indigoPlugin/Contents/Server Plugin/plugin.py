@@ -6,8 +6,16 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        15-05-2026 (v5.19.1)
-# Version:     5.19.1
+# Date:        15-05-2026 (v5.19.2)
+# Version:     5.19.2
+# Changes:     v5.19.2 (15-05-2026) — Live Power Flow visual polish (option B):
+#              soft teal aurora glow + horizon bar behind the card; two
+#              status chips top-right ("On Grid" / "Lockout" / "Grid Down"
+#              and the current manager mode, with VPP override during an
+#              event); richer node labels — battery shows "0.98 kW · Charging"
+#              / "0.50 kW · Discharging" / "Idle", grid flips to Sigenergy-
+#              app ordering "0.94 kW · Exporting". No new data sources;
+#              everything is already in /api/status.
 # Changes:     v5.19.1 (15-05-2026) — Live Power Flow card now uses kW with
 #              2 decimals (e.g. 980 W -> 0.98 kW) for all four nodes (solar,
 #              battery, home, grid). Other cards retain the existing W/kW

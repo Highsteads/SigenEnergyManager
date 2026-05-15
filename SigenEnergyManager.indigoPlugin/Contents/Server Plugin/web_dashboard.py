@@ -88,9 +88,40 @@ header h1{
 .main{padding:12px;display:grid;gap:12px;grid-template-columns:1fr 1fr;grid-template-rows:auto}
 .card{background:#0f1724;border:1px solid #1e2d3d;border-radius:10px;padding:14px}
 .card h2{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}
-/* --- flow card --- */
-.flow-card{grid-column:1;grid-row:1}
-#flow-svg{width:100%;height:auto}
+/* --- flow card (v5.19.2 polish) --- */
+.flow-card{
+  grid-column:1;grid-row:1;
+  position:relative;
+  background:
+    radial-gradient(ellipse 60% 45% at 50% 18%, rgba(34,211,238,.10), transparent 70%),
+    radial-gradient(ellipse 75% 60% at 50% 110%, rgba(16,185,129,.06), transparent 75%),
+    #0f1724;
+  overflow:hidden;
+}
+.flow-card::before{
+  content:"";
+  position:absolute;left:8%;right:8%;top:18px;height:2px;
+  background:linear-gradient(90deg,transparent,rgba(94,234,212,.55),transparent);
+  filter:blur(3px);
+  pointer-events:none;
+}
+.flow-chips{
+  position:absolute;top:12px;right:14px;
+  display:flex;gap:6px;
+  font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;
+  z-index:2;
+}
+.flow-chip{
+  padding:3px 9px;border-radius:999px;
+  background:rgba(15,23,36,.7);
+  border:1px solid #1e2d3d;
+  color:#94a3b8;
+  backdrop-filter:blur(4px);
+}
+.flow-chip.ok    {color:#6ee7b7;border-color:rgba(110,231,183,.35)}
+.flow-chip.warn  {color:#fbbf24;border-color:rgba(251,191,36,.35)}
+.flow-chip.alert {color:#f87171;border-color:rgba(248,113,113,.4)}
+#flow-svg{width:100%;height:auto;position:relative;z-index:1}
 /* --- right panel --- */
 .right-panel{grid-column:2;grid-row:1;display:flex;flex-direction:column;gap:10px}
 .soc-wrap{display:flex;align-items:center;gap:14px}
@@ -330,6 +361,10 @@ header h1{
   <!-- Power Flow -->
   <section class="card flow-card">
     <h2 data-help-title="Live Power Flow" data-help="Real-time animated diagram of where energy is moving right now. Solar panels → inverter → battery, home, and grid. Arrows show direction; thickness/speed scales with watts.">Live Power Flow</h2>
+    <div class="flow-chips">
+      <span id="chip-grid" class="flow-chip ok" data-help-title="Grid status" data-help="On Grid = AC line healthy. Grid Down = power cut in progress (the inverter is islanding the home from the grid). Lockout = post-event cool-down before re-syncing.">&#8212;</span>
+      <span id="chip-mode" class="flow-chip" data-help-title="System mode" data-help="What the manager is doing right now: Self Consumption / Solar Overflow / Night Export / Import / VPP Active. Same source as the Manager Decision card.">&#8212;</span>
+    </div>
     <svg id="flow-svg" viewBox="0 0 520 295" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <filter id="glow"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
@@ -853,13 +888,57 @@ function update(d) {
   const pvW   = d.solar ? d.solar.power_w : 0;
   const gridW = d.grid  ? d.grid.power_w  : 0;
   const homeW = d.home  ? d.home.load_w   : 0;
-  // Live Power Flow card: always show kW with 2 decimals (v5.19.1)
+  // Live Power Flow card: kW with 2 decimals + state labels (v5.19.2 polish)
   document.getElementById('n-pv').textContent   = fmtKw(pvW);
   document.getElementById('n-soc').textContent  = soc.toFixed(1) + '%';
-  document.getElementById('n-bat').textContent  = fmtKw(batW) + (batW > 30 ? ' \u25b2' : batW < -30 ? ' \u25bc' : '');
+  // Battery: 'Charging' / 'Discharging' / 'Idle' next to the power figure
+  let batState = 'Idle';
+  if (batW >  30) batState = 'Charging';
+  if (batW < -30) batState = 'Discharging';
+  const batAbs = Math.abs(batW);
+  document.getElementById('n-bat').textContent =
+    batState === 'Idle' ? 'Idle' : (fmtKw(batAbs) + ' \u00b7 ' + batState);
   document.getElementById('n-home').textContent = fmtKw(homeW);
-  const gridLabel = gridW > 30 ? 'Import ' + fmtKw(gridW) : gridW < -30 ? 'Export ' + fmtKw(-gridW) : 'Standby';
+  // Grid: '0.94 kW \u00b7 Exporting' (Sigenergy app-style ordering)
+  let gridLabel;
+  if      (gridW >  30) gridLabel = fmtKw(gridW)   + ' \u00b7 Importing';
+  else if (gridW < -30) gridLabel = fmtKw(-gridW)  + ' \u00b7 Exporting';
+  else                  gridLabel = 'Standby';
   document.getElementById('n-grid').textContent = gridLabel;
+
+  // Status chips (top-right of flow card)
+  const chipGrid = document.getElementById('chip-grid');
+  const chipMode = document.getElementById('chip-mode');
+  if (chipGrid) {
+    const pcOngoing = d.power_cut && d.power_cut.ongoing;
+    const pcLock    = d.power_cut && d.power_cut.lockout_active;
+    if (pcOngoing) {
+      chipGrid.textContent = 'Grid Down';
+      chipGrid.className   = 'flow-chip alert';
+    } else if (pcLock) {
+      chipGrid.textContent = 'Lockout';
+      chipGrid.className   = 'flow-chip warn';
+    } else {
+      chipGrid.textContent = 'On Grid';
+      chipGrid.className   = 'flow-chip ok';
+    }
+  }
+  if (chipMode) {
+    const vppState = d.vpp && d.vpp.state;
+    const action   = (d.decision && d.decision.action) || 'unknown';
+    let modeLabel, modeClass;
+    if (vppState && vppState !== 'idle' && vppState !== 'IDLE') {
+      modeLabel = 'VPP ' + vppState.toLowerCase().replace(/_/g, ' ');
+      modeClass = (vppState === 'VPP_ACTIVE' || vppState === 'vpp_active') ? 'warn' : '';
+    } else {
+      modeLabel = ACTION_LABELS[action] || action;
+      modeClass = (action === 'self_consumption' || action === 'solar_overflow' || action === 'start_export')
+                  ? 'ok'
+                  : (action.indexOf('import') !== -1 ? 'warn' : '');
+    }
+    chipMode.textContent = modeLabel;
+    chipMode.className   = 'flow-chip ' + modeClass;
+  }
   const gridLineCol = gridW < -30 ? '#22d3ee' : gridW > 30 ? '#f87171' : '#22d3ee';
   document.getElementById('fl-grid').style.stroke = gridLineCol;
 
