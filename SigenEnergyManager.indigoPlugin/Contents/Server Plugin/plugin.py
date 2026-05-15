@@ -6,8 +6,12 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        15-05-2026 (v5.19)
-# Version:     5.19
+# Date:        15-05-2026 (v5.19.1)
+# Version:     5.19.1
+# Changes:     v5.19.1 (15-05-2026) — Live Power Flow card now uses kW with
+#              2 decimals (e.g. 980 W -> 0.98 kW) for all four nodes (solar,
+#              battery, home, grid). Other cards retain the existing W/kW
+#              auto-switching format.
 # Changes:     v5.19 (15-05-2026) — Export sync check (Sigenergy vs Octopus).
 #   • New /api/export-sync endpoint and Export Sync dashboard card. Compares
 #     the inverter's daily export kWh (from daily_history.json) against the

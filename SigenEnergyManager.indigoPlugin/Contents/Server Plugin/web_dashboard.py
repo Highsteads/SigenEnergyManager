@@ -656,6 +656,11 @@ function fmtW(w) {
   if (abs >= 1000) return (w / 1000).toFixed(1) + ' kW';
   return w.toLocaleString() + ' W';
 }
+// Live Power Flow card: always kW, 2 decimals (e.g. 980 W -> 0.98 kW). v5.19.1
+function fmtKw(w) {
+  if (w === null || w === undefined) return '\u2014';
+  return (w / 1000).toFixed(2) + ' kW';
+}
 function fmtKwh(v) { return v !== null && v !== undefined ? v.toFixed(1) + ' kWh' : '\u2014'; }
 
 function setFlow(id, watts, forwardPositive) {
@@ -848,11 +853,12 @@ function update(d) {
   const pvW   = d.solar ? d.solar.power_w : 0;
   const gridW = d.grid  ? d.grid.power_w  : 0;
   const homeW = d.home  ? d.home.load_w   : 0;
-  document.getElementById('n-pv').textContent   = fmtW(pvW);
+  // Live Power Flow card: always show kW with 2 decimals (v5.19.1)
+  document.getElementById('n-pv').textContent   = fmtKw(pvW);
   document.getElementById('n-soc').textContent  = soc.toFixed(1) + '%';
-  document.getElementById('n-bat').textContent  = fmtW(batW) + (batW > 30 ? ' \u25b2' : batW < -30 ? ' \u25bc' : '');
-  document.getElementById('n-home').textContent = fmtW(homeW);
-  const gridLabel = gridW > 30 ? 'Import ' + fmtW(gridW) : gridW < -30 ? 'Export ' + fmtW(-gridW) : 'Standby';
+  document.getElementById('n-bat').textContent  = fmtKw(batW) + (batW > 30 ? ' \u25b2' : batW < -30 ? ' \u25bc' : '');
+  document.getElementById('n-home').textContent = fmtKw(homeW);
+  const gridLabel = gridW > 30 ? 'Import ' + fmtKw(gridW) : gridW < -30 ? 'Export ' + fmtKw(-gridW) : 'Standby';
   document.getElementById('n-grid').textContent = gridLabel;
   const gridLineCol = gridW < -30 ? '#22d3ee' : gridW > 30 ? '#f87171' : '#22d3ee';
   document.getElementById('fl-grid').style.stroke = gridLineCol;
