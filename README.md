@@ -14,6 +14,7 @@ to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.19 | 15-May-2026 | **Export sync check — Sigenergy vs Octopus.** New `/api/export-sync` endpoint and **Export Sync** dashboard card. Compares the inverter's daily export kWh (from `daily_history.json`) against the half-hourly readings settled by Octopus on the export MPAN, for the last 7 fully-settled days. The most recent 3 days are skipped because Octopus typically settles export readings over 24–48 h, so today / yesterday / day-before would always look wrong. Tolerance is ±5%; anything outside is flagged as drift. New `OCTOPUS_EXPORT_MPAN` / `OCTOPUS_EXPORT_SERIAL` keys in `IndigoSecrets.py` (with `octopusExportMpan` / `octopusExportSerial` PluginConfig fallback) — feature silently disabled if absent so existing installs are unaffected. New `octopus_api.get_export_kwh_for_date(date, mpan, serial)` returns `{kwh, slots}` for a single Europe/London day. Results cached on `self.store["export_sync_cache"]` for 6 h; dashboard re-polls hourly. One-line INFO summary at midnight: `[ExportSync] 7d avg diff +0.8%  worst: 2026-05-08 +3.1%` (with `[DRIFT >5%]` suffix when out of tolerance). Show Plugin Info / Run Self-Test now list the two new secret keys. |
 | 5.18.2 | 14-May-2026 | **VPP event post-mortem.** At VPP_ACTIVE → COOLING_OFF the plugin parses the per-event JSONL file just closed and writes nine new summary states to the `axleVppMonitor` device (`lastVppDate`, `lastVppExportKwh`, `lastVppPvKwh`, `lastVppMinPvW`, `lastVppMaxBatteryDischargeW`, `lastVppPeakGridExportW`, `lastVppPvSurvived`, `lastVppEmsModes`, `lastVppLogPath`). Pushover at event end carries the headline numbers AND a pre-formed *Ask Claude* block — JSONL path + four pointed questions ready to paste into Claude Code for analysis. One concise summary line goes to the Indigo Event Log; per-minute snapshots remain JSONL-only. Best-effort: summary failure WARNs but never blocks cool-off. |
 | 5.18.1 | 14-May-2026 | **Quiet VPP event log.** Per-minute VPP snapshots moved out of the Indigo Event Log and into a per-event JSONL file at `<data_dir>/vpp_events/<YYYY-MM-DD_HHMM>.jsonl`. Each file: one `announcement` record (every field Axle's API returned), one `snapshot` record per minute (SOC, PV/battery/home/grid W, EMS mode + register, charge/discharge limits, plant state), one `event_ended` record (final export kWh). Event Log keeps only the key markers: announced / T-10min / RELEASED / WINDOW ACTIVE / event ended / REGAINED. |
 | 5.18 | 14-May-2026 | **TRUE Axle handoff via Remote EMS release.** v5.16+v5.17 were stop-gap measures that had the plugin drive the export through Modbus mode selection (0x06 or 0x02+charge_limit=0) — both held Remote EMS enabled, blocking Axle's cloud channel and forcing us to pick among simple modes that can't do what Axle's cloud can (e.g. simultaneous battery discharge + PV charge). v5.18 properly releases Remote EMS at T-5min via `modbus.disable_remote_ems()`. With Remote EMS off the inverter follows Sigenergy's cloud commands directly — Axle now controls the inverter the way other Axle+Sigenergy users see, including keeping PV running through battery export. Pre-export step (T-4min mode 0x06) removed. Minute-by-minute countdown spam replaced by a single T-10min warning. New `>>> RELEASED CONTROL TO AXLE <<<` and `>>> REGAINED CONTROL <<<` markers for greppability. `_vpp_check_axle_release()` watches `emsWorkMode` for the "Self" string at event end and re-enables Remote EMS the moment Axle hands back. Verify loop skips writes during VPP_ACTIVE/COOLING_OFF (observe-only). |
@@ -99,6 +100,10 @@ OCTOPUS_API_KEY     = "sk_live_..."
 OCTOPUS_ACCOUNT     = "A-XXXXXXXX"
 OCTOPUS_MPAN        = "1300000000000"
 OCTOPUS_SERIAL      = "00X0000000"
+
+# Octopus export MPAN (v5.19 — optional, enables the Export Sync dashboard card)
+OCTOPUS_EXPORT_MPAN   = ""
+OCTOPUS_EXPORT_SERIAL = ""
 
 # Sigenergy inverter (Modbus)
 SIGENERGY_IP        = "192.168.x.x"
@@ -456,6 +461,7 @@ and a 30-day daily totals bar chart. The JSON API has three endpoints:
 | `/api/status` | Live snapshot (see table below) — updates every 30s |
 | `/api/history?hours=N` *(v5.2)* | Half-hourly slots from SQLite for last N hours (max 168) — used by the SOC + stacked-bar charts |
 | `/api/daily?days=N` *(v5.2)* | Per-day totals from `daily_history.json` for last N days (max 365) — used by the daily chart |
+| `/api/export-sync` *(v5.19)* | Sigenergy vs Octopus daily-export comparison for the last 7 settled days (D-3 to D-9). Returns per-row status (`ok` / `drift` / `unsettled` / `fetch_error` / `no_sigen_record`) plus a summary block. Powers the **Export Sync** dashboard card. |
 
 `/api/status` returns:
 

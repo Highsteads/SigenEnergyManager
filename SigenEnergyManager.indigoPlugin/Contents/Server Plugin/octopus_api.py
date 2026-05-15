@@ -309,6 +309,69 @@ class OctopusAPI:
         return profile
 
     # ================================================================
+    # Public: Export-MPAN consumption (v5.19+)
+    # ================================================================
+
+    def get_export_kwh_for_date(self, date_str, export_mpan, export_serial):
+        """Sum all half-hourly export readings for one local (Europe/London) day.
+
+        Octopus settles export readings over ~24-48h, so callers should only
+        query dates that are at least 3 calendar days old. Returns:
+            { "kwh": float, "slots": int }   on success
+            { "kwh": None,  "slots": 0 }     if no data yet (unsettled / missing)
+            None                              on auth/network failure
+        """
+        if not export_mpan or not export_serial:
+            return None
+        try:
+            try:
+                import pytz
+                tz_l = pytz.timezone("Europe/London")
+                day_start = tz_l.localize(
+                    datetime.strptime(date_str, "%Y-%m-%d")
+                )
+            except ImportError:
+                day_start = datetime.strptime(date_str, "%Y-%m-%d")
+            day_end = day_start + timedelta(days=1)
+            period_from = day_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            period_to   = day_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return None
+
+        url = (
+            f"{OCTOPUS_API_BASE}/electricity-meter-points/{export_mpan}/"
+            f"meters/{export_serial}/consumption/"
+        )
+        params = {
+            "period_from": period_from,
+            "period_to":   period_to,
+            "page_size":   100,
+            "order_by":    "period",
+        }
+        try:
+            intervals = self._paginate(url, params, authenticated=True)
+        except Exception as exc:
+            self.logger.debug(f"[Octopus] Export consumption fetch failed for {date_str}: {exc}")
+            return None
+        if intervals is None:
+            return None
+        if not intervals:
+            return {"kwh": None, "slots": 0}
+
+        total = 0.0
+        slots = 0
+        for interval in intervals:
+            try:
+                kwh = float(interval.get("consumption", 0))
+                if kwh < 0:
+                    continue
+                total += kwh
+                slots += 1
+            except (TypeError, ValueError):
+                continue
+        return {"kwh": round(total, 3), "slots": slots}
+
+    # ================================================================
     # Internal: Tracker Rates
     # ================================================================
 

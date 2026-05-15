@@ -584,6 +584,30 @@ header h1{
     </table>
   </section>
 
+  <!-- Export sync check — Sigenergy vs Octopus (v5.19) -->
+  <section class="card period-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h2 style="margin-bottom:0" data-help-title="Export sync — Sigenergy vs Octopus" data-help="Compares the daily export kWh measured by the inverter against the half-hourly readings settled by Octopus, for the last 7 fully-settled days (today, yesterday and the day before are skipped because Octopus typically takes 24–48 h to settle). A drift of more than ±5% on any day usually means missing slots on the Octopus side or a clock-skew issue.">Export sync &mdash; Sigenergy vs Octopus</h2>
+      <div class="muted" style="font-size:11px" id="exp-sync-meta">&#8212;</div>
+    </div>
+    <table class="period-table">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th data-help-title="Sigenergy" data-help="Daily export kWh from the inverter (daily_history.json).">Sigenergy</th>
+          <th data-help-title="Octopus" data-help="Sum of half-hourly export readings for that local day from the Octopus consumption API for the export MPAN.">Octopus</th>
+          <th data-help-title="Diff (kWh)" data-help="Sigenergy minus Octopus, kWh. Positive = inverter measured more than Octopus has settled.">Diff (kWh)</th>
+          <th data-help-title="Diff (%)" data-help="Diff as a percentage of the larger of the two values. ✓ if within ±5%, ⚠ otherwise.">Diff %</th>
+          <th data-help-title="Slots" data-help="Number of half-hourly readings Octopus returned for that day. Should be 48 on a fully-settled day.">Slots</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="exp-sync-tbody">
+        <tr><td colspan="7" class="muted">&#8212;</td></tr>
+      </tbody>
+    </table>
+  </section>
+
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
   <!-- Charts row (v5.2) -->
@@ -1331,14 +1355,84 @@ document.querySelectorAll('.chart-tab').forEach(btn => {
   });
 });
 
+// Export sync (v5.19): pull /api/export-sync once on load and every hour.
+async function refreshExportSync() {
+  const tbody = document.getElementById('exp-sync-tbody');
+  const meta  = document.getElementById('exp-sync-meta');
+  if (!tbody) return;
+  try {
+    const r = await fetch('/api/export-sync');
+    if (!r.ok) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">Could not load</td></tr>';
+      meta.textContent = '';
+      return;
+    }
+    const d = await r.json();
+    if (!d.available) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">'
+        + (d.reason || 'Disabled — set OCTOPUS_EXPORT_MPAN / OCTOPUS_EXPORT_SERIAL')
+        + '</td></tr>';
+      meta.textContent = '';
+      return;
+    }
+    const rows = d.rows || [];
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">No settled days available yet</td></tr>';
+    } else {
+      tbody.innerHTML = rows.map(row => {
+        const sigen = (row.sigen_kwh   !== null && row.sigen_kwh   !== undefined)
+                      ? row.sigen_kwh.toFixed(2)   : '—';
+        const octo  = (row.octopus_kwh !== null && row.octopus_kwh !== undefined)
+                      ? row.octopus_kwh.toFixed(2) : '—';
+        const dkwh  = (row.diff_kwh    !== null && row.diff_kwh    !== undefined)
+                      ? (row.diff_kwh >= 0 ? '+' : '') + row.diff_kwh.toFixed(2) : '—';
+        const dpct  = (row.diff_pct    !== null && row.diff_pct    !== undefined)
+                      ? (row.diff_pct >= 0 ? '+' : '') + row.diff_pct.toFixed(1) + '%' : '—';
+        let badge = '<span class="muted">' + row.status + '</span>';
+        if (row.status === 'ok')      badge = '<span style="color:#34d399">✓ in sync</span>';
+        if (row.status === 'drift')   badge = '<span style="color:#f87171">⚠ drift</span>';
+        if (row.status === 'unsettled') badge = '<span class="muted">unsettled</span>';
+        if (row.status === 'fetch_error') badge = '<span style="color:#fbbf24">fetch error</span>';
+        if (row.status === 'no_sigen_record') badge = '<span class="muted">no record</span>';
+        return '<tr>'
+          + '<td>' + row.date + '</td>'
+          + '<td>' + sigen + ' kWh</td>'
+          + '<td>' + octo  + ' kWh</td>'
+          + '<td>' + dkwh  + '</td>'
+          + '<td>' + dpct  + '</td>'
+          + '<td class="tdays">' + (row.slots || 0) + '</td>'
+          + '<td>' + badge + '</td>'
+        + '</tr>';
+      }).join('');
+    }
+    const s = d.summary || {};
+    const parts = [];
+    if (s.days_compared)  parts.push(s.days_compared + 'd compared');
+    if (s.days_unsettled) parts.push(s.days_unsettled + ' unsettled');
+    if (s.avg_diff_pct !== null && s.avg_diff_pct !== undefined) {
+      const sign = s.avg_diff_pct >= 0 ? '+' : '';
+      parts.push('avg ' + sign + s.avg_diff_pct.toFixed(2) + '%');
+    }
+    if (s.worst) parts.push('worst ' + s.worst.date + ' ' +
+                            (s.worst.diff_pct >= 0 ? '+' : '') +
+                            s.worst.diff_pct.toFixed(1) + '%');
+    if (parts.length === 0) parts.push('no data');
+    meta.textContent = parts.join(' · ');
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">Error: ' + e + '</td></tr>';
+  }
+}
+
 fetchStatus();
 startCountdown();
 _wireHelpTips();
 // Charts refresh independently — every 5 minutes is plenty
 refreshCharts();
 refreshDailyChart();
+refreshExportSync();
 setInterval(refreshCharts, 5 * 60 * 1000);
 setInterval(refreshDailyChart, 30 * 60 * 1000);
+setInterval(refreshExportSync, 60 * 60 * 1000);   // hourly
 </script>
 </body>
 </html>"""
@@ -1444,6 +1538,19 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_daily(days=days)
+                    body = json.dumps(data).encode()
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}).encode()
+            self._send(200, "application/json", body)
+
+        elif path == "/api/export-sync":
+            # Sigenergy vs Octopus export comparison for the last 7 settled
+            # days (D-3 to D-9). Cached on plugin side for 6 h.
+            if self._plugin_ref is None:
+                body = b'{"error":"plugin not ready"}'
+            else:
+                try:
+                    data = self._plugin_ref.get_dashboard_export_sync()
                     body = json.dumps(data).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()

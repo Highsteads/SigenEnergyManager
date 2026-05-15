@@ -68,6 +68,15 @@
     <Field id="octopusSerial" type="textfield" defaultValue="">
         <Label>Electricity meter serial:</Label>
     </Field>
+    <Field id="octopusExportMpan" type="textfield" defaultValue="">
+        <Label>Export MPAN (Octopus Outgoing, 13 digits):</Label>
+    </Field>
+    <Field id="octopusExportSerial" type="textfield" defaultValue="">
+        <Label>Export meter serial:</Label>
+    </Field>
+    <Field id="octopusExportInfo" type="label">
+        <Label>Export MPAN/serial are optional. When set, the plugin compares the inverter's daily export against Octopus's settled half-hourly readings (last 7 settled days, ±5% tolerance) on the Export Sync dashboard card. Settlement typically takes 24-48 h, so the most recent three days are skipped.</Label>
+    </Field>
     <Field id="octopusRegion" type="menu" defaultValue="F">
         <Label>Grid region:</Label>
         <List>

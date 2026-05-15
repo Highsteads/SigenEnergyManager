@@ -6,8 +6,27 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        14-05-2026 (v5.18.2)
-# Version:     5.18.2
+# Date:        15-05-2026 (v5.19)
+# Version:     5.19
+# Changes:     v5.19 (15-05-2026) — Export sync check (Sigenergy vs Octopus).
+#   • New /api/export-sync endpoint and Export Sync dashboard card. Compares
+#     the inverter's daily export kWh (from daily_history.json) against the
+#     half-hourly readings settled by Octopus on the export MPAN, for the
+#     last 7 fully-settled days. The most recent 3 days are skipped because
+#     Octopus typically takes 24-48 h to settle.
+#   • Tolerance ±5% — anything wider is flagged as drift.
+#   • New OCTOPUS_EXPORT_MPAN / OCTOPUS_EXPORT_SERIAL keys (IndigoSecrets.py
+#     first, PluginConfig fallback). Feature silently disabled if absent.
+#   • Octopus client gets get_export_kwh_for_date(date, mpan, serial)
+#     returning {kwh, slots}; reuses the same _paginate + auth path as the
+#     consumption-profile call.
+#   • Results cached on self.store["export_sync_cache"] for 6 h to avoid
+#     hammering the Octopus API; the dashboard refreshes hourly.
+#   • Once-a-day INFO line at midnight: "[ExportSync] 7d avg diff +0.8%
+#     worst: 2026-05-08 +3.1%" (or "[DRIFT >5%]" suffix). Skipped silently
+#     if the export MPAN isn't configured.
+#   • Show Plugin Info / self-test now lists OCTOPUS_EXPORT_MPAN +
+#     OCTOPUS_EXPORT_SERIAL in the secrets table.
 # Changes:     v5.18.2 (14-05-2026) — VPP event post-mortem: states + Pushover.
 #   • New _summarise_vpp_event() parses the per-event JSONL file at the
 #     VPP_ACTIVE -> COOLING_OFF transition and computes:
@@ -371,6 +390,14 @@ try:
 except ImportError:
     OCTOPUS_SERIAL = ""
 try:
+    from IndigoSecrets import OCTOPUS_EXPORT_MPAN
+except ImportError:
+    OCTOPUS_EXPORT_MPAN = ""
+try:
+    from IndigoSecrets import OCTOPUS_EXPORT_SERIAL
+except ImportError:
+    OCTOPUS_EXPORT_SERIAL = ""
+try:
     from IndigoSecrets import AXLE_API_KEY
 except ImportError:
     AXLE_API_KEY = ""
@@ -574,6 +601,9 @@ class Plugin(indigo.PluginBase):
         self.forecast  = None
         self.octopus  = None
         self.manager  = BatteryManager()
+        # Export MPAN/serial — populated by _init_modules
+        self.export_mpan   = ""
+        self.export_serial = ""
         self.axle     = None
 
         # Indigo trigger registry — populated by triggerStartProcessing/Stop.
@@ -1599,6 +1629,243 @@ class Plugin(indigo.PluginBase):
         except (OSError, ValueError):
             return {"days": days, "records": []}
         return {"days": days, "records": records[-days:]}
+
+    # ================================================================
+    # Export sync check (v5.19) — Sigenergy vs Octopus settled exports
+    # ================================================================
+    #
+    # Octopus settles export half-hourly readings over ~24-48h, so we only
+    # compare days that are at least settle_days (default 3) old. Results
+    # are cached on self.store so repeated calls (dashboard polling, action
+    # callbacks, etc.) don't hammer the Octopus API.
+    EXPORT_SYNC_WINDOW_DAYS    = 7
+    EXPORT_SYNC_SETTLE_DAYS    = 3
+    EXPORT_SYNC_TOLERANCE_PCT  = 5.0
+    EXPORT_SYNC_MIN_DAY_KWH    = 0.5    # below this daily total the % is noise, skip drift check
+    EXPORT_SYNC_CACHE_TTL      = 6 * 3600   # 6 h — re-check four times/day at most
+
+    def _compute_export_sync(self, force=False):
+        """Compare Sigenergy daily export vs Octopus settled export.
+
+        Window: last EXPORT_SYNC_WINDOW_DAYS settled days
+                (skipping the most recent EXPORT_SYNC_SETTLE_DAYS, which
+                Octopus may not have published yet).
+
+        Returns a dict:
+            {
+              "computed_at":  ISO8601 UTC timestamp,
+              "window_days":  int,
+              "settle_days":  int,
+              "tolerance_pct": float,
+              "rows": [
+                {"date", "sigen_kwh", "octopus_kwh", "diff_kwh",
+                 "diff_pct", "status", "slots"}, ...
+              ],
+              "summary": {
+                "days_compared":  int,
+                "days_unsettled": int,
+                "avg_diff_pct":   float | None,
+                "worst": {"date", "diff_pct"} | None,
+                "all_within_tolerance": bool,
+              },
+              "available": bool,    # False if no octopus client or no export MPAN
+              "reason":   str,      # populated when available=False
+            }
+        """
+        # Hot cache — skip if recent
+        cached = self.store.get("export_sync_cache")
+        if not force and cached:
+            try:
+                age = time.time() - float(cached.get("_cached_at", 0))
+                if age < self.EXPORT_SYNC_CACHE_TTL:
+                    return cached["data"]
+            except (TypeError, ValueError):
+                pass
+
+        result = {
+            "computed_at":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "window_days":   self.EXPORT_SYNC_WINDOW_DAYS,
+            "settle_days":   self.EXPORT_SYNC_SETTLE_DAYS,
+            "tolerance_pct": self.EXPORT_SYNC_TOLERANCE_PCT,
+            "rows":          [],
+            "summary":       {
+                "days_compared":  0,
+                "days_unsettled": 0,
+                "avg_diff_pct":   None,
+                "worst":          None,
+                "all_within_tolerance": True,
+            },
+            "available":     True,
+            "reason":        "",
+        }
+
+        if not self.octopus or not self.octopus.api_key:
+            result["available"] = False
+            result["reason"]    = "Octopus API key not configured"
+            return result
+        if not self.export_mpan or not self.export_serial:
+            result["available"] = False
+            result["reason"]    = (
+                "Export MPAN/serial not configured — set OCTOPUS_EXPORT_MPAN "
+                "and OCTOPUS_EXPORT_SERIAL in IndigoSecrets.py, or fill in "
+                "PluginConfig"
+            )
+            return result
+
+        # Load daily_history once and index by date
+        path = os.path.join(self.data_dir, "daily_history.json")
+        history_by_date = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for rec in json.load(f):
+                    d = rec.get("date")
+                    if d:
+                        history_by_date[d] = rec
+        except (OSError, ValueError):
+            pass
+
+        # Use Europe/London for "today" (matches _check_midnight)
+        try:
+            import pytz
+            tz_l  = pytz.timezone("Europe/London")
+            today = datetime.now(timezone.utc).astimezone(tz_l)
+        except ImportError:
+            today = datetime.now()
+        today_date = today.date()
+
+        diffs_for_avg = []
+        worst_row     = None
+
+        # Iterate D-(settle_days) back through D-(settle_days+window-1), oldest first
+        oldest_offset = self.EXPORT_SYNC_SETTLE_DAYS + self.EXPORT_SYNC_WINDOW_DAYS - 1
+        for offset in range(oldest_offset, self.EXPORT_SYNC_SETTLE_DAYS - 1, -1):
+            day = today_date - timedelta(days=offset)
+            date_str = day.strftime("%Y-%m-%d")
+
+            sigen_rec = history_by_date.get(date_str)
+            sigen_kwh = None
+            if sigen_rec is not None:
+                try:
+                    sigen_kwh = float(sigen_rec.get("grid_export_kwh", 0.0))
+                except (TypeError, ValueError):
+                    sigen_kwh = None
+
+            try:
+                octo = self.octopus.get_export_kwh_for_date(
+                    date_str, self.export_mpan, self.export_serial
+                )
+            except Exception as exc:
+                self.logger.debug(f"[ExportSync] Octopus fetch error for {date_str}: {exc}")
+                octo = None
+
+            row = {
+                "date":        date_str,
+                "sigen_kwh":   round(sigen_kwh, 2) if sigen_kwh is not None else None,
+                "octopus_kwh": None,
+                "diff_kwh":    None,
+                "diff_pct":    None,
+                "slots":       0,
+                "status":      "unsettled",
+            }
+
+            if octo is None:
+                row["status"] = "fetch_error"
+            else:
+                row["slots"] = int(octo.get("slots", 0))
+                if octo.get("kwh") is None:
+                    row["status"] = "unsettled"
+                else:
+                    row["octopus_kwh"] = round(float(octo["kwh"]), 2)
+                    if sigen_kwh is not None:
+                        diff = sigen_kwh - row["octopus_kwh"]
+                        row["diff_kwh"] = round(diff, 2)
+                        # Use the LARGER of the two as the denominator —
+                        # protects against tiny Sigenergy values inflating %.
+                        denom = max(sigen_kwh, row["octopus_kwh"], 0.001)
+                        pct = (diff / denom) * 100.0 if denom > 0 else 0.0
+                        row["diff_pct"] = round(pct, 1)
+                        # Near-zero export days (winter, rain) — a 0.05 kWh
+                        # delta on a 0.07 kWh day reads as 71% but is
+                        # operationally meaningless. Force-ok and exclude
+                        # from the average / worst summary stats.
+                        if denom < self.EXPORT_SYNC_MIN_DAY_KWH:
+                            row["status"] = "ok"
+                        else:
+                            row["status"] = (
+                                "ok" if abs(pct) <= self.EXPORT_SYNC_TOLERANCE_PCT
+                                else "drift"
+                            )
+                            diffs_for_avg.append(pct)
+                            if worst_row is None or abs(pct) > abs(worst_row["diff_pct"]):
+                                worst_row = row
+                    else:
+                        row["status"] = "no_sigen_record"
+
+            result["rows"].append(row)
+
+        # Summary aggregates
+        compared    = [r for r in result["rows"] if r["status"] in ("ok", "drift")]
+        unsettled   = [r for r in result["rows"] if r["status"] == "unsettled"]
+        result["summary"]["days_compared"]  = len(compared)
+        result["summary"]["days_unsettled"] = len(unsettled)
+        if diffs_for_avg:
+            result["summary"]["avg_diff_pct"] = round(
+                sum(diffs_for_avg) / len(diffs_for_avg), 2
+            )
+        if worst_row is not None:
+            result["summary"]["worst"] = {
+                "date":     worst_row["date"],
+                "diff_pct": worst_row["diff_pct"],
+            }
+        result["summary"]["all_within_tolerance"] = all(
+            r["status"] == "ok" for r in compared
+        )
+
+        # Cache
+        self.store["export_sync_cache"] = {
+            "_cached_at": time.time(),
+            "data":       result,
+        }
+        return result
+
+    def _log_export_sync_summary(self):
+        """Emit one INFO line summarising the export-sync window.
+
+        Called from _check_midnight (so it runs once a day) and skipped
+        silently if the feature isn't available.
+        """
+        try:
+            data = self._compute_export_sync(force=True)
+        except Exception as exc:
+            self.logger.error(f"[ExportSync] Summary computation failed: {exc}")
+            return
+        if not data.get("available", False):
+            return  # disabled by config — stay quiet
+        s = data["summary"]
+        if s["days_compared"] == 0:
+            return  # nothing to say yet (cold start, no settled history)
+        worst_str = ""
+        if s["worst"]:
+            worst_str = (
+                f"  worst: {s['worst']['date']} "
+                f"{s['worst']['diff_pct']:+.1f}%"
+            )
+        avg_str = (
+            f"{s['avg_diff_pct']:+.1f}%"
+            if s["avg_diff_pct"] is not None else "n/a"
+        )
+        flag = "" if s["all_within_tolerance"] else "  [DRIFT >5%]"
+        log(
+            f"[ExportSync] {s['days_compared']}d avg diff {avg_str}"
+            f"{worst_str}{flag}"
+        )
+
+    def get_dashboard_export_sync(self):
+        """Public accessor used by the /api/export-sync dashboard endpoint."""
+        try:
+            return self._compute_export_sync(force=False)
+        except Exception as exc:
+            return {"available": False, "reason": f"compute failed: {exc}"}
 
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
@@ -3638,6 +3905,15 @@ class Plugin(indigo.PluginBase):
         except (ValueError, OSError) as exc:
             self.logger.debug(f"SoH snapshot skipped: {exc}")
 
+        # Daily export-sync check: compare Sigenergy daily export totals against
+        # what Octopus has settled (D-3 to D-9). One-line INFO summary, silent
+        # if export MPAN isn't configured. Full results are visible on the
+        # web dashboard's Export Sync card.
+        try:
+            self._log_export_sync_summary()
+        except Exception as exc:
+            self.logger.debug(f"[ExportSync] Skipped: {exc}")
+
         # Write final daily totals to Indigo variables before reset
         self._write_energy_summary_variables()
         self.store["last_energy_var"] = time.time()
@@ -4834,12 +5110,14 @@ class Plugin(indigo.PluginBase):
         # Secrets
         secrets_status = []
         for name, value in (
-            ("OCTOPUS_API_KEY",     OCTOPUS_API_KEY),
-            ("OCTOPUS_ACCOUNT",     OCTOPUS_ACCOUNT),
-            ("OCTOPUS_MPAN",        OCTOPUS_MPAN),
-            ("OCTOPUS_SERIAL",      OCTOPUS_SERIAL),
-            ("AXLE_API_KEY",        AXLE_API_KEY),
-            ("PUSHOVER_USER_TOKEN", PUSHOVER_USER_TOKEN),
+            ("OCTOPUS_API_KEY",       OCTOPUS_API_KEY),
+            ("OCTOPUS_ACCOUNT",       OCTOPUS_ACCOUNT),
+            ("OCTOPUS_MPAN",          OCTOPUS_MPAN),
+            ("OCTOPUS_SERIAL",        OCTOPUS_SERIAL),
+            ("OCTOPUS_EXPORT_MPAN",   OCTOPUS_EXPORT_MPAN),
+            ("OCTOPUS_EXPORT_SERIAL", OCTOPUS_EXPORT_SERIAL),
+            ("AXLE_API_KEY",          AXLE_API_KEY),
+            ("PUSHOVER_USER_TOKEN",   PUSHOVER_USER_TOKEN),
             ("SIGENERGY_IP",        SIGENERGY_IP),
         ):
             secrets_status.append(
@@ -4993,6 +5271,10 @@ class Plugin(indigo.PluginBase):
         mpan       = OCTOPUS_MPAN    or prefs.get("octopusMpan", "")
         serial     = OCTOPUS_SERIAL  or prefs.get("octopusSerial", "")
         region     = prefs.get("octopusRegion", "F")
+        # Export MPAN/serial (Octopus Outgoing) — used by v5.19 export-sync check.
+        # Optional: if blank, the export-sync feature is silently disabled.
+        self.export_mpan   = OCTOPUS_EXPORT_MPAN   or prefs.get("octopusExportMpan", "")
+        self.export_serial = OCTOPUS_EXPORT_SERIAL or prefs.get("octopusExportSerial", "")
 
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
