@@ -5,9 +5,9 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        15-05-2026 (v5.19.2)
-# Version:     5.19.2
+# Author:      CliveS & Claude Opus 4.7
+# Date:        21-05-2026 (v5.20.0)
+# Version:     5.20.0
 # Changes:     v5.19.2 (15-05-2026) — Live Power Flow visual polish (option B):
 #              soft teal aurora glow + horizon bar behind the card; two
 #              status chips top-right ("On Grid" / "Lockout" / "Grid Down"
@@ -429,6 +429,20 @@ try:
     from IndigoSecrets import AXLE_SUPPORT_EMAIL
 except ImportError:
     AXLE_SUPPORT_EMAIL = ""
+# Unified Dashboards plugin: menuOpenDashboard now points at the Dashboards
+# hub rather than Sigenergy's internal mini-dashboard on WEB_DASHBOARD_PORT.
+try:
+    from IndigoSecrets import INDIGO_URL
+except ImportError:
+    INDIGO_URL = ""
+try:
+    from IndigoSecrets import INDIGO_API_KEY
+except ImportError:
+    INDIGO_API_KEY = ""
+try:
+    from IndigoSecrets import CLAUDEBRIDGE_BEARER_TOKEN
+except ImportError:
+    CLAUDEBRIDGE_BEARER_TOKEN = ""
 
 try:
     from plugin_utils import log_startup_banner
@@ -506,11 +520,6 @@ VPP_COOLING_OFF  = "cooling_off"
 # Axle VPP SOC calculation constants (from SigenergySolar)
 VPP_DISCHARGE_EFFICIENCY  = 0.97
 BATTERY_CAPACITY_KWH      = 35.04
-VPP_PRE_EXPORT_MINUTES    = 5     # start exporting this many minutes before event start.
-                                   # Axle pays based on smart meter readings during their
-                                   # event window — being already exporting at T+0 captures
-                                   # the full paid window even if Axle's dispatch command
-                                   # arrives late (observed: 08:30 event, command at 08:45).
 
 
 # ============================================================
@@ -678,7 +687,7 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_pre_export_active"] = False # True while plugin is pre-exporting (legacy, v5.17-)
         self.store["vpp_charge_stopped"]    = False # True once pre-charge import has ended
         self.store["vpp_10min_warning_sent"] = False # T-10min warning latched
-        self.store["vpp_remote_ems_released"] = False # True from T-5min until handback completes
+        self.store["vpp_remote_ems_released"] = False # True from PRE_CHARGING start until handback completes
         self.store["vpp_last_snapshot_at"]   = 0.0    # time.time() of last detailed snapshot log
 
         # Scheduled import state
@@ -2302,6 +2311,73 @@ class Plugin(indigo.PluginBase):
             return max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
         return 0.0
 
+    def _compute_vpp_export_by_date(self):
+        """Return (today_kwh, tomorrow_kwh) — Axle export expected on each local date.
+
+        Used by flood prevention to subtract VPP export from refill-day capacity.
+        Future-only: an ACTIVE event's elapsed portion is not counted (SOC already
+        reflects it). Pro-rated for events that span local midnight.
+
+        Counts only ANNOUNCED / PRE_CHARGING / ACTIVE states — COOLING_OFF means
+        the export is already complete and reflected in SOC.
+        """
+        vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        vpp_event = self.store.get("vpp_event") or {}
+        if not vpp_event or vpp_state not in (VPP_ANNOUNCED, VPP_PRE_CHARGING, VPP_ACTIVE):
+            return (0.0, 0.0)
+
+        start = vpp_event.get("start_time")
+        end   = vpp_event.get("end_time")
+        if start is None or end is None:
+            return (0.0, 0.0)
+
+        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+
+        try:
+            import pytz
+            london = pytz.timezone("Europe/London")
+            now_local   = datetime.now(timezone.utc).astimezone(london)
+            start_local = start.astimezone(london) if start.tzinfo else start
+            end_local   = end.astimezone(london)   if end.tzinfo   else end
+        except Exception:
+            now_local   = datetime.now(timezone.utc)
+            start_local = start
+            end_local   = end
+
+        # Future-only: clip to "from now"
+        effective_start = max(start_local, now_local)
+        if effective_start >= end_local:
+            return (0.0, 0.0)
+
+        today_date    = now_local.date()
+        tomorrow_date = today_date + timedelta(days=1)
+
+        today_hours    = self._vpp_overlap_hours(effective_start, end_local, today_date)
+        tomorrow_hours = self._vpp_overlap_hours(effective_start, end_local, tomorrow_date)
+
+        return (
+            round(today_hours    * max_export_kw, 3),
+            round(tomorrow_hours * max_export_kw, 3),
+        )
+
+    @staticmethod
+    def _vpp_overlap_hours(start_dt, end_dt, date_obj):
+        """Return overlap hours between [start_dt, end_dt] and local date date_obj.
+
+        start_dt and end_dt are local-time datetimes (tz-aware if pytz available).
+        Returns 0.0 if no overlap, otherwise the duration of the overlap in hours.
+        """
+        day_start = start_dt.replace(
+            year=date_obj.year, month=date_obj.month, day=date_obj.day,
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        day_end = day_start + timedelta(days=1)
+        overlap_start = max(start_dt, day_start)
+        overlap_end   = min(end_dt,   day_end)
+        if overlap_end <= overlap_start:
+            return 0.0
+        return (overlap_end - overlap_start).total_seconds() / 3600.0
+
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
         """Construct the immutable snapshot passed to manager.evaluate()."""
         prefs = self.pluginPrefs
@@ -2313,6 +2389,8 @@ class Plugin(indigo.PluginBase):
         # can override the auto-derived figure if they want.  Detection of
         # "user set a custom value" is approximate — any value differing from
         # the documented default by > 1 kWh is treated as user-intent.
+        vpp_today_kwh, vpp_tomorrow_kwh = self._compute_vpp_export_by_date()
+
         profile      = self.store.get("consumption_profile", []) or []
         live_daily   = sum(profile) if len(profile) == 48 else 0.0
         weekday_pref = float(prefs.get("weekdayKwh", 22.0))
@@ -2340,6 +2418,7 @@ class Plugin(indigo.PluginBase):
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
+            corrected_today_kwh     = float(self.latest_forecast_data.get("correctedTodayKwh", 0.0)),
             corrected_tomorrow_kwh  = float(self.latest_forecast_data.get("correctedTomorrowKwh", 0.0)),
             tariff                  = self._build_tariff_data(),
             forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
@@ -2349,6 +2428,8 @@ class Plugin(indigo.PluginBase):
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             vpp_active                  = self.store["vpp_active"],
             vpp_reserved_kwh            = vpp_reserved_kwh,
+            vpp_today_kwh               = vpp_today_kwh,
+            vpp_tomorrow_kwh            = vpp_tomorrow_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
             flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
@@ -2836,13 +2917,14 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle has the inverter
-        # via Sigenergy's cloud channel (Remote EMS released at T-5min).
-        # Plugin must not write to any EMS register during these states or
-        # we'd fight Axle's commands. _vpp_check_axle_release() handles the
-        # handback when Axle returns control.
+        # Skip during VPP_PRE_CHARGING, VPP_ACTIVE and VPP_COOLING_OFF.
+        # Axle's cloud may begin dispatching as early as T-15min — we must
+        # stop touching 40031 the moment we enter PRE_CHARGING, otherwise
+        # the verify loop will overwrite Axle's "Discharge ESS first" mode
+        # with our "Self Consumption" expectation. _vpp_check_axle_release()
+        # handles the handback when Axle returns control.
         _vpp_state = self.store.get("vpp_state", VPP_IDLE)
-        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
+        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE, VPP_COOLING_OFF):
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -2865,11 +2947,12 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_remote_ems_mode(expected_mode)
 
         # --- Discharge limit and charge limit ---
-        # Skip during VPP_ACTIVE and VPP_COOLING_OFF: Axle controls these registers.
-        # Writing them during the handover window caused a brief 2kW grid import on
-        # 10-Apr-2026 when the solar_overflow charge cap (2395W) was written back 1s
-        # after Axle cleared it to allow full discharge.
-        if _vpp_state not in (VPP_ACTIVE, VPP_COOLING_OFF):
+        # Skip during VPP_PRE_CHARGING, VPP_ACTIVE and VPP_COOLING_OFF:
+        # Axle controls these registers. Writing them during the handover
+        # window caused a brief 2kW grid import on 10-Apr-2026 when the
+        # solar_overflow charge cap (2395W) was written back 1s after
+        # Axle cleared it to allow full discharge.
+        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE, VPP_COOLING_OFF):
             actual_discharge_w = self.modbus.read_discharge_limit()
             if actual_discharge_w is not None:
                 if abs(actual_discharge_w - expected_discharge_w) > 200:
@@ -3229,43 +3312,43 @@ class Plugin(indigo.PluginBase):
             required_soc       = self.store["vpp_pre_charge_soc"]
             current_soc        = self.latest_inverter_data.get("batterySoc", 0.0)
             charge_stopped     = self.store.get("vpp_charge_stopped",   False)
-            remote_ems_released = self.store.get("vpp_remote_ems_released", False)
             soc_ready          = current_soc >= required_soc
 
-            # Step 1: stop charging once SOC target is reached (fire once only)
-            if soc_ready and not charge_stopped and not remote_ems_released:
-                if self.modbus:
+            # Step 1: stop charging once SOC target is reached (fire once only).
+            # Guard against fighting Axle: if 40031 already reads 0x06
+            # (Discharge ESS first) then Axle is mid-dispatch and we must
+            # not overwrite it with 0x02. Battery is already not charging
+            # in that case, so the "stop charging" intent is satisfied.
+            if soc_ready and not charge_stopped:
+                cur_mode = self.modbus.read_ems_mode() if self.modbus else None
+                if cur_mode == 0x06:
+                    self.store["vpp_charge_stopped"] = True
+                    log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
+                        f"{required_soc:.0f}% target. Axle already dispatching "
+                        f"(40031=0x06) — leaving inverter under Axle control.")
+                elif self.modbus:
                     self.modbus.set_self_consumption()
-                self.store["vpp_charge_stopped"] = True
-                log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= {required_soc:.0f}% target. Holding.")
+                    self.store["vpp_charge_stopped"] = True
+                    log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
+                        f"{required_soc:.0f}% target. Holding in Self Consumption.")
 
-            # Step 2: release Remote EMS at T-5min so Axle's cloud commands can
-            # reach the inverter early (in case their dispatch arrives before
-            # event start). Replaces the old "pre-export" hack which fought
-            # Axle for control over the inverter mode register.
-            if (not remote_ems_released
-                    and 0 < hours_to_start <= VPP_PRE_EXPORT_MINUTES / 60.0):
-                if self.modbus and self.modbus.disable_remote_ems():
-                    self.store["vpp_remote_ems_released"] = True
-                    log(
-                        f"[VPP] >>> RELEASED CONTROL TO AXLE <<<  T-{int(hours_to_start * 60 + 0.5)}min, "
-                        f"SOC {current_soc:.0f}%. Sigenergy cloud now drives the inverter; "
-                        f"plugin will monitor only until event end."
-                    )
-                else:
-                    log("[VPP] WARNING: disable_remote_ems() returned False — "
-                        "plugin still holds the inverter lock; Axle may not be able to dispatch.",
-                        level="ERROR")
+            # No explicit "release to Axle" step: Axle dispatches by writing
+            # 40031 directly. The plugin already stops writing to 40031 from
+            # PRE_CHARGING onwards (see verify-loop guards above), so Axle's
+            # writes stand unopposed. The old disable_remote_ems() call here
+            # actively kicked Axle out by clearing 40029 — confirmed bug
+            # 21-May-2026 caused 0 kWh export on a scheduled 4 kWh event.
+            self.store["vpp_remote_ems_released"] = True
 
-            # Step 3: event window open — transition to ACTIVE (Axle already in
-            # control from T-5min; this is just state-machine bookkeeping)
+            # Event window open — transition to ACTIVE (Axle has been free
+            # to dispatch since PRE_CHARGING began; this is just bookkeeping).
             if hours_to_start <= 0:
                 self.store["vpp_export_start_kwh"]  = self.store["grid_export_daily_kwh"]
                 self.store["vpp_charge_stopped"]    = False
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
-                log(f"[VPP] Event window now OPEN — Axle has been in control since T-5min")
+                log(f"[VPP] Event window now OPEN — Axle in control via Remote EMS")
 
         elif current_state == VPP_ACTIVE:
             # Periodic detailed snapshot — every poll cycle while active, so the
@@ -3560,18 +3643,31 @@ class Plugin(indigo.PluginBase):
     def _vpp_check_axle_release(self):
         """Check if Axle has released the inverter and reinstate Remote EMS.
 
-        Axle always reverts the inverter to 'Max Self Consumption' (local mode,
-        register 30003 = 0) when an event ends.  We watch emsWorkMode for that
-        string — the moment we see it we know Axle has handed back control and
-        we can switch to Remote EMS (set_self_consumption() enables 40029=1 +
-        mode 0x02 in 40031, which puts 30003 back to 7 "Remote EMS").
+        Two release signals are accepted:
+          (a) 30003 (emsWorkMode) flips to "Max Self Consumption" — Axle
+              relinquished Remote EMS entirely (40029=0).
+          (b) 40031 reads 0x02 (Self Consumption) — Axle kept 40029=1 but
+              set the mode to do-nothing. Observed 21-May-2026 as Axle's
+              actual end-of-event behaviour.
+        Either way we then call set_self_consumption() to assert plugin
+        control (40029=1 + 40031=0x02), which yields 30003=7 "Remote EMS".
 
         Alert thresholds after VPP_COOLING_OFF was entered (vpp_cooling_start):
           45 min  — Pushover + email to axle@strudwick.co.uk
           60 min  — Force reinstatement regardless of EMS mode
         """
         ems_mode      = self.latest_inverter_data.get("emsWorkMode", "")
-        axle_released = "Self" in ems_mode   # Axle releases to "Self-Consumption" (mode 0)
+        axle_released = "Self" in ems_mode   # Axle releases to "Self-Consumption" (30003=0)
+
+        # Broader signal: Axle sometimes "releases" by writing 40031=0x02
+        # (Self Consumption) without dropping 40029 — the inverter then
+        # sits in Remote EMS doing nothing, so 30003 stays at 7 and the
+        # original "Self" string check never matches. Observed 21-May-2026.
+        if not axle_released and self.modbus:
+            cur_mode_reg = self.modbus.read_ems_mode()
+            if cur_mode_reg == 0x02:
+                axle_released = True
+                ems_mode = f"{ems_mode} (40031=0x02 Self Consumption)"
 
         cooling_start    = self.store.get("vpp_cooling_start", 0)
         elapsed_secs     = time.time() - cooling_start
@@ -5219,19 +5315,32 @@ class Plugin(indigo.PluginBase):
         return True
 
     def menuOpenDashboard(self):
-        """Menu: Open the web dashboard in the default browser.
+        """Menu: Open the unified Dashboards hub in the default browser.
+
+        Routes to the Dashboards plugin's index.html via IWS rather than the
+        legacy internal mini-dashboard on WEB_DASHBOARD_PORT. The internal
+        dashboard server still runs (Sigen-only Sankey/charts) but the menu
+        now lands on the unified hub, which links to Sigen / Heating / etc.
+        Falls back to the legacy URL if INDIGO_URL is not configured.
 
         Note: this opens the browser on the Indigo SERVER. If the Indigo
         client is running on a different Mac, the dashboard will appear on
-        the server's screen, not the client's.  The URL is also logged so
-        it can be clicked from the event log on any client.
+        the server's screen, not the client's. The URL (without api-key) is
+        also logged so it can be clicked from the event log on any client.
         """
-        host = self._resolve_dashboard_host()
-        url  = f"http://{host}:{WEB_DASHBOARD_PORT}/"
-        log(f"[Menu] Web dashboard: {url}")
+        if INDIGO_URL:
+            base = INDIGO_URL.rstrip("/")
+            url_log = f"{base}/com.clives.indigoplugin.dashboards/static/pages/index.html"
+            api_key = INDIGO_API_KEY or CLAUDEBRIDGE_BEARER_TOKEN
+            url_open = f"{url_log}?api-key={api_key}" if api_key else url_log
+        else:
+            host = self._resolve_dashboard_host()
+            url_log  = f"http://{host}:{WEB_DASHBOARD_PORT}/"
+            url_open = url_log
+        log(f"[Menu] Dashboards: {url_log}")
         try:
             import webbrowser
-            opened = webbrowser.open(url, new=2)
+            opened = webbrowser.open(url_open, new=2)
             if not opened:
                 log("[Menu] Could not auto-open browser — open the URL above manually",
                     level="WARNING")

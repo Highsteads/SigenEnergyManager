@@ -89,7 +89,10 @@ def _make_snapshot(
     pv_watts=0,
     export_active=False,
     max_export_kw=4.0,
+    corrected_today_kwh=0.0,
     corrected_tomorrow_kwh=0.0,
+    vpp_today_kwh=0.0,
+    vpp_tomorrow_kwh=0.0,
     flood_prev_target_soc=0.0,
     dawn_target_pct=DAWN_TARGET,
     weekday_kwh=22.0,
@@ -124,7 +127,10 @@ def _make_snapshot(
         max_export_kw          = max_export_kw,
         pv_watts               = pv_watts,
         export_active          = export_active,
+        corrected_today_kwh    = corrected_today_kwh,
         corrected_tomorrow_kwh = corrected_tomorrow_kwh,
+        vpp_today_kwh          = vpp_today_kwh,
+        vpp_tomorrow_kwh       = vpp_tomorrow_kwh,
         flood_prev_target_soc  = flood_prev_target_soc,
         tariff                 = tariff,
         forecast_p50           = forecast_p50 or {},
@@ -669,6 +675,111 @@ class TestFloodPrevention(unittest.TestCase):
 
         self.assertNotEqual(decision.action, ACTION_START_EXPORT)
 
+    def test_flood_prev_post_midnight_blocked_when_today_forecast_poor(self):
+        """21-May-2026 regression: post-midnight pre-drain must check TODAY's forecast.
+
+        At 00:25 local, "tomorrow" in the cache rolls over to the day after the
+        refill day. The pre-bug check used tomorrow_solar (= sunny day-after) and
+        dumped the battery into a poor-today/sunny-day-after pair, then failed to
+        refill from today's weak sun. Fix: when dawn is later today (post-midnight),
+        gate on corrected_today_kwh instead.
+        """
+        today_str = _today_str()
+        # Live 21-May numbers: today=29.5 kWh raw (poor refill), tomorrow=82.6 kWh (irrelevant here)
+        snapshot = _make_snapshot(
+            soc_pct                = 82.0,                # was 82.5% in the incident
+            export_enabled         = True,
+            corrected_today_kwh    = 34.3,                # 29.5 raw * 1.163 bias
+            corrected_tomorrow_kwh = self.sunny_tomorrow, # day-after looks great, irrelevant
+            now_hour               = 0,                   # 00:25-ish — post-midnight
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+            dawn_times             = {today_str: _now(hour=6)},  # dawn is later today
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        # 34.3 < 3 * 22.0 = 66.0 → must NOT export
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+
+    def test_flood_prev_allows_small_vpp_on_refill_day(self):
+        """Small Axle event on refill day: 70 - (22+4)*3 = 70 - 78 → would block,
+        but with 80 kWh forecast: 80 >= 3*(22+4)=78 → passes.
+
+        Confirms VPP is added to demand but doesn't kill flood-prev on genuinely
+        sunny days.
+        """
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_tomorrow_kwh = 80.0,         # sunny — covers 3x (22+4)
+            vpp_tomorrow_kwh       = 4.0,          # 1h × 4kW
+            now_hour               = 22,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertIn("Axle", decision.reason)        # log breakdown shows VPP
+        self.assertIn("4.0", decision.reason)
+
+    def test_flood_prev_blocked_by_large_vpp_on_refill_day(self):
+        """Large Axle event pushes refill demand above 3x threshold → block.
+
+        70 kWh forecast vs (22 + 8) × 3 = 90 kWh → fails. Without the VPP gate
+        this would have fired (70 > 3*22 = 66).
+        """
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_tomorrow_kwh = 70.0,         # would pass without VPP
+            vpp_tomorrow_kwh       = 8.0,          # 2h × 4kW VPP scheduled tomorrow
+            now_hour               = 22,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+
+    def test_flood_prev_post_midnight_uses_today_vpp_field(self):
+        """After midnight, the refill-day VPP comes from vpp_today_kwh, not
+        vpp_tomorrow_kwh. Same arithmetic, different field."""
+        today_str = _today_str()
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_today_kwh    = 70.0,         # would pass without VPP
+            corrected_tomorrow_kwh = 100.0,        # irrelevant — refill day is today
+            vpp_today_kwh          = 8.0,          # large VPP scheduled today
+            vpp_tomorrow_kwh       = 0.0,
+            now_hour               = 0,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+            dawn_times             = {today_str: _now(hour=6)},
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+
+    def test_flood_prev_post_midnight_triggers_when_today_forecast_sunny(self):
+        """Post-midnight, when TODAY's forecast itself is abundantly sunny,
+        flood prevention should still trigger (the bug fix must not be too tight)."""
+        today_str = _today_str()
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_today_kwh    = self.sunny_tomorrow,  # today is great
+            corrected_tomorrow_kwh = self.poor_tomorrow,   # day-after irrelevant when dawn is today
+            now_hour               = 0,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+            dawn_times             = {today_str: _now(hour=6)},
+        )
+        decision = self.bm.evaluate(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+
     def test_flood_prev_blocked_when_soc_below_threshold(self):
         """SOC below 55% threshold — not enough to drain to 40% usefully."""
         snapshot = _make_snapshot(
@@ -774,6 +885,7 @@ class TestFloodPrevention(unittest.TestCase):
             export_enabled         = True,
             export_active          = True,   # export already running
             flood_prev_target_soc  = 40.0,
+            corrected_today_kwh    = self.sunny_tomorrow,  # post-midnight: today is refill day
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 23,
             weekday_kwh            = 22.0,

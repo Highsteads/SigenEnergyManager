@@ -7,8 +7,19 @@
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        19-04-2026
-# Version:     1.0
+# Date:        21-05-2026
+# Version:     1.2.1
+# 1.2.1 — fix NameError in _write_optimiser_file debug log left over from the
+#         v1.2 rename (`corrected_tmrw` → `tomorrow_kwh`). The error fired on
+#         every forecast refresh in the plugin log but didn't affect the
+#         output file itself.
+# 1.2 — bias factor NO LONGER APPLIED to forecast totals. 31 days of records
+#       showed the raw forecast had lower mean error (-2.5%) and lower MAPE
+#       (18.7%) than any bias-corrected variant tried (MAPE 21.9-22.3%). Factor
+#       still computed and stored on `biasFactor` for diagnostic display.
+# 1.1 — bias correction switched from arithmetic-mean-of-ratios to ratio-of-sums
+#       (kWh-weighted). Removes an upward statistical bias that pushed the May
+#       2026 factor to 1.163 vs the correct 1.150. See test_openmeteo_forecast.
 
 import json
 import logging
@@ -525,15 +536,30 @@ class OpenMeteoForecast:
     # ================================================================
 
     def _enrich_forecast(self, combined):
-        """Add bias-corrected totals to the combined forecast dict."""
+        """Add forecast totals to the combined dict.
+
+        v1.2 (21-May-2026): bias factor is NO LONGER APPLIED to corrected totals.
+        The factor is still computed and stored on `biasFactor` for diagnostic
+        display, but `correctedTodayKwh` and `correctedTomorrowKwh` equal the raw
+        totals. Empirical evidence over 31 days of records showed the raw forecast
+        had lower mean error (-2.5%) and lower MAPE (18.7%) than any bias-corrected
+        variant we tried (MAPE 21.9-22.3%). Day-to-day weather variance (~20%)
+        dominates the ~10-15% systematic bias the correction was trying to remove.
+        The 3x safety multiplier in flood prevention provides ample buffer against
+        forecast error without needing seasonal calibration.
+
+        Daily accuracy records are still written by `record_accuracy()` so a
+        future seasonal-bias decision can be revisited if persistent drift emerges
+        over 90+ days.
+        """
         enriched     = dict(combined)
         factor       = self._correction_factor
         raw_today    = combined.get("todayKwh", 0.0)
         raw_tomorrow = combined.get("tomorrowKwh", 0.0)
 
-        enriched["biasFactor"]           = round(factor, 3)
-        enriched["correctedTodayKwh"]    = round(raw_today    * factor, 1)
-        enriched["correctedTomorrowKwh"] = round(raw_tomorrow * factor, 1)
+        enriched["biasFactor"]           = round(factor, 3)     # informational only
+        enriched["correctedTodayKwh"]    = round(raw_today, 1)
+        enriched["correctedTomorrowKwh"] = round(raw_tomorrow, 1)
         return enriched
 
     def _empty_forecast(self, reason=""):
@@ -565,11 +591,21 @@ class OpenMeteoForecast:
         Algorithm:
         1. Try same calendar month (prefer seasonal match, need >= 3 valid records)
         2. Fall back to last 30 valid records
-        3. factor = mean(actual / forecast), clamped to [0.5, 1.5]
-        4. Returns 1.0 if fewer than 3 records available
+        3. factor = sum(actual) / sum(forecast)  (kWh-weighted, unbiased)
+        4. Clamped to [BIAS_CORRECTION_MIN, BIAS_CORRECTION_MAX]
+        5. Returns 1.0 if fewer than 3 records available
 
         Days where forecast < MIN_CALIBRATION_FORECAST_KWH are excluded
         (overcast days where accuracy is not meaningful for calibration).
+        Days with extreme per-day ratios (outside [0.1, 2 × BIAS_CORRECTION_MAX])
+        are excluded too — a 95 %-overshoot day shouldn't define a season.
+
+        21-May-2026: switched from arithmetic-mean-of-ratios (`mean(actual/fc)`) to
+        ratio-of-sums (`sum(actual)/sum(fc)`). The old formula was statistically
+        biased upward because per-day ratios are bounded below by 0 but unbounded
+        above; under-forecast days (ratio > 1) skew the mean further than
+        over-forecast days (ratio < 1). For May 2026 the old formula produced
+        1.163 while the kWh-weighted true factor was 1.150.
         """
         if not records:
             return 1.0
@@ -580,14 +616,11 @@ class OpenMeteoForecast:
             r for r in records
             if r.get("month", "").endswith("-" + current_month.split("-")[1])
             and r.get("forecast_kwh", 0) >= MIN_CALIBRATION_FORECAST_KWH
+            and 0.1 < r.get("factor", 0) < BIAS_CORRECTION_MAX * 2
         ]
 
         if len(same_month) >= 3:
-            factors = [r["factor"] for r in same_month
-                       if 0.1 < r.get("factor", 0) < BIAS_CORRECTION_MAX * 2]
-            if len(factors) >= 3:
-                raw_factor = sum(factors) / len(factors)
-                return round(max(BIAS_CORRECTION_MIN, min(BIAS_CORRECTION_MAX, raw_factor)), 4)
+            return self._clamped_sum_ratio(same_month)
 
         valid = [
             r for r in records[-30:]
@@ -598,8 +631,21 @@ class OpenMeteoForecast:
         if len(valid) < 3:
             return 1.0
 
-        raw_factor = sum(r["factor"] for r in valid) / len(valid)
-        return round(max(BIAS_CORRECTION_MIN, min(BIAS_CORRECTION_MAX, raw_factor)), 4)
+        return self._clamped_sum_ratio(valid)
+
+    @staticmethod
+    def _clamped_sum_ratio(records):
+        """Return sum(actual)/sum(forecast) clamped to the bias bounds.
+
+        Falls back to 1.0 if the records have zero total forecast (shouldn't
+        happen because MIN_CALIBRATION_FORECAST_KWH excludes near-zero days).
+        """
+        sum_actual   = sum(r["actual_kwh"]   for r in records)
+        sum_forecast = sum(r["forecast_kwh"] for r in records)
+        if sum_forecast <= 0:
+            return 1.0
+        raw = sum_actual / sum_forecast
+        return round(max(BIAS_CORRECTION_MIN, min(BIAS_CORRECTION_MAX, raw)), 4)
 
     # ================================================================
     # Optimiser forecast file writer
@@ -612,9 +658,9 @@ class OpenMeteoForecast:
         with UTC timestamp keys. Our internal dict uses local (BST/GMT) keys so
         this method converts them using pytz (falls back to UTC+1 if pytz absent).
 
-        Writes raw (uncorrected) hourly values — with bias_factor ~1.0 for a
-        properly-modelled 4-array system, raw and corrected are essentially equal.
-        The corrected tomorrow_kwh total is written for export viability checks.
+        Writes raw hourly values and raw daily totals (v1.2: bias factor is no
+        longer applied to outputs — see _enrich_forecast). The biasFactor field
+        is still included in the JSON for diagnostic display only.
         """
         try:
             now_utc       = datetime.now(timezone.utc)
@@ -641,9 +687,10 @@ class OpenMeteoForecast:
                     else:
                         tomorrow_kwh += kwh
 
-            # Use bias-corrected tomorrow total for export-viability check in optimiser
-            factor            = self._correction_factor
-            corrected_tmrw    = round(tomorrow_kwh * factor, 2)
+            # v1.2 (21-May-2026): bias factor no longer applied — see _enrich_forecast.
+            # tomorrow_kwh is now the raw sum of hourly slots. biasFactor still
+            # included for diagnostic display.
+            factor      = self._correction_factor
 
             # Determine cache_age_hours from cached_time
             cached_time = self._cached_time or time.time()
@@ -656,7 +703,7 @@ class OpenMeteoForecast:
                 "arrays":           [a["name"] for a in ARRAYS],
                 "bias_factor":      factor,
                 "today_kwh":        round(today_kwh, 2),
-                "tomorrow_kwh":     corrected_tmrw,
+                "tomorrow_kwh":     round(tomorrow_kwh, 2),
                 "hourly":           hourly_out,
             }
 
@@ -665,7 +712,7 @@ class OpenMeteoForecast:
 
             self.logger.debug(
                 f"[OpenMeteo] Wrote optimiser file: {len(hourly_out)} slots, "
-                f"today {today_kwh:.1f} kWh, tomorrow {corrected_tmrw:.1f} kWh"
+                f"today {today_kwh:.1f} kWh, tomorrow {tomorrow_kwh:.1f} kWh"
             )
 
         except Exception as e:

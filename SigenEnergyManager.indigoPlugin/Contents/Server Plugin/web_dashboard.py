@@ -24,333 +24,501 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
 <title>Sigenergy Monitor</title>
 <style>
+/* Sigenergy dashboard — iOS-style theme to match Dashboards plugin pages.
+   v5.20: light/dark via prefers-color-scheme, flat cards, soft shadows,
+   semantic energy colours preserved (solar amber, battery green, etc.).
+   Class/ID names unchanged so existing HTML/JS keeps working. */
+:root{
+  --bg:           #f5f5f7;
+  --card-bg:      #ffffff;
+  --card-bg-alt:  #f2f2f7;
+  --text:         #1d1d1f;
+  --text-secondary:#86868b;
+  --text-muted:   #98989d;
+  --border:       #d2d2d7;
+  --border-soft:  #e5e5ea;
+  --accent:       #5856d6;
+  --on-color:     #34c759;
+  --off-color:    #d2d2d7;
+  --bad:          #ff453a;
+  --warn:         #ff9500;
+  --shadow:       0 1px 3px rgba(0,0,0,0.08);
+  --shadow-hover: 0 6px 18px rgba(0,0,0,0.10);
+
+  /* Semantic energy colours — kept distinct from the iOS palette so the
+     flow diagram is still readable. Each has a light + dark variant. */
+  --solar:       #f5a623;
+  --bat-charge:  #34c759;
+  --bat-disch:   #af52de;
+  --grid-imp:    #ff3b30;
+  --grid-exp:    #007aff;
+  --home-load:   #af52de;
+  --info:        #007aff;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:           #000000;
+    --card-bg:      #1c1c1e;
+    --card-bg-alt:  #2c2c2e;
+    --text:         #f5f5f7;
+    --text-secondary:#98989d;
+    --text-muted:   #6e6e72;
+    --border:       #38383a;
+    --border-soft:  #2c2c2e;
+    --accent:       #7d7aff;
+    --on-color:     #30d158;
+    --off-color:    #48484a;
+    --bad:          #ff453a;
+    --warn:         #ff9f0a;
+    --shadow:       0 1px 3px rgba(0,0,0,0.3);
+    --shadow-hover: 0 6px 18px rgba(0,0,0,0.45);
+
+    --solar:       #ffb340;
+    --bat-charge:  #30d158;
+    --bat-disch:   #bf5af2;
+    --grid-imp:    #ff453a;
+    --grid-exp:    #0a84ff;
+    --home-load:   #bf5af2;
+    --info:        #0a84ff;
+  }
+}
 *{box-sizing:border-box;margin:0;padding:0}
+html,body{
+  overflow-x:hidden;       /* clip any horizontal overflow at the viewport */
+  width:100%;max-width:100vw;
+}
 body{
-  background:
-    linear-gradient(135deg,#0a0e22 0%,#0d1a34 30%,#0a1f2e 70%,#15102a 100%);
-  background-attachment:fixed;
-  color:#e2e8f0;
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',sans-serif;
   font-size:14px;
   min-height:100vh;
-  position:relative;
-  overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;
+  /* Reserve space for the fixed header (title + status, ≈ 72 px + notch). */
+  padding-top:max(80px, calc(72px + env(safe-area-inset-top)));
 }
-/* Animated radial-gradient overlay — bolder glow, much more visible */
-body::before{
-  content:'';
-  position:fixed;inset:0;
-  background:
-    radial-gradient(900px 600px at 18% 22%, rgba(125,211,252,0.28), transparent 55%),
-    radial-gradient(800px 600px at 82% 78%, rgba(167,139,250,0.22), transparent 55%),
-    radial-gradient(700px 500px at 50% 100%, rgba(52,211,153,0.18), transparent 55%);
-  animation:bg-drift 28s ease-in-out infinite alternate;
-  pointer-events:none;z-index:-1;
-}
-@keyframes bg-drift{
-  0%   { transform:translate(0,0)         scale(1);     opacity:1; }
-  50%  { transform:translate(-30px,20px)  scale(1.04);  opacity:0.95; }
-  100% { transform:translate(30px,-25px)  scale(1.06);  opacity:1; }
-}
+/* Defensive: grid/flex items can shrink below their content width on phones,
+   preventing any one card from forcing the whole page wider than the viewport. */
+.main > *, .right-panel > *, .bottom-row > * { min-width: 0; }
+svg { max-width: 100%; }
 header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:12px 16px;
-  background:rgba(15,23,36,0.55);
-  backdrop-filter:blur(14px) saturate(140%);
-  -webkit-backdrop-filter:blur(14px) saturate(140%);
-  border-bottom:1px solid rgba(125,211,252,0.10);
-  position:sticky;top:0;z-index:10;
+  display:grid;
+  grid-template-columns:1fr 2fr 1fr;
+  align-items:center;
+  gap:8px;
+  padding:10px max(16px,env(safe-area-inset-right)) 10px max(16px,env(safe-area-inset-left));
+  padding-top:max(10px,env(safe-area-inset-top));
+  background:var(--card-bg);
+  border-bottom:1px solid var(--border-soft);
+  /* Fixed (not sticky) so the header is pinned regardless of any parent
+     overflow/scrolling-context quirks — matches the Dashboards plugin pages. */
+  position:fixed;top:0;left:0;right:0;z-index:10;
+  box-shadow:var(--shadow);
+}
+.hdr-left  { justify-self:start; display:flex; align-items:center; min-width:0; }
+.hdr-right { justify-self:end;   display:flex; align-items:center; }
+.hdr-center{
+  justify-self:stretch;
+  text-align:center;
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:1px;
+  line-height:1.15;
 }
 header h1{
-  font-size:16px;font-weight:600;
-  color:#7dd3fc;letter-spacing:.3px;
-  text-shadow:0 0 14px rgba(125,211,252,0.35);
+  font-size:20px;font-weight:700;
+  margin:0;letter-spacing:-.02em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  max-width:100%;color:var(--text);
 }
-.hdr-right{text-align:right;line-height:1.6}
-.hdr-right .ts{font-size:13px;color:#cbd5e1;font-variant-numeric:tabular-nums}
-.hdr-right .ts::before{
+.hdr-center .topbar-status{
+  font-size:11px;color:var(--text-secondary);
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+  max-width:100%;
+  overflow:hidden;text-overflow:ellipsis;
+}
+.hdr-center .topbar-status .ts::before{
   content:'●';
-  display:inline-block;
-  color:#34d399;
-  margin-right:7px;
+  color:var(--on-color);
+  margin-right:4px;
   animation:live-pulse 2.4s ease-in-out infinite;
 }
 @keyframes live-pulse{
-  0%,100% { opacity:1;    text-shadow:0 0 12px rgba(52,211,153,0.85); }
-  50%     { opacity:0.45; text-shadow:0 0 4px  rgba(52,211,153,0.20); }
+  0%,100% { opacity:1; }
+  50%     { opacity:0.4; }
 }
-.hdr-right .cdwn{font-size:11px;color:#64748b;font-variant-numeric:tabular-nums}
-#alert-bar{display:none;padding:8px 16px;font-size:13px;font-weight:500;background:#7c2d12;border-bottom:1px solid #991b1b;color:#fca5a5}
-#alert-bar.warn{background:#713f12;border-color:#92400e;color:#fcd34d}
-.main{padding:12px;display:grid;gap:12px;grid-template-columns:1fr 1fr;grid-template-rows:auto}
-.card{background:#0f1724;border:1px solid #1e2d3d;border-radius:10px;padding:14px}
-.card h2{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}
-/* --- flow card (v5.19.2 polish) --- */
+.nav-btn{
+  background:var(--card-bg);
+  border:1px solid var(--border-soft);
+  color:var(--accent);
+  padding:8px 14px;
+  border-radius:10px;
+  font-size:14px;font-weight:600;
+  cursor:pointer;
+  font-family:inherit;
+  text-decoration:none;
+  display:inline-flex;align-items:center;gap:4px;
+  min-height:36px;
+  transition:transform .08s ease-out, background .15s, box-shadow .08s, border-color .15s;
+  box-shadow:0 1px 2px rgba(0,0,0,0.08);
+  user-select:none;
+  -webkit-tap-highlight-color:transparent;
+  white-space:nowrap;
+}
+.nav-btn:hover  { background:var(--card-bg-alt); border-color:var(--accent); }
+.nav-btn:active {
+  transform:translateY(2px) scale(0.96);
+  background:var(--accent); color:#fff;
+  box-shadow:0 0 0 rgba(0,0,0,0);
+}
+#alert-bar{
+  display:none;padding:10px 16px;font-size:13px;font-weight:500;
+  background:rgba(255,69,58,0.12);
+  border-bottom:1px solid rgba(255,69,58,0.30);
+  color:var(--bad);
+}
+#alert-bar.warn{
+  background:rgba(255,149,0,0.12);
+  border-color:rgba(255,149,0,0.30);
+  color:var(--warn);
+}
+.main{
+  padding:16px;display:grid;gap:12px;
+  grid-template-columns:1fr 1fr;grid-template-rows:auto;
+  max-width:1200px;margin:0 auto;
+}
+.card{
+  background:var(--card-bg);
+  border:1px solid var(--border-soft);
+  border-radius:14px;padding:16px;
+  box-shadow:var(--shadow);
+  transition:box-shadow .25s ease, transform .25s ease;
+}
+.card:hover{box-shadow:var(--shadow-hover)}
+.card h2{
+  font-size:11px;font-weight:600;
+  color:var(--text-secondary);
+  text-transform:uppercase;letter-spacing:.6px;
+  margin-bottom:12px;
+}
+/* --- flow card --- */
 .flow-card{
   grid-column:1;grid-row:1;
-  position:relative;
-  background:
-    radial-gradient(ellipse 60% 45% at 50% 18%, rgba(34,211,238,.10), transparent 70%),
-    radial-gradient(ellipse 75% 60% at 50% 110%, rgba(16,185,129,.06), transparent 75%),
-    #0f1724;
-  overflow:hidden;
-}
-.flow-card::before{
-  content:"";
-  position:absolute;left:8%;right:8%;top:18px;height:2px;
-  background:linear-gradient(90deg,transparent,rgba(94,234,212,.55),transparent);
-  filter:blur(3px);
-  pointer-events:none;
+  position:relative;overflow:hidden;
 }
 .flow-chips{
-  position:absolute;top:12px;right:14px;
+  position:absolute;top:14px;right:16px;
   display:flex;gap:6px;
-  font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;
+  font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;
   z-index:2;
 }
 .flow-chip{
-  padding:3px 9px;border-radius:999px;
-  background:rgba(15,23,36,.7);
-  border:1px solid #1e2d3d;
-  color:#94a3b8;
-  backdrop-filter:blur(4px);
+  padding:3px 10px;border-radius:999px;
+  background:var(--card-bg-alt);
+  border:1px solid var(--border-soft);
+  color:var(--text-secondary);
 }
-.flow-chip.ok    {color:#6ee7b7;border-color:rgba(110,231,183,.35)}
-.flow-chip.warn  {color:#fbbf24;border-color:rgba(251,191,36,.35)}
-.flow-chip.alert {color:#f87171;border-color:rgba(248,113,113,.4)}
+.flow-chip.ok    {color:var(--on-color);border-color:rgba(52,199,89,0.30);background:rgba(52,199,89,0.10)}
+.flow-chip.warn  {color:var(--warn);border-color:rgba(255,149,0,0.30);background:rgba(255,149,0,0.10)}
+.flow-chip.alert {color:var(--bad);border-color:rgba(255,69,58,0.30);background:rgba(255,69,58,0.10)}
 #flow-svg{width:100%;height:auto;position:relative;z-index:1}
 /* --- right panel --- */
-.right-panel{grid-column:2;grid-row:1;display:flex;flex-direction:column;gap:10px}
-.soc-wrap{display:flex;align-items:center;gap:14px}
-.soc-ring-wrap{flex-shrink:0;width:90px;height:90px}
+.right-panel{grid-column:2;grid-row:1;display:flex;flex-direction:column;gap:12px}
+.soc-wrap{display:flex;align-items:center;gap:16px}
+.soc-ring-wrap{flex-shrink:0;width:96px;height:96px}
 .soc-ring-wrap svg{width:100%;height:100%}
-.soc-info .soc-pct{font-size:28px;font-weight:700;color:#34d399}
-.soc-info .soc-label{font-size:11px;color:#64748b;margin-top:2px}
-.soc-info .bat-pw{font-size:13px;margin-top:6px}
-.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.stat-box{background:#0a1020;border:1px solid #1e2d3d;border-radius:8px;padding:10px;text-align:center}
-.stat-box .sb-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.6px}
-.stat-box .sb-val{font-size:17px;font-weight:700;margin:4px 0 2px}
-.stat-box .sb-sub{font-size:10px;color:#64748b}
+.soc-info .soc-pct{font-size:32px;font-weight:700;color:var(--on-color);line-height:1}
+.soc-info .soc-label{font-size:11px;color:var(--text-secondary);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
+.soc-info .bat-pw{font-size:13px;margin-top:8px;color:var(--text)}
+/* Battery tile direction colours — match the Grid tile palette:
+   charging = export-blue, discharging = import-red. */
+.soc-info .bat-pw.charging    { color: var(--grid-exp); }
+.soc-info .bat-pw.discharging { color: var(--grid-imp); }
+.soc-info .bat-pw.idle        { color: var(--text-muted); }
+.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.stat-box{
+  background:var(--card-bg-alt);
+  border-radius:10px;padding:12px 10px;text-align:center;
+}
+.stat-box .sb-label{font-size:10px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.6px}
+.stat-box .sb-val{font-size:18px;font-weight:700;margin:6px 0 2px;color:var(--text)}
+.stat-box .sb-sub{font-size:10px;color:var(--text-muted)}
 /* --- forecast --- */
 .forecast-card{grid-column:1 / -1}
-.fc-meta{display:flex;gap:20px;margin-bottom:8px;font-size:12px;color:#94a3b8}
-.fc-meta strong{color:#e2e8f0}
+.fc-meta{display:flex;gap:24px;margin-bottom:10px;font-size:12px;color:var(--text-secondary);flex-wrap:wrap}
+.fc-meta strong{color:var(--text)}
 #fc-svg{width:100%;height:auto}
 /* --- bottom row --- */
-.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.dl{display:flex;flex-direction:column;gap:6px}
+.bottom-row{grid-column:1 / -1;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.dl{display:flex;flex-direction:column;gap:8px}
 .dl-item{display:flex;justify-content:space-between;align-items:baseline;font-size:13px}
-.dl-item .dk{color:#94a3b8}
-.dl-item .dv{font-weight:600}
-.action-badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;margin-bottom:8px;text-transform:capitalize}
-.action-self{background:#14291b;color:#4ade80;border:1px solid #166534}
-.action-overflow{background:#1c2a05;color:#a3e635;border:1px solid #4d7c0f}
-.action-export{background:#12282e;color:#22d3ee;border:1px solid #0e7490}
-.action-import{background:#2c1515;color:#f87171;border:1px solid #991b1b}
-.action-schedule{background:#1e1a08;color:#fbbf24;border:1px solid #92400e}
-.action-unknown{background:#1f2937;color:#9ca3af;border:1px solid #374151}
-.reason{font-size:11px;color:#64748b;line-height:1.5;margin-top:4px;word-break:break-word}
-.dawn-ok{color:#34d399}
-.dawn-warn{color:#f87171}
-.tariff-rate{font-size:24px;font-weight:700;color:#fbbf24}
-.tariff-sub{font-size:11px;color:#64748b;margin-top:2px}
-.tariff-tmrw{margin-top:8px;font-size:13px;color:#94a3b8}
-.tariff-tmrw span{color:#e2e8f0;font-weight:600}
-.self-suff-bar{height:6px;background:#1e2d3d;border-radius:3px;margin-top:4px;overflow:hidden}
-.self-suff-fill{height:100%;background:#34d399;border-radius:3px;transition:width .4s}
-/* --- colors --- */
-.solar{color:#fbbf24}
-.bat-charge{color:#34d399}
-.bat-discharge{color:#a78bfa}
-.grid-import{color:#f87171}
-.grid-export{color:#22d3ee}
-.home-load{color:#a78bfa}
-.muted{color:#64748b}
-/* --- SVG flow animations --- */
-@keyframes flow-fwd{to{stroke-dashoffset:-12}}
-@keyframes flow-rev{to{stroke-dashoffset:12}}
-.flow-fwd{animation:flow-fwd .7s linear infinite}
-.flow-rev{animation:flow-rev .7s linear infinite}
-/* --- economics card (v5.3) --- */
-.eco-rate{font-size:20px;font-weight:700;color:#34d399}
-.eco-rate.eco-neg{color:#f87171}
-.eco-sub{font-size:11px;color:#64748b;margin-top:2px}
-.eco-divider{height:1px;background:#1e2d3d;margin:8px 0}
-/* --- period totals table (v5.5) --- */
+.dl-item .dk{color:var(--text-secondary)}
+.dl-item .dv{font-weight:600;color:var(--text)}
+.action-badge{
+  display:inline-block;padding:4px 12px;border-radius:999px;
+  font-size:11px;font-weight:600;margin-bottom:10px;text-transform:capitalize;
+}
+.action-self     {background:rgba(52,199,89,0.15);color:var(--on-color);border:1px solid rgba(52,199,89,0.30)}
+.action-overflow {background:rgba(163,230,53,0.18);color:#7fad14;border:1px solid rgba(163,230,53,0.40)}
+.action-export   {background:rgba(0,122,255,0.15);color:var(--grid-exp);border:1px solid rgba(0,122,255,0.30)}
+.action-import   {background:rgba(255,69,58,0.15);color:var(--bad);border:1px solid rgba(255,69,58,0.30)}
+.action-schedule {background:rgba(255,149,0,0.15);color:var(--warn);border:1px solid rgba(255,149,0,0.30)}
+.action-unknown  {background:var(--card-bg-alt);color:var(--text-secondary);border:1px solid var(--border-soft)}
+@media (prefers-color-scheme: dark){
+  .action-overflow{color:#a3e635}
+}
+.reason{font-size:11px;color:var(--text-secondary);line-height:1.5;margin-top:6px;word-break:break-word}
+.dawn-ok{color:var(--on-color)}
+.dawn-warn{color:var(--bad)}
+.tariff-rate{font-size:26px;font-weight:700;color:var(--warn)}
+.tariff-sub{font-size:11px;color:var(--text-secondary);margin-top:2px}
+.tariff-tmrw{margin-top:10px;font-size:13px;color:var(--text-secondary)}
+.tariff-tmrw span{color:var(--text);font-weight:600}
+.self-suff-bar{height:8px;background:var(--off-color);border-radius:4px;margin-top:6px;overflow:hidden}
+.self-suff-fill{height:100%;background:var(--on-color);border-radius:4px;transition:width .4s}
+/* --- semantic colours used by JS (energy flow / charts) --- */
+.solar         {color:var(--solar)}
+.bat-charge    {color:var(--bat-charge)}
+.bat-discharge {color:var(--bat-disch)}
+.grid-import   {color:var(--grid-imp)}
+.grid-export   {color:var(--grid-exp)}
+.home-load     {color:var(--home-load)}
+.muted         {color:var(--text-muted)}
+/* --- SVG flow direction arrows ---
+   Two sets of 3 chevrons per line. Default both sets are hidden; the active
+   set is revealed by the .flow-fwd / .flow-rev class set on the parent <g>
+   by JS. Animation duration 1.2s, staggered by .4s per arrow so the 3 form
+   a continuous stream. Travel range ±26px covers the visible part of each
+   ~50px line and the fade-in/out hides the over-travel at the ends. */
+.flow-arrows { transition: opacity .25s; }
+.flow-arrows .fa-fwd,
+.flow-arrows .fa-rev { display: none; }
+.flow-arrows.flow-fwd .fa-fwd { display: inline; }
+.flow-arrows.flow-rev .fa-rev { display: inline; }
+.fa-arrow {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation-iteration-count: infinite;
+  animation-timing-function: linear;
+  animation-duration: 1.2s;
+}
+.fa-arrow.s2 { animation-delay: -0.4s; }
+.fa-arrow.s3 { animation-delay: -0.8s; }
+
+@keyframes fa-y-fwd {
+  0%   { transform: translateY(-26px); opacity: 0; }
+  18%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { transform: translateY(26px);  opacity: 0; }
+}
+@keyframes fa-y-rev {
+  0%   { transform: translateY(26px);  opacity: 0; }
+  18%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { transform: translateY(-26px); opacity: 0; }
+}
+@keyframes fa-x-fwd {
+  0%   { transform: translateX(-26px); opacity: 0; }
+  18%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { transform: translateX(26px);  opacity: 0; }
+}
+@keyframes fa-x-rev {
+  0%   { transform: translateX(26px);  opacity: 0; }
+  18%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { transform: translateX(-26px); opacity: 0; }
+}
+
+/* Vertical lines (solar, grid) use the Y-axis keyframes */
+#fl-solar.flow-fwd .fa-fwd .fa-arrow,
+#fl-grid.flow-fwd  .fa-fwd .fa-arrow { animation-name: fa-y-fwd; }
+#fl-solar.flow-rev .fa-rev .fa-arrow,
+#fl-grid.flow-rev  .fa-rev .fa-arrow { animation-name: fa-y-rev; }
+
+/* Horizontal lines (battery, home) use the X-axis keyframes */
+#fl-bat.flow-fwd  .fa-fwd .fa-arrow,
+#fl-home.flow-fwd .fa-fwd .fa-arrow { animation-name: fa-x-fwd; }
+#fl-bat.flow-rev  .fa-rev .fa-arrow,
+#fl-home.flow-rev .fa-rev .fa-arrow { animation-name: fa-x-rev; }
+/* --- economics card --- */
+.eco-rate{font-size:22px;font-weight:700;color:var(--on-color);font-variant-numeric:tabular-nums}
+.eco-rate.eco-neg{color:var(--bad)}
+.eco-sub{font-size:11px;color:var(--text-secondary);margin-top:2px}
+.eco-divider{height:1px;background:var(--border-soft);margin:10px 0}
+/* --- period totals table --- */
 .period-card{grid-column:1 / -1}
 .period-table{width:100%;border-collapse:collapse;font-size:12px}
-.period-table th{text-align:right;color:#64748b;font-weight:500;padding:6px 8px;border-bottom:1px solid #1e2d3d;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.period-table th{
+  text-align:right;color:var(--text-secondary);font-weight:600;
+  padding:8px;border-bottom:1px solid var(--border-soft);
+  font-size:11px;text-transform:uppercase;letter-spacing:.4px;
+}
 .period-table th:first-child{text-align:left}
-.period-table td{text-align:right;padding:8px;border-bottom:1px solid #0f1724;color:#e2e8f0}
-.period-table td:first-child{text-align:left;color:#cbd5e1;font-weight:600}
-.period-table td.tdays{color:#64748b;font-size:11px}
+.period-table td{
+  text-align:right;padding:10px 8px;
+  border-bottom:1px solid var(--border-soft);color:var(--text);
+}
+.period-table td:first-child{text-align:left;color:var(--text);font-weight:600}
+.period-table td.tdays{color:var(--text-secondary);font-size:11px}
 .period-table tr:last-child td{border-bottom:none}
-.period-pos{color:#34d399}
-.period-neg{color:#f87171}
-.period-table .avg{color:#94a3b8;font-size:11px;display:block}
-/* --- charts (v5.2) --- */
+.period-pos{color:var(--on-color)}
+.period-neg{color:var(--bad)}
+.period-table .avg{color:var(--text-muted);font-size:11px;display:block}
+/* --- charts --- */
 .chart-card{grid-column:1 / -1}
-.chart-tabs{display:flex;gap:6px;margin-bottom:10px}
-.chart-tab{background:#0a1020;color:#94a3b8;border:1px solid #1e2d3d;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit}
-.chart-tab.active{background:#14291b;color:#34d399;border-color:#166534}
-.chart-wrap{position:relative;height:200px;margin-bottom:14px}
+.chart-tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.chart-tab{
+  background:var(--card-bg-alt);color:var(--text-secondary);
+  border:1px solid var(--border-soft);border-radius:8px;
+  padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit;
+  min-height:32px;
+  transition:background .15s, color .15s, border-color .15s;
+}
+.chart-tab:hover{color:var(--text)}
+.chart-tab.active{
+  background:var(--accent);color:#fff;border-color:var(--accent);
+}
+.chart-wrap{position:relative;height:220px;margin-bottom:16px}
 .chart-wrap:last-child{margin-bottom:0}
-/* --- v5.8 glamour pass: glass cards, glow numbers, hover, pulses --- */
-.card{
-  background:rgba(15,23,36,0.42) !important;
-  backdrop-filter:blur(18px) saturate(160%);
-  -webkit-backdrop-filter:blur(18px) saturate(160%);
-  border:1px solid rgba(125,211,252,0.18) !important;
-  border-radius:14px !important;
-  box-shadow:
-    0 8px 32px rgba(0,0,0,0.30),
-    inset 0 0 0 1px rgba(255,255,255,0.04);
-  transition:transform .25s ease, box-shadow .25s ease, border-color .25s ease;
-}
-.card:hover{
-  transform:translateY(-3px);
-  border-color:rgba(125,211,252,0.40) !important;
-  box-shadow:
-    0 18px 42px rgba(0,0,0,0.36),
-    0 0 36px rgba(125,211,252,0.12),
-    inset 0 0 0 1px rgba(255,255,255,0.06);
-}
-.card h2{
-  font-size:11px !important;
-  color:#94a3b8 !important;
-  text-transform:uppercase;letter-spacing:.9px;
-}
-/* Headline number glows */
-.soc-info .soc-pct{
-  text-shadow:0 0 26px rgba(52,211,153,0.50), 0 0 12px rgba(52,211,153,0.30);
-}
-.eco-rate{
-  text-shadow:0 0 24px rgba(52,211,153,0.45), 0 0 10px rgba(52,211,153,0.25);
-  transition:text-shadow .35s ease, color .25s ease;
-}
-.eco-rate.eco-neg{
-  text-shadow:0 0 24px rgba(248,113,113,0.45), 0 0 10px rgba(248,113,113,0.25);
-}
-.tariff-rate{
-  text-shadow:0 0 20px rgba(251,191,36,0.40), 0 0 10px rgba(251,191,36,0.20);
-}
-.stat-box .sb-val{
-  font-variant-numeric:tabular-nums;
-  text-shadow:0 0 12px rgba(125,211,252,0.18);
-}
-/* Action badge — slightly stronger */
-.action-badge{box-shadow:0 0 18px rgba(0,0,0,0.30) inset, 0 0 12px currentColor}
-.action-badge.action-self{box-shadow:0 0 14px rgba(52,211,153,0.20)}
-.action-badge.action-overflow{box-shadow:0 0 14px rgba(163,230,53,0.20)}
-.action-badge.action-export{box-shadow:0 0 14px rgba(34,211,238,0.22)}
-.action-badge.action-import{box-shadow:0 0 14px rgba(248,113,113,0.22)}
-/* Tabular numbers everywhere — stops digit jitter on ticking values */
+/* Tabular numbers everywhere — stops digit jitter */
 .soc-pct, .eco-rate, .tariff-rate, .sb-val, .dl-item .dv,
 .period-table td{ font-variant-numeric:tabular-nums; }
-/* Subtle fade-in for cards on load */
-.card{ animation:card-in .55s cubic-bezier(.18,.78,.30,1.05) both; }
-.card:nth-child(2){ animation-delay:.05s; }
-.card:nth-child(3){ animation-delay:.10s; }
-.card:nth-child(4){ animation-delay:.15s; }
-.card:nth-child(5){ animation-delay:.20s; }
+/* Subtle fade-in on load */
+.card{ animation:card-in .35s ease-out both }
+.card:nth-child(2){ animation-delay:.04s }
+.card:nth-child(3){ animation-delay:.08s }
+.card:nth-child(4){ animation-delay:.12s }
+.card:nth-child(5){ animation-delay:.16s }
 @keyframes card-in{
-  from{ opacity:0; transform:translateY(8px); }
-  to  { opacity:1; transform:translateY(0); }
+  from{ opacity:0; transform:translateY(6px) }
+  to  { opacity:1; transform:translateY(0) }
 }
-/* Skeleton shimmer for empty/unloaded cells */
+/* Skeleton shimmer */
 .skel{
   display:inline-block;
-  background:linear-gradient(90deg,#1e2d3d 0%, #2a3d50 50%, #1e2d3d 100%);
+  background:linear-gradient(90deg,var(--border-soft) 0%, var(--card-bg-alt) 50%, var(--border-soft) 100%);
   background-size:200% 100%;
   animation:skel-shim 1.4s linear infinite;
   border-radius:4px;color:transparent;
   min-width:3em;
 }
 @keyframes skel-shim{
-  0%   { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+  0%   { background-position: 200% 0 }
+  100% { background-position: -200% 0 }
 }
-/* SOC ring — animate stroke transition + subtle glow filter */
+/* SOC ring — smooth transition, no glow */
 #soc-ring{
   transition:stroke-dashoffset .8s cubic-bezier(.2,.7,.3,1), stroke .4s ease;
-  filter:drop-shadow(0 0 6px rgba(52,211,153,0.55));
 }
-/* Forecast bar tooltip (v5.10) — floating panel on hover */
+/* Forecast bar tooltip */
 .fc-tip{
   position:fixed;pointer-events:none;z-index:50;
-  background:rgba(15,23,36,0.92);
-  backdrop-filter:blur(8px) saturate(160%);
-  -webkit-backdrop-filter:blur(8px) saturate(160%);
-  border:1px solid rgba(125,211,252,0.30);
-  border-radius:8px;padding:6px 10px;
-  box-shadow:0 8px 24px rgba(0,0,0,0.40);
+  background:var(--card-bg);
+  border:1px solid var(--border);
+  border-radius:10px;padding:8px 12px;
+  box-shadow:0 8px 24px rgba(0,0,0,0.15);
   opacity:0;transform:translateY(4px);
   transition:opacity .15s ease, transform .15s ease;
   font-size:11px;line-height:1.3;
   min-width:90px;
 }
+@media (prefers-color-scheme: dark){
+  .fc-tip{box-shadow:0 8px 24px rgba(0,0,0,0.5)}
+}
 .fc-tip.fc-tip-show{opacity:1;transform:translateY(0)}
-.fc-tip .fc-tip-time{color:#94a3b8;font-size:10px;letter-spacing:.4px}
-.fc-tip .fc-tip-kwh{color:#fbbf24;font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;text-shadow:0 0 10px rgba(251,191,36,0.35)}
-.fc-tip .fc-tip-unit{color:#64748b;font-size:10px;font-weight:500;margin-left:1px}
+.fc-tip .fc-tip-time{color:var(--text-secondary);font-size:10px;letter-spacing:.4px}
+.fc-tip .fc-tip-kwh{
+  color:var(--warn);font-size:14px;font-weight:700;
+  font-variant-numeric:tabular-nums;
+}
+.fc-tip .fc-tip-unit{color:var(--text-muted);font-size:10px;font-weight:500;margin-left:1px}
 .fc-bar{cursor:pointer}
 .fc-bar rect:first-child{transition:opacity .12s ease}
-/* Help tooltip on forecast-meta labels (v5.12) — explains what each number means */
+/* Help tooltip on forecast-meta labels */
 .fc-meta-item{
-  cursor:help;
-  position:relative;
-  border-bottom:1px dotted rgba(125,211,252,0.30);
+  cursor:help;position:relative;
+  border-bottom:1px dotted var(--border);
   padding-bottom:1px;
-  transition:color .15s ease, border-color .15s ease;
+  transition:color .15s, border-color .15s;
 }
-.fc-meta-item:hover{
-  color:#cbd5e1;
-  border-bottom-color:rgba(125,211,252,0.60);
-}
+.fc-meta-item:hover{color:var(--text);border-bottom-color:var(--accent)}
 .help-tip{
   position:fixed;pointer-events:none;z-index:60;
   max-width:300px;
-  background:rgba(15,23,36,0.95);
-  backdrop-filter:blur(10px) saturate(160%);
-  -webkit-backdrop-filter:blur(10px) saturate(160%);
-  border:1px solid rgba(125,211,252,0.35);
-  border-radius:10px;padding:10px 12px;
-  box-shadow:0 12px 32px rgba(0,0,0,0.45);
+  background:var(--card-bg);
+  border:1px solid var(--border);
+  border-radius:10px;padding:10px 14px;
+  box-shadow:0 12px 32px rgba(0,0,0,0.15);
   opacity:0;transform:translateY(4px);
   transition:opacity .18s ease, transform .18s ease;
-  font-size:12px;line-height:1.45;color:#cbd5e1;
+  font-size:12px;line-height:1.45;color:var(--text);
+}
+@media (prefers-color-scheme: dark){
+  .help-tip{box-shadow:0 12px 32px rgba(0,0,0,0.5)}
 }
 .help-tip.help-tip-show{opacity:1;transform:translateY(0)}
 .help-tip .help-tip-title{
-  color:#7dd3fc;font-weight:600;font-size:11px;
+  color:var(--accent);font-weight:600;font-size:11px;
   letter-spacing:.4px;text-transform:uppercase;
   margin-bottom:6px;
-  text-shadow:0 0 10px rgba(125,211,252,0.30);
 }
 /* Sparkline (SOC card) — 24h trend */
 .spark-wrap{margin-top:12px;height:36px;position:relative}
 .spark-wrap svg{width:100%;height:100%;display:block}
-.spark-wrap path.spark-fill{fill:url(#spark-grad)}
-.spark-wrap path.spark-line{fill:none;stroke:#34d399;stroke-width:1.5;filter:drop-shadow(0 0 4px rgba(52,211,153,0.6))}
-.spark-cap{font-size:10px;color:#64748b;margin-top:4px;text-align:right;letter-spacing:.4px;font-variant-numeric:tabular-nums}
+.spark-wrap path.spark-fill{fill:url(#spark-grad);opacity:0.25}
+.spark-wrap path.spark-line{fill:none;stroke:var(--on-color);stroke-width:1.5}
+.spark-cap{font-size:10px;color:var(--text-secondary);margin-top:4px;text-align:right;letter-spacing:.4px;font-variant-numeric:tabular-nums}
 /* --- responsive --- */
+/* Tablet + narrow desktop: single-column layout.
+   IMPORTANT: also reset grid-row to auto, otherwise the desktop CSS's
+   `grid-row:1` on .flow-card + .right-panel keeps both in row 1 and they
+   render ON TOP OF EACH OTHER. Re-flowing into auto rows fixes the overlap. */
 @media(max-width:680px){
-  .main{grid-template-columns:1fr}
-  .flow-card,.right-panel,.forecast-card{grid-column:1}
+  .main{grid-template-columns:1fr;padding:12px}
+  .flow-card,.right-panel,.forecast-card{grid-column:1;grid-row:auto}
   .bottom-row{grid-template-columns:1fr}
+}
+/* Phones (iPhone Pro Max and smaller): compact header, smaller fonts,
+   tighter padding, header wraps to two rows if needed. */
+@media(max-width:480px){
+  header{padding:8px 12px;padding-top:max(8px,env(safe-area-inset-top))}
+  header h1{font-size:15px;letter-spacing:-.02em}
+  .hdr-right{font-size:11px;gap:4px;width:100%;justify-content:flex-start}
+  .hdr-right .ts::before{margin-right:3px}
+  .back-link{padding:4px 8px;font-size:13px;min-height:30px}
+  .main{padding:8px;gap:8px}
+  .card{padding:12px}
+  .card h2{font-size:10px;margin-bottom:8px}
+  .soc-info .soc-pct{font-size:28px}
+  .stat-box .sb-val{font-size:16px}
+  .tariff-rate{font-size:22px}
+  .eco-rate{font-size:20px}
+  /* SVG flow diagram already scales to 100% width via height:auto */
 }
 </style>
 </head>
 <body>
 <header>
-  <h1>&#9889; Sigenergy Battery Monitor</h1>
+  <div class="hdr-left">
+    <a class="nav-btn" href="http://192.168.100.160:8176/public/dashboards/index.html">&larr; Back</a>
+  </div>
+  <div class="hdr-center">
+    <h1>&#9889; Sigenergy Monitor</h1>
+    <span class="topbar-status"><span class="ts">Updated <span id="ts">&#8212;</span></span> &middot; Next refresh <span id="cdwn">30</span>s</span>
+  </div>
   <div class="hdr-right">
-    <div class="ts">Updated: <span id="ts">&#8212;</span></div>
-    <div class="cdwn">Next refresh in <span id="cdwn">30</span>s</div>
+    <button class="nav-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="Back to top">&uarr; Top</button>
   </div>
 </header>
 
@@ -370,35 +538,91 @@ header h1{
         <filter id="glow"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
       </defs>
       <!-- track lines (always visible, dim) -->
-      <line x1="260" y1="62" x2="260" y2="112" stroke="#1e2d3d" stroke-width="6" stroke-linecap="round"/>
-      <line x1="160" y1="148" x2="207" y2="148" stroke="#1e2d3d" stroke-width="6" stroke-linecap="round"/>
-      <line x1="313" y1="148" x2="360" y2="148" stroke="#1e2d3d" stroke-width="6" stroke-linecap="round"/>
-      <line x1="260" y1="184" x2="260" y2="228" stroke="#1e2d3d" stroke-width="6" stroke-linecap="round"/>
-      <!-- animated flow lines -->
-      <line id="fl-solar" x1="260" y1="62" x2="260" y2="112" stroke="#fbbf24" stroke-width="4" stroke-linecap="round" stroke-dasharray="8 4" stroke-dashoffset="0" opacity="0"/>
-      <line id="fl-bat"   x1="160" y1="148" x2="207" y2="148" stroke="#34d399" stroke-width="4" stroke-linecap="round" stroke-dasharray="8 4" stroke-dashoffset="0" opacity="0"/>
-      <line id="fl-home"  x1="313" y1="148" x2="360" y2="148" stroke="#a78bfa" stroke-width="4" stroke-linecap="round" stroke-dasharray="8 4" stroke-dashoffset="0" opacity="0"/>
-      <line id="fl-grid"  x1="260" y1="184" x2="260" y2="228" stroke="#22d3ee" stroke-width="4" stroke-linecap="round" stroke-dasharray="8 4" stroke-dashoffset="0" opacity="0"/>
+      <line x1="260" y1="62" x2="260" y2="112" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+      <line x1="160" y1="148" x2="207" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+      <line x1="313" y1="148" x2="360" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+      <line x1="260" y1="184" x2="260" y2="228" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+      <!-- Animated direction arrows. Each line carries 3 chevrons that flow
+           along it. Two arrow groups per line (fa-fwd / fa-rev); CSS hides
+           one and animates the other based on .flow-fwd / .flow-rev class.
+           Colour for fl-bat / fl-grid is driven by the parent's `color` style
+           (set by JS), so arrows take their tint from currentColor. -->
+
+      <!-- Solar: vertical line, fwd = downward (always when generating) -->
+      <g id="fl-solar" class="flow-arrows" opacity="0" style="color:#f5a623">
+        <g class="fa-fwd">
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s1" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s2" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s3" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+        </g>
+        <g class="fa-rev">
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s1" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s2" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+          <g transform="translate(260, 87)"><polygon class="fa-arrow s3" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+        </g>
+      </g>
+
+      <!-- Battery: horizontal line. fwd = right (discharging into home). -->
+      <g id="fl-bat" class="flow-arrows" opacity="0" style="color:#34c759">
+        <g class="fa-fwd">
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s1" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s2" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s3" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+        </g>
+        <g class="fa-rev">
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s1" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s2" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+          <g transform="translate(183, 148)"><polygon class="fa-arrow s3" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+        </g>
+      </g>
+
+      <!-- Home: horizontal line, fwd = right (inverter → home). -->
+      <g id="fl-home" class="flow-arrows" opacity="0" style="color:#af52de">
+        <g class="fa-fwd">
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s1" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s2" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s3" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
+        </g>
+        <g class="fa-rev">
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s1" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s2" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+          <g transform="translate(336, 148)"><polygon class="fa-arrow s3" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
+        </g>
+      </g>
+
+      <!-- Grid: vertical line, fwd = down (exporting). rev = up (importing). -->
+      <g id="fl-grid" class="flow-arrows" opacity="0" style="color:#007aff">
+        <g class="fa-fwd">
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s1" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s2" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s3" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+        </g>
+        <g class="fa-rev">
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s1" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s2" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+          <g transform="translate(260, 206)"><polygon class="fa-arrow s3" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+        </g>
+      </g>
       <!-- hub circle -->
-      <circle cx="260" cy="148" r="18" fill="#0f1724" stroke="#334155" stroke-width="2"/>
-      <text x="260" y="152" text-anchor="middle" fill="#475569" font-size="9" font-weight="600">INV</text>
+      <circle cx="260" cy="148" r="18" fill="rgba(255,255,255,0.0)" stroke="rgba(134,134,139,0.55)" stroke-width="2"/>
+      <text x="260" y="152" text-anchor="middle" fill="#86868b" font-size="9" font-weight="600">INV</text>
       <!-- Solar node -->
-      <rect x="190" y="8" width="140" height="54" rx="8" fill="#0f1724" stroke="#92400e" stroke-width="1.5"/>
-      <text x="260" y="28" text-anchor="middle" fill="#fbbf24" font-size="12">&#9728; Solar</text>
-      <text id="n-pv" x="260" y="50" text-anchor="middle" fill="#fde68a" font-size="16" font-weight="700">0 W</text>
-      <!-- Battery node -->
-      <rect x="8" y="108" width="150" height="80" rx="8" fill="#0f1724" stroke="#065f46" stroke-width="1.5"/>
-      <text x="83" y="128" text-anchor="middle" fill="#34d399" font-size="12">&#128267; Battery</text>
-      <text id="n-soc" x="83" y="153" text-anchor="middle" fill="#6ee7b7" font-size="20" font-weight="700">0%</text>
-      <text id="n-bat" x="83" y="174" text-anchor="middle" fill="#94a3b8" font-size="11">0 W</text>
+      <rect x="190" y="8" width="140" height="54" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(245,166,35,0.45)" stroke-width="1.5"/>
+      <text x="260" y="28" text-anchor="middle" fill="#f5a623" font-size="12">&#9728; Solar</text>
+      <text id="n-pv" x="260" y="50" text-anchor="middle" fill="#f5a623" font-size="16" font-weight="700">0 W</text>
+      <!-- Battery node — colour-tinted as a unit (border + label + SoC% + power) -->
+      <rect id="bat-rect" x="8" y="108" width="150" height="80" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(52,199,89,0.45)" stroke-width="1.5"/>
+      <text id="bat-label" x="83" y="128" text-anchor="middle" fill="#34c759" font-size="12">&#128267; Battery</text>
+      <text id="n-soc" x="83" y="153" text-anchor="middle" fill="#34c759" font-size="20" font-weight="700">0%</text>
+      <text id="n-bat" x="83" y="174" text-anchor="middle" fill="#86868b" font-size="11">0 W</text>
       <!-- Home node -->
-      <rect x="362" y="108" width="150" height="80" rx="8" fill="#0f1724" stroke="#3730a3" stroke-width="1.5"/>
-      <text x="437" y="128" text-anchor="middle" fill="#a78bfa" font-size="12">&#127968; Home</text>
-      <text id="n-home" x="437" y="160" text-anchor="middle" fill="#c4b5fd" font-size="20" font-weight="700">0 W</text>
+      <rect x="362" y="108" width="150" height="80" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(175,82,222,0.45)" stroke-width="1.5"/>
+      <text x="437" y="128" text-anchor="middle" fill="#af52de" font-size="12">&#127968; Home</text>
+      <text id="n-home" x="437" y="160" text-anchor="middle" fill="#af52de" font-size="20" font-weight="700">0 W</text>
       <!-- Grid node -->
-      <rect x="190" y="230" width="140" height="57" rx="8" fill="#0f1724" stroke="#155e75" stroke-width="1.5"/>
-      <text x="260" y="250" text-anchor="middle" fill="#22d3ee" font-size="12">&#9889; Grid</text>
-      <text id="n-grid" x="260" y="275" text-anchor="middle" fill="#67e8f9" font-size="14" font-weight="700">0 W</text>
+      <rect x="190" y="230" width="140" height="57" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(0,122,255,0.45)" stroke-width="1.5"/>
+      <text x="260" y="250" text-anchor="middle" fill="#007aff" font-size="12">&#9889; Grid</text>
+      <text id="n-grid" x="260" y="275" text-anchor="middle" fill="#007aff" font-size="11">0 W</text>
     </svg>
   </section>
 
@@ -409,8 +633,8 @@ header h1{
       <div class="soc-wrap">
         <div class="soc-ring-wrap">
           <svg viewBox="0 0 100 100">
-            <circle cx="50" cy="50" r="42" fill="none" stroke="#1e2d3d" stroke-width="10"/>
-            <circle id="soc-ring" cx="50" cy="50" r="42" fill="none" stroke="#34d399" stroke-width="10"
+            <circle cx="50" cy="50" r="42" fill="none" stroke="rgba(128,128,128,0.20)" stroke-width="10"/>
+            <circle id="soc-ring" cx="50" cy="50" r="42" fill="none" stroke="#34c759" stroke-width="10"
               stroke-dasharray="263.9" stroke-dashoffset="263.9"
               stroke-linecap="round" transform="rotate(-90 50 50)"/>
           </svg>
@@ -606,7 +830,7 @@ header h1{
         <tr><td colspan="7" class="muted">&#8212;</td></tr>
       </tbody>
       <tfoot>
-        <tr id="cal-total-row" style="border-top:2px solid #1e2d3d;font-weight:600">
+        <tr id="cal-total-row" style="border-top:2px solid rgba(128,128,128,0.20);font-weight:600">
           <td>Year total</td>
           <td class="tdays" id="cal-total-days">&#8212;</td>
           <td id="cal-total-benefit">&#8212;</td>
@@ -735,7 +959,7 @@ function renderForecast(hourly) {
     const y   = chartH - bh;
     const past   = hr < curHr;
     const curr   = hr === curHr;
-    const col    = curr ? '#fbbf24' : '#34d399';
+    const col    = curr ? '#f5a623' : '#34c759';
     const opac   = past ? '0.32' : '1';
     out +=
       `<g class="fc-bar" data-hr="${hr}" data-kwh="${kwh.toFixed(2)}" data-curr="${curr ? '1':'0'}">`
@@ -744,11 +968,11 @@ function renderForecast(hourly) {
       + `<title>${hr.toString().padStart(2,'0')}:00 — ${kwh.toFixed(2)} kWh</title>`
       + `</g>`;
     if (hr % 2 === 0) {
-      out += `<text x="${x+bw/2}" y="${labelY}" text-anchor="middle" fill="#64748b" font-size="9">${hr}</text>`;
+      out += `<text x="${x+bw/2}" y="${labelY}" text-anchor="middle" fill="#86868b" font-size="9">${hr}</text>`;
     }
   });
   // x-axis line
-  out += `<line x1="6" y1="${chartH}" x2="750" y2="${chartH}" stroke="#1e2d3d" stroke-width="1"/>`;
+  out += `<line x1="6" y1="${chartH}" x2="750" y2="${chartH}" stroke="rgba(128,128,128,0.20)" stroke-width="1"/>`;
   svg.innerHTML = out;
   _wireForecastTooltip();
 }
@@ -874,15 +1098,18 @@ function update(d) {
   const offset = circ - (soc/100)*circ;
   const ring = document.getElementById('soc-ring');
   ring.style.strokeDashoffset = offset;
-  ring.style.stroke = soc >= 60 ? '#34d399' : soc >= 30 ? '#fbbf24' : '#f87171';
+  ring.style.stroke = soc >= 60 ? '#34c759' : soc >= 30 ? '#f5a623' : '#ff3b30';
   tweenNumber(document.getElementById('soc-pct'), soc, {decimals:1, suffix:'%', duration:700});
   document.getElementById('soc-pct').style.color  = ring.style.stroke;
   const batW = d.battery ? d.battery.power_w : 0;
   const batDir = batW > 30 ? 'Charging ' : batW < -30 ? 'Discharging ' : 'Idle';
-  const batCol = batW > 30 ? '#34d399' : batW < -30 ? '#a78bfa' : '#64748b';
+  const batCls = batW > 30 ? 'charging'  : batW < -30 ? 'discharging' : 'idle';
   const pwEl = document.getElementById('soc-pw');
   pwEl.textContent = batDir + (Math.abs(batW) > 30 ? fmtW(batW) : '');
-  pwEl.style.color = batCol;
+  // Use CSS classes so dark mode and theming follow the Grid tile colours.
+  pwEl.classList.remove('charging', 'discharging', 'idle');
+  pwEl.classList.add(batCls);
+  pwEl.style.color = '';   // clear any previously inlined colour
 
   // Flow SVG nodes
   const pvW   = d.solar ? d.solar.power_w : 0;
@@ -891,13 +1118,16 @@ function update(d) {
   // Live Power Flow card: kW with 2 decimals + state labels (v5.19.2 polish)
   document.getElementById('n-pv').textContent   = fmtKw(pvW);
   document.getElementById('n-soc').textContent  = soc.toFixed(1) + '%';
-  // Battery: 'Charging' / 'Discharging' / 'Idle' next to the power figure
+  // Battery: 'Charging' / 'Discharging' / 'Idle' next to the power figure.
+  // Colour follows the Grid tile palette: charging = blue, discharging = red.
   let batState = 'Idle';
   if (batW >  30) batState = 'Charging';
   if (batW < -30) batState = 'Discharging';
   const batAbs = Math.abs(batW);
-  document.getElementById('n-bat').textContent =
+  const nBat = document.getElementById('n-bat');
+  nBat.textContent =
     batState === 'Idle' ? 'Idle' : (fmtKw(batAbs) + ' \u00b7 ' + batState);
+  // n-bat fill is set below by the batBoxCol logic (alongside rect, label, SoC%).
   document.getElementById('n-home').textContent = fmtKw(homeW);
   // Grid: '0.94 kW \u00b7 Exporting' (Sigenergy app-style ordering)
   let gridLabel;
@@ -939,8 +1169,27 @@ function update(d) {
     chipMode.textContent = modeLabel;
     chipMode.className   = 'flow-chip ' + modeClass;
   }
-  const gridLineCol = gridW < -30 ? '#22d3ee' : gridW > 30 ? '#f87171' : '#22d3ee';
-  document.getElementById('fl-grid').style.stroke = gridLineCol;
+  // Resolve the iOS palette colours from CSS variables so dark mode follows.
+  const _r       = getComputedStyle(document.documentElement);
+  const _blue    = _r.getPropertyValue('--grid-exp').trim()    || '#007aff';
+  const _red     = _r.getPropertyValue('--grid-imp').trim()    || '#ff3b30';
+  const _green   = _r.getPropertyValue('--bat-charge').trim()  || '#34c759';
+  const _muted   = _r.getPropertyValue('--text-muted').trim()  || '#86868b';
+
+  // Grid arrows pick their colour from the parent's `color` style.
+  const gridLineCol = gridW < -30 ? _blue : gridW > 30 ? _red : _blue;
+  document.getElementById('fl-grid').style.color = gridLineCol;
+
+  // Battery arrows + box tint: blue when charging, red when discharging, green at idle.
+  const batBoxCol     = batW > 30 ? _blue : batW < -30 ? _red : _green;
+  const batBoxStroke  = batW > 30 ? 'rgba(0,122,255,0.45)'
+                      : batW < -30 ? 'rgba(255,59,48,0.45)'
+                      : 'rgba(52,199,89,0.45)';
+  document.getElementById('fl-bat').style.color = batBoxCol;
+  document.getElementById('bat-rect').setAttribute('stroke', batBoxStroke);
+  document.getElementById('bat-label').style.fill = batBoxCol;
+  document.getElementById('n-soc').style.fill     = batBoxCol;
+  document.getElementById('n-bat').style.fill     = batBoxCol;
 
   // Animated flow lines
   // Solar: always flows toward inverter (down) when generating
@@ -1042,7 +1291,7 @@ function update(d) {
     const netEl = document.getElementById(prefix + 'net');
     netEl.textContent = _fmtGbp(econ.net_today_gbp);
     netEl.style.color = econ.net_today_gbp !== null && econ.net_today_gbp < 0
-      ? '#f87171' : '#34d399';
+      ? '#ff3b30' : '#34c759';
     document.getElementById(prefix + 'nosolar').textContent = _fmtGbp(econ.no_solar_cost_gbp);
     const ratesParts = [];
     if (econ.import_rate_p !== null) ratesParts.push('Import ' + econ.import_rate_p + 'p');
@@ -1278,12 +1527,12 @@ let socChart = null, energyChart = null, dailyChart = null;
 let currentRange = 24;
 
 const CHART_COLORS = {
-  soc:    '#34d399',
-  pv:     '#fbbf24',
-  imp:    '#f87171',
-  exp:    '#22d3ee',
-  home:   '#a78bfa',
-  grid:   '#94a3b8',
+  soc:    '#34c759',
+  pv:     '#f5a623',
+  imp:    '#ff3b30',
+  exp:    '#007aff',
+  home:   '#af52de',
+  grid:   '#86868b',
 };
 
 const CHART_BASE = {
@@ -1292,16 +1541,16 @@ const CHART_BASE = {
   animation: { duration: 200 },
   interaction: { mode: 'index', intersect: false },
   scales: {
-    x: { ticks: { color: '#64748b', maxRotation: 0, autoSkipPadding: 20 },
+    x: { ticks: { color: '#86868b', maxRotation: 0, autoSkipPadding: 20 },
          grid: { color: 'rgba(100,116,139,0.08)' } },
-    y: { ticks: { color: '#64748b' },
+    y: { ticks: { color: '#86868b' },
          grid: { color: 'rgba(100,116,139,0.12)' } },
   },
   plugins: {
-    legend: { labels: { color: '#cbd5e1', font: { size: 11 } } },
-    tooltip: { backgroundColor: '#0f1724', borderColor: '#1e2d3d',
-               borderWidth: 1, titleColor: '#7dd3fc',
-               bodyColor: '#e2e8f0', padding: 8 },
+    legend: { labels: { color: '#1d1d1f', font: { size: 11 } } },
+    tooltip: { backgroundColor: 'rgba(255,255,255,0.0)', borderColor: 'rgba(128,128,128,0.20)',
+               borderWidth: 1, titleColor: '#5856d6',
+               bodyColor: '#1d1d1f', padding: 8 },
   },
 };
 
@@ -1378,7 +1627,7 @@ async function refreshCharts() {
       options: { ...CHART_BASE,
         scales: { ...CHART_BASE.scales,
           y: { ...CHART_BASE.scales.y, min: 0, max: 100,
-               title: { display: true, text: 'SOC %', color: '#94a3b8' } },
+               title: { display: true, text: 'SOC %', color: '#86868b' } },
         } }
     });
 
@@ -1395,7 +1644,7 @@ async function refreshCharts() {
         scales: { ...CHART_BASE.scales,
           x: { ...CHART_BASE.scales.x, stacked: true },
           y: { ...CHART_BASE.scales.y, stacked: true,
-               title: { display: true, text: 'kWh per slot', color: '#94a3b8' } },
+               title: { display: true, text: 'kWh per slot', color: '#86868b' } },
         } }
     });
   } catch(e) { /* silently ignore — charts will reappear next refresh */ }
@@ -1425,7 +1674,7 @@ async function refreshDailyChart() {
       options: { ...CHART_BASE,
         scales: { ...CHART_BASE.scales,
           y: { ...CHART_BASE.scales.y,
-               title: { display: true, text: 'kWh per day', color: '#94a3b8' } },
+               title: { display: true, text: 'kWh per day', color: '#86868b' } },
         } }
     });
   } catch(e) { /* silently ignore */ }
@@ -1474,10 +1723,10 @@ async function refreshExportSync() {
         const dpct  = (row.diff_pct    !== null && row.diff_pct    !== undefined)
                       ? (row.diff_pct >= 0 ? '+' : '') + row.diff_pct.toFixed(1) + '%' : '—';
         let badge = '<span class="muted">' + row.status + '</span>';
-        if (row.status === 'ok')      badge = '<span style="color:#34d399">✓ in sync</span>';
-        if (row.status === 'drift')   badge = '<span style="color:#f87171">⚠ drift</span>';
+        if (row.status === 'ok')      badge = '<span style="color:#34c759">✓ in sync</span>';
+        if (row.status === 'drift')   badge = '<span style="color:#ff3b30">⚠ drift</span>';
         if (row.status === 'unsettled') badge = '<span class="muted">unsettled</span>';
-        if (row.status === 'fetch_error') badge = '<span style="color:#fbbf24">fetch error</span>';
+        if (row.status === 'fetch_error') badge = '<span style="color:#f5a623">fetch error</span>';
         if (row.status === 'no_sigen_record') badge = '<span class="muted">no record</span>';
         return '<tr>'
           + '<td>' + row.date + '</td>'
@@ -1518,6 +1767,44 @@ refreshExportSync();
 setInterval(refreshCharts, 5 * 60 * 1000);
 setInterval(refreshDailyChart, 30 * 60 * 1000);
 setInterval(refreshExportSync, 60 * 60 * 1000);   // hourly
+</script>
+
+<style>
+/* Floating back-to-top button — mirrors the Dashboards plugin pages so
+   long-scroll behaviour is consistent across both servers (Sigen 8179
+   + Dashboards 8176/public). Hidden until scrolled > 200 px. */
+.back-to-top {
+    position: fixed;
+    bottom: max(80px, calc(72px + env(safe-area-inset-bottom)));
+    right: max(16px, env(safe-area-inset-right));
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    background: var(--accent, #5856d6); color: #fff;
+    border: none; cursor: pointer;
+    font-size: 22px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.25s, transform 0.15s;
+    z-index: 9;
+    font-family: inherit;
+}
+.back-to-top.visible { opacity: 0.9; pointer-events: auto; }
+.back-to-top:hover   { opacity: 1; transform: translateY(-2px); }
+.back-to-top:active  { transform: translateY(0); opacity: 0.85; }
+</style>
+<button class="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="Back to top">&uarr;</button>
+<script>
+(function() {
+    const btn = document.querySelector(".back-to-top");
+    if (!btn) return;
+    const onScroll = () => {
+        if (window.scrollY > 200) btn.classList.add("visible");
+        else btn.classList.remove("visible");
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+})();
 </script>
 </body>
 </html>"""

@@ -5,8 +5,14 @@
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Sonnet 4.6
-# Date:        03-05-2026
-# Version:     3.2
+# Date:        21-05-2026
+# Version:     3.4
+# 3.4 — flood prevention also subtracts Axle VPP export scheduled on the refill
+#       day (treated as extra demand). Pro-rated for events that span midnight.
+# 3.3 — flood prevention now gates on the *refill-day* solar forecast
+#       (today's when dawn is later today; tomorrow's otherwise). Fixes the
+#       21-May-2026 incident where a post-midnight check used the day-after's
+#       forecast and dumped the battery into a poor-today/sunny-day-after pair.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -116,6 +122,7 @@ class ManagerSnapshot:
     pv_watts:               int   = 0
     house_load_watts:       int   = 0
     export_active:          bool  = False   # export active (flood prevention v4.4, or legacy v3.x)
+    corrected_today_kwh:    float = 0.0     # bias-corrected forecast for today (kWh)
     corrected_tomorrow_kwh: float = 0.0     # bias-corrected forecast for tomorrow (kWh)
     bias_factor:            float = 1.0     # forecast correction (applied to hourly values)
 
@@ -139,6 +146,13 @@ class ManagerSnapshot:
 
     # VPP reserve: kWh to protect from export for an upcoming event
     vpp_reserved_kwh: float = 0.0
+
+    # VPP export quantity expected on each local date (kWh). Pre-computed by
+    # plugin.py and pro-rated for events that span midnight. "Future only" —
+    # the portion of an ACTIVE event that has already happened is not counted.
+    # Used by flood prevention to inflate refill-day demand.
+    vpp_today_kwh:    float = 0.0
+    vpp_tomorrow_kwh: float = 0.0
 
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
@@ -985,6 +999,65 @@ class BatteryManager:
     # Flood Prevention (Night Pre-Drain)
     # ================================================================
 
+    def _refill_day_view(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> Tuple[float, float, float]:
+        """Return (solar_kwh, need_kwh, vpp_kwh) for the day that will refill the battery.
+
+        Pre-drain happens overnight; the battery refills on the day the *next dawn*
+        falls on (UK local). For a 22:00 pre-drain that's tomorrow; for a 00:25
+        pre-drain it's today. Picking the wrong day was the 21-May-2026 bug.
+
+        vpp_kwh is the Axle VPP export expected on the refill day — pro-rated
+        for events that span midnight. Treated as additional demand by the
+        flood-prevention gate so refill capacity isn't double-counted.
+
+        Falls back to tomorrow values if dawn_dt is missing.
+        """
+        try:
+            now_local = self._to_local(snapshot.now)
+            if balance.dawn_dt is not None:
+                dawn_local = self._to_local(balance.dawn_dt)
+                if dawn_local.date() == now_local.date():
+                    return (
+                        snapshot.corrected_today_kwh,
+                        balance.need_24h_kwh,
+                        snapshot.vpp_today_kwh,
+                    )
+        except Exception:
+            pass
+        return (
+            balance.tomorrow_solar_kwh,
+            balance.tomorrow_need_kwh,
+            snapshot.vpp_tomorrow_kwh,
+        )
+
+    def _refill_day_label(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> str:
+        """Human-readable label ("Today" or "Tomorrow") for the refill day."""
+        try:
+            now_local = self._to_local(snapshot.now)
+            if balance.dawn_dt is not None:
+                dawn_local = self._to_local(balance.dawn_dt)
+                if dawn_local.date() == now_local.date():
+                    return "Today"
+        except Exception:
+            pass
+        return "Tomorrow"
+
+    @staticmethod
+    def _to_local(dt: datetime) -> datetime:
+        """Convert dt to UK local time; handle naive datetimes as already local."""
+        try:
+            import pytz
+            london = pytz.timezone("Europe/London")
+            if dt.tzinfo is None:
+                return dt
+            return dt.astimezone(london)
+        except Exception:
+            return dt
+
     def _check_flood_prevention(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> Optional[Decision]:
@@ -1025,12 +1098,27 @@ class BatteryManager:
         if not snapshot.export_enabled:
             return None
 
-        # Safety gate: tomorrow must be abundantly sunny to guarantee solar refill.
-        # Without this, pre-draining could leave the battery short and force reimport
-        # at full Tracker price — wiping out the export revenue.
+        # Safety gate: the *refill day* must be abundantly sunny to guarantee solar
+        # refill. Without this, pre-draining could leave the battery short and force
+        # reimport at full Tracker price — wiping out the export revenue.
         # With export@12p and Tracker import@23p+, reimporting even half the exported
         # kWh wipes the revenue. Require 3x need so only genuinely excellent days qualify.
-        if balance.tomorrow_solar_kwh < FLOOD_PREV_FORECAST_MULT * balance.tomorrow_need_kwh:
+        #
+        # The refill day is the day the *next dawn* falls on (in local time):
+        #   pre-midnight pre-drain  → dawn is tomorrow → check tomorrow's forecast
+        #   post-midnight pre-drain → dawn is today    → check today's forecast
+        # The earlier bug (21-May-2026) used tomorrow_solar_kwh in both cases, so a
+        # 00:25 check on a poor-today/sunny-tomorrow pair would dump the battery and
+        # then fail to refill it from today's weak sun.
+        #
+        # Axle VPP export scheduled on the refill day is added to refill demand,
+        # so the gate refuses pre-drain when the refill day can't cover house
+        # consumption + the VPP export at 3x safety margin.
+        refill_solar_kwh, refill_need_kwh, refill_vpp_kwh = self._refill_day_view(
+            snapshot, balance
+        )
+        refill_demand_kwh = refill_need_kwh + refill_vpp_kwh
+        if refill_solar_kwh < FLOOD_PREV_FORECAST_MULT * refill_demand_kwh:
             return None
 
         # Effective target: respect storm/seasonal SOC floor.
@@ -1056,13 +1144,21 @@ class BatteryManager:
         export_kwh  = (snapshot.current_soc_pct - effective_target) / 100.0 * cap_kwh
         revenue_gbp = export_kwh * 12.0 / 100.0   # 12p/kWh flat Outgoing rate
 
+        refill_label = self._refill_day_label(snapshot, balance)
+        if refill_vpp_kwh > 0.01:
+            demand_str = (
+                f"{refill_demand_kwh:.1f} kWh = house {refill_need_kwh:.1f} "
+                f"+ Axle {refill_vpp_kwh:.1f}"
+            )
+        else:
+            demand_str = f"{refill_demand_kwh:.1f} kWh"
         return Decision(
             action          = ACTION_START_EXPORT,
             reason          = (
                 f"Flood prevention: SOC {snapshot.current_soc_pct:.1f}% → "
                 f"{effective_target:.0f}% ({export_kwh:.1f} kWh @ 12p = ~£{revenue_gbp:.2f}). "
-                f"Tomorrow {balance.tomorrow_solar_kwh:.1f} kWh forecast "
-                f">= {FLOOD_PREV_FORECAST_MULT:.0f}x need ({balance.tomorrow_need_kwh:.1f} kWh) "
+                f"{refill_label} {refill_solar_kwh:.1f} kWh forecast "
+                f">= {FLOOD_PREV_FORECAST_MULT:.0f}x need ({demand_str}) "
                 f"— solar refills without reimport. "
                 f"Lower dawn SOC sustains DNO-capped export through peak hours"
             ),
@@ -1111,14 +1207,22 @@ class BatteryManager:
                 dawn_viable = True,
             )
 
-        # Conditions changed (rare): tomorrow is no longer abundantly sunny — abort
-        if balance.tomorrow_solar_kwh < FLOOD_PREV_FORECAST_MULT * balance.tomorrow_need_kwh:
+        # Conditions changed (rare): refill day is no longer abundantly sunny — abort.
+        # Includes any newly-announced Axle VPP export on the refill day.
+        refill_solar_kwh, refill_need_kwh, refill_vpp_kwh = self._refill_day_view(
+            snapshot, balance
+        )
+        refill_demand_kwh = refill_need_kwh + refill_vpp_kwh
+        if refill_solar_kwh < FLOOD_PREV_FORECAST_MULT * refill_demand_kwh:
+            refill_label = self._refill_day_label(snapshot, balance)
+            vpp_note = f" + Axle {refill_vpp_kwh:.1f}" if refill_vpp_kwh > 0.01 else ""
             return Decision(
                 action      = ACTION_SELF_CONSUMPTION,
                 reason      = (
-                    f"Flood prevention: aborting — forecast {balance.tomorrow_solar_kwh:.1f} kWh "
-                    f"no longer >= {FLOOD_PREV_FORECAST_MULT:.0f}x need "
-                    f"({balance.tomorrow_need_kwh:.1f} kWh)"
+                    f"Flood prevention: aborting — {refill_label.lower()} forecast "
+                    f"{refill_solar_kwh:.1f} kWh no longer >= "
+                    f"{FLOOD_PREV_FORECAST_MULT:.0f}x need "
+                    f"({refill_demand_kwh:.1f} kWh{vpp_note})"
                 ),
                 dawn_viable = True,
             )
