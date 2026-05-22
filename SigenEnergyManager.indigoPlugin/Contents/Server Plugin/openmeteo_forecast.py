@@ -6,9 +6,20 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        21-05-2026
-# Version:     1.2.1
+# Author:      CliveS & Claude Opus 4.7
+# Date:        22-05-2026
+# Version:     1.3
+# 1.3 — magnitude-conditional bias correction (replaces v1.2's "no correction").
+#       Analysis of 31 days showed err% vs forecast_kwh r = -0.462: the model
+#       under-forecasts on moderate-forecast days (25-45 kWh, factor ~1.2-1.34)
+#       and over-forecasts on high-forecast clear days (>55 kWh, factor ~0.88).
+#       A single flat factor cancels these out (v1.2's experiment); a per-band
+#       table follows the shape and projects MAPE 19.8% -> ~14-16%. Bands
+#       computed via median(actual/forecast) of records within ±7.5 kWh of each
+#       centre (17.5/30/40/50/65); bands with fewer than 3 samples inherit the
+#       global sum-ratio factor. Hourly outputs scale uniformly by that day's
+#       daily-total band factor — the correction is calibrated against daily
+#       totals, not hourly slots.
 # 1.2.1 — fix NameError in _write_optimiser_file debug log left over from the
 #         v1.2 rename (`corrected_tmrw` → `tomorrow_kwh`). The error fired on
 #         every forecast refresh in the plugin log but didn't affect the
@@ -17,6 +28,8 @@
 #       showed the raw forecast had lower mean error (-2.5%) and lower MAPE
 #       (18.7%) than any bias-corrected variant tried (MAPE 21.9-22.3%). Factor
 #       still computed and stored on `biasFactor` for diagnostic display.
+#       SUPERSEDED by v1.3 — the v1.2 analysis used a single flat factor; a
+#       magnitude-conditional table beats both raw and flat.
 # 1.1 — bias correction switched from arithmetic-mean-of-ratios to ratio-of-sums
 #       (kWh-weighted). Removes an upward statistical bias that pushed the May
 #       2026 factor to 1.163 vs the correct 1.150. See test_openmeteo_forecast.
@@ -87,6 +100,17 @@ BIAS_CORRECTION_MAX          = 1.5   # tighter than Solcast (was 3.0 for 2-array
 BIAS_CORRECTION_MIN          = 0.5
 MIN_CALIBRATION_FORECAST_KWH = 10.0  # ignore days where forecast < 10 kWh (overcast outliers)
 
+# Magnitude-conditional bias bands (v1.3).
+# Each centre defines a daily-forecast-kWh bucket; the correction factor at
+# any raw forecast value is linearly interpolated between adjacent centres.
+# Centres derived from the May 2026 analysis: error shape is non-uniform —
+# under-forecast at moderate predictions, accurate at extremes, over-forecast
+# on bright days. A flat factor (v1.2) cancels these out; a per-band table
+# follows the shape.
+BIAS_BAND_CENTRES_KWH = (17.5, 30.0, 40.0, 50.0, 65.0)
+BIAS_BAND_HALF_WIDTH  = 7.5    # ±7.5 kWh window of records that define a band
+MIN_BAND_SAMPLES      = 3       # below this, band inherits the global factor
+
 # Path of the optimiser input file (read by openmeteo_battery_optimiser.py).
 OPTIMISER_FORECAST_FILE = (
     "/Library/Application Support/Perceptive Automation/"
@@ -143,7 +167,8 @@ class OpenMeteoForecast:
 
         # Bias correction state
         self._morning_forecast_kwh = 0.0  # captured at 00:05
-        self._correction_factor    = 1.0  # current seasonal factor
+        self._correction_factor    = 1.0  # overall kWh-weighted scalar (display only)
+        self._correction_bands     = [(c, 1.0) for c in BIAS_BAND_CENTRES_KWH]
 
         # Pre-warm in-memory cache from disk so restarts don't lose data
         self._load_combined_cache()
@@ -159,7 +184,10 @@ class OpenMeteoForecast:
 
         Returns dict with keys:
             todayKwh, tomorrowKwh, correctedTodayKwh, correctedTomorrowKwh,
-            biasFactor, currentHourWatts, nextHourWatts, remainingTodayKwh,
+            biasFactor (overall scalar — display only),
+            biasFactorToday, biasFactorTomorrow (per-day effective factors),
+            biasBands (list of [centre_kwh, factor] pairs in ascending order),
+            currentHourWatts, nextHourWatts, remainingTodayKwh,
             forecastStatus, lastUpdate,
             _hourly_p50_today  ({"YYYY-MM-DD HH:00:00": wh_int})
             _hourly_p50_tomorrow (same format, for tomorrow's date)
@@ -261,23 +289,31 @@ class OpenMeteoForecast:
         )
 
         self._correction_factor = self._compute_correction_factor(records)
-        self.logger.info(
-            f"[OpenMeteo] Updated bias correction factor: {self._correction_factor:.3f}"
-        )
+        self._correction_bands  = self._compute_correction_bands(records)
+        self._log_bands("Updated")
 
         self._morning_forecast_kwh = 0.0
 
     def load_correction_factor(self):
-        """Load and compute correction factor from saved accuracy records.
+        """Load and compute correction factor + bands from saved accuracy records.
 
         Call on plugin startup so bias correction is active immediately.
         """
         records = self._load_accuracy_records()
         self._correction_factor = self._compute_correction_factor(records)
+        self._correction_bands  = self._compute_correction_bands(records)
         self.logger.info(
-            f"[OpenMeteo] Loaded bias correction factor from {len(records)} records: "
-            f"{self._correction_factor:.3f}"
+            f"[OpenMeteo] Loaded bias correction from {len(records)} records: "
+            f"overall {self._correction_factor:.3f}"
         )
+        self._log_bands("Loaded")
+
+    def _log_bands(self, prefix):
+        """Log the band table at INFO level — one row per band."""
+        line = ", ".join(
+            f"{int(c):>3} kWh: {f:.3f}" for c, f in self._correction_bands
+        )
+        self.logger.info(f"[OpenMeteo] {prefix} bias bands: {line}")
 
     def get_accuracy_summary(self, window_days=7):
         """Return a dict summarising forecast accuracy over the last N days.
@@ -536,30 +572,33 @@ class OpenMeteoForecast:
     # ================================================================
 
     def _enrich_forecast(self, combined):
-        """Add forecast totals to the combined dict.
+        """Add corrected forecast totals to the combined dict.
 
-        v1.2 (21-May-2026): bias factor is NO LONGER APPLIED to corrected totals.
-        The factor is still computed and stored on `biasFactor` for diagnostic
-        display, but `correctedTodayKwh` and `correctedTomorrowKwh` equal the raw
-        totals. Empirical evidence over 31 days of records showed the raw forecast
-        had lower mean error (-2.5%) and lower MAPE (18.7%) than any bias-corrected
-        variant we tried (MAPE 21.9-22.3%). Day-to-day weather variance (~20%)
-        dominates the ~10-15% systematic bias the correction was trying to remove.
-        The 3x safety multiplier in flood prevention provides ample buffer against
-        forecast error without needing seasonal calibration.
+        v1.3 (22-May-2026): magnitude-conditional bias correction is applied.
+        For each day, `_apply_band_correction(raw_kwh)` linearly interpolates
+        a factor from `self._correction_bands` and multiplies the raw total.
 
-        Daily accuracy records are still written by `record_accuracy()` so a
-        future seasonal-bias decision can be revisited if persistent drift emerges
-        over 90+ days.
+        `biasFactor` keeps its v1.2 meaning — the overall kWh-weighted scalar
+        across all records — so dashboard displays don't shift unexpectedly.
+        Per-day effective factors are exposed as `biasFactorToday` and
+        `biasFactorTomorrow` for diagnostics; the full band table is on
+        `biasBands` so the dashboard can render the correction curve.
         """
         enriched     = dict(combined)
-        factor       = self._correction_factor
         raw_today    = combined.get("todayKwh", 0.0)
         raw_tomorrow = combined.get("tomorrowKwh", 0.0)
 
-        enriched["biasFactor"]           = round(factor, 3)     # informational only
-        enriched["correctedTodayKwh"]    = round(raw_today, 1)
-        enriched["correctedTomorrowKwh"] = round(raw_tomorrow, 1)
+        factor_today    = self._apply_band_correction(raw_today)
+        factor_tomorrow = self._apply_band_correction(raw_tomorrow)
+
+        enriched["biasFactor"]           = round(self._correction_factor, 3)
+        enriched["biasFactorToday"]      = round(factor_today, 3)
+        enriched["biasFactorTomorrow"]   = round(factor_tomorrow, 3)
+        enriched["biasBands"]            = [
+            [round(c, 1), round(f, 4)] for c, f in self._correction_bands
+        ]
+        enriched["correctedTodayKwh"]    = round(raw_today    * factor_today,    1)
+        enriched["correctedTomorrowKwh"] = round(raw_tomorrow * factor_tomorrow, 1)
         return enriched
 
     def _empty_forecast(self, reason=""):
@@ -571,6 +610,10 @@ class OpenMeteoForecast:
             "correctedTodayKwh":    0.0,
             "correctedTomorrowKwh": 0.0,
             "biasFactor":           1.0,
+            "biasFactorToday":      1.0,
+            "biasFactorTomorrow":   1.0,
+            "biasBands":            [[round(c, 1), 1.0]
+                                     for c in BIAS_BAND_CENTRES_KWH],
             "remainingTodayKwh":    0.0,
             "currentHourWatts":     0,
             "nextHourWatts":        0,
@@ -647,6 +690,81 @@ class OpenMeteoForecast:
         raw = sum_actual / sum_forecast
         return round(max(BIAS_CORRECTION_MIN, min(BIAS_CORRECTION_MAX, raw)), 4)
 
+    def _compute_correction_bands(self, records):
+        """Return per-band correction factors as list of (centre_kwh, factor) tuples.
+
+        For each centre in BIAS_BAND_CENTRES_KWH:
+          1. Filter records whose raw forecast falls within ±BIAS_BAND_HALF_WIDTH
+             of the centre, are above MIN_CALIBRATION_FORECAST_KWH, and have a
+             per-day ratio inside [0.1, 2 × BIAS_CORRECTION_MAX].
+          2. If ≥ MIN_BAND_SAMPLES survive, factor = median(actual/forecast).
+             Median (not mean / sum-ratio) is more robust given small per-band
+             sample counts (n=4–12 typical for a 60-day window).
+          3. Otherwise inherit the global kWh-weighted factor across the same
+             window — better than 1.0 when we know the overall direction.
+          4. Clamp every band to [BIAS_CORRECTION_MIN, BIAS_CORRECTION_MAX].
+
+        Returns a list in ascending centre order so `_apply_band_correction`
+        can linearly interpolate.
+        """
+        window = records[-60:] if records else []
+        valid_all = [
+            r for r in window
+            if r.get("forecast_kwh", 0) >= MIN_CALIBRATION_FORECAST_KWH
+            and 0.1 < r.get("factor", 0) < BIAS_CORRECTION_MAX * 2
+        ]
+        global_factor = (
+            self._clamped_sum_ratio(valid_all) if len(valid_all) >= MIN_BAND_SAMPLES
+            else 1.0
+        )
+
+        bands = []
+        for centre in BIAS_BAND_CENTRES_KWH:
+            lo = centre - BIAS_BAND_HALF_WIDTH
+            hi = centre + BIAS_BAND_HALF_WIDTH
+            band_records = [
+                r for r in valid_all
+                if lo <= r["forecast_kwh"] < hi
+            ]
+            if len(band_records) >= MIN_BAND_SAMPLES:
+                ratios = sorted(r["actual_kwh"] / r["forecast_kwh"]
+                                for r in band_records)
+                mid = len(ratios) // 2
+                raw_factor = (
+                    ratios[mid] if len(ratios) % 2
+                    else (ratios[mid - 1] + ratios[mid]) / 2.0
+                )
+            else:
+                raw_factor = global_factor
+
+            clamped = max(BIAS_CORRECTION_MIN,
+                          min(BIAS_CORRECTION_MAX, raw_factor))
+            bands.append((float(centre), round(clamped, 4)))
+
+        return bands
+
+    def _apply_band_correction(self, raw_kwh):
+        """Linearly interpolate the correction factor for a given raw forecast kWh.
+
+        Below the first band centre returns the first factor; above the last
+        returns the last; between centres linearly interpolates.
+        """
+        bands = self._correction_bands
+        if not bands or raw_kwh <= 0:
+            return 1.0
+        if raw_kwh <= bands[0][0]:
+            return bands[0][1]
+        if raw_kwh >= bands[-1][0]:
+            return bands[-1][1]
+        for (c_lo, f_lo), (c_hi, f_hi) in zip(bands, bands[1:]):
+            if c_lo <= raw_kwh <= c_hi:
+                span = c_hi - c_lo
+                if span <= 0:
+                    return f_lo
+                w = (raw_kwh - c_lo) / span
+                return f_lo + w * (f_hi - f_lo)
+        return 1.0   # unreachable but defensive
+
     # ================================================================
     # Optimiser forecast file writer
     # ================================================================
@@ -658,53 +776,73 @@ class OpenMeteoForecast:
         with UTC timestamp keys. Our internal dict uses local (BST/GMT) keys so
         this method converts them using pytz (falls back to UTC+1 if pytz absent).
 
-        Writes raw hourly values and raw daily totals (v1.2: bias factor is no
-        longer applied to outputs — see _enrich_forecast). The biasFactor field
-        is still included in the JSON for diagnostic display only.
+        v1.3 (22-May-2026): magnitude-conditional bias correction applied.
+          1. Compute raw daily totals per local-time day from the hourly buckets.
+          2. Apply `_apply_band_correction(raw_daily)` to each day separately —
+             today and tomorrow can land in different bands.
+          3. Scale every hourly slot in that day's bucket by its day's factor,
+             so the optimiser sees a shape-preserving correction (peaks scale,
+             zero hours stay zero) rather than a uniform daily shift.
+        Hourly slots are calibrated against daily totals, not against individual
+        hours — that's why the per-day factor is applied uniformly within a day
+        rather than re-binning each hourly value against the band table.
         """
         try:
             now_utc       = datetime.now(timezone.utc)
             today_date    = now_utc.date()
             tomorrow_date = (now_utc + timedelta(days=1)).date()
 
-            hourly_out   = {}
-            today_kwh    = 0.0
-            tomorrow_kwh = 0.0
+            today_slots    = []   # (utc_key, raw_kwh)
+            tomorrow_slots = []
+            raw_today_kwh    = 0.0
+            raw_tomorrow_kwh = 0.0
 
-            for bucket_name, target_date in (
-                ("_hourly_p50_today",    today_date),
-                ("_hourly_p50_tomorrow", tomorrow_date),
+            for bucket_name, target_date, slot_list in (
+                ("_hourly_p50_today",    today_date,    today_slots),
+                ("_hourly_p50_tomorrow", tomorrow_date, tomorrow_slots),
             ):
                 bucket = combined.get(bucket_name, {})
                 for local_key, wh_int in bucket.items():
                     utc_key = self._local_key_to_utc(local_key)
                     if utc_key is None:
                         continue
-                    kwh = round(wh_int / 1000.0, 3)
-                    hourly_out[utc_key] = {"kwh": kwh}
+                    kwh = wh_int / 1000.0
+                    slot_list.append((utc_key, kwh))
                     if target_date == today_date:
-                        today_kwh += kwh
+                        raw_today_kwh += kwh
                     else:
-                        tomorrow_kwh += kwh
+                        raw_tomorrow_kwh += kwh
 
-            # v1.2 (21-May-2026): bias factor no longer applied — see _enrich_forecast.
-            # tomorrow_kwh is now the raw sum of hourly slots. biasFactor still
-            # included for diagnostic display.
-            factor      = self._correction_factor
+            factor_today    = self._apply_band_correction(raw_today_kwh)
+            factor_tomorrow = self._apply_band_correction(raw_tomorrow_kwh)
 
-            # Determine cache_age_hours from cached_time
+            hourly_out = {}
+            for utc_key, kwh in today_slots:
+                hourly_out[utc_key] = {"kwh": round(kwh * factor_today, 3)}
+            for utc_key, kwh in tomorrow_slots:
+                hourly_out[utc_key] = {"kwh": round(kwh * factor_tomorrow, 3)}
+
+            today_kwh    = raw_today_kwh    * factor_today
+            tomorrow_kwh = raw_tomorrow_kwh * factor_tomorrow
+
             cached_time = self._cached_time or time.time()
             cache_age   = round((time.time() - cached_time) / 3600.0, 2)
 
             forecast_doc = {
-                "generated_at":     now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "source":           "open_meteo",
-                "cache_age_hours":  cache_age,
-                "arrays":           [a["name"] for a in ARRAYS],
-                "bias_factor":      factor,
-                "today_kwh":        round(today_kwh, 2),
-                "tomorrow_kwh":     round(tomorrow_kwh, 2),
-                "hourly":           hourly_out,
+                "generated_at":         now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source":               "open_meteo",
+                "cache_age_hours":      cache_age,
+                "arrays":               [a["name"] for a in ARRAYS],
+                "bias_factor":          self._correction_factor,
+                "bias_factor_today":    round(factor_today,    4),
+                "bias_factor_tomorrow": round(factor_tomorrow, 4),
+                "bias_bands":           [[round(c, 1), round(f, 4)]
+                                         for c, f in self._correction_bands],
+                "raw_today_kwh":        round(raw_today_kwh,    2),
+                "raw_tomorrow_kwh":     round(raw_tomorrow_kwh, 2),
+                "today_kwh":            round(today_kwh,        2),
+                "tomorrow_kwh":         round(tomorrow_kwh,     2),
+                "hourly":               hourly_out,
             }
 
             with open(OPTIMISER_FORECAST_FILE, "w", encoding="utf-8") as f:
@@ -712,7 +850,8 @@ class OpenMeteoForecast:
 
             self.logger.debug(
                 f"[OpenMeteo] Wrote optimiser file: {len(hourly_out)} slots, "
-                f"today {today_kwh:.1f} kWh, tomorrow {tomorrow_kwh:.1f} kWh"
+                f"today {today_kwh:.1f} kWh (raw {raw_today_kwh:.1f}, ×{factor_today:.3f}), "
+                f"tomorrow {tomorrow_kwh:.1f} kWh (raw {raw_tomorrow_kwh:.1f}, ×{factor_tomorrow:.3f})"
             )
 
         except Exception as e:

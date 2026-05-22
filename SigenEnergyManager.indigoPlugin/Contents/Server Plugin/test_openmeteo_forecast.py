@@ -3,8 +3,11 @@
 # Filename:    test_openmeteo_forecast.py
 # Description: Unit tests for OpenMeteoForecast bias-correction maths
 # Author:      CliveS & Claude Opus 4.7
-# Date:        21-05-2026
-# Version:     1.0
+# Date:        22-05-2026
+# Version:     1.1
+# 1.1 — added TestComputeCorrectionBands, TestApplyBandCorrection, and rewrote
+#       TestBiasFactorNotApplied as TestBiasFactorApplied for v1.3 of the
+#       module under test.
 
 import os
 import sys
@@ -18,6 +21,8 @@ from openmeteo_forecast import (
     BIAS_CORRECTION_MIN,
     BIAS_CORRECTION_MAX,
     MIN_CALIBRATION_FORECAST_KWH,
+    BIAS_BAND_CENTRES_KWH,
+    MIN_BAND_SAMPLES,
 )
 
 
@@ -156,11 +161,13 @@ class TestComputeCorrectionFactor(unittest.TestCase):
         self.assertAlmostEqual(factor, 1.150, places=3)
 
 
-class TestBiasFactorNotApplied(unittest.TestCase):
-    """v1.2 (21-May-2026): bias factor is computed but NOT applied to corrected totals.
+class TestComputeCorrectionBands(unittest.TestCase):
+    """v1.3 (22-May-2026): per-band correction factors via median(actual/forecast).
 
-    Confirms that even with a non-1.0 factor active, correctedTodayKwh and
-    correctedTomorrowKwh equal the raw todayKwh / tomorrowKwh respectively.
+    Each band centre in BIAS_BAND_CENTRES_KWH gets a factor computed from
+    records whose raw forecast falls within ±BIAS_BAND_HALF_WIDTH of centre.
+    Bands with fewer than MIN_BAND_SAMPLES records inherit the global
+    kWh-weighted factor across all valid records.
     """
 
     def setUp(self):
@@ -171,19 +178,138 @@ class TestBiasFactorNotApplied(unittest.TestCase):
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_corrected_equals_raw_even_with_nonunity_factor(self):
-        """biasFactor field still populated, but corrected totals equal raw."""
-        self.f._correction_factor = 1.150  # would have multiplied by 15%
+    def test_empty_records_returns_unity_bands(self):
+        bands = self.f._compute_correction_bands([])
+        self.assertEqual(len(bands), len(BIAS_BAND_CENTRES_KWH))
+        for centre, factor in bands:
+            self.assertEqual(factor, 1.0)
+
+    def test_band_uses_median_of_in_band_ratios(self):
+        """Three records in the 40 kWh band — factor should equal the median ratio."""
+        recs = [
+            _rec("2026-05-01", 38.0, 44.0),   # ratio 1.1579
+            _rec("2026-05-02", 40.0, 52.0),   # ratio 1.3000  <- median
+            _rec("2026-05-03", 42.0, 56.0),   # ratio 1.3333
+        ]
+        bands = self.f._compute_correction_bands(recs)
+        band_dict = dict(bands)
+        self.assertAlmostEqual(band_dict[40.0], 1.3000, places=4)
+
+    def test_sparse_band_inherits_global_factor(self):
+        """A band with < MIN_BAND_SAMPLES records inherits the kWh-weighted scalar."""
+        # 4 records all near the 30 kWh band; nothing near 50/65
+        recs = [_rec(f"2026-05-{d:02d}", 30.0, 36.0)
+                for d in range(1, 5)]   # ratio 1.20 each
+        bands = self.f._compute_correction_bands(recs)
+        band_dict = dict(bands)
+        # 30 band has 4 samples → median = 1.20
+        self.assertAlmostEqual(band_dict[30.0], 1.20, places=4)
+        # Bands with no in-window records inherit global sum-ratio (also 1.20 here)
+        self.assertAlmostEqual(band_dict[65.0], 1.20, places=4)
+
+    def test_band_factor_clamped_to_max(self):
+        # Ratio 2.0 — above MAX (1.5) but inside the per-day outlier filter
+        # [0.1, 2 × MAX = 3.0] so records survive to the band stage.
+        recs = [_rec(f"2026-05-{d:02d}", 30.0, 60.0)
+                for d in range(1, 5)]
+        bands = self.f._compute_correction_bands(recs)
+        band_dict = dict(bands)
+        self.assertEqual(band_dict[30.0], BIAS_CORRECTION_MAX)
+
+    def test_band_factor_clamped_to_min(self):
+        # Ratio 0.30 — below MIN (0.5) but above the 0.1 outlier floor.
+        recs = [_rec(f"2026-05-{d:02d}", 50.0, 15.0)
+                for d in range(1, 5)]
+        bands = self.f._compute_correction_bands(recs)
+        band_dict = dict(bands)
+        self.assertEqual(band_dict[50.0], BIAS_CORRECTION_MIN)
+
+    def test_below_min_calibration_records_excluded(self):
+        recs = (
+            [_rec(f"2026-05-{d:02d}", 30.0, 36.0) for d in range(1, 4)]
+            + [_rec("2026-05-04", MIN_CALIBRATION_FORECAST_KWH * 0.5, 8.0)]
+        )
+        bands = self.f._compute_correction_bands(recs)
+        # 30 band has exactly 3 valid samples — median = 1.20, not pulled by the outlier
+        self.assertAlmostEqual(dict(bands)[30.0], 1.20, places=4)
+
+
+class TestApplyBandCorrection(unittest.TestCase):
+    """v1.3: linear interpolation of the band factor for any raw kWh value."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
+        self.f = OpenMeteoForecast(data_dir=self._tmp)
+        # Hand-crafted bands so interpolation behaviour is unambiguous
+        self.f._correction_bands = [
+            (17.5, 1.00),
+            (30.0, 1.30),
+            (40.0, 1.15),
+            (50.0, 0.95),
+            (65.0, 0.88),
+        ]
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_zero_returns_unity(self):
+        self.assertEqual(self.f._apply_band_correction(0.0), 1.0)
+
+    def test_below_first_centre_returns_first_factor(self):
+        self.assertEqual(self.f._apply_band_correction(5.0), 1.00)
+
+    def test_above_last_centre_returns_last_factor(self):
+        self.assertEqual(self.f._apply_band_correction(80.0), 0.88)
+
+    def test_exactly_at_centre_returns_that_factor(self):
+        self.assertEqual(self.f._apply_band_correction(30.0), 1.30)
+        self.assertEqual(self.f._apply_band_correction(50.0), 0.95)
+
+    def test_midpoint_is_linear_average(self):
+        # Halfway between 30 (1.30) and 40 (1.15) → 1.225
+        self.assertAlmostEqual(self.f._apply_band_correction(35.0), 1.225, places=4)
+        # Halfway between 50 (0.95) and 65 (0.88) → 0.915
+        self.assertAlmostEqual(self.f._apply_band_correction(57.5), 0.915, places=4)
+
+
+class TestBiasFactorApplied(unittest.TestCase):
+    """v1.3 (22-May-2026): bias factor IS now applied to corrected totals.
+
+    Replaces v1.2's TestBiasFactorNotApplied since the magnitude-conditional
+    band correction makes corrected != raw whenever any band factor != 1.0.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
+        self.f = OpenMeteoForecast(data_dir=self._tmp)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_corrected_uses_per_day_band_factor(self):
+        """Today and tomorrow fall in different bands → different multipliers."""
+        self.f._correction_factor = 1.10  # display scalar — used unchanged
+        self.f._correction_bands = [
+            (17.5, 1.00),
+            (30.0, 1.30),   # today's band (raw 30 kWh)
+            (40.0, 1.15),
+            (50.0, 0.95),   # tomorrow's band (raw 50 kWh)
+            (65.0, 0.88),
+        ]
         enriched = self.f._enrich_forecast({
             "todayKwh":    30.0,
             "tomorrowKwh": 50.0,
         })
-        self.assertEqual(enriched["biasFactor"],           1.15)
-        self.assertEqual(enriched["correctedTodayKwh"],    30.0)
-        self.assertEqual(enriched["correctedTomorrowKwh"], 50.0)
+        self.assertEqual(enriched["biasFactor"],         1.10)
+        self.assertEqual(enriched["biasFactorToday"],    1.300)
+        self.assertEqual(enriched["biasFactorTomorrow"], 0.950)
+        self.assertEqual(enriched["correctedTodayKwh"],    39.0)   # 30 × 1.30
+        self.assertEqual(enriched["correctedTomorrowKwh"], 47.5)   # 50 × 0.95
 
-    def test_corrected_equals_raw_with_unity_factor(self):
-        self.f._correction_factor = 1.0
+    def test_corrected_equals_raw_with_unity_bands(self):
+        # Default bands are all 1.0 from __init__ — corrected must equal raw
         enriched = self.f._enrich_forecast({
             "todayKwh":    30.0,
             "tomorrowKwh": 50.0,

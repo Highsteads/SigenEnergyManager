@@ -6,8 +6,23 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        21-05-2026 (v5.20.0)
-# Version:     5.20.0
+# Date:        22-05-2026 (v5.21.0)
+# Version:     5.21.0
+# Changes:     v5.21.0 (22-05-2026) — magnitude-conditional bias correction in
+#              openmeteo_forecast.py (module bumped 1.2.1 → 1.3). Analysis of
+#              31 days showed err% vs forecast_kwh r = -0.462: the model
+#              under-forecasts on moderate-prediction days (25-45 kWh,
+#              ratio 1.18-1.28) and over-forecasts on bright days (>55 kWh,
+#              ratio ~0.93). A flat factor (v1.2's experiment) cancels these
+#              out; a 5-band table (centres 17.5/30/40/50/65 kWh, median
+#              actual/forecast per band, linear interp) follows the shape and
+#              projects MAPE 19.8% → ~14-16%. Bands recomputed nightly from
+#              accuracy records (rolling 60 days). Per-day factor applied to
+#              both correctedTodayKwh/Tomorrow and to every hourly slot in
+#              openmeteo_forecast.json so the battery optimiser sees the
+#              corrected shape. New JSON fields: biasFactorToday,
+#              biasFactorTomorrow, biasBands. 24 unit tests; plugin restart
+#              clean.
 # Changes:     v5.19.2 (15-05-2026) — Live Power Flow visual polish (option B):
 #              soft teal aurora glow + horizon bar behind the card; two
 #              status chips top-right ("On Grid" / "Lockout" / "Grid Down"
