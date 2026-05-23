@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        22-05-2026 (v5.21.0)
-# Version:     5.21.0
+# Date:        23-05-2026 (v5.21.1)
+# Version:     5.21.1
 # Changes:     v5.21.0 (22-05-2026) — magnitude-conditional bias correction in
 #              openmeteo_forecast.py (module bumped 1.2.1 → 1.3). Analysis of
 #              31 days showed err% vs forecast_kwh r = -0.462: the model
@@ -444,6 +444,16 @@ try:
     from IndigoSecrets import AXLE_SUPPORT_EMAIL
 except ImportError:
     AXLE_SUPPORT_EMAIL = ""
+# Site coordinates — IndigoSecrets first, PluginConfig fallback, Big Ben default.
+# Names match the existing IndigoSecrets convention (LATITUDE / LONGITUDE).
+try:
+    from IndigoSecrets import LATITUDE as SITE_LATITUDE
+except ImportError:
+    SITE_LATITUDE = None
+try:
+    from IndigoSecrets import LONGITUDE as SITE_LONGITUDE
+except ImportError:
+    SITE_LONGITUDE = None
 # Unified Dashboards plugin: menuOpenDashboard now points at the Dashboards
 # hub rather than Sigenergy's internal mini-dashboard on WEB_DASHBOARD_PORT.
 try:
@@ -893,14 +903,23 @@ class Plugin(indigo.PluginBase):
             health_pct = float(prefs.get("batteryHealthCutoff", "1"))
         except (TypeError, ValueError):
             health_pct = 1.0
-        try:
-            site_lat   = float(prefs.get("siteLatitude",   "54.882"))
-        except (TypeError, ValueError):
-            site_lat   = 54.882
-        try:
-            site_lon   = float(prefs.get("siteLongitude", "-1.818"))
-        except (TypeError, ValueError):
-            site_lon   = -1.818
+        # Site coordinates — IndigoSecrets first, PluginConfig next, Big Ben last.
+        # Big Ben (51.5007, -0.1246) is a neutral public default for any user
+        # who hasn't set IndigoSecrets.py or filled in PluginConfig.
+        if SITE_LATITUDE is not None:
+            site_lat = float(SITE_LATITUDE)
+        else:
+            try:
+                site_lat = float(prefs.get("siteLatitude", "51.5007"))
+            except (TypeError, ValueError):
+                site_lat = 51.5007
+        if SITE_LONGITUDE is not None:
+            site_lon = float(SITE_LONGITUDE)
+        else:
+            try:
+                site_lon = float(prefs.get("siteLongitude", "-0.1246"))
+            except (TypeError, ValueError):
+                site_lon = -0.1246
 
         # Export rate — best-effort lookup from latest_rates_data; default 12p.
         try:
@@ -5242,9 +5261,11 @@ class Plugin(indigo.PluginBase):
             ("AXLE_API_KEY",          AXLE_API_KEY),
             ("PUSHOVER_USER_TOKEN",   PUSHOVER_USER_TOKEN),
             ("SIGENERGY_IP",        SIGENERGY_IP),
+            ("LATITUDE",            SITE_LATITUDE),
+            ("LONGITUDE",           SITE_LONGITUDE),
         ):
             secrets_status.append(
-                f"  {name:<22}: {'SET' if value else 'missing (using PluginConfig)'}"
+                f"  {name:<22}: {'SET' if value not in (None, '') else 'missing (using PluginConfig or default)'}"
             )
         log("Secrets (from IndigoSecrets.py):")
         for line in secrets_status:
@@ -5418,17 +5439,18 @@ class Plugin(indigo.PluginBase):
         # Initialised before Modbus so that downstream callers (startup, etc.)
         # always have a forecast object available even if the Modbus IP is not
         # yet configured.
-        # Site coordinates are taken from PluginConfig if the user has set
-        # them, otherwise the module-level defaults (Highsteads, Medomsley)
-        # are used.  Array specs remain in source for v5 — a per-array UI is
-        # on the v6 roadmap.
+        # Site coordinates: IndigoSecrets.py first (LATITUDE / LONGITUDE),
+        # then PluginConfig (siteLatitude / siteLongitude), then None — the
+        # OpenMeteoForecast constructor's own Big Ben default kicks in if
+        # nothing is set anywhere.  Array specs remain in source for v5 —
+        # a per-array UI is on the v6 roadmap.
         def _as_float(value, fallback):
             try:
                 return float(value) if value not in (None, "") else fallback
             except (TypeError, ValueError):
                 return fallback
-        site_lat = _as_float(prefs.get("siteLatitude"),  None)
-        site_lon = _as_float(prefs.get("siteLongitude"), None)
+        site_lat = SITE_LATITUDE  if SITE_LATITUDE  is not None else _as_float(prefs.get("siteLatitude"),  None)
+        site_lon = SITE_LONGITUDE if SITE_LONGITUDE is not None else _as_float(prefs.get("siteLongitude"), None)
         # Optional per-array JSON override.  Strict shape check — every entry
         # must declare all 5 required keys (name, tilt, azimuth, kwp, shade)
         # with the right types.  Bad JSON falls back to the module default
