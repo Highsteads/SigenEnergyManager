@@ -390,14 +390,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# Secrets (from master secrets.py - never committed to git)
+# Secrets (from master IndigoSecrets.py - never committed to git)
 # ============================================================
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "/Library/Application Support/Perceptive Automation")
 # Master credentials file: IndigoSecrets.py at
 # /Library/Application Support/Perceptive Automation/IndigoSecrets.py
-# (renamed from `secrets.py` on 10-May-2026 — see feedback_secrets_module_shadowing.md
+# (renamed from `IndigoSecrets.py` on 10-May-2026 — see feedback_secrets_module_shadowing.md
 # for why: avoid colliding with Python's stdlib `secrets` module).
 # Per-key try/except so a missing single key does not blank the others.
 try:
@@ -2537,7 +2537,7 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _resolve_pushover_user(self):
-        """Return the Pushover user/group key, preferring secrets.py over PluginConfig.
+        """Return the Pushover user/group key, preferring IndigoSecrets.py over PluginConfig.
 
         Returns "" and logs an ERROR (once per call) if neither source is set.
         Callers should treat "" as "skip alert".
@@ -2546,7 +2546,7 @@ class Plugin(indigo.PluginBase):
         if not token:
             log(
                 "[Pushover] No user/group key configured. Set PUSHOVER_USER_TOKEN in "
-                "secrets.py or fill in 'Pushover user/group key' under Plugins -> "
+                "IndigoSecrets.py or fill in 'Pushover user/group key' under Plugins -> "
                 "Sigenergy Manager -> Configure. Alert skipped.",
                 level="ERROR",
             )
@@ -2555,7 +2555,7 @@ class Plugin(indigo.PluginBase):
     def _resolve_dashboard_host(self):
         """Resolve the host shown in the dashboard URL log line.
 
-        Order of precedence: DASHBOARD_HOST in secrets.py, then dashboardHost
+        Order of precedence: DASHBOARD_HOST in IndigoSecrets.py, then dashboardHost
         in PluginConfig, then auto-detect via socket.  Auto-detect is the silent
         default — no warning needed, since the dashboard binds to all interfaces
         regardless and the URL is purely a convenience log line.
@@ -3785,7 +3785,7 @@ class Plugin(indigo.PluginBase):
         # Pushover alert (uses corrected helper — handles secrets/config + skip-with-warning)
         self._send_pushover(subject, plain, priority="1")
 
-        # Email to Axle support — address comes from secrets.py (AXLE_SUPPORT_EMAIL)
+        # Email to Axle support — address comes from IndigoSecrets.py (AXLE_SUPPORT_EMAIL)
         # so it can be overridden per install without touching plugin code.
         if AXLE_SUPPORT_EMAIL:
             try:
@@ -3795,8 +3795,8 @@ class Plugin(indigo.PluginBase):
                 log(f"[VPP] Email alert failed: {e}", level="ERROR")
         else:
             log(
-                "[VPP] AXLE_SUPPORT_EMAIL not set in secrets.py — VPP release "
-                "email alert skipped. Add the address to secrets.py to enable.",
+                "[VPP] AXLE_SUPPORT_EMAIL not set in IndigoSecrets.py — VPP release "
+                "email alert skipped. Add the address to IndigoSecrets.py to enable.",
                 level="ERROR",
             )
 
@@ -5428,7 +5428,7 @@ class Plugin(indigo.PluginBase):
         """Initialise all module instances from current preferences."""
         prefs = self.pluginPrefs
 
-        # Resolve credentials: secrets.py wins over PluginConfig
+        # Resolve credentials: IndigoSecrets.py wins over PluginConfig
         api_key    = OCTOPUS_API_KEY or prefs.get("octopusApiKey", "")
         account_id = OCTOPUS_ACCOUNT or prefs.get("octopusAccount", "")
         mpan       = OCTOPUS_MPAN    or prefs.get("octopusMpan", "")
@@ -5523,13 +5523,13 @@ class Plugin(indigo.PluginBase):
         # Axle VPP
         self.axle = AxleAPI(api_token=axle_key) if axle_key else None
 
-        # Inverter IP: secrets.py wins over PluginConfig.  If neither is set,
+        # Inverter IP: IndigoSecrets.py wins over PluginConfig.  If neither is set,
         # log an ERROR and skip Modbus init only — the rest of the plugin can
         # still run for development/diagnostic use.
         inv_ip     = SIGENERGY_IP or prefs.get("inverterIp", "")
         if not inv_ip:
             log(
-                "[Config] No inverter IP configured. Set SIGENERGY_IP in secrets.py "
+                "[Config] No inverter IP configured. Set SIGENERGY_IP in IndigoSecrets.py "
                 "or fill in 'Inverter IP address' under Plugins -> Sigenergy Manager -> "
                 "Configure. Modbus connection will not start until this is set.",
                 level="ERROR",
