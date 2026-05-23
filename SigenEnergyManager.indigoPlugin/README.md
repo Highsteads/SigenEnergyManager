@@ -1,12 +1,96 @@
 # SigenEnergyManager
 
-**Indigo home automation plugin for Sigenergy solar/battery systems.**
+**Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-Self-sufficiency-first battery management: never import from grid unless the battery
-cannot reach the next solar generation window at the configured minimum SOC. Exports
-surplus to grid to prevent the battery from hitting 100% and curtailing PV generation.
-At night, exports battery surplus to grid when the battery has more energy than needed
-to reach dawn, provided tomorrow's solar forecast is good enough to recharge it.
+A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
+over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
+home-consumption profile, and picks the inverter mode that keeps the most kWh
+in the battery for the longest time. Grid import is never used unless the
+battery genuinely cannot reach the configured minimum SOC by next sunrise.
+
+## What it does
+
+**Battery management (`battery_manager.py`)**
+- 24-hour sufficiency model — projects dawn SOC using a 48-slot half-hourly
+  consumption profile (auto-calibrated from live inverter data) and the
+  Open-Meteo solar forecast
+- Tariff-aware import scheduling — auto-detects the active Octopus tariff
+  (Tracker / Go / iGo / Flux / iFlux / Agile) and defers import to the
+  cheapest available window when one exists
+- Seasonal resilience buffer — 10 % overnight floor April–September,
+  20 % October–March (configurable)
+- Daytime solar-overflow export — caps the battery's `HOLD_ESS_MAX_CHARGE`
+  register once SOC ≥ 40 % so PV surplus flows continuously to the grid;
+  battery reaches 100 % as near to dusk as solar allows, never curtailing PV
+- Night export to grid — discharges battery surplus to the DNO cap when the
+  bias-corrected solar forecast shows tomorrow will refill it
+- Flood-prevention pre-drain — overnight pre-drain to create headroom for
+  next-day peak solar, gated on the refill-day forecast (today vs tomorrow)
+  and inclusive of any scheduled Axle VPP export
+- Drift protection — `HOLD_ESS_MAX_CHARGE` / `HOLD_ESS_MAX_DISCHARGE` reset
+  on every mode change and read-back-verified every 15 minutes
+
+**Solar forecasting (`openmeteo_forecast.py`)**
+- Open-Meteo, no API key — per-array tilt / azimuth / shade modelling
+  (4 arrays out of the box, configurable JSON for any roof layout)
+- Magnitude-conditional bias correction *(v5.21)* — 5-band correction factor
+  (17.5 / 30 / 40 / 50 / 65 kWh) derived nightly from a rolling 60-day
+  forecast-vs-actual record; corrects opposite-sign errors at low-vs-high
+  forecast extremes that a single flat factor cannot
+- 7-day rolling MAPE summary logged at midnight
+
+**Octopus Energy integration (`octopus_api.py`)**
+- Auto-detects tariff product code (no manual selection)
+- Pulls today + tomorrow import + export rates; rate-limit-aware
+  (warn > 80/hr, hard-stop > 95/hr)
+- Export-sync check *(v5.19)* — compares the inverter's daily export kWh
+  against Octopus's settled half-hourly readings for the last 7 settled
+  days; anything outside ±5 % is flagged as drift
+
+**Axle VPP (`axle_api.py`)**
+- Full 5-state machine: `IDLE → ANNOUNCED → PRE_CHARGING → ACTIVE → COOLING_OFF`
+- Pre-event battery top-up to cover dispatched kWh + resilience floor
+- True Remote-EMS release at T-5min *(v5.18)* — Axle drives the inverter via
+  Sigenergy's cloud channel during the event so PV stays alive during
+  battery export (something Modbus-only paths cannot achieve)
+- Per-event JSONL telemetry at `<data_dir>/vpp_events/<YYYY-MM-DD_HHMM>.jsonl`
+- Post-event summary written to the `axleVppMonitor` device, plus a Pushover
+  with a pre-formed *Ask Claude* analysis prompt
+
+**Grid + storm awareness**
+- Storm watch (`storm_watch.py`) — MeteoAlarm CAP feed; raises the dawn-target
+  SOC and suppresses export during amber / red warnings
+- Power-cut detection with a rolling 100-event log — 4-hour export lockout
+  after grid restoration; menu item to inspect the log
+
+**Web dashboard (`web_dashboard.py`)**
+- Local HTTP server on port 8179 with live power-flow diagram, status chips
+  for grid state and current manager mode, and Chart.js (CDN) charts:
+  24h / 48h / 7d SOC line, stacked half-hourly energy bars
+  (PV / export / import / home), 30-day daily totals
+- JSON API: `/api/status`, `/api/history`, `/api/daily`, `/api/export-sync`
+
+**Indigo integration**
+- Five custom device types: Battery Manager, Sigenergy Inverter,
+  Solar Forecast, Tariff Monitor, Axle VPP Monitor
+- Custom plugin events for triggers — emergency import, export start / stop,
+  VPP lifecycle, flood-prevention lifecycle, power-cut lockout
+- Indigo variables for live status, the optimiser plan, and a
+  `sigen_manager_paused` pause-from-anywhere switch
+- Companion advisory script `openmeteo_battery_optimiser.py` — 20:00 EVENING
+  and 01:45 OVERNIGHT Pushover messages describing tonight's plan in plain
+  prose; reads the plugin-published `sigen_site_config.json` so it can never
+  drift from plugin values
+
+**Reliability + ops**
+- Half-hourly SQLite energy log (feeds TariffAnalyser), 365-day daily-history
+  ring buffer, weekly battery State-of-Health snapshot, weekly tar.gz backup
+  of all on-disk state to `data_dir/data_backup/` (8 kept ≈ 2 months)
+- Auto-update notifier — checks GitHub releases on startup, logs an INFO
+  line if a newer plugin version is available
+- All credentials resolved from `IndigoSecrets.py` first, PluginConfig
+  fallback; an ERROR is logged and the feature skipped if neither is set
+- Pushover quiet hours + configurable sound; HIGH-priority alerts always fire
 
 ---
 
@@ -203,14 +287,20 @@ Reads:
 Every 60 seconds the plugin:
 
 1. Reads live data from the inverter via Modbus TCP
-2. Projects battery SOC at the next dawn using the Solcast P50 forecast dawn time
-   and a 48-slot half-hourly consumption profile
+2. Projects battery SOC at the next dawn using the Open-Meteo dawn time and a
+   48-slot half-hourly consumption profile (auto-calibrated from live data)
 3. If projected SOC at dawn < dawn target: schedules or starts a grid import
 4. During daylight, once SOC >= 40%: caps HOLD_ESS_MAX_CHARGE so PV surplus exports
    to grid continuously, reaching 100% SOC as near to dusk as solar allows (see below)
 5. If it is night and battery has surplus above the dawn floor: force-discharges to grid,
    provided tomorrow's solar forecast is good enough to recharge (see below)
-6. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+6. If tomorrow's forecast is high enough that a full battery would choke off morning
+   export: pre-drains overnight (flood prevention)
+7. Otherwise: holds in Max Self Consumption mode (Remote EMS 0x02)
+
+Storm warnings (MeteoAlarm amber/red) raise the dawn target and suppress export
+for the duration of the alert. A 4-hour export lockout is enforced after any
+grid restoration (power-cut recovery).
 
 ### Night export
 
@@ -220,26 +310,26 @@ must all be true:
 
 | Condition | Detail |
 |-----------|--------|
-| **Night** | Current time is outside the daytime window (before today's Solcast dawn, or more than 14h after it) |
+| **Night** | Current time is outside the daytime window (before today's Open-Meteo dawn, or more than 14h after it) |
 | **Surplus** | Projected SOC at dawn > dawn target + 1 kWh safety buffer |
 | **Tomorrow viable** | `correctedTomorrowKwh x 0.6 >= daily_consumption_kWh` |
 
-The tomorrow viability check uses Solcast's **bias-corrected P50** estimate
+The tomorrow viability check uses the **bias-corrected** Open-Meteo estimate
 (`correctedTomorrowKwh`) at 60% confidence -- meaning "even if tomorrow comes in
-40% below our best estimate, the battery will still be recharged". This is far less
-conservative than P10 (10th percentile), which would block export even on nights
-before clearly sunny days.
+40% below our best estimate, the battery will still be recharged". The bias
+correction is the magnitude-conditional 5-band scheme introduced in v5.21
+(see Solar forecasting above).
 
 **Why PV watts is not used as the night/day indicator:** In Discharge ESS First mode
 (0x06) the Sigenergy inverter suppresses PV generation to 0W, so `pvPowerWatts`
 reads zero regardless of actual solar. A PV threshold check would never fire while
-exporting. Sunrise is instead detected from the Solcast-predicted `dawn_times`.
+exporting. Sunrise is instead detected from the Open-Meteo-predicted `dawn_times`.
 
 **Daytime window:** Export is blocked for 14 hours after today's dawn time (e.g.
 dawn 07:00 -> blocked until 21:00, then nighttime resumes and export can start again).
 
 Night export stops automatically when:
-- Today's Solcast dawn time is reached (sunrise)
+- Today's Open-Meteo dawn time is reached (sunrise)
 - Battery surplus drops below the minimum threshold
 - Tomorrow's forecast deteriorates below the viability check
 
@@ -327,7 +417,11 @@ Full 5-state machine: `IDLE` → `ANNOUNCED` → `PRE_CHARGING` → `ACTIVE` →
 
 ---
 
-## Bug fixes (v1.1 - v1.4)
+## Historical bug fixes (v1.1 – v1.4)
+
+*Kept as a deep-dive on the early Modbus / register-persistence quirks. For
+recent changes (v5.x) see the Version history table at the top of this file
+and the per-version notes in the repo `CLAUDE.md`.*
 
 ### v1.4 -- Night export stop condition permanently blind (critical)
 
@@ -409,13 +503,13 @@ oscillated around 80%.
 
 ## Device types
 
-| Type | Purpose |
-|------|---------|
-| Battery Manager | Main control device -- one per system |
-| Inverter Monitor | Real-time PV, battery, grid, home power readings |
-| Solcast Forecast | Today/tomorrow solar forecast (bias-corrected P50) — *note: v4.7 removed Solcast, this is now Open-Meteo backed* |
-| Octopus Tariff | Current unit rate, standing charge, tomorrow's rate |
-| Axle VPP | VPP event state machine, SOC management, and v5.18.2 post-event summary states (`lastVpp*`) |
+| Type ID | Display name | Purpose |
+|---------|--------------|---------|
+| `batteryManager` | Battery Manager | Main control device -- one per system |
+| `sigenergyInverter` | Sigenergy Inverter | Real-time PV, battery, grid, home power readings |
+| `solarForecast` | Solar Forecast | Today/tomorrow Open-Meteo forecast (bias-corrected, per-array model) |
+| `tariffMonitor` | Tariff Monitor | Current unit rate, standing charge, tomorrow's rate, export rate |
+| `axleVppMonitor` | Axle VPP Monitor | VPP event state machine, SOC management, post-event summary states (`lastVpp*`) |
 
 ---
 
@@ -434,6 +528,7 @@ Available from Indigo: **Plugins → Sigenergy Manager** menu.
 | Show Today's Energy Summary | PV / Import / Export / Home / SOC peaks for today |
 | **Run Self-Test** *(v5.0)* | Verifies Modbus / Octopus / Open-Meteo / Axle / Pushover / secrets resolution in one report |
 | **Show Power Cut Log** *(v5.0)* | Last 20 grid-status transitions (rolling 100-entry log) |
+| Open Web Dashboard | Opens the local dashboard URL in the default browser |
 | Toggle Debug Logging | Quick on/off without opening the prefs dialog |
 | Show Plugin Info | Re-prints the startup banner (version, paths, API version) |
 
@@ -496,15 +591,16 @@ and a 30-day daily totals bar chart. The JSON API has three endpoints:
 
 ```bash
 cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
-python3 -m unittest test_battery_manager test_sigenergy_modbus -v
+python3 -m unittest test_battery_manager test_sigenergy_modbus test_openmeteo_forecast -v
 ```
 
-**72 tests** across two test files, all passing without Indigo installed:
+**101 tests** across three test files, all passing without Indigo installed:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_battery_manager.py` | 51 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (multiple cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
+| `test_battery_manager.py` | 56 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (refill-day + VPP-aware cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
 | `test_sigenergy_modbus.py` | 21 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation, write-back verification |
+| `test_openmeteo_forecast.py` | 24 | kWh-weighted bias correction formula, magnitude-conditional band table, per-day factor application across hourly slots, live-data replay |
 
 ---
 
