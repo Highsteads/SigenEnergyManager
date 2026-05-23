@@ -87,7 +87,7 @@ class TestComputeCorrectionFactor(unittest.TestCase):
     def setUp(self):
         # Need a writable data_dir for the class but we don't trigger any disk I/O.
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
 
     def tearDown(self):
         import shutil
@@ -172,7 +172,7 @@ class TestComputeCorrectionBands(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
 
     def tearDown(self):
         import shutil
@@ -239,7 +239,7 @@ class TestApplyBandCorrection(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
         # Hand-crafted bands so interpolation behaviour is unambiguous
         self.f._correction_bands = [
             (17.5, 1.00),
@@ -282,7 +282,7 @@ class TestBiasFactorApplied(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
 
     def tearDown(self):
         import shutil

@@ -37,12 +37,12 @@
         <Label>SOLAR FORECAST (Open-Meteo — no API key required)</Label>
     </Field>
     <Field id="label_forecast_info" type="label">
-        <Label>Arrays are modelled using Open-Meteo free GTI data (10,000 calls/day limit). Set your site coordinates and array specs below. The defaults below point at Big Ben, London (51.5007, -0.1246) — change them to your own roof. The plugin reads LATITUDE / LONGITUDE from IndigoSecrets.py first if present; these fields are the fallback. The arrays field expects a JSON list — leave blank to use the built-in default.</Label>
+        <Label>Arrays are modelled using Open-Meteo free GTI data (10,000 calls/day limit). Site coordinates have NO built-in default — fill them in below for your own roof, or set LATITUDE / LONGITUDE in IndigoSecrets.py. If neither is set the plugin logs an ERROR and skips the solar forecast. Example: Big Ben, London is 51.5007, -0.1246. The arrays field expects a JSON list — leave blank to use the built-in default.</Label>
     </Field>
-    <Field id="siteLatitude" type="textfield" defaultValue="51.5007">
+    <Field id="siteLatitude" type="textfield" defaultValue="">
         <Label>Site latitude (degrees N, e.g. 51.5007 for London):</Label>
     </Field>
-    <Field id="siteLongitude" type="textfield" defaultValue="-0.1246">
+    <Field id="siteLongitude" type="textfield" defaultValue="">
         <Label>Site longitude (degrees E, negative for W, e.g. -0.1246 for London):</Label>
     </Field>
     <Field id="siteArraysJson" type="textfield" defaultValue="">

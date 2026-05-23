@@ -800,7 +800,8 @@ class Plugin(indigo.PluginBase):
 
         self._init_modules()
         self._init_timeseries_db()
-        self.forecast.load_correction_factor()
+        if self.forecast:
+            self.forecast.load_correction_factor()
         # Pre-populate latest_forecast_data from disk cache so the first manager
         # evaluation has forecast data available (disk cache was loaded in
         # OpenMeteoForecast.__init__; this propagates it into plugin.py's dict).
@@ -903,23 +904,26 @@ class Plugin(indigo.PluginBase):
             health_pct = float(prefs.get("batteryHealthCutoff", "1"))
         except (TypeError, ValueError):
             health_pct = 1.0
-        # Site coordinates — IndigoSecrets first, PluginConfig next, Big Ben last.
-        # Big Ben (51.5007, -0.1246) is a neutral public default for any user
-        # who hasn't set IndigoSecrets.py or filled in PluginConfig.
-        if SITE_LATITUDE is not None:
-            site_lat = float(SITE_LATITUDE)
-        else:
+        # Site coordinates — IndigoSecrets first, PluginConfig next, None last.
+        # No built-in default: a fresh install must explicitly configure a
+        # location (in IndigoSecrets.py or the PluginConfig fields). If neither
+        # is set the forecast feature logs an ERROR and skips itself.  The
+        # site_config publish below writes None into the JSON in that case.
+        def _coord(secrets_value, prefs_key):
+            if secrets_value is not None:
+                try:
+                    return float(secrets_value)
+                except (TypeError, ValueError):
+                    return None
+            raw = (prefs.get(prefs_key) or "").strip()
+            if not raw:
+                return None
             try:
-                site_lat = float(prefs.get("siteLatitude", "51.5007"))
+                return float(raw)
             except (TypeError, ValueError):
-                site_lat = 51.5007
-        if SITE_LONGITUDE is not None:
-            site_lon = float(SITE_LONGITUDE)
-        else:
-            try:
-                site_lon = float(prefs.get("siteLongitude", "-0.1246"))
-            except (TypeError, ValueError):
-                site_lon = -0.1246
+                return None
+        site_lat = _coord(SITE_LATITUDE,  "siteLatitude")
+        site_lon = _coord(SITE_LONGITUDE, "siteLongitude")
 
         # Export rate — best-effort lookup from latest_rates_data; default 12p.
         try:
@@ -4005,11 +4009,13 @@ class Plugin(indigo.PluginBase):
         log(f"Midnight: recording daily history for {yesterday}")
 
         # Capture morning forecast for bias correction (00:05 next run)
-        self.forecast.capture_morning_forecast()
+        if self.forecast:
+            self.forecast.capture_morning_forecast()
 
-        # Write accuracy record for yesterday (pass date explicitly — datetime.now()
-        # inside record_accuracy would give the new day, stamping records one day ahead)
-        self.forecast.record_accuracy(self.store["pv_daily_kwh"], date_str=yesterday)
+            # Write accuracy record for yesterday (pass date explicitly —
+            # datetime.now() inside record_accuracy would give the new day,
+            # stamping records one day ahead)
+            self.forecast.record_accuracy(self.store["pv_daily_kwh"], date_str=yesterday)
 
         # Write daily history ring buffer
         self._write_daily_history(yesterday)
@@ -4017,7 +4023,7 @@ class Plugin(indigo.PluginBase):
         # Forecast accuracy: log the rolling 7-day summary so trends are
         # visible without having to read the JSON file.
         try:
-            summary = self.forecast.get_accuracy_summary(window_days=7)
+            summary = self.forecast.get_accuracy_summary(window_days=7) if self.forecast else {"days": 0}
             if summary["days"] > 0:
                 log(
                     f"[Forecast] 7-day accuracy: MAPE {summary['mape_pct']:.1f}%  "
@@ -5440,9 +5446,9 @@ class Plugin(indigo.PluginBase):
         # always have a forecast object available even if the Modbus IP is not
         # yet configured.
         # Site coordinates: IndigoSecrets.py first (LATITUDE / LONGITUDE),
-        # then PluginConfig (siteLatitude / siteLongitude), then None — the
-        # OpenMeteoForecast constructor's own Big Ben default kicks in if
-        # nothing is set anywhere.  Array specs remain in source for v5 —
+        # then PluginConfig (siteLatitude / siteLongitude), then None — there
+        # is NO built-in default.  If both are unset the forecast feature is
+        # skipped with a clear ERROR.  Array specs remain in source for v5 —
         # a per-array UI is on the v6 roadmap.
         def _as_float(value, fallback):
             try:
@@ -5485,13 +5491,23 @@ class Plugin(indigo.PluginBase):
                     f"to built-in default ARRAYS. Fix the JSON in PluginConfig.",
                     level="ERROR",
                 )
-        self.forecast = OpenMeteoForecast(
-            data_dir=self.data_dir,
-            logger=self.logger,
-            latitude=site_lat,
-            longitude=site_lon,
-            arrays=arrays_override,
-        )
+        if site_lat is None or site_lon is None:
+            log(
+                "[Config] No site coordinates configured. Set LATITUDE / "
+                "LONGITUDE in IndigoSecrets.py OR fill in siteLatitude / "
+                "siteLongitude under Plugins → Sigenergy Manager → Configure. "
+                "Solar forecast feature is disabled until both are set.",
+                level="ERROR",
+            )
+            self.forecast = None
+        else:
+            self.forecast = OpenMeteoForecast(
+                data_dir=self.data_dir,
+                logger=self.logger,
+                latitude=site_lat,
+                longitude=site_lon,
+                arrays=arrays_override,
+            )
 
         # Octopus
         self.octopus = OctopusAPI(

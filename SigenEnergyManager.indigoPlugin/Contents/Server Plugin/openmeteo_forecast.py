@@ -56,11 +56,16 @@ except ImportError:
 
 
 # ============================================================
-# Site configuration — Highsteads, Medomsley (54.882N, 1.818W)
+# Site configuration — coordinates are NOT defaulted here.
+# The plugin passes latitude / longitude into the constructor below,
+# resolved from IndigoSecrets.py (LATITUDE / LONGITUDE) first, then
+# PluginConfig (siteLatitude / siteLongitude).  If neither is set the
+# plugin skips forecast init entirely with an ERROR log — this module
+# is never instantiated with None coordinates.
 # ============================================================
 
-LATITUDE  = 54.882
-LONGITUDE = -1.818
+LATITUDE  = None
+LONGITUDE = None
 
 # Four PV arrays — specs from original solar quotation (Alps Electrical, 2025)
 # azimuth: 0=South, 90=West, -90=East, 180=North  (Open-Meteo convention)
@@ -145,21 +150,27 @@ class OpenMeteoForecast:
             data_dir:  Directory for cache and accuracy record files
                        (Preferences/Plugins/.../com.clives.indigoplugin.sigenergy-energy-manager/).
             logger:    Optional logger instance.
-            latitude:  Site latitude in degrees N (defaults to module LATITUDE,
-                       i.e. Highsteads, Medomsley).
-            longitude: Site longitude in degrees E (negative for W).  Defaults to
-                       module LONGITUDE.
+            latitude:  Site latitude in degrees N.  Required — there is NO
+                       built-in default.  Callers must resolve from
+                       IndigoSecrets.py / PluginConfig before instantiating.
+            longitude: Site longitude in degrees E (negative for W). Required.
             arrays:    List of array config dicts (see ARRAYS in this module for
                        the expected shape: name/tilt/azimuth/kwp/shade).  None
                        falls back to the module ARRAYS for back-compat — a
                        future plugin release will expose per-array config in
                        PluginConfig.xml.
         """
+        if latitude is None or longitude is None:
+            raise ValueError(
+                "OpenMeteoForecast requires explicit latitude and longitude; "
+                "set LATITUDE / LONGITUDE in IndigoSecrets.py or siteLatitude / "
+                "siteLongitude in PluginConfig."
+            )
         self.data_dir = data_dir
         self.logger   = logger or logging.getLogger("SigenEnergyManager.OpenMeteo")
-        self.latitude  = LATITUDE  if latitude  is None else float(latitude)
-        self.longitude = LONGITUDE if longitude is None else float(longitude)
-        self.arrays    = ARRAYS    if arrays    is None else list(arrays)
+        self.latitude  = float(latitude)
+        self.longitude = float(longitude)
+        self.arrays    = ARRAYS if arrays is None else list(arrays)
 
         # In-memory cache: last successfully combined forecast dict
         self._cached_forecast = None
