@@ -6,9 +6,13 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        23-05-2026 (v5.21.1)
-# Version:     5.21.1
-# Changes:     v5.21.0 (22-05-2026) — magnitude-conditional bias correction in
+# Date:        23-05-2026 (v5.21.2)
+# Version:     5.21.2
+# Changes:     v5.21.2 (23-05-2026) — millisecond timestamp [HH:MM:SS.mmm]
+#              prefix on every log line via plugin_utils.install_timestamp_filter().
+#              Matches Device Activity Monitor convention. New "Toggle
+#              Timestamps in Log" menu item.
+#              v5.21.0 (22-05-2026) — magnitude-conditional bias correction in
 #              openmeteo_forecast.py (module bumped 1.2.1 → 1.3). Analysis of
 #              31 days showed err% vs forecast_kwh r = -0.462: the model
 #              under-forecasts on moderate-prediction days (25-45 kWh,
@@ -473,6 +477,10 @@ try:
     from plugin_utils import log_startup_banner
 except ImportError:
     log_startup_banner = None
+try:
+    from plugin_utils import install_timestamp_filter
+except ImportError:
+    install_timestamp_filter = None
 
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
@@ -631,6 +639,12 @@ class Plugin(indigo.PluginBase):
 
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs):
         super().__init__(plugin_id, plugin_display_name, plugin_version, plugin_prefs)
+
+        self.timestamp_enabled = bool(plugin_prefs.get("timestampEnabled", True))
+        if install_timestamp_filter:
+            self._ts_filter = install_timestamp_filter(self, enabled=self.timestamp_enabled)
+        else:
+            self._ts_filter = None
 
         if log_startup_banner:
             log_startup_banner(plugin_id, plugin_display_name, plugin_version)
@@ -5659,7 +5673,19 @@ class Plugin(indigo.PluginBase):
     # -------------------------------------------------------------------------
 
     def showPluginInfo(self, valuesDict=None, typeId=None):
+        extras = [("Timestamps in Log:", "ON" if self.timestamp_enabled else "OFF")]
         if log_startup_banner:
-            log_startup_banner(self.pluginId, self.pluginDisplayName, self.pluginVersion)
+            log_startup_banner(self.pluginId, self.pluginDisplayName, self.pluginVersion, extras=extras)
         else:
             indigo.server.log(f"{self.pluginDisplayName} v{self.pluginVersion}")
+            for label, value in extras:
+                indigo.server.log(f"  {label} {value}")
+
+    def menuToggleTimestamps(self, valuesDict=None, typeId=None):
+        self.timestamp_enabled = not self.timestamp_enabled
+        self.pluginPrefs["timestampEnabled"] = self.timestamp_enabled
+        if self._ts_filter:
+            self._ts_filter.enabled = self.timestamp_enabled
+        state = "ON" if self.timestamp_enabled else "OFF"
+        indigo.server.log(f"[{self.pluginDisplayName}] Timestamps in Log -> {state}")
+        return True

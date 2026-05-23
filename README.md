@@ -94,10 +94,25 @@ battery genuinely cannot reach the configured minimum SOC by next sunrise.
 
 ---
 
+## Logging
+
+Every log line from `self.logger.*` is prefixed with a millisecond timestamp
+`[HH:MM:SS.mmm]` so events can be correlated tightly with other CliveS plugins
+(Device Activity Monitor uses the same convention).
+
+To turn the prefix off (or back on) at any time:
+
+**Plugins → Sigenergy Manager → Toggle Timestamps in Log (on/off)**
+
+The setting is stored in `pluginPrefs` (`timestampEnabled`) and persists across
+restarts. Defaults to ON. *Note: some legacy submodules log via
+`indigo.server.log()` directly and are unaffected by the toggle.*
+
 ## Version history
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.21.2 | 23-May-2026 | Millisecond timestamp `[HH:MM:SS.mmm]` prefix on every `self.logger` line via `plugin_utils.install_timestamp_filter()`; new "Toggle Timestamps in Log" menu item. |
 | 5.21.1 | 23-May-2026 | **Site coordinates moved into the IndigoSecrets pattern; no built-in default.** Plugin now reads `LATITUDE` / `LONGITUDE` from `IndigoSecrets.py` first, PluginConfig (`siteLatitude` / `siteLongitude`) next. There is no hardcoded fallback — if neither is set the plugin logs an ERROR and skips the solar forecast feature (matching the existing pattern for a missing inverter IP). The previous developer-home defaults (54.882 / -1.818) have been removed from `plugin.py`, `PluginConfig.xml`, and `openmeteo_forecast.py`. `OpenMeteoForecast.__init__` now raises `ValueError` if instantiated with no coordinates. The README and PluginConfig label show **Big Ben (51.5007, -0.1246)** purely as a recognisable example. Run-Self-Test secrets block now lists `LATITUDE` / `LONGITUDE`. Four `self.forecast.X` call sites guarded so the plugin stays up when the forecast is disabled. 101/101 unit tests still pass (test fixtures pass explicit example coords). |
 | 5.21.0 | 22-May-2026 | **Magnitude-conditional bias correction.** `openmeteo_forecast.py` bumped 1.2.1 → 1.3, replacing v5.19.6's "no correction" with a 5-band per-day correction factor. Centres at 17.5 / 30 / 40 / 50 / 65 kWh; each band's factor is the median `actual/forecast` ratio of records whose raw forecast falls within ±7.5 kWh of the centre, clamped to [0.5, 1.5]. Bands with fewer than 3 in-window records inherit the global kWh-weighted scalar. Linear interpolation between centres so a forecast of 35 kWh blends the 30-band and 40-band factors. Recomputed nightly from a rolling 60-day window of accuracy records. Analysis of 31 days showed `err% vs forecast_kwh r = -0.462` — the model under-forecasts on moderate-prediction days (25–45 kWh, ratio 1.18–1.28) and over-forecasts on bright days (>55 kWh, ratio ~0.93). A single flat factor cancels these opposite-sign errors out (which is why v5.19.6 reverted to raw); the band table follows the shape. Projects MAPE 19.8% → ~14–16%. Per-day factor applied to `correctedTodayKwh`/`correctedTomorrowKwh` AND scaled proportionally across every hourly slot in `openmeteo_forecast.json` so the battery optimiser sees a shape-preserving correction (peaks scale, zero hours stay zero). New JSON / state fields: `biasFactorToday`, `biasFactorTomorrow`, `biasBands`. `test_openmeteo_forecast.py` bumped 1.0 → 1.1: added `TestComputeCorrectionBands`, `TestApplyBandCorrection`, and `TestBiasFactorApplied` (replacing v1.2's `TestBiasFactorNotApplied`); 24 tests pass. First-startup bands on the live 32-record file: 17.5/1.052, 30/1.282, 40/1.179, 50/0.984, 65/0.926. |
 | 5.20.0 | 21-May-2026 | **VPP handover fix — confirmed via a 4 kWh paid event that reported 0.00 kWh export.** Root cause: the old `_poll_vpp` Step 2 called `disable_remote_ems()` at T-5min, which writes 40029=0 and literally kicks Axle out of Remote EMS — the very channel Axle dispatches through. Fix: no explicit "release" call. The "skip Modbus writes" guard now extends from `{ACTIVE, COOLING_OFF}` to also include `PRE_CHARGING`, so from T-30min the plugin stops touching register 40031 and the charge/discharge limits, letting Axle's writes stand. Step 1's `set_self_consumption()` now reads 40031 first and skips if Axle is already dispatching (mode 0x06). `_vpp_check_axle_release()` broadened to also accept `40031 == 0x02` as Axle's end-of-event signal (previously only `30003 == 0`, which Axle doesn't always set — that night's cooling_off only released at the 60-min force-timeout). Dead `VPP_PRE_EXPORT_MINUTES` constant removed. |
