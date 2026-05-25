@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
 # Date:        23-05-2026 (v5.21.2)
-# Version:     5.21.2
+# Version:     5.21.3
 # Changes:     v5.21.2 (23-05-2026) — millisecond timestamp [HH:MM:SS.mmm]
 #              prefix on every log line via plugin_utils.install_timestamp_filter().
 #              Matches Device Activity Monitor convention. New "Toggle
@@ -1949,6 +1949,18 @@ class Plugin(indigo.PluginBase):
 
     def deviceStopComm(self, dev):
         pass
+
+    @staticmethod
+    def didDeviceCommPropertyChange(oldDevice, newDevice):
+        """Suppress unnecessary deviceStopComm/deviceStartComm cycles.
+
+        Devices in this plugin are created and managed internally from Modbus
+        polling, Open-Meteo forecast updates and snapshot writes; there are no
+        user-editable pluginProps that justify a comm restart. Returning False
+        prevents Indigo from cycling comm on every internal
+        replacePluginPropsOnServer write.
+        """
+        return False
 
     def _set_device_initial_state(self, dev):
         """Write placeholder states and state image for a device on startup."""
