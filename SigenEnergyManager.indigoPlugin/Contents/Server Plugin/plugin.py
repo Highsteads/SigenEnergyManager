@@ -6,9 +6,14 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        23-05-2026 (v5.21.2)
-# Version:     5.21.3
-# Changes:     v5.21.2 (23-05-2026) — millisecond timestamp [HH:MM:SS.mmm]
+# Date:        26-05-2026 (v5.21.4)
+# Version:     5.21.4
+# Changes:     v5.21.4 (26-05-2026) — openmeteo_forecast.py 1.3 → 1.4: one-shot
+#              retry on transient network errors (Timeout, ConnectionError,
+#              ChunkedEncodingError — the last covers Open-Meteo's occasional
+#              SSL UNEXPECTED_EOF hiccups). Transient blips now log at WARNING
+#              not ERROR; cache fallback and 3-of-4 array path unchanged.
+#              v5.21.2 (23-05-2026) — millisecond timestamp [HH:MM:SS.mmm]
 #              prefix on every log line via plugin_utils.install_timestamp_filter().
 #              Matches Device Activity Monitor convention. New "Toggle
 #              Timestamps in Log" menu item.

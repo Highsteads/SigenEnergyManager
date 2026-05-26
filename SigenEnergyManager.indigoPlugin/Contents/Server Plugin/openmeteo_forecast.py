@@ -7,8 +7,16 @@
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        22-05-2026
-# Version:     1.3
+# Date:        26-05-2026
+# Version:     1.4
+# 1.4 — one-shot retry on transient network errors (Timeout, ConnectionError,
+#       ChunkedEncodingError — the latter covering the SSL UNEXPECTED_EOF
+#       hiccups Open-Meteo throws occasionally). All transient network errors
+#       now log at WARNING, not ERROR — they're expected, the cache fallback
+#       and 3-of-4 array path already handle them gracefully. ERROR is
+#       reserved for HTTP non-200, malformed JSON, and genuinely unexpected
+#       exceptions. No behaviour change when retry succeeds (silent except
+#       for one WARNING on the first failed attempt).
 # 1.3 — magnitude-conditional bias correction (replaces v1.2's "no correction").
 #       Analysis of 31 days showed err% vs forecast_kwh r = -0.462: the model
 #       under-forecasts on moderate-forecast days (25-45 kWh, factor ~1.2-1.34)
@@ -93,6 +101,8 @@ PERFORMANCE_RATIO = 0.90
 OPENMETEO_URL   = "https://api.open-meteo.com/v1/forecast"
 REQUEST_TIMEOUT = 30    # seconds per array call
 CACHE_TTL       = 1800  # 30 minutes — well within 10,000 call/day free tier
+RETRY_ATTEMPTS  = 2     # total attempts per array call (1 initial + 1 retry)
+RETRY_BACKOFF_S = 2     # seconds between attempts on transient network errors
 
 # Dawn detection: first hourly slot whose output exceeds this threshold (Wh).
 # 500 Wh/h ~ 500 W average sustained; below this = pre-dawn / post-dusk.
@@ -514,13 +524,54 @@ class OpenMeteoForecast:
             "timeformat": "iso8601",
         }
 
-        try:
-            response = requests.get(
-                OPENMETEO_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            )
+        # Transient network errors (TLS hiccups, connection resets, DNS blips,
+        # read timeouts) are common against cloud APIs — one retry with a brief
+        # backoff masks the vast majority. Anything still failing after the
+        # retry falls through to cache, same as before.
+        response  = None
+        last_exc  = None
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                response = requests.get(
+                    OPENMETEO_URL,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                last_exc = None
+                break
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                last_exc = e
+                if attempt < RETRY_ATTEMPTS:
+                    self.logger.warning(
+                        f"[OpenMeteo] {array_cfg['name']}: transient network "
+                        f"error (attempt {attempt}/{RETRY_ATTEMPTS}) — "
+                        f"{type(e).__name__}: {e}; retrying in "
+                        f"{RETRY_BACKOFF_S}s"
+                    )
+                    time.sleep(RETRY_BACKOFF_S)
+                else:
+                    self.logger.warning(
+                        f"[OpenMeteo] {array_cfg['name']}: transient network "
+                        f"error after {RETRY_ATTEMPTS} attempts — "
+                        f"{type(e).__name__}: {e}"
+                    )
+            except Exception as e:
+                # Unexpected — log at ERROR and don't retry
+                self.logger.error(
+                    f"[OpenMeteo] Error fetching {array_cfg['name']}: {e}"
+                )
+                last_exc = e
+                break
 
+        if response is None:
+            # All attempts failed — fall back to cache if we have one
+            if cached:
+                return cached.get("data", [])
+            return None
+
+        try:
             if response.status_code != 200:
                 self.logger.error(
                     f"[OpenMeteo] HTTP {response.status_code} for "
@@ -563,16 +614,9 @@ class OpenMeteoForecast:
             )
             return result
 
-        except requests.exceptions.Timeout:
-            self.logger.warning(
-                f"[OpenMeteo] Timeout fetching {array_cfg['name']}"
-            )
-            if cached:
-                return cached.get("data", [])
-            return None
         except Exception as e:
             self.logger.error(
-                f"[OpenMeteo] Error fetching {array_cfg['name']}: {e}"
+                f"[OpenMeteo] Error parsing response for {array_cfg['name']}: {e}"
             )
             if cached:
                 return cached.get("data", [])
