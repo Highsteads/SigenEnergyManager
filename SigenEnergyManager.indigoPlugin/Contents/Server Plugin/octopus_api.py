@@ -481,12 +481,19 @@ class OctopusAPI:
         cheap_start = window.get("cheap_start", "02:00")
         cheap_end   = window.get("cheap_end", "05:00")
 
-        # Resolve Europe/London timezone once
+        # Resolve Europe/London timezone once. Prefer stdlib zoneinfo
+        # (Python 3.9+) so the conversion works even when pytz isn't
+        # installed (e.g. test environments). pytz remains a fallback.
+        _tz_l = None
         try:
-            import pytz
-            _tz_l = pytz.timezone("Europe/London")
+            from zoneinfo import ZoneInfo
+            _tz_l = ZoneInfo("Europe/London")
         except ImportError:
-            _tz_l = None
+            try:
+                import pytz
+                _tz_l = pytz.timezone("Europe/London")
+            except ImportError:
+                _tz_l = None
 
         # Group rates by time window
         cheap_rates    = []

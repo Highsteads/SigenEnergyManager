@@ -1069,6 +1069,22 @@ class TestOctopusTouLocalBucketing(unittest.TestCase):
         result = self.api._parse_tou_slots(slots, self.window)
         self.assertEqual(result.get("cheap_p"), 7.0)
 
+    def test_bst_utc_0030_is_local_0130_not_cheap(self):
+        """During BST: UTC 00:30 == local 01:30 — still inside the 00:30-05:30
+        cheap window so SHOULD be cheap. Regression for the inverse case to
+        confirm BST→local shift is applied (not just classified-as-cheap by
+        coincidence)."""
+        # UTC 04:30 in summer == local 05:30 — boundary, should be standard
+        slots = [{
+            "valid_from":    "2026-06-15T04:30:00Z",
+            "valid_to":      "2026-06-15T05:00:00Z",
+            "value_inc_vat": 25.0,
+        }]
+        result = self.api._parse_tou_slots(slots, self.window)
+        # local 05:30 is the END of the cheap window (exclusive) → standard
+        self.assertIsNone(result.get("cheap_p"))
+        self.assertEqual(result.get("standard_p"), 25.0)
+
 
 class TestModbusSleepFunction(unittest.TestCase):
     """Tests for sigenergy_modbus sleep_func injection (v4.5 fix)."""

@@ -4,9 +4,20 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        21-05-2026
-# Version:     3.4
+# Author:      CliveS & Claude Opus 4.7
+# Date:        27-05-2026
+# Version:     3.5
+# 3.5 — Decision dataclass gains an `audit_trail: List[Tuple[str, str]]` field;
+#       evaluate() populates it at every branch (CONTEXT, BALANCE, OVERRIDE,
+#       RESILIENCE, FLOOD-PREP, IMPORT, OVERFLOW, RELEASE-OVERFLOW, DEFAULT)
+#       so the whole decision tree — both matched and considered-but-skipped
+#       branches — is visible in a single audit block.  Plan-object pattern
+#       lifted from mlamoure/indigo-auto-lights; same shape already applied to
+#       openmeteo_battery_optimiser v3.6 and octopus_tracker_rate v1.2 (the
+#       three together = "every Sigenergy-touching decision script audits its
+#       reasoning the same way").  Logged by plugin.py _log_manager_decision on
+#       action change (no per-poll spam).  Pure additive — audit_trail defaults
+#       to [] so existing tests in test_battery_manager.py are unaffected.
 # 3.4 — flood prevention also subtracts Axle VPP export scheduled on the refill
 #       day (treated as extra demand). Pro-rated for events that span midnight.
 # 3.3 — flood prevention now gates on the *refill-day* solar forecast
@@ -212,6 +223,10 @@ class Decision:
     soc_at_dawn_kwh: float = 0.0
     import_kwh:      float = 0.0
     export_kw:       float = 0.0    # kW being exported (solar overflow)
+    # v3.5 — Plan-object audit trail: (tag, message) tuples appended at every
+    # branch evaluate() considers (matched OR skipped).  Plugin logs this on
+    # action change to make the WHY visible without re-running with debug on.
+    audit_trail:     List[Tuple[str, str]] = field(default_factory=list)
 
 
 # ============================================================
@@ -249,25 +264,64 @@ class BatteryManager:
           4. Import        — tomorrow won't reach sufficiency without grid
           5. Overflow      — daytime export when surplus exceeds DNO cap
           6. Self-consume  — nothing else applies
+
+        v3.5: every branch — matched OR considered-but-skipped — appends an
+        entry to a local audit list which is attached to the returned Decision.
+        Plugin.py logs the audit on action change.  Skip-reason text is short
+        because each branch's full reasoning lives in the matched-case reason
+        string; the audit captures the path through the tree, not the algebra.
         """
+        audit: List[Tuple[str, str]] = []
+        audit.append((
+            "CONTEXT",
+            f"SOC {snapshot.current_soc_pct:.1f}%, tariff={snapshot.tariff.tariff_key}, "
+            f"export_enabled={snapshot.export_enabled}, vpp_active={snapshot.vpp_active}, "
+            f"export_active={snapshot.export_active}"
+        ))
+
         # 1. Overrides — VPP suspension or already-running flood prevention
         override = self._check_overrides(snapshot)
         if override is not None:
+            audit.append(("OVERRIDE", f"matched -> {override.reason}"))
+            override.audit_trail = audit
             return override
+        audit.append(("OVERRIDE", "skipped — no VPP active, no running flood export"))
 
         # 24h sufficiency calc used by every later branch
         balance = self._calculate_24h_balance(snapshot)
+        audit.append((
+            "BALANCE",
+            f"surplus {balance.surplus_kwh:.1f} kWh, import_needed={balance.import_needed}, "
+            f"daytime={balance.is_daytime}, dawn SOC {balance.battery_at_dawn_kwh:.1f} kWh, "
+            f"tomorrow need {balance.tomorrow_need_kwh:.1f} kWh"
+        ))
 
         # 2. Resilience buffer (flat-rate tariffs only)
         resilience = self._check_resilience_buffer(snapshot, balance)
         if resilience is not None:
+            audit.append(("RESILIENCE", f"matched -> {resilience.reason}"))
+            resilience.audit_trail = audit
             return resilience
+        audit.append((
+            "RESILIENCE",
+            f"skipped — tariff={snapshot.tariff.tariff_key}, daytime={balance.is_daytime}, "
+            f"SOC {snapshot.current_soc_pct:.1f}% vs dawn_target {snapshot.dawn_target_pct:.0f}%"
+        ))
 
         # 3. Overnight flood prevention pre-drain (only if export enabled)
         if snapshot.export_enabled and not balance.is_daytime:
             flood = self._check_flood_prevention(snapshot, balance)
             if flood is not None:
+                audit.append(("FLOOD-PREP", f"matched -> {flood.reason}"))
+                flood.audit_trail = audit
                 return flood
+            audit.append(("FLOOD-PREP", "skipped — gate conditions not met (SOC or forecast)"))
+        else:
+            audit.append((
+                "FLOOD-PREP",
+                f"skipped — export_enabled={snapshot.export_enabled}, "
+                f"daytime={balance.is_daytime}"
+            ))
 
         # 4. Import takes priority: ensure tomorrow is covered before exporting today
         if balance.import_needed:
@@ -279,17 +333,25 @@ class BatteryManager:
                 decision.dawn_viable = False
             decision.soc_at_dawn_kwh = balance.battery_at_dawn_kwh
             decision.import_kwh      = balance.import_kwh_grid
+            audit.append(("IMPORT", f"matched -> {decision.action}: {decision.reason}"))
+            decision.audit_trail = audit
             return decision
+        audit.append(("IMPORT", "skipped — import_needed=False (battery+solar covers tomorrow)"))
 
         # 5. Daytime solar overflow: export surplus PV that would otherwise be clipped
         if snapshot.export_enabled:
             overflow = self._check_solar_overflow(snapshot, balance)
             if overflow is not None:
+                audit.append(("OVERFLOW", f"matched -> {overflow.reason}"))
+                overflow.audit_trail = audit
                 return overflow
+            audit.append(("OVERFLOW", "skipped — no surplus or conditions not met"))
+        else:
+            audit.append(("OVERFLOW", "skipped — export not enabled"))
 
         # 5b. Release a previously-applied overflow cap if conditions no longer hold
         if snapshot.solar_overflow_active:
-            return Decision(
+            release = Decision(
                 action          = ACTION_SELF_CONSUMPTION,
                 reason          = (
                     f"Solar overflow: conditions no longer met — releasing charge cap "
@@ -299,9 +361,15 @@ class BatteryManager:
                 dawn_viable     = True,
                 soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
             )
+            audit.append((
+                "RELEASE-OVERFLOW",
+                "matched -> previously-applied overflow cap no longer applicable"
+            ))
+            release.audit_trail = audit
+            return release
 
         # 6. Default: nothing to do, sit on self-consumption
-        return Decision(
+        default_decision = Decision(
             action          = ACTION_SELF_CONSUMPTION,
             reason          = (
                 f"24h sufficient — surplus {balance.surplus_kwh:.1f} kWh | "
@@ -311,6 +379,9 @@ class BatteryManager:
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
+        audit.append(("DEFAULT", "matched -> self-consumption (no other branch applied)"))
+        default_decision.audit_trail = audit
+        return default_decision
 
     # ------------------------------------------------------------------
     # evaluate() decision branches — extracted for readability

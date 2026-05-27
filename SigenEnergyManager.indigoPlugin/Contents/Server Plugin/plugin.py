@@ -6,9 +6,30 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        26-05-2026 (v5.21.4)
-# Version:     5.21.4
-# Changes:     v5.21.4 (26-05-2026) — openmeteo_forecast.py 1.3 → 1.4: one-shot
+# Date:        27-05-2026 (v5.22.1)
+# Version:     5.22.1
+# Changes:     v5.22.1 (27-05-2026) — octopus_api._parse_tou_slots: BST-aware
+#              UTC→Europe/London conversion no longer depends on pytz being
+#              importable. Now prefers stdlib zoneinfo (always available on
+#              Python 3.9+) and only falls back to pytz, with None as last
+#              resort. Fixes test_battery_manager regression where a UTC
+#              23:30 Go cheap slot in summer was misclassified as standard
+#              because the test environment lacks pytz; production Indigo
+#              installs (pytz in requirements.txt) were already correct but
+#              this hardens the path so the test environment matches.
+#              v5.22.0 (27-05-2026) — battery_manager.py 3.4 → 3.5: plan-object
+#              decision-audit pattern lifted from mlamoure/indigo-auto-lights.
+#              Decision dataclass gains an audit_trail field populated at every
+#              branch (CONTEXT, BALANCE, OVERRIDE, RESILIENCE, FLOOD-PREP,
+#              IMPORT, OVERFLOW, RELEASE-OVERFLOW, DEFAULT) — both matched AND
+#              considered-but-skipped branches recorded.  _log_manager_decision
+#              now dumps the audit block after the action-change INFO line,
+#              once per action transition (not per-poll) so no log spam.  Same
+#              shape applied to openmeteo_battery_optimiser v3.6 and
+#              octopus_tracker_rate v1.2 the same day.  Existing 16+ unit
+#              tests in test_battery_manager.py unaffected (audit_trail
+#              defaults to empty list).
+#              v5.21.4 (26-05-2026) — openmeteo_forecast.py 1.3 → 1.4: one-shot
 #              retry on transient network errors (Timeout, ConnectionError,
 #              ChunkedEncodingError — the last covers Open-Meteo's occasional
 #              SSL UNEXPECTED_EOF hiccups). Transient blips now log at WARNING
@@ -2557,6 +2578,19 @@ class Plugin(indigo.PluginBase):
                 f"[Manager] SOC={soc_pct:.1f}%  PV={snapshot.pv_watts}W  "
                 f"Action={decision.action}  {decision.reason}"
             )
+
+        # v5.22.0 — Decision audit trail (plan-object pattern from
+        # battery_manager.py v3.5).  Logged on action change so the WHY of the
+        # new action is visible without re-running with debug on.  Silently
+        # skipped when audit_trail is empty (e.g. unit-test Decisions
+        # constructed directly without going through evaluate()).
+        audit_trail = getattr(decision, "audit_trail", None) or []
+        if audit_trail:
+            log("[Manager] === DECISION AUDIT ===")
+            tag_width = max((len(t) for t, _ in audit_trail), default=10)
+            for tag, msg in audit_trail:
+                log(f"[Manager]   [{tag:<{tag_width}}]  {msg}")
+            log("[Manager] ======================")
 
         self.store["last_manager_action"] = decision.action
 
