@@ -6,9 +6,21 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        28-05-2026 (v5.24.0)
-# Version:     5.24.0
-# Changes:     v5.24.0 (28-05-2026) — added currentMode List-enum state to the
+# Date:        28-05-2026 (v5.24.1)
+# Version:     5.24.1
+# Changes:     v5.24.1 (28-05-2026) — silence the one spurious red ERROR per
+#              restart: `device "Battery Manager" state key currentMode not
+#              defined (ignoring update request)`. The currentMode List-enum is
+#              registered ASYNCHRONOUSLY after stateListOrDisplayStateIdChanged()
+#              in deviceStartComm, so the FIRST evaluate write (which batches
+#              currentMode with ~20 other keys) raced the registration and
+#              logged one harmless ERROR (rest of the batch applied fine). The
+#              init-state seed already correctly omitted currentMode (v5.24.0);
+#              this extends the same guard to the evaluate write — currentMode is
+#              now appended to the batch only once `"currentMode" in dev.states`,
+#              so the first post-restart tick skips it and the next (<=60s) writes
+#              the real mode. No alarming red line, nothing lost.
+#              v5.24.0 (28-05-2026) — added currentMode List-enum state to the
 #              Battery Manager device so Indigo auto-generates one BoolTrueFalse
 #              sub-state per mode (currentMode.solarOverflow etc.). Users can now
 #              trigger directly on "battery entered night-export" without a
@@ -4627,7 +4639,8 @@ class Plugin(indigo.PluginBase):
         states = [
             {"key": "managerStatus",       "value": "Running" if not self.store["vpp_active"] else "VPP Active"},
             {"key": "currentAction",       "value": action_display},
-            {"key": "currentMode",         "value": ACTION_MODE_TOKEN.get(decision.action, "selfConsumption")},
+            # currentMode (List enum) appended below, guarded — see note before
+            # the updateStatesOnServer call.
             {"key": "currentReason",       "value": decision.reason[:255]},
             {"key": "dawnViable",          "value": str(decision.dawn_viable)},
             {"key": "socAtDawn",           "value": str(round(decision.soc_at_dawn_kwh, 2))},
@@ -4648,6 +4661,18 @@ class Plugin(indigo.PluginBase):
             {"key": "tomorrowNeedKwh",     "value": round(_tomorrow_need_kwh, 1)},
             {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
+        # currentMode is a List-enum registered ASYNCHRONOUSLY after the
+        # stateListOrDisplayStateIdChanged() call in deviceStartComm. On the
+        # very first evaluate tick right after a plugin restart it may not be
+        # registered yet, and writing it then logs a spurious red
+        #   device "Battery Manager" state key currentMode not defined
+        # ERROR (the rest of the batch still applies, so it's harmless — but it
+        # breaks the "no alarming red lines for expected conditions" rule). Only
+        # include it once the state actually exists; the next tick (<=60s) writes
+        # the real mode, so nothing is lost.
+        if "currentMode" in dev.states:
+            states.append({"key": "currentMode",
+                           "value": ACTION_MODE_TOKEN.get(decision.action, "selfConsumption")})
         dev.updateStatesOnServer(states)
 
     def _update_forecast_device(self, data):
