@@ -154,6 +154,29 @@
                 <TriggerLabel>Manager action changed</TriggerLabel>
                 <ControlPageLabel>Current Action</ControlPageLabel>
             </State>
+            <!-- currentMode mirrors currentAction as a List enum so Indigo
+                 auto-generates one BoolTrueFalse sub-state per mode
+                 (currentMode.solarOverflow etc.). Users can then trigger
+                 directly on "battery entered night-export" without a string
+                 compare. Option value= is the camelCase token the plugin
+                 writes; the text is the friendly label. Added v5.24.0. -->
+            <State id="currentMode">
+                <ValueType>
+                    <List>
+                        <Option value="selfConsumption">Self Consumption</Option>
+                        <Option value="solarOverflow">Solar Overflow Export</Option>
+                        <Option value="startImport">Grid Import Active</Option>
+                        <Option value="scheduleImport">Import Scheduled</Option>
+                        <Option value="stopImport">Import Stopping</Option>
+                        <Option value="startExport">Night Export Active</Option>
+                        <Option value="stopExport">Export Stopping</Option>
+                    </List>
+                </ValueType>
+                <TriggerLabel>Battery mode changed</TriggerLabel>
+                <TriggerLabelPrefix>Mode is</TriggerLabelPrefix>
+                <ControlPageLabel>Current Mode</ControlPageLabel>
+                <ControlPageLabelPrefix>Mode is</ControlPageLabelPrefix>
+            </State>
             <State id="currentReason">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Reason changed</TriggerLabel>

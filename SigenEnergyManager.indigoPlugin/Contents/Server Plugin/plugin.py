@@ -6,9 +6,16 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        27-05-2026 (v5.23.0)
-# Version:     5.23.0
-# Changes:     v5.23.0 (27-05-2026) — added prepare_to_sleep / wake_up overrides
+# Date:        28-05-2026 (v5.24.0)
+# Version:     5.24.0
+# Changes:     v5.24.0 (28-05-2026) — added currentMode List-enum state to the
+#              Battery Manager device so Indigo auto-generates one BoolTrueFalse
+#              sub-state per mode (currentMode.solarOverflow etc.). Users can now
+#              trigger directly on "battery entered night-export" without a
+#              string compare. Additive: currentAction keeps its friendly display
+#              string. deviceStartComm now re-fetches the device after the state
+#              list refresh so the new enum + sub-states register cleanly.
+#              v5.23.0 (27-05-2026) — added prepare_to_sleep / wake_up overrides
 #              harvested from the 27-May plugin_base.py sweep. Mac sleep used
 #              to leave the inverter in whatever forced mode it was last set
 #              to (force-charge, night-export) — an 8-hour overnight Mac sleep
@@ -545,6 +552,21 @@ from web_dashboard import WebDashboard
 # add a hardcoded version constant here — Info.plist is the single source of truth.
 PLUGIN_NAME        = "Sigenergy Manager"
 WEB_DASHBOARD_PORT = 8179
+
+# Maps the raw decision action (snake_case) to the camelCase token written to
+# the batteryManager "currentMode" List-enum state. Indigo derives one
+# BoolTrueFalse sub-state per token (currentMode.solarOverflow etc.) for
+# per-mode triggering. Tokens MUST match the <Option value=> entries in
+# Devices.xml. currentAction keeps the friendly display string separately.
+ACTION_MODE_TOKEN = {
+    ACTION_SELF_CONSUMPTION: "selfConsumption",
+    ACTION_SOLAR_OVERFLOW:   "solarOverflow",
+    ACTION_START_IMPORT:     "startImport",
+    ACTION_SCHEDULE_IMPORT:  "scheduleImport",
+    ACTION_STOP_IMPORT:      "stopImport",
+    ACTION_START_EXPORT:     "startExport",
+    ACTION_STOP_EXPORT:      "stopExport",
+}
 
 # Minimum inverter readings required per half-hourly slot before we trust the
 # accumulated average over the default profile.  5 readings = ~5 days of data
@@ -2023,6 +2045,7 @@ class Plugin(indigo.PluginBase):
 
     def deviceStartComm(self, dev):
         dev.stateListOrDisplayStateIdChanged()
+        dev = indigo.devices[dev.id]   # re-fetch: state list changed, local object is stale
         try:
             self._set_device_initial_state(dev)
         except Exception as e:
@@ -2063,6 +2086,14 @@ class Plugin(indigo.PluginBase):
             dev.updateStatesOnServer([
                 {"key": "managerStatus", "value": "Initialising"},
                 {"key": "currentAction", "value": "self_consumption"},
+                # currentMode (List enum) is intentionally NOT seeded here:
+                # the state-list registration kicked off by
+                # stateListOrDisplayStateIdChanged() is async and hasn't
+                # completed at deviceStartComm time, so an immediate write
+                # logs a spurious "state key not defined" ERROR. Indigo
+                # registers the enum with its first Option (selfConsumption)
+                # as the default, and the first evaluate tick (<=5s) writes
+                # the real mode — so nothing is lost.
                 {"key": "currentReason", "value": "Starting up"},
                 {"key": "dawnViable",    "value": ""},
                 {"key": "socAtDawn",     "value": ""},
@@ -4596,6 +4627,7 @@ class Plugin(indigo.PluginBase):
         states = [
             {"key": "managerStatus",       "value": "Running" if not self.store["vpp_active"] else "VPP Active"},
             {"key": "currentAction",       "value": action_display},
+            {"key": "currentMode",         "value": ACTION_MODE_TOKEN.get(decision.action, "selfConsumption")},
             {"key": "currentReason",       "value": decision.reason[:255]},
             {"key": "dawnViable",          "value": str(decision.dawn_viable)},
             {"key": "socAtDawn",           "value": str(round(decision.soc_at_dawn_kwh, 2))},
