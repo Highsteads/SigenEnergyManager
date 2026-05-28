@@ -6,9 +6,21 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        27-05-2026 (v5.22.1)
-# Version:     5.22.1
-# Changes:     v5.22.1 (27-05-2026) — octopus_api._parse_tou_slots: BST-aware
+# Date:        27-05-2026 (v5.23.0)
+# Version:     5.23.0
+# Changes:     v5.23.0 (27-05-2026) — added prepare_to_sleep / wake_up overrides
+#              harvested from the 27-May plugin_base.py sweep. Mac sleep used
+#              to leave the inverter in whatever forced mode it was last set
+#              to (force-charge, night-export) — an 8-hour overnight Mac sleep
+#              while the inverter sat in force-charge would overcharge the
+#              battery. Now: on sleep, return to self-consumption (safe
+#              baseline), save accumulators, stop dashboard, disconnect
+#              modbus. On wake, restart dashboard, force last_modbus and
+#              last_manager to 0 so the next tick polls + re-evaluates
+#              immediately rather than waiting the full interval. The
+#              SAFE-on-sleep behaviour is the most important operational
+#              improvement in this version — biggest win of the harvest.
+#              v5.22.1 (27-05-2026) — octopus_api._parse_tou_slots: BST-aware
 #              UTC→Europe/London conversion no longer depends on pytz being
 #              importable. Now prefers stdlib zoneinfo (always available on
 #              Python 3.9+) and only falls back to pytz, with None as last
@@ -1118,6 +1130,52 @@ class Plugin(indigo.PluginBase):
                 pass
             self.modbus.disconnect()
         self._save_accumulators()
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Mac sleep / wake
+    # ────────────────────────────────────────────────────────────────────────
+    # Defensive: an unattended Mac could sleep for hours. If the inverter is
+    # in a forced mode (force-charge, night-export) when sleep happens, that
+    # mode would persist until wake — overcharging or over-discharging the
+    # battery. Return to self-consumption (the safe baseline) on sleep, then
+    # let the manager re-evaluate normally on wake. Modbus reconnects lazily
+    # on next poll cycle; we only need to restart the web dashboard.
+    def prepare_to_sleep(self):
+        log("Mac going to sleep — returning inverter to self-consumption and stopping dashboard")
+        if self.web_dashboard:
+            try:
+                self.web_dashboard.stop()
+            except Exception as exc:
+                log(f"[Web] Dashboard stop error on sleep: {exc}", level="ERROR")
+        if self.modbus and self.modbus.connected:
+            try:
+                self.modbus.set_self_consumption()
+                log("[Sleep] Inverter returned to self-consumption mode")
+            except Exception as exc:
+                log(f"[Sleep] set_self_consumption failed: {exc}", level="WARNING")
+            try:
+                self.modbus.disconnect()
+            except Exception:
+                pass
+        self._save_accumulators()
+        super().prepare_to_sleep()
+    prepareToSleep = prepare_to_sleep
+
+    def wake_up(self):
+        log("Mac woke — restarting dashboard; modbus reconnects on next poll, manager re-evaluates within 60s")
+        super().wake_up()
+        try:
+            self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT)
+            self.web_dashboard.start()
+            host = self._resolve_dashboard_host()
+            log(f"[Web] Dashboard at http://{host}:{WEB_DASHBOARD_PORT}")
+        except Exception as exc:
+            log(f"[Web] Dashboard restart on wake failed: {exc}", level="ERROR")
+        # Force a fresh modbus poll on the next tick (not wait the full
+        # interval). This makes the system feel responsive after sleep.
+        self.store["last_modbus"] = 0.0
+        self.store["last_manager"] = 0.0
+    wakeUp = wake_up
 
     # ------------------------------------------------------------------ #
     # Web dashboard data provider                                          #
