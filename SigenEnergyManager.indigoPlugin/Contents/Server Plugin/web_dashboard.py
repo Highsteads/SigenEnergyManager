@@ -4,9 +4,9 @@
 # Description: Lightweight HTTP server serving live Sigenergy battery dashboard.
 #              Runs on port 8179. Exposes / (HTML) and /api/status (JSON).
 #              Started from plugin.startup(), stopped on plugin.shutdown().
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        19-04-2026
-# Version:     1.0
+# Author:      CliveS & Claude Opus 4.8
+# Date:        01-06-2026
+# Version:     1.2
 
 import http.server
 import json
@@ -233,6 +233,8 @@ header h1{
 #flow-svg{width:100%;height:auto;position:relative;z-index:1}
 /* --- right panel --- */
 .right-panel{grid-column:2;grid-row:1;display:flex;flex-direction:column;gap:12px}
+.bt-row{display:flex;gap:12px;flex-wrap:wrap}
+.bt-row>*{flex:1 1 240px}
 .soc-wrap{display:flex;align-items:center;gap:16px}
 .soc-ring-wrap{flex-shrink:0;width:96px;height:96px}
 .soc-ring-wrap svg{width:100%;height:100%}
@@ -314,6 +316,21 @@ header h1{
 }
 .fa-arrow.s2 { animation-delay: -0.4s; }
 .fa-arrow.s3 { animation-delay: -0.8s; }
+
+/* CSS-animated flow dots (v5.25.2) — replaces SMIL animateMotion, which Safari
+   freezes under macOS Reduce Motion / window occlusion (the Indigo Server Mac
+   showed static dots while iPhone/MacBook animated). Non-opted-in CSS animations
+   keep running, matching the old chevron mechanism that worked everywhere.
+   All 4 legs are axis-aligned, so a per-leg translate vector (--tx/--ty) is enough. */
+@keyframes flowdot {
+  0%   { transform: translate(0px, 0px);                     opacity: 0; }
+  15%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { transform: translate(var(--tx,0px), var(--ty,0px)); opacity: 0; }
+}
+.fdot { transform-box: fill-box; transform-origin: center; animation: flowdot 1.4s linear infinite; }
+.fdot.d2 { animation-delay: -0.47s; }
+.fdot.d3 { animation-delay: -0.93s; }
 
 @keyframes fa-y-fwd {
   0%   { transform: translateY(-26px); opacity: 0; }
@@ -533,101 +550,92 @@ header h1{
       <span id="chip-grid" class="flow-chip ok" data-help-title="Grid status" data-help="On Grid = AC line healthy. Grid Down = power cut in progress (the inverter is islanding the home from the grid). Lockout = post-event cool-down before re-syncing.">&#8212;</span>
       <span id="chip-mode" class="flow-chip" data-help-title="System mode" data-help="What the manager is doing right now: Self Consumption / Solar Overflow / Night Export / Import / VPP Active. Same source as the Manager Decision card.">&#8212;</span>
     </div>
-    <svg id="flow-svg" viewBox="0 0 520 295" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <filter id="glow"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-      </defs>
-      <!-- track lines (always visible, dim) -->
-      <line x1="260" y1="62" x2="260" y2="112" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
-      <line x1="160" y1="148" x2="207" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
-      <line x1="313" y1="148" x2="360" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
-      <line x1="260" y1="184" x2="260" y2="228" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
-      <!-- Animated direction arrows. Each line carries 3 chevrons that flow
-           along it. Two arrow groups per line (fa-fwd / fa-rev); CSS hides
-           one and animates the other based on .flow-fwd / .flow-rev class.
-           Colour for fl-bat / fl-grid is driven by the parent's `color` style
-           (set by JS), so arrows take their tint from currentColor. -->
+      <svg id="flow-svg" viewBox="0 0 520 295" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <filter id="glow"><feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+        <!-- dim track lines (always visible) -->
+        <line x1="260" y1="80"  x2="260" y2="128" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+        <line x1="260" y1="168" x2="260" y2="216" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+        <line x1="134" y1="148" x2="240" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
+        <line x1="280" y1="148" x2="386" y2="148" stroke="rgba(128,128,128,0.20)" stroke-width="6" stroke-linecap="round"/>
 
-      <!-- Solar: vertical line, fwd = downward (always when generating) -->
-      <g id="fl-solar" class="flow-arrows" opacity="0" style="color:#f5a623">
-        <g class="fa-fwd">
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s1" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s2" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s3" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
+        <!-- Flowing dots: CSS-animated (.fdot) for cross-browser reliability
+             (SMIL animateMotion froze under Safari Reduce-Motion / occlusion).
+             4 legs x fwd/rev, pre-coloured, toggled by setDots() via group opacity.
+             Diamond: Solar top, Home left, Grid right, Battery bottom. -->
+        <g id="dot-solar-fwd" style="opacity:0;--tx:0px;--ty:48px">
+          <circle class="fdot" cx="260" cy="80" r="4" fill="#f5a623"/>
+          <circle class="fdot d2" cx="260" cy="80" r="4" fill="#f5a623"/>
+          <circle class="fdot d3" cx="260" cy="80" r="4" fill="#f5a623"/>
         </g>
-        <g class="fa-rev">
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s1" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s2" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
-          <g transform="translate(260, 87)"><polygon class="fa-arrow s3" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
+        <g id="dot-solar-rev" style="opacity:0;--tx:0px;--ty:-48px">
+          <circle class="fdot" cx="260" cy="128" r="4" fill="#f5a623"/>
+          <circle class="fdot d2" cx="260" cy="128" r="4" fill="#f5a623"/>
+          <circle class="fdot d3" cx="260" cy="128" r="4" fill="#f5a623"/>
         </g>
-      </g>
+        <g id="dot-home-fwd" style="opacity:0;--tx:-106px;--ty:0px">
+          <circle class="fdot" cx="240" cy="148" r="4" fill="#af52de"/>
+          <circle class="fdot d2" cx="240" cy="148" r="4" fill="#af52de"/>
+          <circle class="fdot d3" cx="240" cy="148" r="4" fill="#af52de"/>
+        </g>
+        <g id="dot-home-rev" style="opacity:0;--tx:106px;--ty:0px">
+          <circle class="fdot" cx="134" cy="148" r="4" fill="#af52de"/>
+          <circle class="fdot d2" cx="134" cy="148" r="4" fill="#af52de"/>
+          <circle class="fdot d3" cx="134" cy="148" r="4" fill="#af52de"/>
+        </g>
+        <g id="dot-bat-fwd" style="opacity:0;--tx:0px;--ty:-44px">
+          <circle class="fdot" cx="260" cy="212" r="4" fill="#ff3b30"/>
+          <circle class="fdot d2" cx="260" cy="212" r="4" fill="#ff3b30"/>
+          <circle class="fdot d3" cx="260" cy="212" r="4" fill="#ff3b30"/>
+        </g>
+        <g id="dot-bat-rev" style="opacity:0;--tx:0px;--ty:44px">
+          <circle class="fdot" cx="260" cy="168" r="4" fill="#007aff"/>
+          <circle class="fdot d2" cx="260" cy="168" r="4" fill="#007aff"/>
+          <circle class="fdot d3" cx="260" cy="168" r="4" fill="#007aff"/>
+        </g>
+        <g id="dot-grid-fwd" style="opacity:0;--tx:110px;--ty:0px">
+          <circle class="fdot" cx="280" cy="148" r="4" fill="#007aff"/>
+          <circle class="fdot d2" cx="280" cy="148" r="4" fill="#007aff"/>
+          <circle class="fdot d3" cx="280" cy="148" r="4" fill="#007aff"/>
+        </g>
+        <g id="dot-grid-rev" style="opacity:0;--tx:-110px;--ty:0px">
+          <circle class="fdot" cx="390" cy="148" r="4" fill="#ff3b30"/>
+          <circle class="fdot d2" cx="390" cy="148" r="4" fill="#ff3b30"/>
+          <circle class="fdot d3" cx="390" cy="148" r="4" fill="#ff3b30"/>
+        </g>
 
-      <!-- Battery: horizontal line. fwd = right (discharging into home). -->
-      <g id="fl-bat" class="flow-arrows" opacity="0" style="color:#34c759">
-        <g class="fa-fwd">
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s1" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s2" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s3" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-        </g>
-        <g class="fa-rev">
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s1" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s2" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-          <g transform="translate(183, 148)"><polygon class="fa-arrow s3" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-        </g>
-      </g>
+        <!-- inverter hub -->
+        <circle cx="260" cy="148" r="20" fill="rgba(255,255,255,0.0)" stroke="rgba(134,134,139,0.55)" stroke-width="2"/>
+        <text x="260" y="152" text-anchor="middle" fill="#86868b" font-size="9" font-weight="600">INV</text>
 
-      <!-- Home: horizontal line, fwd = right (inverter → home). -->
-      <g id="fl-home" class="flow-arrows" opacity="0" style="color:#af52de">
-        <g class="fa-fwd">
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s1" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s2" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s3" points="-3,-4 3,0 -3,4" fill="currentColor"/></g>
-        </g>
-        <g class="fa-rev">
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s1" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s2" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-          <g transform="translate(336, 148)"><polygon class="fa-arrow s3" points="3,-4 -3,0 3,4" fill="currentColor"/></g>
-        </g>
-      </g>
+        <!-- Solar node (top) -->
+        <circle cx="260" cy="46" r="38" fill="rgba(255,255,255,0.0)" stroke="rgba(245,166,35,0.45)" stroke-width="1.5"/>
+        <text x="260" y="41" text-anchor="middle" fill="#f5a623" font-size="11">&#9728; Solar</text>
+        <text id="n-pv" x="260" y="59" text-anchor="middle" fill="#f5a623" font-size="14" font-weight="700">0 W</text>
 
-      <!-- Grid: vertical line, fwd = down (exporting). rev = up (importing). -->
-      <g id="fl-grid" class="flow-arrows" opacity="0" style="color:#007aff">
-        <g class="fa-fwd">
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s1" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s2" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s3" points="-4,-3 4,-3 0,3" fill="currentColor"/></g>
-        </g>
-        <g class="fa-rev">
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s1" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s2" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
-          <g transform="translate(260, 206)"><polygon class="fa-arrow s3" points="-4,3 4,3 0,-3" fill="currentColor"/></g>
-        </g>
-      </g>
-      <!-- hub circle -->
-      <circle cx="260" cy="148" r="18" fill="rgba(255,255,255,0.0)" stroke="rgba(134,134,139,0.55)" stroke-width="2"/>
-      <text x="260" y="152" text-anchor="middle" fill="#86868b" font-size="9" font-weight="600">INV</text>
-      <!-- Solar node -->
-      <rect x="190" y="8" width="140" height="54" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(245,166,35,0.45)" stroke-width="1.5"/>
-      <text x="260" y="28" text-anchor="middle" fill="#f5a623" font-size="12">&#9728; Solar</text>
-      <text id="n-pv" x="260" y="50" text-anchor="middle" fill="#f5a623" font-size="16" font-weight="700">0 W</text>
-      <!-- Battery node — colour-tinted as a unit (border + label + SoC% + power) -->
-      <rect id="bat-rect" x="8" y="108" width="150" height="80" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(52,199,89,0.45)" stroke-width="1.5"/>
-      <text id="bat-label" x="83" y="128" text-anchor="middle" fill="#34c759" font-size="12">&#128267; Battery</text>
-      <text id="n-soc" x="83" y="153" text-anchor="middle" fill="#34c759" font-size="20" font-weight="700">0%</text>
-      <text id="n-bat" x="83" y="174" text-anchor="middle" fill="#86868b" font-size="11">0 W</text>
-      <!-- Home node -->
-      <rect x="362" y="108" width="150" height="80" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(175,82,222,0.45)" stroke-width="1.5"/>
-      <text x="437" y="128" text-anchor="middle" fill="#af52de" font-size="12">&#127968; Home</text>
-      <text id="n-home" x="437" y="160" text-anchor="middle" fill="#af52de" font-size="20" font-weight="700">0 W</text>
-      <!-- Grid node -->
-      <rect x="190" y="230" width="140" height="57" rx="8" fill="rgba(255,255,255,0.0)" stroke="rgba(0,122,255,0.45)" stroke-width="1.5"/>
-      <text x="260" y="250" text-anchor="middle" fill="#007aff" font-size="12">&#9889; Grid</text>
-      <text id="n-grid" x="260" y="275" text-anchor="middle" fill="#007aff" font-size="11">0 W</text>
-    </svg>
+        <!-- Home node (left) -->
+        <circle cx="96" cy="148" r="38" fill="rgba(255,255,255,0.0)" stroke="rgba(175,82,222,0.45)" stroke-width="1.5"/>
+        <text x="96" y="131" text-anchor="middle" fill="#af52de" font-size="11">&#127968; Home</text>
+        <text id="n-home" x="96" y="153" text-anchor="middle" fill="#af52de" font-size="14" font-weight="700">0 W</text>
+
+        <!-- Grid node (right) -->
+        <circle cx="424" cy="148" r="38" fill="rgba(255,255,255,0.0)" stroke="rgba(0,122,255,0.45)" stroke-width="1.5"/>
+        <text x="424" y="131" text-anchor="middle" fill="#007aff" font-size="11">&#9889; Grid</text>
+        <text id="n-grid" x="424" y="153" text-anchor="middle" fill="#007aff" font-size="14" font-weight="700">0 W</text>
+        <text id="n-grid-dir" x="424" y="171" text-anchor="middle" fill="#86868b" font-size="10">Idle</text>
+
+        <!-- Battery node (bottom) -->
+        <circle id="bat-rect" cx="260" cy="250" r="38" fill="rgba(255,255,255,0.0)" stroke="rgba(52,199,89,0.45)" stroke-width="1.5"/>
+        <text id="bat-label" x="260" y="233" text-anchor="middle" fill="#34c759" font-size="11">&#128267; Battery</text>
+        <text id="n-bat" x="260" y="255" text-anchor="middle" fill="#34c759" font-size="14" font-weight="700">0 W</text>
+        <text id="n-soc" x="260" y="273" text-anchor="middle" fill="#86868b" font-size="10">0%</text>
+      </svg>
   </section>
 
   <!-- Right panel: SOC + stats -->
   <div class="right-panel">
+    <div class="bt-row">
     <div class="card">
       <h2 data-help-title="Battery State" data-help="Current battery state of charge as a % of usable capacity (35.04 kWh total). Ring colour: green ≥ 60%, amber 30–59%, red < 30%. Below the figure: charging / discharging power and direction.">Battery State</h2>
       <div class="soc-wrap">
@@ -647,6 +655,14 @@ header h1{
       </div>
       <div class="spark-wrap"><svg id="spark-soc" viewBox="0 0 200 36" preserveAspectRatio="none"></svg></div>
       <div class="spark-cap" id="spark-soc-cap">&#8212;</div>
+    </div>
+    <section class="card">
+      <h2 data-help-title="Electricity Tariff" data-help="Today's import rate (top, big amber number, in pence per kWh) and tomorrow's. On Octopus Tracker the rate changes every day at midnight UK time and is published the day before. Refreshed every 30 minutes from the Octopus API.">Tariff</h2>
+      <div class="tariff-rate"><span id="tar-rate">&#8212;</span>p</div>
+      <div class="tariff-sub" id="tar-name">&#8212;</div>
+      <div class="tariff-sub muted" id="tar-code">&#8212;</div>
+      <div class="tariff-tmrw">Tomorrow: <span id="tar-tmrw">&#8212;</span>p</div>
+    </section>
     </div>
 
     <div class="card">
@@ -718,15 +734,6 @@ header h1{
         <div class="dl-item"><span class="dk" data-help-title="Self-sufficiency" data-help="Percentage of today's home consumption met without grid import. Calculated as (home_kWh − import_kWh) / home_kWh × 100. 100% = grid drew zero. Bar fills from green proportionally.">Self-sufficiency</span><span class="dv" id="sum-ss">&#8212;</span></div>
       </div>
       <div class="self-suff-bar"><div class="self-suff-fill" id="ss-bar" style="width:0%"></div></div>
-    </section>
-
-    <!-- Tariff -->
-    <section class="card">
-      <h2 data-help-title="Electricity Tariff" data-help="Today's import rate (top, big amber number, in pence per kWh) and tomorrow's. On Octopus Tracker the rate changes every day at midnight UK time and is published the day before. Refreshed every 30 minutes from the Octopus API.">Tariff</h2>
-      <div class="tariff-rate"><span id="tar-rate">&#8212;</span>p</div>
-      <div class="tariff-sub" id="tar-name">&#8212;</div>
-      <div class="tariff-sub muted" id="tar-code">&#8212;</div>
-      <div class="tariff-tmrw">Tomorrow: <span id="tar-tmrw">&#8212;</span>p</div>
     </section>
 
     <!-- Today's Cost / Economics (v5.3) -->
@@ -922,19 +929,14 @@ function fmtKw(w) {
 }
 function fmtKwh(v) { return v !== null && v !== undefined ? v.toFixed(1) + ' kWh' : '\u2014'; }
 
-function setFlow(id, watts, forwardPositive) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  const threshold = 30;
-  if (Math.abs(watts) < threshold) {
-    el.style.opacity = '0';
-    el.classList.remove('flow-fwd','flow-rev');
-    return;
-  }
-  el.style.opacity = '1';
+function setDots(leg, watts, forwardPositive) {
+  const fwd = document.getElementById('dot-' + leg + '-fwd');
+  const rev = document.getElementById('dot-' + leg + '-rev');
+  if (!fwd || !rev) return;
+  if (Math.abs(watts) < 30) { fwd.style.opacity = '0'; rev.style.opacity = '0'; return; }
   const goFwd = forwardPositive ? (watts > 0) : (watts < 0);
-  el.classList.toggle('flow-fwd',  goFwd);
-  el.classList.toggle('flow-rev', !goFwd);
+  fwd.style.opacity = goFwd ? '1' : '0';
+  rev.style.opacity = goFwd ? '0' : '1';
 }
 
 function renderForecast(hourly) {
@@ -1126,15 +1128,16 @@ function update(d) {
   const batAbs = Math.abs(batW);
   const nBat = document.getElementById('n-bat');
   nBat.textContent =
-    batState === 'Idle' ? 'Idle' : (fmtKw(batAbs) + ' \u00b7 ' + batState);
+    batState === 'Idle' ? 'Idle' : fmtKw(batAbs);
   // n-bat fill is set below by the batBoxCol logic (alongside rect, label, SoC%).
   document.getElementById('n-home').textContent = fmtKw(homeW);
-  // Grid: '0.94 kW \u00b7 Exporting' (Sigenergy app-style ordering)
-  let gridLabel;
-  if      (gridW >  30) gridLabel = fmtKw(gridW)   + ' \u00b7 Importing';
-  else if (gridW < -30) gridLabel = fmtKw(-gridW)  + ' \u00b7 Exporting';
-  else                  gridLabel = 'Standby';
-  document.getElementById('n-grid').textContent = gridLabel;
+  // Grid: big kW value (matches Home) with a separate Imp/Exp/Nil line below.
+  let gridDir;
+  if      (gridW >  30) gridDir = 'Import';
+  else if (gridW < -30) gridDir = 'Export';
+  else                  gridDir = 'Idle';
+  document.getElementById('n-grid').textContent     = fmtKw(Math.abs(gridW));
+  document.getElementById('n-grid-dir').textContent = gridDir;
 
   // Status chips (top-right of flow card)
   const chipGrid = document.getElementById('chip-grid');
@@ -1176,16 +1179,14 @@ function update(d) {
   const _green   = _r.getPropertyValue('--bat-charge').trim()  || '#34c759';
   const _muted   = _r.getPropertyValue('--text-muted').trim()  || '#86868b';
 
-  // Grid arrows pick their colour from the parent's `color` style.
-  const gridLineCol = gridW < -30 ? _blue : gridW > 30 ? _red : _blue;
-  document.getElementById('fl-grid').style.color = gridLineCol;
+  // Flow-dot colours are baked into the dot sets (export blue / import red).
 
   // Battery arrows + box tint: blue when charging, red when discharging, green at idle.
   const batBoxCol     = batW > 30 ? _blue : batW < -30 ? _red : _green;
   const batBoxStroke  = batW > 30 ? 'rgba(0,122,255,0.45)'
                       : batW < -30 ? 'rgba(255,59,48,0.45)'
                       : 'rgba(52,199,89,0.45)';
-  document.getElementById('fl-bat').style.color = batBoxCol;
+  // (battery dot colour is baked into the dot sets: charge blue / discharge red)
   document.getElementById('bat-rect').setAttribute('stroke', batBoxStroke);
   document.getElementById('bat-label').style.fill = batBoxCol;
   document.getElementById('n-soc').style.fill     = batBoxCol;
@@ -1193,15 +1194,15 @@ function update(d) {
 
   // Animated flow lines
   // Solar: always flows toward inverter (down) when generating
-  setFlow('fl-solar', pvW,   true);
+  setDots('solar', pvW,   true);
   // Battery: >0 charging (flows toward inverter from battery side), <0 discharging (reversed)
   // Line goes battery→inverter; positive batW = charging = energy going FROM grid/PV INTO battery
   // So when charging (batW>0), flow goes from right to left (inverter→battery), i.e. reversed
-  setFlow('fl-bat',   batW,  false);
+  setDots('bat',   batW,  false);
   // Home: always flows away from inverter (always positive load)
-  setFlow('fl-home',  homeW, true);
+  setDots('home',  homeW, true);
   // Grid: positive = import (flows toward inverter = forward), negative = export (reversed)
-  setFlow('fl-grid',  gridW, false);
+  setDots('grid',  gridW, false);
 
   // Stat boxes
   document.getElementById('s-pv').textContent  = pvW.toLocaleString();

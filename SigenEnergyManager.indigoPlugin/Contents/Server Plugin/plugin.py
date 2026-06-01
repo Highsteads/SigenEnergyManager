@@ -6,9 +6,15 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
-# Date:        28-05-2026 (v5.24.1)
-# Version:     5.24.1
-# Changes:     v5.24.1 (28-05-2026) — silence the one spurious red ERROR per
+# Date:        01-06-2026 (v5.25.4)
+# Version:     5.25.4
+# Changes:     v5.25.4 (01-06-2026) — Live Power Flow diagram polish: uniform
+#              r=38 circles (Solar/Home/Grid/Battery), Grid kW enlarged to match
+#              Home with an Import/Export/Idle line below it, Battery shows kW
+#              over % (swapped), Home/Grid kW aligned on the flow axis. This
+#              commit also catches the repo up from 5.24.1 — the 5.25.0–5.25.3
+#              dashboard work was live/installed but had never been committed.
+#              v5.24.1 (28-05-2026) — silence the one spurious red ERROR per
 #              restart: `device "Battery Manager" state key currentMode not
 #              defined (ignoring update request)`. The currentMode List-enum is
 #              registered ASYNCHRONOUSLY after stateListOrDisplayStateIdChanged()
