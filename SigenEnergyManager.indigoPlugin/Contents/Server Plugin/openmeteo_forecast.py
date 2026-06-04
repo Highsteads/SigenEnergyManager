@@ -6,9 +6,12 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Opus 4.7
-# Date:        26-05-2026
-# Version:     1.4
+# Author:      CliveS & Claude Opus 4.8
+# Date:        04-06-2026
+# Version:     1.5
+# 1.5 — HTTP 5xx (502/503/504) from Open-Meteo now logged at WARNING (transient
+#       server-side gateway blip; falls back to cached/partial forecast) instead
+#       of a red ERROR. 4xx still ERROR. Fixes recurring "HTTP 502" ERROR spam.
 # 1.4 — one-shot retry on transient network errors (Timeout, ConnectionError,
 #       ChunkedEncodingError — the latter covering the SSL UNEXPECTED_EOF
 #       hiccups Open-Meteo throws occasionally). All transient network errors
@@ -573,10 +576,21 @@ class OpenMeteoForecast:
 
         try:
             if response.status_code != 200:
-                self.logger.error(
-                    f"[OpenMeteo] HTTP {response.status_code} for "
-                    f"{array_cfg['name']}: {response.text[:200]}"
-                )
+                if response.status_code >= 500:
+                    # Transient server-side blip (502/503/504 — Open-Meteo's
+                    # nginx gateway). Not ours to fix; fall back to the cached/
+                    # partial forecast and log at WARNING, not an alarming red
+                    # ERROR. The 3-of-4 fallback / cache keeps the manager running.
+                    self.logger.warning(
+                        f"[OpenMeteo] {array_cfg['name']}: HTTP "
+                        f"{response.status_code} (server-side, transient) — "
+                        f"using cached/partial forecast"
+                    )
+                else:
+                    self.logger.error(
+                        f"[OpenMeteo] HTTP {response.status_code} for "
+                        f"{array_cfg['name']}: {response.text[:200]}"
+                    )
                 if cached:
                     return cached.get("data", [])
                 return None

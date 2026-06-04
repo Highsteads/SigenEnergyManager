@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.7
 # Date:        01-06-2026 (v5.25.4)
-# Version:     5.25.4
+# Version:     5.25.5
 # Changes:     v5.25.4 (01-06-2026) — Live Power Flow diagram polish: uniform
 #              r=38 circles (Solar/Home/Grid/Battery), Grid kW enlarged to match
 #              Home with an Import/Export/Idle line below it, Battery shows kW
