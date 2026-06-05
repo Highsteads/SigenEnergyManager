@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        04-06-2026 (v5.25.6)
-# Version:     5.25.6
+# Version:     5.25.7
 # Changes:     v5.25.4 (01-06-2026) — Live Power Flow diagram polish: uniform
 #              r=38 circles (Solar/Home/Grid/Battery), Grid kW enlarged to match
 #              Home with an Import/Export/Idle line below it, Battery shows kW
@@ -606,6 +606,24 @@ VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 STORM_WATCH_INTERVAL = 7200  # 2 hours
+
+
+def _as_float(value, fallback):
+    """Coerce a config value to float, returning fallback on blank/None/non-numeric.
+    Config textfields come back as strings (blank after a dialog save), so float() must
+    be guarded everywhere a pref reaches the battery-evaluate maths."""
+    try:
+        return float(value) if value not in (None, "") else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_int(value, fallback):
+    """Coerce a config value to int, returning fallback on blank/None/non-numeric."""
+    try:
+        return int(value) if value not in (None, "") else fallback
+    except (TypeError, ValueError):
+        return fallback
 ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo variables
 
 # Storm-level hierarchy (mirrors storm_watch._LEVELS)
@@ -866,7 +884,7 @@ class Plugin(indigo.PluginBase):
         # above the 10% health floor on poor solar days.  Direct file edits are
         # overwritten by Indigo on shutdown, so we correct the value here and
         # let Indigo persist it naturally.
-        _dawn_target = float(self.pluginPrefs.get("dawnSocTarget", "10"))
+        _dawn_target = _as_float(self.pluginPrefs.get("dawnSocTarget"), "10")
         if _dawn_target < 15.0:
             self.pluginPrefs["dawnSocTarget"] = "15"
             log(
@@ -966,31 +984,31 @@ class Plugin(indigo.PluginBase):
         """
         prefs = self.pluginPrefs
         try:
-            capacity   = float(prefs.get("batteryCapacityKwh", "35.04"))
+            capacity   = _as_float(prefs.get("batteryCapacityKwh"), "35.04")
         except (TypeError, ValueError):
             capacity = 35.04
         try:
-            efficiency = float(prefs.get("batteryEfficiency", "94")) / 100.0
+            efficiency = _as_float(prefs.get("batteryEfficiency"), "94") / 100.0
         except (TypeError, ValueError):
             efficiency = 0.94
         try:
-            inv_kw     = float(prefs.get("inverterMaxKw",   "10.0"))
+            inv_kw     = _as_float(prefs.get("inverterMaxKw"), "10.0")
         except (TypeError, ValueError):
             inv_kw     = 10.0
         try:
-            export_kw  = float(prefs.get("maxExportKw",     "4.0"))
+            export_kw  = _as_float(prefs.get("maxExportKw"), "4.0")
         except (TypeError, ValueError):
             export_kw  = 4.0
         try:
-            dawn_pct   = float(prefs.get("dawnSocTarget",   "10"))
+            dawn_pct   = _as_float(prefs.get("dawnSocTarget"), "10")
         except (TypeError, ValueError):
             dawn_pct   = 10.0
         try:
-            winter_pct = float(prefs.get("winterBufferPct", "20"))
+            winter_pct = _as_float(prefs.get("winterBufferPct"), "20")
         except (TypeError, ValueError):
             winter_pct = 20.0
         try:
-            health_pct = float(prefs.get("batteryHealthCutoff", "1"))
+            health_pct = _as_float(prefs.get("batteryHealthCutoff"), "1")
         except (TypeError, ValueError):
             health_pct = 1.0
         # Site coordinates — IndigoSecrets first, PluginConfig next, None last.
@@ -2500,7 +2518,7 @@ class Plugin(indigo.PluginBase):
         vpp_state = self.store.get("vpp_state", VPP_IDLE)
         vpp_event = self.store.get("vpp_event") or {}
         if vpp_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING) and vpp_event:
-            max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+            max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
             duration_hrs  = vpp_event.get("duration_hrs", 1.0)
             return max_export_kw * duration_hrs / VPP_DISCHARGE_EFFICIENCY
         return 0.0
@@ -2525,7 +2543,7 @@ class Plugin(indigo.PluginBase):
         if start is None or end is None:
             return (0.0, 0.0)
 
-        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
 
         try:
             import pytz
@@ -2587,8 +2605,8 @@ class Plugin(indigo.PluginBase):
 
         profile      = self.store.get("consumption_profile", []) or []
         live_daily   = sum(profile) if len(profile) == 48 else 0.0
-        weekday_pref = float(prefs.get("weekdayKwh", 22.0))
-        weekend_pref = float(prefs.get("weekendKwh", 30.0))
+        weekday_pref = _as_float(prefs.get("weekdayKwh"), 22.0)
+        weekend_pref = _as_float(prefs.get("weekendKwh"), 30.0)
         if live_daily >= 5.0:    # plausibility floor — ignore wildly low partial profiles
             weekday_user_override = abs(weekday_pref - 22.0) > 1.0
             weekend_user_override = abs(weekend_pref - 30.0) > 1.0
@@ -2601,12 +2619,12 @@ class Plugin(indigo.PluginBase):
 
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
-            capacity_kwh       = float(prefs.get("batteryCapacityKwh", 35.04)),
-            efficiency         = float(prefs.get("batteryEfficiency", 94)) / 100.0,
-            dawn_target_pct    = float(prefs.get("dawnSocTarget", 10)),    # v4.0: retained for VPP/storm
-            health_cutoff_pct  = float(prefs.get("batteryHealthCutoff", 1)),
+            capacity_kwh       = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
+            efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
+            dawn_target_pct    = _as_float(prefs.get("dawnSocTarget"), 10),    # v4.0: retained for VPP/storm
+            health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             export_enabled     = export_enabled,
-            max_export_kw      = float(prefs.get("maxExportKw", 4.0)),
+            max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
             weekday_kwh        = weekday_pref,
             weekend_kwh        = weekend_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
@@ -2638,7 +2656,7 @@ class Plugin(indigo.PluginBase):
             local_month = datetime.now().month
 
         if local_month in (10, 11, 12, 1, 2, 3):
-            winter_buf = float(self.pluginPrefs.get("winterBufferPct", 20))
+            winter_buf = _as_float(self.pluginPrefs.get("winterBufferPct"), 20)
             if winter_buf > snapshot.dawn_target_pct:
                 snapshot.dawn_target_pct = winter_buf
                 log(
@@ -2912,7 +2930,7 @@ class Plugin(indigo.PluginBase):
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
                 power_w = min(decision.power_watts or 10000,
-                              int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000))
+                              int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
                 if self.modbus.force_charge(power_w):
                     self.store["import_active"]     = True
                     self.store["import_target_soc"] = decision.target_soc_pct
@@ -2938,7 +2956,7 @@ class Plugin(indigo.PluginBase):
             # Idempotent: only call night_export if not already exporting
             if not prev_import and not prev_export:
                 log(f"[Manager] Starting night export: {decision.reason}")
-                inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+                inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
                 # Flood prevention uses DNO export cap (decision.power_watts).
                 # Legacy night export falls back to full inverter capacity (inv_max_w).
                 export_w = decision.power_watts if decision.power_watts > 0 else inv_max_w
@@ -2964,7 +2982,7 @@ class Plugin(indigo.PluginBase):
                 # Clean up flood prevention cutoff if it was active
                 flood_target = self.store.get("flood_prev_target_soc")
                 if flood_target:
-                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
                     self._set_flood_prev_target(None)
@@ -2994,7 +3012,7 @@ class Plugin(indigo.PluginBase):
                 # now so it does not act as a hidden floor during daytime operation.
                 flood_target = self.store.get("flood_prev_target_soc")
                 if flood_target:
-                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% "
                         f"(flood prevention interrupted at dawn)")
@@ -3048,7 +3066,7 @@ class Plugin(indigo.PluginBase):
                     log("[Manager] Export disabled — returning to self-consumption")
                 self.modbus.set_self_consumption()
                 if flood_target:
-                    health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1))
+                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
                     self.modbus.set_discharge_cutoff(health_floor)
                     log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
                     self._set_flood_prev_target(None)
@@ -3110,7 +3128,7 @@ class Plugin(indigo.PluginBase):
         if not self.modbus or not self.modbus.connected:
             return
 
-        inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+        inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
 
         # Always expect inverter max — night_export() uses HOLD_GRID_MAX_EXPORT_LIMIT
         # (not the discharge register) to constrain grid flow.
@@ -3188,7 +3206,7 @@ class Plugin(indigo.PluginBase):
         # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
         # Skip if flood prevention has temporarily raised the cutoff — it owns it too.
         if not self.store.get("vpp_cutoff_raised") and not self.store.get("flood_prev_target_soc"):
-            expected_cutoff_pct = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
+            expected_cutoff_pct = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
             actual_cutoff_pct   = self.modbus.read_discharge_cutoff()
             if actual_cutoff_pct is not None:
                 if abs(actual_cutoff_pct - expected_cutoff_pct) > 0.5:
@@ -3980,9 +3998,11 @@ class Plugin(indigo.PluginBase):
         rather than us importing at cost to cover their export.
         """
         duration_hrs    = event.get("duration_hrs", 1.0)
-        cap_kwh         = float(self.pluginPrefs.get("batteryCapacityKwh", BATTERY_CAPACITY_KWH))
-        max_export_kw   = float(self.pluginPrefs.get("maxExportKw", 4.0))
-        dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
+        cap_kwh         = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), BATTERY_CAPACITY_KWH)
+        if cap_kwh <= 0:
+            cap_kwh = BATTERY_CAPACITY_KWH   # guard the (required_kwh / cap_kwh) divisions below
+        max_export_kw   = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
+        dawn_target_pct = _as_float(self.pluginPrefs.get("dawnSocTarget"), 10)
 
         # For daytime events solar will recharge during/after the event, so we
         # only need to hold the export energy itself.  For night events we must
@@ -4043,8 +4063,8 @@ class Plugin(indigo.PluginBase):
         Called from _start_vpp_precharge() with the is_daytime flag already
         determined, NOT at announcement time.
         """
-        health_floor    = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
-        dawn_target_pct = float(self.pluginPrefs.get("dawnSocTarget", 10))
+        health_floor    = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+        dawn_target_pct = _as_float(self.pluginPrefs.get("dawnSocTarget"), 10)
 
         if is_daytime:
             floor_pct = health_floor
@@ -4125,7 +4145,7 @@ class Plugin(indigo.PluginBase):
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""
         if self.modbus:
-            health_floor = float(self.pluginPrefs.get("batteryHealthCutoff", 1.0))
+            health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
             self.modbus.set_discharge_cutoff(health_floor)
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
             log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
@@ -4806,7 +4826,7 @@ class Plugin(indigo.PluginBase):
 
         inv_data  = self.latest_inverter_data or {}
         cur_soc   = float(inv_data.get("batterySoc", 0.0))
-        cap_kwh   = float(self.pluginPrefs.get("batteryCapacityKwh", "35.04"))
+        cap_kwh   = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), "35.04")
 
         anchor_pv     = self.store.get("hh_anchor_pv_kwh")
         anchor_import = self.store.get("hh_anchor_import_kwh")
@@ -4974,7 +4994,7 @@ class Plugin(indigo.PluginBase):
             end_str      = _local_time(event["end_time"])
             duration_hrs = event.get("duration_hrs", 0.0)
 
-        max_export_kw = float(self.pluginPrefs.get("maxExportKw", 4.0))
+        max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
         earnings_est  = round(max_export_kw * duration_hrs * 1.00, 2)  # GBP1/kWh Axle rate
 
         states = [
@@ -5017,12 +5037,12 @@ class Plugin(indigo.PluginBase):
                     values["targetSocPct"] = str(suggested)
                 if not values.get("powerKw"):
                     values["powerKw"] = str(
-                        float(self.pluginPrefs.get("inverterMaxKw", "10.0"))
+                        _as_float(self.pluginPrefs.get("inverterMaxKw"), "10.0")
                     )
             elif type_id == "forceExport":
                 if not values.get("powerKw"):
                     values["powerKw"] = str(
-                        float(self.pluginPrefs.get("maxExportKw", "4.0"))
+                        _as_float(self.pluginPrefs.get("maxExportKw"), "4.0")
                     )
         except Exception as exc:
             self.logger.debug(f"getActionConfigUiValues fallback: {exc}")
@@ -5036,8 +5056,8 @@ class Plugin(indigo.PluginBase):
         """Action: Force immediate grid import."""
         with self._state_lock:
             props     = action.props
-            power_kw  = float(props.get("powerKw", 10.0))
-            target_soc = float(props.get("targetSocPct", 80.0))
+            power_kw  = _as_float(props.get("powerKw"), 10.0)
+            target_soc = _as_float(props.get("targetSocPct"), 80.0)
             log(f"[Action] Force grid import: {power_kw}kW to {target_soc:.0f}% SOC")
             if self.modbus and self.modbus.force_charge(int(power_kw * 1000)):
                 self.store["import_active"]     = True
@@ -5047,7 +5067,7 @@ class Plugin(indigo.PluginBase):
     def actionForceExport(self, action):
         """Action: Force immediate grid export."""
         with self._state_lock:
-            inv_max_w = int(float(self.pluginPrefs.get("inverterMaxKw", 10.0)) * 1000)
+            inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
             log("[Action] Force export: night_export mode")
             if self.modbus and self.modbus.night_export(inv_max_w):
                 self.store["export_active"]  = True
@@ -5123,7 +5143,7 @@ class Plugin(indigo.PluginBase):
         """Menu: Log current manager status to event log."""
         from datetime import datetime as _dt
         now_str  = _dt.now().strftime("%H:%M:%S")
-        capacity = float(self.pluginPrefs.get("batteryCapacityKwh", 35.04))
+        capacity = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), 35.04)
 
         inv   = self._find_device("sigenergyInverter")
         mgr   = self._find_device("batteryManager")
@@ -5724,7 +5744,7 @@ class Plugin(indigo.PluginBase):
                 f"Axle={'OK' if axle_key else 'disabled'}"
             )
             return
-        inv_port   = int(prefs.get("modbusPort", 502))
+        inv_port   = _as_int(prefs.get("modbusPort"), 502)
         # Modbus poll interval — read from pluginPrefs (v5.9), clamped to a
         # safe range. Sigenergy spec allows ~1s; 5s gives plenty of headroom.
         try:
@@ -5733,8 +5753,8 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             self.modbus_poll_s = MODBUS_POLL_INTERVAL
         log(f"[Init] Modbus poll interval: {self.modbus_poll_s}s")
-        plant_addr = int(prefs.get("plantAddress", 247))
-        inv_addr   = int(prefs.get("inverterSlaveId", 1))
+        plant_addr = _as_int(prefs.get("plantAddress"), 247)
+        inv_addr   = _as_int(prefs.get("inverterSlaveId"), 1)
 
         # Modbus
         if self.modbus:
@@ -5754,12 +5774,12 @@ class Plugin(indigo.PluginBase):
         # A previous force_discharge() call may have left a low limit that caps battery
         # output even in self-consumption mode. Always reset to full inverter capacity.
         if self.modbus.connect():
-            inverter_max_w = int(float(prefs.get("inverterMaxKw", 10.0)) * 1000)
+            inverter_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
             self.modbus.set_discharge_limit(inverter_max_w)   # clear any stale discharge cap
             self.modbus.set_charge_limit(inverter_max_w)      # clear any stale charge cap
             self.modbus.set_charge_cutoff(100.0)              # ensure unrestricted charging
             if prefs.get("exportEnabled", False):
-                dno_startup_w = int(float(prefs.get("maxExportKw", 4.0)) * 1000)
+                dno_startup_w = int(_as_float(prefs.get("maxExportKw"), 4.0) * 1000)
                 self.modbus.set_export_limit(dno_startup_w)
 
         log(

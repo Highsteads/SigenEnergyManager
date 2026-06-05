@@ -396,7 +396,7 @@ class OctopusAPI:
         # Tomorrow's rate (published around 16:00 each day)
         tomorrow_date   = (datetime.now(timezone.utc) + timedelta(days=1)).date()
         tomorrow_slots  = self._fetch_rate_schedule(product_code, tariff_code, tomorrow_date)
-        tomorrow_rate   = tomorrow_slots[0]["value_inc_vat"] if tomorrow_slots else None
+        tomorrow_rate   = tomorrow_slots[0].get("value_inc_vat") if tomorrow_slots else None
 
         result = {
             "today_p":    today_rate,
