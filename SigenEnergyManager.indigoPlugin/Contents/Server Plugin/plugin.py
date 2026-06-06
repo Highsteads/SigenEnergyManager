@@ -6,8 +6,21 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-06-2026 (v5.26.0)
-# Version:     5.26.0
+# Date:        06-06-2026 (v5.26.1)
+# Version:     5.26.1
+# 5.26.1 — Medium-severity hardening batch (follow-up to 5.26.0's highs):
+#   (A) runConcurrentThread wraps each _tick so one bad tick task (modbus/forecast/
+#       VPP) is logged and retried, not fatal to the whole polling loop; _as_float/
+#       _as_int now coerce their fallback too, so a string default ('94') can't leak
+#       into arithmetic (e.g. _as_float(blank,'94')/100.0) when a field is blank.
+#   (B) battery_manager._estimate_consumption_until indexes the 48-slot profile by
+#       LOCAL time, not the UTC hour (was 2 slots off in BST).
+#   (C) openmeteo_forecast skips a day-shifted disk cache (a pre-midnight cache whose
+#       "today" buckets are yesterday's) on restart instead of serving stale day data.
+#   +8 regression tests (battery 62, modbus 27 incl. signed negative/boundary decode).
+#   Advisory scripts: octopus_tracker_rate v1.5 (re-read secrets each run), optimiser
+#   v3.8 (Pushover msgSound/msgPriority + honest day+2-beyond-horizon log), axle diff
+#   analyser v1.1 (de-nest f-string + None-register guard).
 # 5.26.0 — High-severity bug-fix batch from the comprehensive review:
 #   (1) Pause feature was dead — sigen_manager_paused / Pause action set a flag
 #       nothing read, so a "Paused" manager kept driving the inverter. Now gated
@@ -627,17 +640,30 @@ STORM_WATCH_INTERVAL = 7200  # 2 hours
 def _as_float(value, fallback):
     """Coerce a config value to float, returning fallback on blank/None/non-numeric.
     Config textfields come back as strings (blank after a dialog save), so float() must
-    be guarded everywhere a pref reaches the battery-evaluate maths."""
+    be guarded everywhere a pref reaches the battery-evaluate maths. The fallback is
+    coerced too: several callers pass a string default ('35.04', '94'), which must never
+    leak unconverted into arithmetic (e.g. `_as_float(blank, '94') / 100.0` → TypeError)."""
     try:
-        return float(value) if value not in (None, "") else fallback
+        if value not in (None, ""):
+            return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(fallback)
     except (TypeError, ValueError):
         return fallback
 
 
 def _as_int(value, fallback):
-    """Coerce a config value to int, returning fallback on blank/None/non-numeric."""
+    """Coerce a config value to int, returning fallback on blank/None/non-numeric.
+    The fallback is coerced too so a string default can't leak into arithmetic."""
     try:
-        return int(value) if value not in (None, "") else fallback
+        if value not in (None, ""):
+            return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(fallback)
     except (TypeError, ValueError):
         return fallback
 ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo variables
@@ -2183,11 +2209,26 @@ class Plugin(indigo.PluginBase):
             dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 
     def runConcurrentThread(self):
-        """Main 10-second polling loop."""
+        """Main 10-second polling loop.
+
+        A failure in any single tick task must not kill the whole polling loop —
+        one bad modbus read / forecast parse / VPP poll should be logged and
+        retried on the next tick, not take the manager offline until a plugin
+        restart. StopThread still propagates so shutdown stays clean. (_tick
+        releases self._state_lock via its `with` block before any exception
+        reaches here, so the lock is never held across the retry.)
+        """
         try:
             while True:
                 now = time.time()
-                self._tick(now)
+                try:
+                    self._tick(now)
+                except self.StopThread:
+                    raise
+                except Exception:
+                    self.logger.exception(
+                        "[Tick] Unhandled error in poll tick — continuing to next tick"
+                    )
                 self.sleep(10)
         except self.StopThread:
             pass

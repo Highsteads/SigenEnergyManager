@@ -666,7 +666,12 @@ class BatteryManager:
             fraction        = max(0.0, min(1.0, fraction))
 
             if fraction > 0:
-                slot_idx   = cursor.hour * 2 + (1 if cursor.minute >= 30 else 0)
+                # The 48-slot profile is indexed by LOCAL (Europe/London) half-hour,
+                # but `cursor` is UTC — index by local time or we read the wrong slot
+                # (two slots off in BST). London is always a whole-hour offset from
+                # UTC, so the slot boundaries still align; only the index must shift.
+                local_cursor = self._to_local(cursor)
+                slot_idx   = local_cursor.hour * 2 + (1 if local_cursor.minute >= 30 else 0)
                 slot_idx   = max(0, min(47, slot_idx))
                 total_kwh += profile[slot_idx] * fraction
 

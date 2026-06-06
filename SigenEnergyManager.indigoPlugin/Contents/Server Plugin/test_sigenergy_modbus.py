@@ -367,6 +367,48 @@ class TestNightExportMethod(unittest.TestCase):
         self.assertIn(10000, discharge_writes)
 
 
+class TestSignedRegisterDecode(unittest.TestCase):
+    """Signed 16/32-bit Modbus decode — negative, boundary and positive paths.
+    Previously only the positive path was exercised (via read_all); a sign-extension
+    slip would silently turn a -700W battery discharge into +64836W."""
+
+    def setUp(self):
+        self.modbus, self.client = _make_modbus()
+        self.modbus._sleep = lambda _s: None   # no real throttle wait in tests
+
+    def _set_registers(self, registers):
+        r = MagicMock()
+        r.isError.return_value = False
+        r.registers = registers
+        self.client.read_holding_registers.return_value = r
+
+    # --- signed 16-bit ---
+    def test_int16_negative(self):
+        self._set_registers([65486])          # -50 as unsigned 16-bit
+        self.assertEqual(self.modbus._read_int16(30000), -50)
+
+    def test_int16_min_boundary(self):
+        self._set_registers([0x8000])         # 32768 -> -32768
+        self.assertEqual(self.modbus._read_int16(30000), -32768)
+
+    def test_int16_max_positive(self):
+        self._set_registers([0x7FFF])         # 32767
+        self.assertEqual(self.modbus._read_int16(30000), 32767)
+
+    # --- signed 32-bit (big-endian word order [hi, lo]) ---
+    def test_int32_negative(self):
+        self._set_registers([0xFFFF, 0xFC18])  # 0xFFFFFC18 -> -1000
+        self.assertEqual(self.modbus._read_int32(30000), -1000)
+
+    def test_int32_min_boundary(self):
+        self._set_registers([0x8000, 0x0000])  # -2147483648
+        self.assertEqual(self.modbus._read_int32(30000), -2147483648)
+
+    def test_int32_positive(self):
+        self._set_registers([0x0001, 0x0000])  # 65536
+        self.assertEqual(self.modbus._read_int32(30000), 65536)
+
+
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
     unittest.main(verbosity=2)

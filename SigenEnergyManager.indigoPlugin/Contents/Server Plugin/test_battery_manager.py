@@ -505,6 +505,23 @@ class TestConsumptionEstimation(unittest.TestCase):
         # 2 hours * 0.45 = 0.9 kWh
         self.assertAlmostEqual(result, 0.9, places=1)
 
+    def test_profile_indexed_by_local_time_in_bst(self):
+        """The 48-slot profile is indexed by LOCAL time, not UTC. In BST (UTC+1) a
+        UTC 08:00-08:30 window is local 09:00-09:30 → profile slot 18, not slot 16."""
+        profile    = [float(i) for i in range(48)]   # slot i contributes i kWh
+        now_utc    = datetime(2026, 6, 15, 8, 0, tzinfo=timezone.utc)   # = 09:00 BST
+        target_utc = now_utc + timedelta(minutes=30)
+        result = self.bm._estimate_consumption_until(now_utc, target_utc, profile)
+        self.assertEqual(result, 18.0)   # local slot 18 (09:00), not UTC slot 16 (08:00)
+
+    def test_profile_indexed_by_utc_in_winter(self):
+        """In GMT (winter) local == UTC, so a UTC 08:00 window maps to slot 16."""
+        profile    = [float(i) for i in range(48)]
+        now_utc    = datetime(2026, 12, 15, 8, 0, tzinfo=timezone.utc)   # = 08:00 GMT
+        target_utc = now_utc + timedelta(minutes=30)
+        result = self.bm._estimate_consumption_until(now_utc, target_utc, profile)
+        self.assertEqual(result, 16.0)
+
 
 class TestTimeWindowHelper(unittest.TestCase):
     """Tests for the time window helper."""

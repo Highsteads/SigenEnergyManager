@@ -1047,6 +1047,24 @@ class OpenMeteoForecast:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
+            # Day-shift guard: a cache written just before midnight has its "today"
+            # buckets dated yesterday, yet a 20-min-old cache loaded at 00:10 passes
+            # the age check below. Serving those as today's forecast would feed the
+            # manager the wrong day's solar. If the cached today-bucket date no longer
+            # matches today's LOCAL date, skip the pre-warm — the first tick's fetch
+            # repopulates fresh data within the poll interval.
+            _today_keys = sorted(data.get("_hourly_p50_today", {}).keys())
+            if _today_keys:
+                _cached_today = _today_keys[0][:10]
+                _local_today  = self._now_local().date().strftime("%Y-%m-%d")
+                if _cached_today != _local_today:
+                    self.logger.warning(
+                        f"[OpenMeteo] Disk cache is for {_cached_today}, not today "
+                        f"({_local_today}) — skipping pre-warm; first fetch will refresh."
+                    )
+                    return
+
             cached_time = data.pop("_cached_time", 0.0)
             self._cached_forecast = data
             self._cached_time     = cached_time
