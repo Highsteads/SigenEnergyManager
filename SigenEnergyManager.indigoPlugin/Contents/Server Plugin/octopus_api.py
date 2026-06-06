@@ -405,6 +405,38 @@ class OctopusAPI:
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
 
+    def get_active_rate_schedule(self, force=False):
+        """Today's and tomorrow's raw rate slots for the ACTIVE import tariff.
+
+        Single source of truth for the elec_rates_today_json / elec_rates_tomorrow_json
+        Indigo variables the openmeteo battery optimiser consumes — this lets the plugin
+        replace the standalone octopus_tracker_rate.py script. Each slot is the raw
+        Octopus dict {valid_from, valid_to, value_inc_vat, ...}; tomorrow_slots stays
+        empty until Octopus publishes (~16:00 local). Tariff-agnostic (uses whatever
+        get_current_tariff() resolves), so it is correct for non-Tracker users too.
+        """
+        cache_key = "active_schedule"
+        now = time.time()
+        cached = self._rates_cache.get(cache_key)
+        if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
+            return cached["data"]
+
+        tariff_info  = self.get_current_tariff(force=force) or {}
+        product_code = tariff_info.get("product_code")
+        tariff_code  = tariff_info.get("tariff_code")
+        if not product_code or not tariff_code:
+            return {"product_code": product_code, "today_slots": [], "tomorrow_slots": []}
+
+        today_date    = datetime.now(timezone.utc).date()
+        tomorrow_date = today_date + timedelta(days=1)
+        result = {
+            "product_code":   product_code,
+            "today_slots":    self._fetch_rate_schedule(product_code, tariff_code, today_date),
+            "tomorrow_slots": self._fetch_rate_schedule(product_code, tariff_code, tomorrow_date),
+        }
+        self._rates_cache[cache_key] = {"data": result, "cached_at": now}
+        return result
+
     # ================================================================
     # Internal: TOU (Go/Flux) Rates
     # ================================================================

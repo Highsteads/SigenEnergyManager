@@ -6,8 +6,19 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-06-2026 (v5.26.2)
-# Version:     5.26.2
+# Date:        06-06-2026 (v5.27.0)
+# Version:     5.27.0
+# 5.27.0 — Octopus single source of truth (retires octopus_tracker_rate.py). The plugin
+#   now writes the rate + slot-JSON variables the openmeteo battery optimiser consumes —
+#   elec_rates_today_json / elec_rates_tomorrow_json (raw Octopus slots), tracker_rate_today
+#   / tracker_rate_tomorrow, tracker_product_code/name, tracker_last_updated/fetch_status —
+#   from its own octopus_api fetch, on every octopus refresh. New
+#   octopus_api.get_active_rate_schedule() returns today+tomorrow raw slots for the ACTIVE
+#   tariff (tariff-agnostic, correct for non-Tracker users); plugin._write_tariff_schedule_
+#   variables() emits them (tomorrow only once published). Removes the two-Octopus-clients
+#   duplication; the standalone script's Indigo schedule ("Octopus Tracker Daily Rate") is
+#   disabled and the script kept on disk as a fallback. Verified live: plugin writes fresh,
+#   correct values (fixed the script's stale tracker_rate_today). 126 tests pass.
 # 5.26.2 — Low-severity sweep (clears the review queue bar the octopus consolidation):
 #   • prepare_to_sleep now also resets a raised discharge cutoff to the health floor —
 #     a flood-prev/storm/VPP floor left high would lock the battery and force overnight
@@ -3399,6 +3410,7 @@ class Plugin(indigo.PluginBase):
             }
 
             self._update_tariff_device(tariff_info, monitored)
+            self._write_tariff_schedule_variables(tariff_info, monitored)
 
             # Log on first fetch or when tariff / rate changes; also in debug mode
             tracker    = monitored.get("tracker", {})
@@ -3419,6 +3431,56 @@ class Plugin(indigo.PluginBase):
 
         except Exception as e:
             log(f"[Octopus] Rate refresh error: {e}", level="ERROR")
+
+    def _write_tariff_schedule_variables(self, tariff_info, monitored):
+        """Write the rate + slot-JSON Indigo variables consumed by the openmeteo
+        battery optimiser, so the plugin is the single source of truth and the
+        standalone octopus_tracker_rate.py script can be retired.
+
+        elec_rates_*_json carry the raw Octopus slots [{valid_from, valid_to,
+        value_inc_vat}, ...]. Tomorrow's slots aren't published until ~16:00, so the
+        tomorrow variable is only overwritten when slots are available — stale is
+        softer than empty (the optimiser refuses to plan on an empty list).
+        """
+        if not self.octopus:
+            return
+        try:
+            sched   = self.octopus.get_active_rate_schedule()
+            tracker = (monitored or {}).get("tracker", {}) or {}
+            folder  = self._sigenergy_folder_id()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            today_slots    = sched.get("today_slots") or []
+            tomorrow_slots = sched.get("tomorrow_slots") or []
+            today_p        = tracker.get("today_p")
+            tomorrow_p     = tracker.get("tomorrow_p")
+
+            writes = []
+            if today_slots:
+                writes.append(("elec_rates_today_json", json.dumps(today_slots)))
+            if tomorrow_slots:
+                writes.append(("elec_rates_tomorrow_json", json.dumps(tomorrow_slots)))
+            writes.append(("tracker_rate_today",
+                           f"{today_p:.2f}" if today_p is not None else "unavailable"))
+            writes.append(("tracker_rate_tomorrow",
+                           f"{tomorrow_p:.2f}" if tomorrow_p is not None else "pending"))
+            if sched.get("product_code"):
+                writes.append(("tracker_product_code", sched["product_code"]))
+            if tariff_info and tariff_info.get("display_name"):
+                writes.append(("tracker_product_name", tariff_info["display_name"]))
+            writes.append(("tracker_last_updated", now_str))
+            writes.append(("tracker_fetch_status", "OK"))
+
+            for name, value in writes:
+                var_id = self._ensure_var(name, folder)
+                if var_id:
+                    indigo.variable.updateValue(var_id, value)
+            self.logger.debug(
+                f"[Octopus] Tariff vars written: today {len(today_slots)} slot(s), "
+                f"tomorrow {len(tomorrow_slots)} slot(s)"
+            )
+        except Exception as exc:
+            log(f"[Octopus] Tariff-schedule variable write failed: {exc}", level="WARNING")
 
     def _accumulate_home_profile(self, home_watts):
         """Accumulate one inverter home-load reading into the 48-slot half-hourly profile.
