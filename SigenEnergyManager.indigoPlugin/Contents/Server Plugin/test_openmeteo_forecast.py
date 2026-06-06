@@ -318,5 +318,59 @@ class TestBiasFactorApplied(unittest.TestCase):
         self.assertEqual(enriched["correctedTomorrowKwh"], 50.0)
 
 
+class TestPartialFetch(unittest.TestCase):
+    """Regression: a partial Open-Meteo fetch (one or more arrays missing) must
+    never be stamped 'OK' nor overwrite a complete cached forecast — a low total
+    would inflate the manager's import need and trigger unnecessary grid import.
+    """
+
+    def setUp(self):
+        import openmeteo_forecast as omf
+        self._omf      = omf
+        self._prev_req = omf.REQUESTS_AVAILABLE
+        omf.REQUESTS_AVAILABLE = True   # _fetch_array is mocked, so no real HTTP
+        self._tmp = tempfile.mkdtemp()
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+
+    def tearDown(self):
+        self._omf.REQUESTS_AVAILABLE = self._prev_req
+
+    def _mock_arrays(self, ok_count):
+        """First ok_count arrays return (empty) data; the rest fail (None)."""
+        state = {"n": 0}
+        def fake_fetch(_array_cfg):
+            state["n"] += 1
+            return [] if state["n"] <= ok_count else None
+        self.f._fetch_array = fake_fetch
+
+    def test_partial_without_cache_flagged_and_not_cached(self):
+        self.assertGreater(len(self.f.arrays), 1)
+        self._mock_arrays(ok_count=1)                      # 1 of N arrays succeed
+        result = self.f.fetch_forecast(force=True)
+        self.assertTrue(
+            result["forecastStatus"].startswith("Partial"),
+            f"expected a Partial status, got {result['forecastStatus']!r}",
+        )
+        self.assertIsNone(self.f._cached_forecast)          # degraded → not cached
+
+    def test_partial_does_not_clobber_complete_cache(self):
+        n = len(self.f.arrays)
+        self.f._cached_forecast = {
+            "todayKwh": 50.0, "tomorrowKwh": 40.0,
+            "arrays_ok": n, "arrays_total": n, "forecastStatus": "OK",
+            "_hourly_p50_today": {}, "_hourly_p50_tomorrow": {}, "_dawn_times": {},
+        }
+        self._mock_arrays(ok_count=1)                       # next fetch is partial
+        result = self.f.fetch_forecast(force=True)
+        self.assertEqual(result["todayKwh"], 50.0)          # served the complete cache
+        self.assertEqual(self.f._cached_forecast["todayKwh"], 50.0)   # cache untouched
+
+    def test_complete_fetch_is_ok_and_cached(self):
+        self._mock_arrays(ok_count=len(self.f.arrays))      # all arrays succeed
+        result = self.f.fetch_forecast(force=True)
+        self.assertEqual(result["forecastStatus"], "OK")
+        self.assertIsNotNone(self.f._cached_forecast)
+
+
 if __name__ == "__main__":
     unittest.main()

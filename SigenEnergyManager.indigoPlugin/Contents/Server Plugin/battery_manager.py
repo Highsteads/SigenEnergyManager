@@ -756,8 +756,10 @@ class BatteryManager:
                 target_soc_pct = target_soc,
             )
 
-        # Are we currently in the cheap window?
-        now_hm = now.strftime("%H:%M")
+        # Are we currently in the cheap window? cheap_start/cheap_end are LOCAL
+        # (Europe/London) HH:MM but snapshot.now is UTC — convert before comparing
+        # or the test is an hour off in BST (mirrors the _plan_tracker_import path).
+        now_hm = self._to_local(now).strftime("%H:%M")
         if self._time_in_window(now_hm, cheap_start, cheap_end):
             return Decision(
                 action         = ACTION_START_IMPORT,
@@ -1336,17 +1338,37 @@ class BatteryManager:
 
     @staticmethod
     def _next_window_start(now: datetime, window_start_str: str) -> Optional[datetime]:
-        """Return the next occurrence of HH:MM window start as a datetime."""
+        """Return the next occurrence of a LOCAL (Europe/London) HH:MM window
+        start, expressed in `now`'s own timezone.
+
+        window_start_str is the local-time cheap-window boundary (Go/Flux/iGo).
+        Building it naively against a UTC `now` would be an hour off in BST and
+        schedule the import at the wrong instant — so do the arithmetic in local
+        time, then convert the result back to now's tz.
+        """
         try:
-            h, m      = window_start_str.split(":")
-            candidate = now.replace(
-                hour=int(h), minute=int(m), second=0, microsecond=0
+            h, m = window_start_str.split(":")
+            h, m = int(h), int(m)
+        except (ValueError, AttributeError):
+            return None
+        try:
+            import pytz
+            london          = pytz.timezone("Europe/London")
+            local_now       = now.astimezone(london) if now.tzinfo else london.localize(now)
+            local_naive_now = local_now.replace(tzinfo=None)
+            cand_naive      = local_naive_now.replace(
+                hour=h, minute=m, second=0, microsecond=0
             )
+            if cand_naive <= local_naive_now:
+                cand_naive += timedelta(days=1)
+            candidate = london.localize(cand_naive)        # localize handles DST gap/fold
+            return candidate.astimezone(now.tzinfo) if now.tzinfo else cand_naive
+        except Exception:
+            # Fallback (pytz unavailable): original naive behaviour, UTC == local.
+            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
             if candidate <= now:
                 candidate += timedelta(days=1)
             return candidate
-        except (ValueError, AttributeError):
-            return None
 
     @staticmethod
     def _forecast_next_n_hours(

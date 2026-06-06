@@ -373,7 +373,13 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         # Go tariff: defer to cheap window since battery can safely reach it
         self.assertEqual(decision.action, ACTION_SCHEDULE_IMPORT)
         self.assertIsNotNone(decision.scheduled_time)
-        self.assertEqual(decision.scheduled_time.hour, 0)   # cheap window start hour
+        # Cheap window start is 00:30 LOCAL (Europe/London). Assert in local time
+        # so the test is correct in both BST and GMT — the old UTC `.hour == 0`
+        # check silently encoded the BST-offset bug (00:30 local is 23:30 UTC in
+        # summer, not 00:00 UTC).
+        import pytz
+        local_sched = decision.scheduled_time.astimezone(pytz.timezone("Europe/London"))
+        self.assertEqual((local_sched.hour, local_sched.minute), (0, 30))
 
     def test_go_import_now_if_margin_too_low_for_cheap_window(self):
         """On Go tariff, import immediately if battery cannot reach cheap window."""
@@ -409,6 +415,43 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         decision = self.bm.evaluate(snapshot)
         self.assertEqual(decision.action, ACTION_START_IMPORT)
         self.assertIn("cheap window", decision.reason.lower())
+
+
+class TestTouWindowLocalTime(unittest.TestCase):
+    """Regression: TOU cheap-window detection must use the LOCAL (Europe/London)
+    clock, not the UTC clock. snapshot.now is UTC; cheap_start/cheap_end are local
+    HH:MM. In BST (UTC+1) the old code was an hour off — importing outside the
+    cheap window or scheduling at the wrong instant.
+    """
+
+    def test_next_window_start_returns_local_0030_in_bst(self):
+        import pytz
+        london = pytz.timezone("Europe/London")
+        now    = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)   # summer → BST
+        result = BatteryManager._next_window_start(now, "00:30")
+        # 00:30 LOCAL on 16 Jun == 23:30 UTC on 15 Jun (BST = UTC+1)
+        self.assertEqual(
+            result.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "2026-06-15 23:30",
+        )
+        self.assertEqual(result.astimezone(london).strftime("%H:%M"), "00:30")
+
+    def test_next_window_start_returns_0030_utc_in_gmt(self):
+        now    = datetime(2026, 12, 15, 20, 0, tzinfo=timezone.utc)  # winter → GMT
+        result = BatteryManager._next_window_start(now, "00:30")
+        # 00:30 LOCAL == 00:30 UTC in GMT
+        self.assertEqual(result.astimezone(timezone.utc).strftime("%H:%M"), "00:30")
+
+    def test_in_window_check_uses_local_clock(self):
+        # 22:45 UTC in summer == 23:45 BST, which IS inside an iGo 23:30–05:30 window.
+        bst_2245 = datetime(2026, 6, 15, 22, 45, tzinfo=timezone.utc)
+        local_hm = BatteryManager._to_local(bst_2245).strftime("%H:%M")
+        self.assertEqual(local_hm, "23:45")
+        self.assertTrue(BatteryManager._time_in_window(local_hm, "23:30", "05:30"))
+        # The old UTC clock would have read 22:45 and judged it OUTSIDE the window.
+        self.assertFalse(
+            BatteryManager._time_in_window(bst_2245.strftime("%H:%M"), "23:30", "05:30")
+        )
 
 
 class TestVppSuppression(unittest.TestCase):

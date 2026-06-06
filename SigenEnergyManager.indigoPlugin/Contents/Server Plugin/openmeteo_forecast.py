@@ -246,6 +246,38 @@ class OpenMeteoForecast:
                 return self._enrich_forecast(self._cached_forecast)
             return self._empty_forecast("All array fetches failed")
 
+        arrays_ok    = combined.get("arrays_ok", 0)
+        arrays_total = combined.get("arrays_total", arrays_ok)
+        is_partial   = arrays_ok < arrays_total
+
+        if is_partial:
+            # A partial fetch (one or more arrays missing) produces a falsely-low
+            # daily total. A low tomorrow_solar inflates the battery manager's
+            # import_kwh and triggers unnecessary grid import — the exact opposite
+            # of the self-sufficiency goal. So a partial result must NEVER be
+            # stamped "OK", and must NEVER clobber a complete cached forecast.
+            prev          = self._cached_forecast
+            prev_complete = bool(prev) and prev.get("arrays_ok", 0) >= prev.get("arrays_total", 1)
+            if prev_complete:
+                self.logger.warning(
+                    f"[OpenMeteo] Partial fetch ({arrays_ok}/{arrays_total} arrays) — "
+                    f"keeping the previous complete forecast rather than overwriting "
+                    f"with a low total."
+                )
+                return self._enrich_forecast(prev)
+
+            # No complete forecast to fall back on — serve the partial but flag it
+            # clearly (status carries 'Partial N/M') so consumers can detect the
+            # degraded total, and do NOT persist it so the next full fetch wins.
+            combined["forecastStatus"] = f"Partial {arrays_ok}/{arrays_total}"
+            combined["lastUpdate"]     = datetime.now().strftime("%H:%M:%S")
+            self.logger.warning(
+                f"[OpenMeteo] Partial fetch ({arrays_ok}/{arrays_total} arrays) and no "
+                f"complete cache — serving degraded forecast (status "
+                f"'{combined['forecastStatus']}'); not caching."
+            )
+            return self._enrich_forecast(combined)
+
         combined["forecastStatus"] = "OK"
         combined["lastUpdate"]     = datetime.now().strftime("%H:%M:%S")
 
@@ -490,6 +522,8 @@ class OpenMeteoForecast:
             "remainingTodayKwh":    round(remaining_today_kwh, 1),
             "currentHourWatts":     hourly_today.get(cur_key, 0),
             "nextHourWatts":        hourly_today.get(nxt_key, 0),
+            "arrays_ok":            arrays_ok,
+            "arrays_total":         len(self.arrays),
             "_hourly_p50_today":    hourly_today,
             "_hourly_p50_tomorrow": hourly_tomorrow,
             "_dawn_times":          dawn_times,

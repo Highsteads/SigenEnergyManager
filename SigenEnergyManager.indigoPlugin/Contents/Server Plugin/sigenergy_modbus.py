@@ -524,6 +524,27 @@ class SigenergyModbus:
             self._connected = False
             return None
 
+        # Critical-register guard. A partial read drops the failed key entirely;
+        # every consumer then does .get("batterySoc", 0.0), so a single transient
+        # SOC-register failure (slave busy / CRC) would feed the manager a phantom
+        # 0% SOC — a force-charge that never completes (keeps importing) or a
+        # force-charge of an already-full battery. If any critical register failed
+        # this cycle, return None so _poll_modbus keeps the last-known-good snapshot
+        # instead of acting on fabricated zeros. The connection is healthy, so we
+        # do NOT flip self._connected — the next poll retries normally.
+        CRITICAL_KEYS = (
+            "batterySoc", "gridPowerWatts", "batteryPowerWatts",
+            "plantRunningState", "gridStatus",
+        )
+        missing_critical = [k for k in CRITICAL_KEYS if k not in data]
+        if missing_critical:
+            self.logger.warning(
+                f"Partial Modbus read — critical register(s) missing "
+                f"{missing_critical} ({total_errors}/16 errors); keeping "
+                f"last-known-good snapshot this cycle (not acting on partial data)."
+            )
+            return None
+
         data["modbusConnected"] = True
         data["lastUpdate"]      = datetime.now().strftime("%H:%M:%S")
 

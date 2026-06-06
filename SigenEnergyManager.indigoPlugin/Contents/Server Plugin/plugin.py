@@ -6,8 +6,24 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        04-06-2026 (v5.25.6)
-# Version:     5.25.7
+# Date:        06-06-2026 (v5.26.0)
+# Version:     5.26.0
+# 5.26.0 — High-severity bug-fix batch from the comprehensive review:
+#   (1) Pause feature was dead — sigen_manager_paused / Pause action set a flag
+#       nothing read, so a "Paused" manager kept driving the inverter. Now gated
+#       in _evaluate_manager (skips evaluate/verify/act); pause returns the
+#       inverter to self-consumption (KPI-safe), seeds from the variable at
+#       startup, and resumes with an immediate re-evaluate.
+#   (2) Partial Modbus read could feed the manager a phantom 0% SOC (a dropped
+#       SOC register left the key missing → consumers .get(...,0.0)) → force-charge
+#       that never completes / keeps importing. read_all() now returns None on any
+#       missing critical register so _poll_modbus keeps the last-known-good snapshot.
+#   (3) battery_manager TOU cheap-window detection used the UTC clock vs local-time
+#       window strings (1h off in BST) — now converts to Europe/London first.
+#   (4) Open-Meteo partial fetch (some arrays missing) was stamped OK and clobbered
+#       the good cache, producing a low total that triggered needless import — now
+#       flagged "Partial N/M" and never overwrites a complete forecast.
+#   +6 regression tests (108 pass).
 # Changes:     v5.25.4 (01-06-2026) — Live Power Flow diagram polish: uniform
 #              r=38 circles (Solar/Home/Grid/Battery), Grid kW enlarged to match
 #              Home with an Import/Export/Idle line below it, Battery shows kW
@@ -1126,6 +1142,15 @@ class Plugin(indigo.PluginBase):
         already exist.  The current paused state is mirrored in.  Indigo
         variables are always strings — "true" / "false" lower-case."""
         if "sigen_manager_paused" in indigo.variables:
+            # Seed the in-memory flag from the variable so a restart-while-paused
+            # stays paused (the _evaluate_manager gate self-heals the device label).
+            var = indigo.variables["sigen_manager_paused"]
+            self.store["manager_paused"] = (
+                str(var.value).strip().lower() in ("true", "1", "yes", "on", "paused")
+            )
+            if self.store["manager_paused"]:
+                log("[Setup] Battery manager is PAUSED at startup "
+                    "(sigen_manager_paused=true) — not driving the inverter until resumed.")
             return
         folder_id = self._sigenergy_folder_id()
         try:
@@ -1134,6 +1159,7 @@ class Plugin(indigo.PluginBase):
                 value="false",
                 folder=folder_id,
             )
+            self.store["manager_paused"] = False
             log("[Setup] Created variable 'sigen_manager_paused' — set to 'true' "
                 "to pause the battery manager from anywhere in Indigo.")
         except Exception as exc:
@@ -1153,17 +1179,9 @@ class Plugin(indigo.PluginBase):
             new_value = str(new_var.value).strip().lower()
             paused = new_value in ("true", "1", "yes", "on", "paused")
             if self.store.get("manager_paused", False) != paused:
-                self.store["manager_paused"] = paused
-                log(
-                    f"[Variable] Manager {'paused' if paused else 'resumed'} "
-                    f"via sigen_manager_paused = {new_var.value!r}"
+                self._set_manager_paused(
+                    paused, f"sigen_manager_paused={new_var.value!r}"
                 )
-                dev = self._find_device("batteryManager")
-                if dev:
-                    dev.updateStateOnServer(
-                        "managerStatus",
-                        value="Paused" if paused else "Running",
-                    )
 
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
@@ -2434,6 +2452,18 @@ class Plugin(indigo.PluginBase):
           9. push device state
         """
         if not self.latest_inverter_data:
+            return
+
+        # Manager paused (Pause action or sigen_manager_paused variable): stay
+        # completely hands-off the inverter.  Skipping evaluate/verify/act here is
+        # what makes pause a real control rather than a cosmetic label.  The
+        # inverter was returned to self-consumption on the pause transition (see
+        # _set_manager_paused); self-heal the device label so a restart-while-
+        # paused shows "Paused".
+        if self.store.get("manager_paused", False):
+            dev = self._find_device("batteryManager")
+            if dev and dev.states.get("managerStatus") != "Paused":
+                dev.updateStateOnServer("managerStatus", value="Paused")
             return
 
         soc_pct = self.latest_inverter_data.get("batterySoc", 0.0)
@@ -5091,23 +5121,56 @@ class Plugin(indigo.PluginBase):
                 self.store["import_active"] = False
                 self.store["export_active"] = False
 
+    def _set_manager_paused(self, paused, source):
+        """Single entry point for pause/resume (Pause/Resume actions + the
+        sigen_manager_paused variable).  Caller must hold self._state_lock.
+
+        On PAUSE we hand the inverter back to self-consumption — the same safe
+        baseline prepare_to_sleep() uses — so a latched force-charge or
+        force-export cannot keep importing/exporting under a "Paused" label
+        (the self-sufficiency KPI must never lose to a dead control).  The
+        manager evaluate is then gated in _evaluate_manager while paused.
+        On RESUME we force an immediate re-evaluation on the next tick.
+        """
+        was_paused = self.store.get("manager_paused", False)
+        self.store["manager_paused"] = paused
+        dev = self._find_device("batteryManager")
+        if dev:
+            dev.updateStateOnServer(
+                "managerStatus", value="Paused" if paused else "Running"
+            )
+        if paused:
+            if self.modbus and self.modbus.connected:
+                try:
+                    self.modbus.set_self_consumption()
+                    log(f"[Pause] Manager paused ({source}) — inverter returned "
+                        f"to self-consumption; holding hands-off until resumed.")
+                except Exception as exc:
+                    log(f"[Pause] set_self_consumption failed on pause: {exc}",
+                        level="WARNING")
+            else:
+                log(f"[Pause] Manager paused ({source}) — modbus offline, "
+                    f"inverter left as-is.")
+            # Clear forced-mode store flags (mirrors actionReturnToLocalEms) so a
+            # later resume re-evaluates from a clean baseline.
+            self.store["import_active"] = False
+            self.store["export_active"] = False
+        elif was_paused:
+            # Resume: re-evaluate now rather than waiting up to MANAGER_EVAL_INTERVAL.
+            self.store["last_manager"] = 0.0
+            log(f"[Pause] Manager resumed ({source}) — re-evaluating immediately.")
+
     def actionPauseManager(self, action):
-        """Action: Pause battery manager."""
+        """Action: Pause battery manager (hands the inverter back to
+        self-consumption, then stops the manager acting — see
+        _set_manager_paused)."""
         with self._state_lock:
-            log("[Action] Battery manager paused")
-            self.store["manager_paused"] = True
-            dev = self._find_device("batteryManager")
-            if dev:
-                dev.updateStateOnServer("managerStatus", value="Paused")
+            self._set_manager_paused(True, "Pause action")
 
     def actionResumeManager(self, action):
         """Action: Resume battery manager."""
         with self._state_lock:
-            log("[Action] Battery manager resumed")
-            self.store["manager_paused"] = False
-            dev = self._find_device("batteryManager")
-            if dev:
-                dev.updateStateOnServer("managerStatus", value="Running")
+            self._set_manager_paused(False, "Resume action")
 
     def actionRefreshForecast(self, action):
         """Action: Manual solar forecast refresh (Open-Meteo)."""
