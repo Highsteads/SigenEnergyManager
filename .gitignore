@@ -3,6 +3,8 @@ IndigoSecrets.py
 **/secrets.py
 **/IndigoSecrets.py
 __pycache__/
+.pytest_cache/
+**/.pytest_cache/
 *.pyc
 *.pyo
 .DS_Store

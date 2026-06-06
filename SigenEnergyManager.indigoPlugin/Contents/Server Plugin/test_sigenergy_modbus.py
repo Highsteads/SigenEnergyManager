@@ -51,6 +51,7 @@ def _make_modbus():
     modbus = SigenergyModbus("192.168.100.49")
     modbus._connected        = True
     modbus._last_request_time = 0   # bypass 1-second throttle
+    modbus._sleep            = lambda _s: None   # no real throttle wait — suite was ~2 min
 
     mock_client = MagicMock()
 

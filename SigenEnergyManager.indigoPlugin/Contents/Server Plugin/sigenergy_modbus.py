@@ -75,6 +75,11 @@ HOLD_ESS_BACKUP_SOC        = 40046    # U16 RW, gain 10, % - backup reserve SOC
 HOLD_ESS_CHARGE_CUTOFF     = 40047    # U16 RW, gain 10, % - max charge SOC
 HOLD_ESS_DISCHARGE_CUTOFF  = 40048    # U16 RW, gain 10, % - min discharge SOC (reserve protection)
 
+# Sanity ceiling for power-limit writes (watts). Far above any residential inverter,
+# so a value above this is certainly a bug/typo — the setters clamp to it with a
+# warning rather than writing garbage to the inverter.
+MAX_POWER_LIMIT_W = 100_000
+
 # --- EMS work modes (register 30003) ---
 
 EMS_MODES = {
@@ -706,6 +711,10 @@ class SigenergyModbus:
         if watts < 0:
             self.logger.error(f"Invalid charge limit: {watts}W (must be >= 0)")
             return False
+        if watts > MAX_POWER_LIMIT_W:
+            self.logger.warning(f"Charge limit {watts}W exceeds sanity ceiling "
+                                f"{MAX_POWER_LIMIT_W}W — clamping")
+            watts = MAX_POWER_LIMIT_W
         if not quiet:
             self.logger.info(f"Setting ESS max charge limit: {watts}W")
         else:
@@ -717,6 +726,10 @@ class SigenergyModbus:
         if watts < 0:
             self.logger.error(f"Invalid discharge limit: {watts}W (must be >= 0)")
             return False
+        if watts > MAX_POWER_LIMIT_W:
+            self.logger.warning(f"Discharge limit {watts}W exceeds sanity ceiling "
+                                f"{MAX_POWER_LIMIT_W}W — clamping")
+            watts = MAX_POWER_LIMIT_W
         self.logger.info(f"Setting ESS max discharge limit: {watts}W")
         return self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts)
 
@@ -732,6 +745,10 @@ class SigenergyModbus:
         if watts < 0:
             self.logger.error(f"Invalid export limit: {watts}W (must be >= 0)")
             return False
+        if watts > MAX_POWER_LIMIT_W:
+            self.logger.warning(f"Export limit {watts}W exceeds sanity ceiling "
+                                f"{MAX_POWER_LIMIT_W}W — clamping")
+            watts = MAX_POWER_LIMIT_W
         self.logger.info(f"Setting grid max export limit: {watts}W")
         success = self._write_uint32_registers(HOLD_GRID_MAX_EXPORT_LIMIT, watts)
         if not success:

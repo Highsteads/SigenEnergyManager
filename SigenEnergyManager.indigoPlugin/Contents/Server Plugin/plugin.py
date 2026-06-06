@@ -6,8 +6,24 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-06-2026 (v5.26.1)
-# Version:     5.26.1
+# Date:        06-06-2026 (v5.26.2)
+# Version:     5.26.2
+# 5.26.2 — Low-severity sweep (clears the review queue bar the octopus consolidation):
+#   • prepare_to_sleep now also resets a raised discharge cutoff to the health floor —
+#     a flood-prev/storm/VPP floor left high would lock the battery and force overnight
+#     grid import across a long Mac sleep.
+#   • Modbus power-limit setters (charge/discharge/export) clamp to a 100kW sanity
+#     ceiling before writing watts to the inverter (was lower-bound only).
+#   • Poll loop sleeps min(modbus_poll_s, 10) so the advertised 5s "very live" interval
+#     is actually honoured (was a hardcoded 10s).
+#   • Seasonal + storm overrides log only on state change (were spamming every 60s).
+#   • web_dashboard 1.3: NaN/Infinity-safe JSON (one bad float no longer breaks the live
+#     update), calendar view state hoisted to <script> scope (selected year survives the
+#     5s refresh), Back link host-relative (was a hardcoded LAN IP).
+#   • Tests: modbus harness uses a no-op throttle sleep (suite 123s → ~11s); new
+#     test_plugin.py (config-coercion helpers). 126 tests pass.
+#   DEFERRED (needs its own session + decision): retire octopus_tracker_rate.py by having
+#   the plugin write elec_rates_*_json itself (single source of truth vs octopus_api).
 # 5.26.1 — Medium-severity hardening batch (follow-up to 5.26.0's highs):
 #   (A) runConcurrentThread wraps each _tick so one bad tick task (modbus/forecast/
 #       VPP) is logged and retried, not fatal to the whole polling loop; _as_float/
@@ -1255,6 +1271,17 @@ class Plugin(indigo.PluginBase):
                 log("[Sleep] Inverter returned to self-consumption mode")
             except Exception as exc:
                 log(f"[Sleep] set_self_consumption failed: {exc}", level="WARNING")
+            # Also reset any raised discharge cutoff (flood-prev / storm / VPP floor)
+            # to the health floor. set_self_consumption clears the forced MODE but not
+            # the cutoff register; a cutoff left high would lock the battery above that
+            # SOC and force grid import for the whole sleep. The manager re-evaluates
+            # and re-applies on wake if conditions still warrant it.
+            try:
+                health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
+                self.modbus.set_discharge_cutoff(health_floor)
+                log(f"[Sleep] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
+            except Exception as exc:
+                log(f"[Sleep] discharge-cutoff reset failed: {exc}", level="WARNING")
             try:
                 self.modbus.disconnect()
             except Exception:
@@ -2229,7 +2256,10 @@ class Plugin(indigo.PluginBase):
                     self.logger.exception(
                         "[Tick] Unhandled error in poll tick — continuing to next tick"
                     )
-                self.sleep(10)
+                # Sleep the smaller of the 10s base tick and the configured modbus poll
+                # interval, so the advertised 5s "very live" setting is actually honoured
+                # (per-task interval checks inside _tick gate everything else).
+                self.sleep(min(getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL), 10))
         except self.StopThread:
             pass
 
@@ -2726,14 +2756,21 @@ class Plugin(indigo.PluginBase):
         except Exception:
             local_month = datetime.now().month
 
+        applied = None
         if local_month in (10, 11, 12, 1, 2, 3):
             winter_buf = _as_float(self.pluginPrefs.get("winterBufferPct"), 20)
             if winter_buf > snapshot.dawn_target_pct:
                 snapshot.dawn_target_pct = winter_buf
-                log(
-                    f"[Seasonal] Winter buffer active (month {local_month}): "
-                    f"resilience floor raised to {winter_buf:.0f}%"
-                )
+                applied = winter_buf
+        # Log only on a state change — this runs every 60s evaluate, so an
+        # unconditional log spammed the event log all winter.
+        if applied != self.store.get("seasonal_override_applied"):
+            if applied is not None:
+                log(f"[Seasonal] Winter buffer active (month {local_month}): "
+                    f"resilience floor raised to {applied:.0f}%")
+            elif self.store.get("seasonal_override_applied") is not None:
+                log("[Seasonal] Winter buffer no longer active — back to summer floor")
+            self.store["seasonal_override_applied"] = applied
 
     def _apply_storm_override(self, snapshot):
         """Raise dawn target and suppress exports during active storm warnings."""
@@ -2743,14 +2780,19 @@ class Plugin(indigo.PluginBase):
         elif storm_level == "yellow":
             override_soc = STORM_SOC_YELLOW
         else:
+            self.store["storm_override_logged_level"] = None
             return
 
         snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
         snapshot.export_enabled  = False   # never export during a storm
-        log(
-            f"[Storm] Storm override active (level={storm_level}): "
-            f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
-        )
+        # Log only when the storm level changes — runs every 60s evaluate, and the
+        # level transition itself is already logged by _check_storm_watch.
+        if self.store.get("storm_override_logged_level") != storm_level:
+            log(
+                f"[Storm] Storm override active (level={storm_level}): "
+                f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
+            )
+            self.store["storm_override_logged_level"] = storm_level
 
     def _log_manager_decision(self, decision, snapshot, soc_pct):
         """Log manager decisions only on action change — no periodic heartbeat."""

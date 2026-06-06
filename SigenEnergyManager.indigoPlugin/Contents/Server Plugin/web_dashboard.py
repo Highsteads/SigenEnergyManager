@@ -5,16 +5,34 @@
 #              Runs on port 8179. Exposes / (HTML) and /api/status (JSON).
 #              Started from plugin.startup(), stopped on plugin.shutdown().
 # Author:      CliveS & Claude Opus 4.8
-# Date:        01-06-2026
-# Version:     1.2
+# Date:        06-06-2026
+# Version:     1.3
+# 1.3 — NaN/Infinity-safe JSON (one non-finite float no longer breaks the whole live
+#       update); calendar view state (_calCurrentYear/_calYearsLoaded) hoisted to
+#       <script> scope so the selected year tab survives the 5s refresh; Back link
+#       host-relative (was a hardcoded LAN IP, Clive-only).
 
 import http.server
 import json
 import logging
+import math
 import socketserver
 import threading
 
 DASHBOARD_PORT = 8179
+
+
+def _json_safe(obj):
+    """Recursively replace NaN/Infinity floats with None so the emitted JSON is
+    valid. Default json.dumps writes bare NaN/Infinity tokens, which the browser's
+    JSON.parse rejects — one non-finite float would take down the whole live update."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 # ============================================================
 # Embedded self-contained dashboard HTML
@@ -528,7 +546,7 @@ header h1{
 <body>
 <header>
   <div class="hdr-left">
-    <a class="nav-btn" href="http://192.168.100.160:8176/public/dashboards/index.html">&larr; Back</a>
+    <a class="nav-btn" href="#" onclick="location.href=location.protocol+'//'+location.hostname+':8176/public/dashboards/index.html';return false;">&larr; Back</a>
   </div>
   <div class="hdr-center">
     <h1>&#9889; Sigenergy Monitor</h1>
@@ -1090,6 +1108,11 @@ function updateAlerts(d) {
   }
 }
 
+// Calendar view state — hoisted to <script> scope so it persists across the 5s
+// update() calls. It was redeclared inside update(), which reset the user's
+// selected year tab and re-fetched /api/years on every refresh.
+let _calCurrentYear = null;
+let _calYearsLoaded = false;
 function update(d) {
   if (d.error) { document.getElementById('ts').textContent = 'Error: ' + d.error; return; }
   document.getElementById('ts').textContent = d.timestamp || '\u2014';
@@ -1333,9 +1356,8 @@ function update(d) {
     }).join('');
   }
 
-  let _calCurrentYear = null;
-  let _calYearsLoaded = false;
-
+  // (calendar state _calCurrentYear / _calYearsLoaded hoisted to <script> scope
+  //  above so it survives the 5s refresh)
   async function _loadYearTabs() {
     if (_calYearsLoaded) return;
     _calYearsLoaded = true;
@@ -1841,7 +1863,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_data()
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
@@ -1862,7 +1884,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_history(hours=hours)
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
@@ -1879,7 +1901,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_calendar(year or "")
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
@@ -1891,7 +1913,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_years()
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
@@ -1911,7 +1933,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_daily(days=days)
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
@@ -1924,7 +1946,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             else:
                 try:
                     data = self._plugin_ref.get_dashboard_export_sync()
-                    body = json.dumps(data).encode()
+                    body = json.dumps(_json_safe(data)).encode()
                 except Exception as exc:
                     body = json.dumps({"error": str(exc)}).encode()
             self._send(200, "application/json", body)
