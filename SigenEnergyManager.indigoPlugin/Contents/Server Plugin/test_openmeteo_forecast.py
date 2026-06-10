@@ -22,7 +22,6 @@ from openmeteo_forecast import (
     BIAS_CORRECTION_MAX,
     MIN_CALIBRATION_FORECAST_KWH,
     BIAS_BAND_CENTRES_KWH,
-    MIN_BAND_SAMPLES,
 )
 
 

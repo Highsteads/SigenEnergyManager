@@ -566,7 +566,6 @@ class OpenMeteoForecast:
         # backoff masks the vast majority. Anything still failing after the
         # retry falls through to cache, same as before.
         response  = None
-        last_exc  = None
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
                 response = requests.get(
@@ -574,12 +573,10 @@ class OpenMeteoForecast:
                     params=params,
                     timeout=REQUEST_TIMEOUT,
                 )
-                last_exc = None
                 break
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError) as e:
-                last_exc = e
                 if attempt < RETRY_ATTEMPTS:
                     self.logger.warning(
                         f"[OpenMeteo] {array_cfg['name']}: transient network "
@@ -599,7 +596,6 @@ class OpenMeteoForecast:
                 self.logger.error(
                     f"[OpenMeteo] Error fetching {array_cfg['name']}: {e}"
                 )
-                last_exc = e
                 break
 
         if response is None:

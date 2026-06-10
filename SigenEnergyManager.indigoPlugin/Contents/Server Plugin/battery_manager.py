@@ -705,7 +705,6 @@ class BatteryManager:
         Uses cheapest available time window for the active tariff.
         """
         tariff      = snapshot.tariff
-        now         = snapshot.now
         battery_kwh = snapshot.current_soc_pct / 100.0 * snapshot.capacity_kwh
 
         # Target SOC: current SOC + the net import deficit.

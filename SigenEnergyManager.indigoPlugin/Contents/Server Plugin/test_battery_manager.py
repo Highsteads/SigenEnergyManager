@@ -7,19 +7,14 @@
 # Date:        03-05-2026
 # Version:     1.3
 
-import sys
 import unittest
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
 
 # Allow running without Indigo (battery_manager imports octopus_api constants via try/except)
 from battery_manager import (
     BatteryManager,
     ManagerSnapshot,
     TariffData,
-    Decision,
-    SufficiencyBalance,
     ACTION_SELF_CONSUMPTION,
     ACTION_START_IMPORT,
     ACTION_SCHEDULE_IMPORT,
@@ -28,11 +23,7 @@ from battery_manager import (
     ACTION_VPP_EXPORT,
     TARIFF_TRACKER,
     TARIFF_GO,
-    TARIFF_FLUX,
-    TRACKER_DEFER_THRESHOLD,
-    FLOOD_PREV_SOC_THRESHOLD_PCT,
     FLOOD_PREV_TARGET_PCT,
-    FLOOD_PREV_FORECAST_MULT,
 )
 
 
@@ -1201,5 +1192,5 @@ import time as time_module
 
 
 if __name__ == "__main__":
-    print(f"Running {PLUGIN_NAME if 'PLUGIN_NAME' in dir() else 'SigenEnergyManager'} battery_manager tests")
+    print(f"Running {globals().get('PLUGIN_NAME', 'SigenEnergyManager')} battery_manager tests")
     unittest.main(verbosity=2)

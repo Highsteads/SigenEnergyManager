@@ -19,7 +19,6 @@
 import base64
 import json
 import logging
-import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -799,7 +798,6 @@ class OctopusAPI:
 
     def _classify_tariff_code(self, tariff_code):
         """Classify a full tariff code into one of our tariff keys."""
-        upper_code   = tariff_code.upper()
         product_code = self._product_from_tariff_code(tariff_code)
 
         for tariff_key, prefixes in TARIFF_PRODUCT_PREFIXES.items():

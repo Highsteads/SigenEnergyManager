@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        10-06-2026 (v5.28.2)
-# Version:     5.28.2
+# Date:        10-06-2026
+# Version:     5.28.3
 # 5.28.2 — Axle VPP payment rate is now a config pref (axleVppRatePerKwh, default 1.00
 #   GBP/kWh) instead of a hardcoded £1, used for the earnings estimate on the Axle VPP
 #   Monitor. Coerced via the guarded _as_float so a blank/bad value falls back to 1.00.
@@ -520,9 +520,7 @@
 
 import indigo
 import json
-import logging
 import os
-import platform
 import sqlite3
 import sys
 import threading
@@ -624,8 +622,7 @@ from battery_manager  import (
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT,
-    ACTION_SOLAR_OVERFLOW, SOLAR_OVERFLOW_CAP_DEADBAND_W,
-    FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
+    ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
 )
 from axle_api      import AxleAPI
@@ -3376,7 +3373,7 @@ class Plugin(indigo.PluginBase):
             scheduled = pytz.timezone("Europe/London").localize(scheduled).astimezone(timezone.utc)
 
         if now_utc >= scheduled:
-            log(f"[Manager] Scheduled import window reached - starting import")
+            log("[Manager] Scheduled import window reached - starting import")
             target_soc = self.store.get("import_target_soc", 12.0)
             if self.modbus and self.modbus.force_charge(10000):
                 self.store["import_active"]      = True
@@ -3885,7 +3882,6 @@ class Plugin(indigo.PluginBase):
 
         # Parse all snapshot records out of the JSONL file
         snapshots   = []
-        announce    = None
         ended       = None
         if path and os.path.exists(path):
             try:
@@ -3902,7 +3898,7 @@ class Plugin(indigo.PluginBase):
                         if rtype == "snapshot":
                             snapshots.append(rec)
                         elif rtype == "announcement":
-                            announce = rec
+                            pass  # announcement records are not surfaced here
                         elif rtype == "event_ended":
                             ended = rec
             except Exception as exc:
@@ -4095,7 +4091,7 @@ class Plugin(indigo.PluginBase):
             reason    = "daytime event — solar will recharge"
         else:
             floor_pct = dawn_target_pct
-            reason    = f"night event — protecting dawn floor"
+            reason    = "night event — protecting dawn floor"
 
         floor_pct = max(floor_pct, health_floor)  # never below the health floor
 
@@ -5458,7 +5454,7 @@ class Plugin(indigo.PluginBase):
                 if float(chg) > 0:
                     log(f"[VPP] Pre-charge target:   {chg}% SOC")
                 else:
-                    log(f"[VPP] Pre-charge:          Not needed (SOC sufficient)")
+                    log("[VPP] Pre-charge:          Not needed (SOC sufficient)")
 
         log("[VPP] =============================================")
         return True
@@ -5495,7 +5491,7 @@ class Plugin(indigo.PluginBase):
         # 12-May-2026 (87.8 kWh expected total for a 14.25 kWp array — physically
         # impossible).  fcst_today retained for compatibility but not used in
         # the summary line below.
-        fcst_today    = fcast.states.get("correctedTodayKwh",  "?") if fcast else "?"
+        fcst_today    = fcast.states.get("correctedTodayKwh",  "?") if fcast else "?"  # noqa: F841 — retained for compatibility (see comment above)
         fcst_remain   = fcast.states.get("remainingTodayKwh", "?") if fcast else "?"
         fcst_tmrw     = fcast.states.get("correctedTomorrowKwh", "?") if fcast else "?"
 
@@ -5539,7 +5535,7 @@ class Plugin(indigo.PluginBase):
             else:
                 log(f"[Today] VPP:                 Completed  ({vpp_exp:.2f} kWh exported)  "
                     f"state: {vpp_state}")
-        log(f"[Today] =============================================")
+        log("[Today] =============================================")
         return True
 
     def menuToggleDebug(self):

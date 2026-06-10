@@ -11,7 +11,7 @@
 
 import sys
 import unittest
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 # ============================================================
 # Patch pymodbus before importing sigenergy_modbus
