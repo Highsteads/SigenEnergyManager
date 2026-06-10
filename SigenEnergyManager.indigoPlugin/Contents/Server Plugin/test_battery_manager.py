@@ -25,6 +25,7 @@ from battery_manager import (
     ACTION_SCHEDULE_IMPORT,
     ACTION_START_EXPORT,
     ACTION_STOP_EXPORT,
+    ACTION_VPP_EXPORT,
     TARIFF_TRACKER,
     TARIFF_GO,
     TARIFF_FLUX,
@@ -460,8 +461,12 @@ class TestVppSuppression(unittest.TestCase):
     def setUp(self):
         self.bm = BatteryManager()
 
-    def test_vpp_active_returns_self_consumption(self):
-        """When VPP is active, always return self-consumption regardless of SOC."""
+    def test_vpp_active_self_drives_export(self):
+        """When VPP is active, self-drive the export window regardless of SOC.
+
+        v3.6: the override no longer stands down for Axle (their dispatch is
+        unreliable and settlement is meter-based) — it drives the export itself.
+        """
         snapshot = _make_snapshot(
             soc_pct    = 5.0,   # would normally trigger import
             vpp_active = True,
@@ -469,8 +474,18 @@ class TestVppSuppression(unittest.TestCase):
         )
         decision = self.bm.evaluate(snapshot)
 
-        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+        self.assertEqual(decision.action, ACTION_VPP_EXPORT)
         self.assertIn("VPP", decision.reason)
+
+    def test_vpp_export_takes_priority_over_import(self):
+        """VPP export override wins even when SOC is low enough to want an import."""
+        snapshot = _make_snapshot(
+            soc_pct    = 5.0,
+            vpp_active = True,
+            now_hour   = 8,
+        )
+        decision = self.bm.evaluate(snapshot)
+        self.assertEqual(decision.action, ACTION_VPP_EXPORT)
 
 
 class TestConsumptionEstimation(unittest.TestCase):

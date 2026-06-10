@@ -4,9 +4,14 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 4.7
-# Date:        27-05-2026
-# Version:     3.5
+# Author:      CliveS & Claude Opus 4.8
+# Date:        10-06-2026
+# Version:     3.6
+# 3.6 — VPP override now self-drives the export window (ACTION_VPP_EXPORT) instead
+#       of standing down for Axle. Axle settle on the meter reading so exporting it
+#       ourselves counts identically, and their cloud dispatch is unreliable (no-show
+#       10-Jun-2026, Axle acknowledged a SigEnergy-API fault). Plugin.py drives
+#       night_export for the window and ignores Axle's start/stop.
 # 3.5 — Decision dataclass gains an `audit_trail: List[Tuple[str, str]]` field;
 #       evaluate() populates it at every branch (CONTEXT, BALANCE, OVERRIDE,
 #       RESILIENCE, FLOOD-PREP, IMPORT, OVERFLOW, RELEASE-OVERFLOW, DEFAULT)
@@ -65,6 +70,7 @@ ACTION_SCHEDULE_IMPORT  = "schedule_import"     # defer import to a cheaper/late
 ACTION_START_EXPORT     = "start_export"        # used by flood prevention pre-drain (v4.4+)
 ACTION_STOP_EXPORT      = "stop_export"         # stop active legacy export (v3.x migration)
 ACTION_SOLAR_OVERFLOW   = "solar_overflow"      # daytime: cap charge so PV surplus exports
+ACTION_VPP_EXPORT       = "vpp_export"          # VPP event window: self-drive export (ignore Axle dispatch)
 
 # Minimum percentage cheaper to justify waiting for tomorrow's Tracker rate
 TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper)
@@ -248,7 +254,8 @@ class BatteryManager:
          ZERO conversion loss. Pre-charging wastes ~6% at no rate benefit.
          Exception: defer to 00:05 if tomorrow's Tracker rate is 10%+ cheaper.
     3. No overnight force-discharge: stays in Self Consumption mode (0x02) always.
-    4. VPP events override all decisions (Axle cloud controls battery).
+    4. VPP events override all decisions — self-drive export for the window
+       (meter-settled, so Axle's own dispatch is not relied upon).
 
     This class is stateless: it takes a ManagerSnapshot and returns a Decision.
     All state is managed by plugin.py.
@@ -391,7 +398,8 @@ class BatteryManager:
         """Return a Decision if a higher-priority override applies, else None.
 
         Two overrides:
-          - VPP active: Axle has control, manager must stand down.
+          - VPP active: self-drive the export window (meter-settled; Axle's own
+            cloud dispatch is ignored). Returns ACTION_VPP_EXPORT.
           - Flood-prevention export already running: continue or stop based on
             the live 24h balance (managed by _continue_flood_prevention).
 
@@ -401,9 +409,14 @@ class BatteryManager:
         overnight.
         """
         if snapshot.vpp_active:
+            # Self-drive the export window instead of standing down. Axle settle on
+            # the meter reading, so exporting it ourselves counts identically — and
+            # their cloud dispatch proved unreliable (no-show 10-Jun-2026, Axle
+            # acknowledged a SigEnergy-API fault that "may not be resolved before the
+            # next event"). We no longer wait for or hand control to Axle.
             return Decision(
-                action = ACTION_SELF_CONSUMPTION,
-                reason = "VPP event active — Axle has control",
+                action = ACTION_VPP_EXPORT,
+                reason = "VPP event active — self-driving export (Axle dispatch ignored)",
             )
         if snapshot.export_active and snapshot.flood_prev_target_soc > 0:
             balance = self._calculate_24h_balance(snapshot)

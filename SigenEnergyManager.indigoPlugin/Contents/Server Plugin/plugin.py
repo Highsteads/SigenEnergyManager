@@ -6,8 +6,17 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-06-2026 (v5.27.0)
-# Version:     5.27.0
+# Date:        10-06-2026 (v5.28.0)
+# Version:     5.28.0
+# 5.28.0 — VPP self-drive. The plugin now drives the export itself for each announced
+#   Axle window (T-2min on -> end+2min off) instead of waiting for Axle's cloud dispatch,
+#   which proved unreliable (10-Jun-2026 no-show; Axle confirmed a SigEnergy-API fault).
+#   Axle settle on the meter reading so self-export counts identically (~£1/kWh, stacking
+#   with Octopus Outgoing 12p). Manager override now returns ACTION_VPP_EXPORT (was a
+#   self-consumption stand-down); night_export fires on VPP_ACTIVE entry and is re-asserted
+#   idempotently each manager tick; discharge floor = next-day reserve; no grid import.
+#   The Axle release-watcher (45/60-min alerts) is bypassed — dead code retained for now,
+#   to be removed in a follow-up cleanup once proven over a couple of live events.
 # 5.27.0 — Octopus single source of truth (retires octopus_tracker_rate.py). The plugin
 #   now writes the rate + slot-JSON variables the openmeteo battery optimiser consumes —
 #   elec_rates_today_json / elec_rates_tomorrow_json (raw Octopus slots), tracker_rate_today
@@ -609,6 +618,7 @@ from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
+    ACTION_VPP_EXPORT,
     ACTION_SOLAR_OVERFLOW, SOLAR_OVERFLOW_CAP_DEADBAND_W,
     FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
@@ -640,6 +650,7 @@ ACTION_MODE_TOKEN = {
     ACTION_STOP_IMPORT:      "stopImport",
     ACTION_START_EXPORT:     "startExport",
     ACTION_STOP_EXPORT:      "stopExport",
+    ACTION_VPP_EXPORT:       "startExport",   # reuse export token — no new Devices.xml Option
 }
 
 # Minimum inverter readings required per half-hourly slot before we trust the
@@ -3099,6 +3110,20 @@ class Plugin(indigo.PluginBase):
                     )
                     self._trigger_event("exportStarted")
 
+        elif action == ACTION_VPP_EXPORT:
+            # VPP event window: self-drive 4 kW export (inverter DNO firmware caps
+            # grid flow). The state machine starts night_export on entry to
+            # VPP_ACTIVE; this re-asserts it idempotently each manager tick so a
+            # transient drop self-heals. The discharge floor was set at pre-charge
+            # (next-day reserve) — leave it. Axle settle on the meter so this counts
+            # identically; their own dispatch is ignored.
+            if not prev_export:
+                log(f"[Manager] VPP export — {decision.reason}")
+                inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+                if self.modbus.night_export(inv_max_w):
+                    self.store["export_active"] = True
+                    self._trigger_event("exportStarted")
+
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
                 log("[Manager] Stopping night export - returning to self-consumption")
@@ -3625,20 +3650,21 @@ class Plugin(indigo.PluginBase):
             # Axle API returns None when no event is scheduled or the event has ended
 
             if current_state == VPP_ACTIVE:
-                # Event ended (API stopped returning it)
-                vpp_export = (self.store["grid_export_daily_kwh"]
-                              - self.store.get("vpp_export_start_kwh", 0.0))
-                self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
-                self.store["vpp_cooling_start"]   = time.time()
-                self._vpp_transition(VPP_COOLING_OFF)
-                self.store["vpp_active"] = False
-                self._trigger_event("vppEnded")
-                log(
-                    f"[VPP] Event complete. Estimated VPP export: {vpp_export:.2f} kWh. "
-                    f"Waiting for Axle to release inverter..."
-                )
+                # We self-drive on our OWN stored window — the API returning None
+                # usually just means the event ended, but only stop once we are past
+                # our stored end_time + 2-min tail, so a transient API blip mid-event
+                # cannot cut the export short.
+                stored   = self.store.get("vpp_event") or {}
+                end_time = stored.get("end_time")
+                if end_time is not None and now < end_time + timedelta(minutes=2):
+                    self._log_vpp_snapshot(stored)
+                    self._update_vpp_device()
+                    return
+                self._end_vpp_export(now, stored)
 
             elif current_state == VPP_COOLING_OFF:
+                # Legacy state — no longer entered by the self-drive path (kept so
+                # an in-flight cool-off across a restart still resolves).
                 self._vpp_check_axle_release()
 
             elif current_state != VPP_IDLE:
@@ -3689,7 +3715,7 @@ class Plugin(indigo.PluginBase):
             log(
                 f"[VPP] Late detection: event already active {_local_time(start_time)} - "
                 f"{_local_time(end_time)} BST (Axle published {mins_late} min late) — "
-                f"entering ACTIVE, suppressing plugin Modbus writes"
+                f"entering ACTIVE, self-driving export"
             )
             self.store["vpp_event"] = event
             self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
@@ -3740,59 +3766,29 @@ class Plugin(indigo.PluginBase):
             # 21-May-2026 caused 0 kWh export on a scheduled 4 kWh event.
             self.store["vpp_remote_ems_released"] = True
 
-            # Event window open — transition to ACTIVE (Axle has been free
-            # to dispatch since PRE_CHARGING began; this is just bookkeeping).
-            if hours_to_start <= 0:
+            # Start the self-driven export 2 min BEFORE the window opens, so we are
+            # already exporting by the time Axle's meter window begins (v5.28).
+            if hours_to_start <= 2.0 / 60.0:
                 self.store["vpp_export_start_kwh"]  = self.store["grid_export_daily_kwh"]
                 self.store["vpp_charge_stopped"]    = False
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
-                log(f"[VPP] Event window now OPEN — Axle in control via Remote EMS")
+                log("[VPP] T-2min — self-driving export for the window "
+                    "(ignoring Axle dispatch; meter-settled).")
 
         elif current_state == VPP_ACTIVE:
             # Periodic detailed snapshot — every poll cycle while active, so the
             # plugin captures what Axle is doing for post-hoc analysis.
             self._log_vpp_snapshot(event)
-            if now >= end_time:
-                # Time-based end — Axle has been driving the inverter, no
-                # Modbus writes needed here. _vpp_check_axle_release() in
-                # COOLING_OFF watches for Axle to hand the inverter back
-                # and re-enables Remote EMS when it does.
-                vpp_export = (self.store["grid_export_daily_kwh"]
-                              - self.store.get("vpp_export_start_kwh", 0.0))
-                self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
-                self.store["vpp_cooling_start"]   = time.time()
-                self._vpp_transition(VPP_COOLING_OFF)
-                self.store["vpp_active"] = False
-                self._trigger_event("vppEnded")
-                # Record the wrap-up record in the per-event JSONL file
-                try:
-                    import json as _json
-                    path = self._vpp_event_log_path(event)
-                    with open(path, "a", encoding="utf-8") as fh:
-                        fh.write(_json.dumps({
-                            "type":          "event_ended",
-                            "logged_at":     datetime.now(timezone.utc).isoformat(),
-                            "export_kwh":    round(vpp_export, 3),
-                        }) + "\n")
-                except Exception:
-                    pass
-                log(
-                    f"[VPP] Event ended. Estimated VPP export: {vpp_export:.2f} kWh. "
-                    f"Waiting for Axle to release the inverter back to plugin control..."
-                )
-                # v5.18.2: post-event summary -> axleVppMonitor states +
-                # Pushover with the headline numbers and a ready-to-paste
-                # Claude prompt pointing at the JSONL file.  Best-effort:
-                # any failure here must not block the cool-off state machine.
-                try:
-                    self._summarise_vpp_event(event)
-                except Exception as _exc:
-                    log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
+            if now >= end_time + timedelta(minutes=2):
+                # Our timer drives the stop (+2-min tail past the window). We do not
+                # wait for Axle to release anything — we never handed it over.
+                self._end_vpp_export(now, event)
 
         elif current_state == VPP_COOLING_OFF:
-            # Axle API may still return the event briefly after it ends
+            # Legacy state — no longer entered by the self-drive path (kept so an
+            # in-flight cool-off across a restart still resolves).
             self._vpp_check_axle_release()
 
         self._update_vpp_device()
@@ -4325,6 +4321,51 @@ class Plugin(indigo.PluginBase):
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
             log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
 
+    def _end_vpp_export(self, now, event):
+        """Stop the self-driven VPP export at window end (+2-min tail).
+
+        Restores Self Consumption + the health-floor discharge cutoff and returns
+        the state machine straight to IDLE — no COOLING_OFF / Axle-release wait,
+        because we never handed control to Axle. Records the wrap-up + summary.
+        """
+        event = event or {}
+        vpp_export = (self.store["grid_export_daily_kwh"]
+                      - self.store.get("vpp_export_start_kwh", 0.0))
+        self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
+
+        if self.modbus:
+            self.modbus.set_self_consumption()
+        self._restore_discharge_cutoff()
+
+        self.store["export_active"] = False
+        self.store["vpp_active"]    = False
+        self._vpp_transition(VPP_IDLE)
+        self.store["vpp_event"]     = None
+        self.store["had_vpp_today"] = True
+        self._trigger_event("vppEnded")
+
+        # Wrap-up record in the per-event JSONL file (best-effort)
+        try:
+            import json as _json
+            path = self._vpp_event_log_path(event)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps({
+                    "type":       "event_ended",
+                    "logged_at":  now.isoformat(),
+                    "export_kwh": round(vpp_export, 3),
+                }) + "\n")
+        except Exception:
+            pass
+
+        log(f"[VPP] >>> EVENT COMPLETE <<<  self-driven export ~{vpp_export:.2f} kWh. "
+            f"Restored to Self Consumption.")
+
+        # Post-event summary -> axleVppMonitor states + Pushover (best-effort)
+        try:
+            self._summarise_vpp_event(event)
+        except Exception as _exc:
+            log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
+
     def _vpp_transition(self, new_state):
         """Transition VPP state machine to a new state."""
         old_state = self.store["vpp_state"]
@@ -4332,21 +4373,22 @@ class Plugin(indigo.PluginBase):
         if self.debug:
             log(f"[VPP] State: {old_state} -> {new_state}")
 
-        # On entry to VPP_ACTIVE we do NOTHING to the inverter. Axle's cloud
-        # commands have been driving it since T-5min (when PRE_CHARGING
-        # released Remote EMS). Plugin's job during this state is observe +
-        # log only. The verify loop already skips during VPP_ACTIVE so it
-        # won't fight Axle.
-        # (Prior models — v5.15 cancelled export, v5.16 used mode 0x06 which
-        # curtailed PV, v5.17 used 0x02+charge_limit=0 which broke in
-        # winter — all failed because Remote EMS was kept enabled, blocking
-        # Axle's cloud channel. v5.18 properly releases the lock.)
+        # On entry to VPP_ACTIVE we self-drive the export (v5.28). Axle settle on
+        # the meter reading so exporting it ourselves counts identically — and
+        # their cloud dispatch proved unreliable (no-show 10-Jun-2026; Axle
+        # acknowledged a SigEnergy-API fault that may not be fixed before the next
+        # event). We drive night_export here for a prompt start at T-2min, and the
+        # manager's ACTION_VPP_EXPORT override re-asserts it idempotently each tick.
+        # The discharge floor (next-day reserve) was set at pre-charge time.
         if new_state == VPP_ACTIVE:
             if self.store.get("solar_overflow_active"):
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
-            log("[VPP] >>> VPP WINDOW ACTIVE <<<  plugin in observe-only mode; "
-                "Axle has full inverter control via Sigenergy cloud.")
+            inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+            if self.modbus and self.modbus.night_export(inv_max_w):
+                self.store["export_active"] = True
+            log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
+                "(mode 0x06, DNO-capped 4 kW; Axle dispatch ignored).")
 
     # ================================================================
     # Midnight Tasks
@@ -4803,6 +4845,7 @@ class Plugin(indigo.PluginBase):
             ACTION_SCHEDULE_IMPORT:  "Import Scheduled",
             ACTION_START_EXPORT:     "Night Export Active",
             ACTION_STOP_EXPORT:      "Export Stopping",
+            ACTION_VPP_EXPORT:       "VPP Export Active",
         }.get(decision.action, decision.action)
 
         # Flood prevention visibility (v4.5)
