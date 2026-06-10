@@ -147,6 +147,9 @@
     <Field id="axleApiKey" type="textfield" defaultValue="" visibleBindingId="axleEnabled" visibleBindingValue="true">
         <Label>Axle API token (Bearer):</Label>
     </Field>
+    <Field id="axleVppRatePerKwh" type="textfield" defaultValue="1.00" visibleBindingId="axleEnabled" visibleBindingValue="true">
+        <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
+    </Field>
 
     <Field id="separator_pushover" type="separator"/>
     <Field id="label_pushover" type="label">

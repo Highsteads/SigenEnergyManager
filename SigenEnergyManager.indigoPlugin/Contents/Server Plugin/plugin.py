@@ -6,8 +6,12 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        10-06-2026 (v5.28.1)
-# Version:     5.28.1
+# Date:        10-06-2026 (v5.28.2)
+# Version:     5.28.2
+# 5.28.2 — Axle VPP payment rate is now a config pref (axleVppRatePerKwh, default 1.00
+#   GBP/kWh) instead of a hardcoded £1, used for the earnings estimate on the Axle VPP
+#   Monitor. Coerced via the guarded _as_float so a blank/bad value falls back to 1.00.
+#   Mirrors Predbat's axle_pence_per_kwh. No behaviour change beyond the estimate figure.
 # 5.28.1 — VPP cleanup follow-up: removed the now-dead Axle release-watcher
 #   (_vpp_check_axle_release + _send_vpp_release_alert, ~122 lines), the VPP_COOLING_OFF
 #   state + its dead branches, and the unused AXLE_SUPPORT_EMAIL import. Added a dedicated
@@ -5062,7 +5066,8 @@ class Plugin(indigo.PluginBase):
             duration_hrs = event.get("duration_hrs", 0.0)
 
         max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
-        earnings_est  = round(max_export_kw * duration_hrs * 1.00, 2)  # GBP1/kWh Axle rate
+        vpp_rate      = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)  # GBP/kWh, configurable (default £1)
+        earnings_est  = round(max_export_kw * duration_hrs * vpp_rate, 2)
 
         states = [
             {"key": "vppStatus",         "value": "Active" if self.store["vpp_active"] else "Standby"},
