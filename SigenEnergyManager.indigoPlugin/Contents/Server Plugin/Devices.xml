@@ -170,6 +170,7 @@
                         <Option value="stopImport">Import Stopping</Option>
                         <Option value="startExport">Night Export Active</Option>
                         <Option value="stopExport">Export Stopping</Option>
+                        <Option value="vppExport">VPP Export Active</Option>
                     </List>
                 </ValueType>
                 <TriggerLabel>Battery mode changed</TriggerLabel>

@@ -6,8 +6,13 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        10-06-2026 (v5.28.0)
-# Version:     5.28.0
+# Date:        10-06-2026 (v5.28.1)
+# Version:     5.28.1
+# 5.28.1 — VPP cleanup follow-up: removed the now-dead Axle release-watcher
+#   (_vpp_check_axle_release + _send_vpp_release_alert, ~122 lines), the VPP_COOLING_OFF
+#   state + its dead branches, and the unused AXLE_SUPPORT_EMAIL import. Added a dedicated
+#   `vppExport` currentMode enum Option so a trigger can fire on "VPP export active"
+#   (previously reused the startExport token). No behaviour change to the self-drive.
 # 5.28.0 — VPP self-drive. The plugin now drives the export itself for each announced
 #   Axle window (T-2min on -> end+2min off) instead of waiting for Axle's cloud dispatch,
 #   which proved unreliable (10-Jun-2026 no-show; Axle confirmed a SigEnergy-API fault).
@@ -572,10 +577,6 @@ try:
     from IndigoSecrets import DASHBOARD_HOST
 except ImportError:
     DASHBOARD_HOST = ""
-try:
-    from IndigoSecrets import AXLE_SUPPORT_EMAIL
-except ImportError:
-    AXLE_SUPPORT_EMAIL = ""
 # Site coordinates — IndigoSecrets first, PluginConfig fallback, Big Ben default.
 # Names match the existing IndigoSecrets convention (LATITUDE / LONGITUDE).
 try:
@@ -650,7 +651,7 @@ ACTION_MODE_TOKEN = {
     ACTION_STOP_IMPORT:      "stopImport",
     ACTION_START_EXPORT:     "startExport",
     ACTION_STOP_EXPORT:      "stopExport",
-    ACTION_VPP_EXPORT:       "startExport",   # reuse export token — no new Devices.xml Option
+    ACTION_VPP_EXPORT:       "vppExport",     # dedicated enum token (currentMode.vppExport trigger)
 }
 
 # Minimum inverter readings required per half-hourly slot before we trust the
@@ -724,7 +725,6 @@ VPP_IDLE         = "idle"
 VPP_ANNOUNCED    = "announced"
 VPP_PRE_CHARGING = "pre_charging"
 VPP_ACTIVE       = "active"
-VPP_COOLING_OFF  = "cooling_off"
 
 # Axle VPP SOC calculation constants (from SigenergySolar)
 VPP_DISCHARGE_EFFICIENCY  = 0.97
@@ -894,12 +894,8 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_pre_charge_soc"]   = 0.0
         self.store["vpp_export_start_kwh"]  = 0.0   # grid_export_daily_kwh at event start
         self.store["vpp_last_export_kwh"]   = 0.0   # export kWh during last completed event
-        self.store["vpp_cooling_start"]     = 0.0   # time.time() when COOLING_OFF entered
-        self.store["vpp_release_alerted"]   = False # True once 45-min alert has been sent
-        self.store["vpp_pre_export_active"] = False # True while plugin is pre-exporting (legacy, v5.17-)
         self.store["vpp_charge_stopped"]    = False # True once pre-charge import has ended
         self.store["vpp_10min_warning_sent"] = False # T-10min warning latched
-        self.store["vpp_remote_ems_released"] = False # True from PRE_CHARGING start until handback completes
         self.store["vpp_last_snapshot_at"]   = 0.0    # time.time() of last detailed snapshot log
 
         # Scheduled import state
@@ -3291,14 +3287,12 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Skip during VPP_PRE_CHARGING, VPP_ACTIVE and VPP_COOLING_OFF.
-        # Axle's cloud may begin dispatching as early as T-15min — we must
-        # stop touching 40031 the moment we enter PRE_CHARGING, otherwise
-        # the verify loop will overwrite Axle's "Discharge ESS first" mode
-        # with our "Self Consumption" expectation. _vpp_check_axle_release()
-        # handles the handback when Axle returns control.
+        # Skip during VPP_PRE_CHARGING and VPP_ACTIVE — the VPP state machine and
+        # manager own the inverter mode through the window (self-driven export), so
+        # the verify loop must not overwrite mode 0x06 with our self-consumption
+        # expectation. Normal verification resumes the moment the window ends.
         _vpp_state = self.store.get("vpp_state", VPP_IDLE)
-        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE, VPP_COOLING_OFF):
+        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE):
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -3321,12 +3315,11 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_remote_ems_mode(expected_mode)
 
         # --- Discharge limit and charge limit ---
-        # Skip during VPP_PRE_CHARGING, VPP_ACTIVE and VPP_COOLING_OFF:
-        # Axle controls these registers. Writing them during the handover
-        # window caused a brief 2kW grid import on 10-Apr-2026 when the
-        # solar_overflow charge cap (2395W) was written back 1s after
-        # Axle cleared it to allow full discharge.
-        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE, VPP_COOLING_OFF):
+        # Skip during VPP_PRE_CHARGING and VPP_ACTIVE: the self-driven export owns
+        # these registers through the window (night_export sets the discharge limit
+        # to inverter max). A stray write here once caused a brief 2kW grid import
+        # (10-Apr-2026) when the solar_overflow charge cap was written back mid-window.
+        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE):
             actual_discharge_w = self.modbus.read_discharge_limit()
             if actual_discharge_w is not None:
                 if abs(actual_discharge_w - expected_discharge_w) > 200:
@@ -3618,14 +3611,12 @@ class Plugin(indigo.PluginBase):
     def _vpp_poll_interval(self):
         """Return adaptive VPP poll interval.
 
-        COOLING_OFF polls at 60s: Axle can release the inverter within 1-2 minutes
-        of an event ending. The Modbus poll already refreshes emsWorkMode every 60s;
-        we need to check equally often so Remote EMS is reinstated promptly.
+        ACTIVE polls at 60s so the self-driven export window is tracked closely.
         """
         state = self.store["vpp_state"]
         event = self.store["vpp_event"]
 
-        if state in (VPP_ACTIVE, VPP_COOLING_OFF):
+        if state == VPP_ACTIVE:
             return VPP_POLL_ACTIVE_INTERVAL
 
         if event and state in (VPP_ANNOUNCED, VPP_PRE_CHARGING):
@@ -3662,20 +3653,14 @@ class Plugin(indigo.PluginBase):
                     return
                 self._end_vpp_export(now, stored)
 
-            elif current_state == VPP_COOLING_OFF:
-                # Legacy state — no longer entered by the self-drive path (kept so
-                # an in-flight cool-off across a restart still resolves).
-                self._vpp_check_axle_release()
-
             elif current_state != VPP_IDLE:
-                log("[VPP] Event cancelled/disappeared - restoring discharge cutoff")
+                # Event cancelled / disappeared before the window opened — stand down.
+                log("[VPP] Event cancelled/disappeared - restoring self-consumption")
                 self._restore_discharge_cutoff()
-                if self.store.get("vpp_pre_export_active"):
-                    if self.modbus:
-                        self.modbus.set_self_consumption()
-                    log("[VPP] Pre-export stopped (event cancelled)")
-                self.store["vpp_pre_export_active"] = False
-                self.store["vpp_charge_stopped"]    = False
+                if self.store.get("export_active") and self.modbus:
+                    self.modbus.set_self_consumption()
+                self.store["export_active"]      = False
+                self.store["vpp_charge_stopped"] = False
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
 
@@ -3690,7 +3675,6 @@ class Plugin(indigo.PluginBase):
         if current_state == VPP_IDLE and hours_to_start > 0:
             self.store["vpp_event"] = event
             self.store["vpp_10min_warning_sent"]  = False  # latched per event
-            self.store["vpp_remote_ems_released"] = False
             # Discharge cutoff is NOT raised here — it is raised at pre-charge time
             # (30 min before event). Raising it at announcement (up to 24h early)
             # locks the battery below the floor if SOC is low, causing unnecessary
@@ -3758,14 +3742,6 @@ class Plugin(indigo.PluginBase):
                     log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
                         f"{required_soc:.0f}% target. Holding in Self Consumption.")
 
-            # No explicit "release to Axle" step: Axle dispatches by writing
-            # 40031 directly. The plugin already stops writing to 40031 from
-            # PRE_CHARGING onwards (see verify-loop guards above), so Axle's
-            # writes stand unopposed. The old disable_remote_ems() call here
-            # actively kicked Axle out by clearing 40029 — confirmed bug
-            # 21-May-2026 caused 0 kWh export on a scheduled 4 kWh event.
-            self.store["vpp_remote_ems_released"] = True
-
             # Start the self-driven export 2 min BEFORE the window opens, so we are
             # already exporting by the time Axle's meter window begins (v5.28).
             if hours_to_start <= 2.0 / 60.0:
@@ -3785,11 +3761,6 @@ class Plugin(indigo.PluginBase):
                 # Our timer drives the stop (+2-min tail past the window). We do not
                 # wait for Axle to release anything — we never handed it over.
                 self._end_vpp_export(now, event)
-
-        elif current_state == VPP_COOLING_OFF:
-            # Legacy state — no longer entered by the self-drive path (kept so an
-            # in-flight cool-off across a restart still resolves).
-            self._vpp_check_axle_release()
 
         self._update_vpp_device()
 
@@ -4035,128 +4006,6 @@ class Plugin(indigo.PluginBase):
             f"PV {pv_kwh:.2f} kWh ({pv_status}), "
             f"peak grid export {peak_grid_export_w} W, "
             f"EMS modes: {ems_modes_str}. Log: {path}")
-
-    def _vpp_check_axle_release(self):
-        """Check if Axle has released the inverter and reinstate Remote EMS.
-
-        Two release signals are accepted:
-          (a) 30003 (emsWorkMode) flips to "Max Self Consumption" — Axle
-              relinquished Remote EMS entirely (40029=0).
-          (b) 40031 reads 0x02 (Self Consumption) — Axle kept 40029=1 but
-              set the mode to do-nothing. Observed 21-May-2026 as Axle's
-              actual end-of-event behaviour.
-        Either way we then call set_self_consumption() to assert plugin
-        control (40029=1 + 40031=0x02), which yields 30003=7 "Remote EMS".
-
-        Alert thresholds after VPP_COOLING_OFF was entered (vpp_cooling_start):
-          45 min  — Pushover + email to axle@strudwick.co.uk
-          60 min  — Force reinstatement regardless of EMS mode
-        """
-        ems_mode      = self.latest_inverter_data.get("emsWorkMode", "")
-        axle_released = "Self" in ems_mode   # Axle releases to "Self-Consumption" (30003=0)
-
-        # Broader signal: Axle sometimes "releases" by writing 40031=0x02
-        # (Self Consumption) without dropping 40029 — the inverter then
-        # sits in Remote EMS doing nothing, so 30003 stays at 7 and the
-        # original "Self" string check never matches. Observed 21-May-2026.
-        if not axle_released and self.modbus:
-            cur_mode_reg = self.modbus.read_ems_mode()
-            if cur_mode_reg == 0x02:
-                axle_released = True
-                ems_mode = f"{ems_mode} (40031=0x02 Self Consumption)"
-
-        cooling_start    = self.store.get("vpp_cooling_start", 0)
-        elapsed_secs     = time.time() - cooling_start
-        alerted          = self.store.get("vpp_release_alerted", False)
-        ALERT_SECS       = 2700   # 45 minutes
-        FORCE_SECS       = 3600   # 60 minutes
-
-        # Send alert at 45 min if not yet released
-        if elapsed_secs >= ALERT_SECS and not alerted and not axle_released:
-            self.store["vpp_release_alerted"] = True
-            elapsed_min = int(elapsed_secs / 60)
-            log(
-                f"[VPP] WARNING: Axle has not released inverter after {elapsed_min} min "
-                f"(EMS mode: '{ems_mode}'). Sending alert.",
-                level="WARNING"
-            )
-            self._send_vpp_release_alert(elapsed_min, ems_mode)
-
-        # Still waiting and not yet at force timeout
-        if not (axle_released or elapsed_secs >= FORCE_SECS):
-            if self.debug:
-                log(f"[VPP] Waiting for Axle release "
-                    f"(EMS='{ems_mode}', {int(elapsed_secs)}s elapsed)")
-            return
-
-        # Either released naturally or force timeout reached
-        if not axle_released:
-            log(
-                f"[VPP] 60-min timeout - forcing Remote EMS reinstatement "
-                f"(EMS still: '{ems_mode}')",
-                level="WARNING"
-            )
-        else:
-            log(
-                f"[VPP] Axle released inverter (EMS now: '{ems_mode}')"
-            )
-
-        if self.modbus:
-            self.modbus.set_self_consumption()
-
-        log(
-            "[VPP] >>> REGAINED CONTROL <<<  Remote EMS re-enabled, "
-            "Max Self Consumption restored. Plugin back to normal operation."
-        )
-
-        self._restore_discharge_cutoff()
-        self._vpp_transition(VPP_IDLE)
-        self.store["vpp_event"]                = None
-        self.store["vpp_release_alerted"]      = False   # reset for next event
-        self.store["vpp_10min_warning_sent"]   = False
-        self.store["vpp_remote_ems_released"]  = False
-        self.store["had_vpp_today"]            = True
-
-    def _send_vpp_release_alert(self, elapsed_min, ems_mode):
-        """Send Pushover + email when Axle has not released the inverter on time."""
-        subject = f"Axle VPP - Inverter not released after {elapsed_min} min"
-        plain   = (
-            f"The Axle VPP event ended {elapsed_min} minutes ago but the "
-            f"Sigenergy inverter has not returned to Self Consumption mode.\n\n"
-            f"Current EMS mode: {ems_mode}\n"
-            f"Expected: Max Self Consumption\n\n"
-            f"Remote EMS will be force-reinstated at 60 minutes if Axle has "
-            f"still not released.\n\nPlease check the Axle app and Sigenergy portal."
-        )
-        html    = (
-            f"<html><body>"
-            f"<p>The Axle VPP event ended <strong>{elapsed_min} minutes ago</strong> "
-            f"but the Sigenergy inverter has not returned to Self Consumption mode.</p>"
-            f"<p><strong>Current EMS mode:</strong> {ems_mode}<br>"
-            f"<strong>Expected:</strong> Max Self Consumption</p>"
-            f"<p>Remote EMS will be force-reinstated at 60 minutes if Axle has "
-            f"still not released.</p>"
-            f"<p>Please check the Axle app and Sigenergy portal.</p>"
-            f"</body></html>"
-        )
-
-        # Pushover alert (uses corrected helper — handles secrets/config + skip-with-warning)
-        self._send_pushover(subject, plain, priority="1")
-
-        # Email to Axle support — address comes from IndigoSecrets.py (AXLE_SUPPORT_EMAIL)
-        # so it can be overridden per install without touching plugin code.
-        if AXLE_SUPPORT_EMAIL:
-            try:
-                indigo.server.sendEmailTo(AXLE_SUPPORT_EMAIL, subject=subject, body=html)
-                log(f"[VPP] Email alert sent to {AXLE_SUPPORT_EMAIL}")
-            except Exception as e:
-                log(f"[VPP] Email alert failed: {e}", level="ERROR")
-        else:
-            log(
-                "[VPP] AXLE_SUPPORT_EMAIL not set in IndigoSecrets.py — VPP release "
-                "email alert skipped. Add the address to IndigoSecrets.py to enable.",
-                level="ERROR",
-            )
 
     def _start_vpp_precharge(self, event):
         """Assess SOC 30 min before VPP event; raise discharge cutoff; no grid import.
