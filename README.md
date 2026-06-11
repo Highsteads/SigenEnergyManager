@@ -250,7 +250,7 @@ DASHBOARD_HOST      = ""
 
 | Setting | Description |
 |---------|-------------|
-| Inverter IP | Sigenergy inverter LAN address (default 192.168.100.49) |
+| Inverter IP | Sigenergy inverter LAN address (e.g. 192.168.1.49 — find it in your router or the Sigenergy app) |
 | Modbus port | Inverter Modbus TCP port (default 502) |
 | Plant slave address | Modbus slave address for plant data (default 247) |
 | Inverter slave address | Modbus slave address for inverter data (default 1) |
