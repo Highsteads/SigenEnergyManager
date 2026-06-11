@@ -638,8 +638,8 @@ Developed and tested on:
 - DNO export cap: 4 kW
 - Tariff: Octopus Tracker
 
----
+## Authors & licence
 
-## Author
+Vibed into existence by **CliveS**, who knew what he wanted, argued until he got it, and tested it on a real house. Typed at inhuman speed by **Claude** (Anthropic), who mostly did as it was told.
 
-CliveS & Claude (Sonnet 4.6 / Opus 4.7) -- Medomsley, County Durham, England
+© 2026 CliveS · [MIT licence](LICENSE) — copy it, fork it, bend it, break it, fix it, ship it. If it breaks, you get to keep both pieces.
