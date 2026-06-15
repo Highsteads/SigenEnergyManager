@@ -368,6 +368,70 @@ class TestNightExportMethod(unittest.TestCase):
         self.assertIn(10000, discharge_writes)
 
 
+class TestDaytimeExportMethod(unittest.TestCase):
+    """Tests for daytime_export() — PV-first grid export (mode 0x05).
+
+    daytime_export() must:
+      - Set mode 0x05 (Discharge PV First) — NOT 0x06
+      - Set HOLD_ESS_MAX_DISCHARGE = inverter_max_w (battery free to cover shortfall)
+      - Set HOLD_ESS_MAX_CHARGE = inverter_max_w (charge left open so excess PV
+        charges the battery rather than being curtailed)
+      - NOT write HOLD_GRID_MAX_EXPORT_LIMIT (inverter's own DNO cap handles that)
+      - Enable Remote EMS first
+    """
+
+    def test_daytime_export_sets_mode_0x05(self):
+        """daytime_export() activates Discharge PV First mode (0x05), not 0x06."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+
+        mode_writes = _decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_MODE)
+        self.assertIn(0x05, mode_writes)
+        self.assertNotIn(0x06, mode_writes)
+
+    def test_daytime_export_sets_discharge_to_inverter_max(self):
+        """daytime_export() sets HOLD_ESS_MAX_DISCHARGE = inverter_max_w."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+
+        discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
+        self.assertIn(10000, discharge_writes)
+
+    def test_daytime_export_leaves_charge_at_inverter_max(self):
+        """daytime_export() sets HOLD_ESS_MAX_CHARGE = inverter_max_w so excess PV charges."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+
+        charge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_CHARGE)
+        self.assertIn(10000, charge_writes)
+
+    def test_daytime_export_does_not_write_export_limit_register(self):
+        """daytime_export() does NOT write HOLD_GRID_MAX_EXPORT_LIMIT (DNO cap handles it)."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+
+        export_writes = _decode_write_registers_calls(mock_client, HOLD_GRID_MAX_EXPORT_LIMIT)
+        self.assertEqual(len(export_writes), 0)
+
+    def test_daytime_export_enables_remote_ems(self):
+        """daytime_export() enables Remote EMS before setting mode."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+
+        ems_enable_writes = _decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_ENABLE)
+        self.assertIn(1, ems_enable_writes)
+
+    def test_sc_after_daytime_export_resets_limits_to_inverter_max(self):
+        """Returning to SC after daytime_export resets discharge limit to 10000W."""
+        modbus, mock_client = _make_modbus()
+        modbus.daytime_export(10000)
+        mock_client.reset_mock()
+        modbus.set_self_consumption()
+
+        discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
+        self.assertIn(10000, discharge_writes)
+
+
 class TestSignedRegisterDecode(unittest.TestCase):
     """Signed 16/32-bit Modbus decode — negative, boundary and positive paths.
     Previously only the positive path was exercised (via read_all); a sign-extension

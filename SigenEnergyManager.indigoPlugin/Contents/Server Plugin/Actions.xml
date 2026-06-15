@@ -24,6 +24,11 @@
         </ConfigUI>
     </Action>
 
+    <Action id="forceDaytimeExport" deviceFilter="self.sigenergyInverter">
+        <Name>Force Daytime Export (PV First, test)</Name>
+        <CallbackMethod>actionForceDaytimeExport</CallbackMethod>
+    </Action>
+
     <Action id="setSelfConsumption" deviceFilter="self.sigenergyInverter">
         <Name>Set Self-Consumption Mode</Name>
         <CallbackMethod>actionSetSelfConsumption</CallbackMethod>

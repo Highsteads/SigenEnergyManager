@@ -6,8 +6,19 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        10-06-2026
-# Version:     5.28.3
+# Date:        15-06-2026
+# Version:     5.29.0
+# 5.29.0 — Daytime VPP export now uses mode 0x05 (Discharge PV First) instead of 0x06
+#   (Discharge ESS First). 0x06 curtailed PV to 0 W during daytime windows (battery did
+#   all the work — confirmed on the 15-Jun 07:00-08:00 event, 4.22 kWh all from battery,
+#   PV flat). 0x05 sources the grid dispatch from PV first and only draws the battery for
+#   the shortfall, so PV keeps running and the battery is preserved — yet the full (paid)
+#   4 kW dispatch is still guaranteed (and 0x05 == 0x06 when PV is zero, so no downside).
+#   _vpp_transition(VPP_ACTIVE) + the manager's ACTION_VPP_EXPORT re-assert now pick the
+#   mode by self._event_is_daytime(); dark windows stay on 0x06. _verify_ems_registers
+#   self-heals the chosen mode during VPP_ACTIVE (mode register only — never the limits).
+#   New sigenergy_modbus.daytime_export(); new "Force Daytime Export (PV First, test)"
+#   action for hardware validation. JSONL snapshots now carry ems_mode_name + driver.
 # 5.28.2 — Axle VPP payment rate is now a config pref (axleVppRatePerKwh, default 1.00
 #   GBP/kWh) instead of a hardcoded £1, used for the earnings estimate on the Axle VPP
 #   Monitor. Coerced via the guarded _as_float so a blank/bad value falls back to 1.00.
@@ -3117,7 +3128,14 @@ class Plugin(indigo.PluginBase):
             if not prev_export:
                 log(f"[Manager] VPP export — {decision.reason}")
                 inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-                if self.modbus.night_export(inv_max_w):
+                # Match the mode the state machine chose at VPP_ACTIVE entry
+                # (0x05 PV-first for daytime, 0x06 ESS-first for dark). Default
+                # 0x06 if the flag is missing (late-detection / restart path).
+                if self.store.get("vpp_export_mode", 0x06) == 0x05:
+                    ok = self.modbus.daytime_export(inv_max_w)
+                else:
+                    ok = self.modbus.night_export(inv_max_w)
+                if ok:
                     self.store["export_active"] = True
                     self._trigger_event("exportStarted")
 
@@ -3292,6 +3310,8 @@ class Plugin(indigo.PluginBase):
         # manager own the inverter mode through the window (self-driven export), so
         # the verify loop must not overwrite mode 0x06 with our self-consumption
         # expectation. Normal verification resumes the moment the window ends.
+        mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First",
+                      0x05: "Discharge PV First", 0x06: "Discharge ESS First"}
         _vpp_state = self.store.get("vpp_state", VPP_IDLE)
         if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE):
             # Determine what mode the inverter should be in based on store flags.
@@ -3307,10 +3327,25 @@ class Plugin(indigo.PluginBase):
 
             actual_mode = self.modbus.read_ems_mode()
             if actual_mode is not None and actual_mode != expected_mode:
-                mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First", 0x06: "Discharge ESS First"}
                 log(
                     f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
                     f"expected={mode_names.get(expected_mode, expected_mode)} — correcting",
+                    level="WARNING",
+                )
+                self.modbus.set_remote_ems_mode(expected_mode)
+        elif _vpp_state == VPP_ACTIVE and self.store.get("export_active"):
+            # During the self-driven window the export mode is written once at
+            # VPP_ACTIVE entry and the manager's ACTION_VPP_EXPORT guard does not
+            # re-write it. Maintain the chosen mode (0x05 daytime / 0x06 dark)
+            # here so a transient drift self-heals. MODE REGISTER ONLY — never
+            # touch the charge/discharge limits mid-window (a stray limit write
+            # once caused a brief 2 kW grid import, 10-Apr-2026).
+            expected_mode = self.store.get("vpp_export_mode", 0x06)
+            actual_mode   = self.modbus.read_ems_mode()
+            if actual_mode is not None and actual_mode != expected_mode:
+                log(
+                    f"[Verify] VPP export mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
+                    f"expected={mode_names.get(expected_mode, expected_mode)} — re-asserting",
                     level="WARNING",
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
@@ -3840,6 +3875,10 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 elapsed = None
 
+            ems_mode_names = {0x00: "PCS Remote Control", 0x01: "Standby",
+                              0x02: "Max Self Consumption", 0x03: "Charge Grid First",
+                              0x04: "Charge PV First", 0x05: "Discharge PV First",
+                              0x06: "Discharge ESS First", 0x07: "AI Mode"}
             record = {
                 "type":               "snapshot",
                 "logged_at":          datetime.now(timezone.utc).isoformat(),
@@ -3851,6 +3890,8 @@ class Plugin(indigo.PluginBase):
                 "grid_w":             inv.get("gridPowerWatts"),
                 "ems_work_mode":      inv.get("emsWorkMode"),
                 "ems_mode_register":  ems_mode,
+                "ems_mode_name":      ems_mode_names.get(ems_mode) if ems_mode is not None else None,
+                "driver":             "self" if self.store.get("export_active") else "axle",
                 "charge_limit_w":     chg_lim,
                 "discharge_limit_w":  dis_lim,
                 "grid_status":        inv.get("gridStatus"),
@@ -4234,10 +4275,30 @@ class Plugin(indigo.PluginBase):
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
             inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-            if self.modbus and self.modbus.night_export(inv_max_w):
-                self.store["export_active"] = True
-            log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
-                "(mode 0x06, DNO-capped 4 kW; Axle dispatch ignored).")
+
+            # Daytime windows export PV-first (mode 0x05): the grid dispatch is
+            # sourced from PV before touching the battery, so PV keeps running
+            # and the battery is preserved — yet the full (paid) dispatch is
+            # still guaranteed (battery covers any shortfall, and behaves exactly
+            # like night_export when PV is zero). Dark windows stay on ESS-First
+            # (mode 0x06) where there is no PV to draw on anyway.
+            event      = self.store.get("vpp_event") or {}
+            is_daytime = self._event_is_daytime(event.get("start_time"))
+            self.store["vpp_export_mode"] = 0x05 if is_daytime else 0x06
+
+            if self.modbus:
+                ok = (self.modbus.daytime_export(inv_max_w) if is_daytime
+                      else self.modbus.night_export(inv_max_w))
+                if ok:
+                    self.store["export_active"] = True
+
+            if is_daytime:
+                log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
+                    "(mode 0x05 PV-first, DNO-capped 4 kW; PV runs, battery covers "
+                    "shortfall; Axle dispatch ignored).")
+            else:
+                log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
+                    "(mode 0x06 ESS-first, DNO-capped 4 kW; Axle dispatch ignored).")
 
     # ================================================================
     # Midnight Tasks
@@ -5140,6 +5201,23 @@ class Plugin(indigo.PluginBase):
             if self.modbus and self.modbus.night_export(inv_max_w):
                 self.store["export_active"]  = True
                 self.store["import_active"]  = False
+
+    def actionForceDaytimeExport(self, action):
+        """Action: Force PV-first grid export (mode 0x05) for hardware validation.
+
+        Lets us confirm the inverter's real 0x05 behaviour before trusting it in
+        an unattended VPP window: with PV above the DNO cap the grid should hold
+        ~4 kW sourced from PV (battery flat / charging from surplus); below the
+        cap the battery should top the export up to 4 kW. Watch home_status /
+        the inverter device states after firing. Reverts via Set Self-Consumption
+        (or the manager's next tick) — pause the manager first to hold it.
+        """
+        with self._state_lock:
+            inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+            log("[Action] Force daytime export: mode 0x05 (Discharge PV First) — test")
+            if self.modbus and self.modbus.daytime_export(inv_max_w):
+                self.store["export_active"] = True
+                self.store["import_active"] = False
 
     def actionSetSelfConsumption(self, action):
         """Action: Return to self-consumption mode."""
