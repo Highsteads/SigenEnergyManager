@@ -5,9 +5,13 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Sonnet 4.6
 # Date:        30-04-2026
-# Version:     1.5
+# Version:     1.6
 #
-# Register map verified against Sigenergy Modbus Protocol V2.8 (2025-11-28)
+# Register map reviewed against Sigenergy Modbus Protocol V2.9 (2026-05-13).
+# (Was verified against V2.8 (2025-11-28); V2.9 deltas applied: 40031 mode 0x07
+#  is "Reserved" (not "AI Mode"), 0x08="V2G" added; 40032/40034 are GLOBAL caps
+#  "regardless of EMS mode". Not yet used: 40001 PCS active-power dispatch
+#  (S32 kW; needs 40029=1 + 40031=0; no command watchdog; verify sign on hardware).)
 # Adapted from SigenergySolar v3.1 sigenergy_modbus.py
 # Changes from SigenergySolar version:
 #   - Added set_export_limit(watts) wrapper for register 40038-39
@@ -32,8 +36,8 @@ except ImportError:
 
 
 # ============================================================
-# Constants - Sigenergy Modbus Register Map V2.8
-# Reference: Sigenergy Modbus Protocol V2.8 (2025-11-28)
+# Constants - Sigenergy Modbus Register Map
+# Reference: Sigenergy Modbus Protocol V2.9 (2026-05-13)
 # ============================================================
 
 # --- Plant registers (slave address 247, read-only, function 0x03) ---
@@ -67,8 +71,8 @@ INV_BATTERY_MIN_TEMP       = 30621    # S16, gain 10, degC
 
 HOLD_REMOTE_EMS_ENABLE     = 40029    # U16 RW: 0=disabled, 1=enabled
 HOLD_REMOTE_EMS_MODE       = 40031    # U16 RW: Remote EMS control mode (Appendix 6)
-HOLD_ESS_MAX_CHARGE        = 40032    # U32 RW (2 regs), gain 1000, kW. Mode 3 or 4
-HOLD_ESS_MAX_DISCHARGE     = 40034    # U32 RW (2 regs), gain 1000, kW. Mode 5 or 6
+HOLD_ESS_MAX_CHARGE        = 40032    # U32 RW (2 regs), gain 1000, kW. GLOBAL cap, all EMS modes (V2.9)
+HOLD_ESS_MAX_DISCHARGE     = 40034    # U32 RW (2 regs), gain 1000, kW. GLOBAL cap, all EMS modes (V2.9)
 HOLD_GRID_MAX_EXPORT_LIMIT = 40038    # U32 RW (2 regs), gain 1000, kW. Requires grid sensor.
 HOLD_GRID_MAX_IMPORT_LIMIT = 40040    # U32 RW (2 regs), gain 1000, kW.
 HOLD_ESS_BACKUP_SOC        = 40046    # U16 RW, gain 10, % - backup reserve SOC
@@ -94,14 +98,15 @@ EMS_MODES = {
 # --- Remote EMS control modes (register 40031, Appendix 6) ---
 
 REMOTE_EMS_MODES = {
-    0x00: "PCS Remote Control",
+    0x00: "PCS Remote Control",   # active-power dispatch via 40001 (S32 kW); we don't use this yet
     0x01: "Standby",
     0x02: "Max Self Consumption",
     0x03: "Charge Grid First",
     0x04: "Charge PV First",
     0x05: "Discharge PV First",
     0x06: "Discharge ESS First",
-    0x07: "AI Mode",            # Sigenergy AI-optimised mode (firmware >= 1.4.x)
+    0x07: "Reserved",             # was mislabelled "AI Mode" pre-V2.9; 0x07 is Reserved
+    0x08: "V2G",                  # added in Protocol V2.9 (2026-05-13)
 }
 
 PLANT_RUNNING_STATES = {

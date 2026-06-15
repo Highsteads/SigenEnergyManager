@@ -7,7 +7,16 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        15-06-2026
-# Version:     5.29.1
+# Version:     5.29.2
+# 5.29.2 — Register-map corrections from a deep-dive review against Sigenergy Modbus
+#   Protocol V2.9 (2026-05-13), the revision after our V2.8 baseline. Doc/label only,
+#   NO behaviour change: REMOTE_EMS_MODES 0x07 is "Reserved" (was mislabelled "AI Mode";
+#   0x07 was never commanded), 0x08="V2G" added; the snapshot ems_mode_name decode matches.
+#   Corrected the 40032/40034 comments — they are GLOBAL caps "regardless of EMS mode"
+#   (which is exactly why 5.29.1's charge=0 forces export). Header notes register 40001
+#   (PCS active-power dispatch, S32 kW, needs 40029=1 + 40031=0, no command watchdog) as a
+#   future "export a precise power" option — deliberately NOT used yet (PCS-level not a grid
+#   target, sign must be verified on hardware). sigenergy_modbus module 1.5 -> 1.6.
 # 5.29.1 — Daytime export (mode 0x05) now pins the CHARGE limit to 0. Hardware testing
 #   at PV > 4 kW (15-Jun) showed that with the charge limit left open, mode 0x05 greedily
 #   charges the battery with PV surplus INSTEAD of exporting — grid sat near 0 for the
@@ -3888,7 +3897,7 @@ class Plugin(indigo.PluginBase):
             ems_mode_names = {0x00: "PCS Remote Control", 0x01: "Standby",
                               0x02: "Max Self Consumption", 0x03: "Charge Grid First",
                               0x04: "Charge PV First", 0x05: "Discharge PV First",
-                              0x06: "Discharge ESS First", 0x07: "AI Mode"}
+                              0x06: "Discharge ESS First", 0x07: "Reserved", 0x08: "V2G"}
             record = {
                 "type":               "snapshot",
                 "logged_at":          datetime.now(timezone.utc).isoformat(),
