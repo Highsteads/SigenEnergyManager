@@ -820,25 +820,33 @@ class SigenergyModbus:
     def daytime_export(self, inverter_max_w=10000):
         """Discharge to grid PV-first, battery only covering the shortfall.
 
-        Sets Discharge PV First mode (0x05). The inverter's own commissioned DNO
-        export cap limits grid flow (typically 4 kW) — same as night_export, no
-        need to write HOLD_GRID_MAX_EXPORT_LIMIT.
+        Sets Discharge PV First mode (0x05) AND pins the charge limit to 0. The
+        inverter's own commissioned DNO export cap limits grid flow (typically
+        4 kW) — same as night_export, no need to write HOLD_GRID_MAX_EXPORT_LIMIT.
 
-        Difference from night_export (mode 0x06, ESS First): the grid export is
-        sourced from PV first and the battery only tops up any shortfall, so:
-          - PV >= export cap: export is 100% PV, battery untouched, surplus PV
-            charges the battery (charge limit left at inverter max).
-          - PV  < export cap: export = PV + battery shortfall.
+        WHY charge limit 0 (learned on hardware 15-Jun-2026): in mode 0x05 with
+        the charge limit left open, when PV exceeds house load + the export cap
+        the inverter greedily charges the battery with the surplus INSTEAD of
+        exporting — grid sits near 0 and the paid dispatch is missed (observed
+        20-60s of "charging, not exporting" at high PV). Pinning the charge
+        limit to 0 removes that competing path, so the PV surplus is forced out
+        to the grid up to the DNO cap immediately and stably.
+
+        Behaviour with charge limit 0:
+          - PV >= cap + house: grid exports at the DNO cap from PV, battery flat,
+            any PV above (cap + house) is curtailed for the window.
+          - PV  < cap + house: export = PV + battery shortfall (PV-first).
           - PV == 0: behaves exactly like night_export (battery supplies it all).
-        This keeps PV running and preserves the battery during a daytime VPP
-        window while still guaranteeing the full (paid) dispatch.
-
-        Charge limit is deliberately left at inverter max so excess PV can be
-        absorbed by the battery rather than curtailed.
+        This guarantees the full (paid) dispatch in all PV conditions while
+        keeping the battery essentially flat (preserved) during daylight.
+        Trade-off vs night_export (0x06): PV keeps running and the battery is
+        not drained; the only cost is curtailing PV above the cap during the
+        window (the export payment far outweighs the un-banked surplus, and the
+        battery refills from solar after the event).
         """
         self.logger.info(
-            f"Daytime export: mode 0x05 (PV first), discharge limit {inverter_max_w}W "
-            f"(inverter DNO cap enforces grid limit)"
+            f"Daytime export: mode 0x05 (PV first), discharge limit {inverter_max_w}W, "
+            f"charge limit 0 (force PV to grid; inverter DNO cap enforces grid limit)"
         )
         if not self.enable_remote_ems():
             return False
@@ -846,9 +854,9 @@ class SigenergyModbus:
             return False
         if not self.set_discharge_limit(inverter_max_w):
             return False
-        if not self.set_charge_limit(inverter_max_w):
+        if not self.set_charge_limit(0):
             return False
-        self.logger.info("Daytime export active: PV exports first, battery covers shortfall")
+        self.logger.info("Daytime export active: PV forced to grid, battery covers any shortfall")
         return True
 
     def set_self_consumption(self):

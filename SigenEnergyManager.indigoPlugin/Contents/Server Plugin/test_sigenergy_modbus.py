@@ -397,13 +397,19 @@ class TestDaytimeExportMethod(unittest.TestCase):
         discharge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
         self.assertIn(10000, discharge_writes)
 
-    def test_daytime_export_leaves_charge_at_inverter_max(self):
-        """daytime_export() sets HOLD_ESS_MAX_CHARGE = inverter_max_w so excess PV charges."""
+    def test_daytime_export_pins_charge_to_zero(self):
+        """daytime_export() sets HOLD_ESS_MAX_CHARGE = 0 so PV is forced to the grid.
+
+        With the charge limit left open, mode 0x05 charges the battery with PV
+        surplus instead of exporting when PV is high (confirmed on hardware
+        15-Jun-2026). Pinning charge to 0 removes that competing path.
+        """
         modbus, mock_client = _make_modbus()
         modbus.daytime_export(10000)
 
         charge_writes = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_CHARGE)
-        self.assertIn(10000, charge_writes)
+        self.assertIn(0, charge_writes)
+        self.assertNotIn(10000, charge_writes)
 
     def test_daytime_export_does_not_write_export_limit_register(self):
         """daytime_export() does NOT write HOLD_GRID_MAX_EXPORT_LIMIT (DNO cap handles it)."""

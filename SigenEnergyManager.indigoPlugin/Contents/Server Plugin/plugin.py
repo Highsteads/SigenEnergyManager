@@ -7,7 +7,17 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        15-06-2026
-# Version:     5.29.0
+# Version:     5.29.1
+# 5.29.1 — Daytime export (mode 0x05) now pins the CHARGE limit to 0. Hardware testing
+#   at PV > 4 kW (15-Jun) showed that with the charge limit left open, mode 0x05 greedily
+#   charges the battery with PV surplus INSTEAD of exporting — grid sat near 0 for the
+#   first 20-60s and the paid 4 kW dispatch was missed (battery +3.5 kW, grid 0). Pinning
+#   charge to 0 removes the competing path, so PV is forced out to the grid up to the DNO
+#   cap immediately and stably (re-test: grid -4001 W, battery flat from the first sample).
+#   Cost: PV above (cap + house) is curtailed for the window — acceptable, the payment far
+#   outweighs the un-banked surplus and the battery refills from solar after the event.
+#   Sub-4 kW behaviour unchanged (battery already had to top the export up). daytime_export()
+#   docstring documents the why; test asserts charge=0.
 # 5.29.0 — Daytime VPP export now uses mode 0x05 (Discharge PV First) instead of 0x06
 #   (Discharge ESS First). 0x06 curtailed PV to 0 W during daytime windows (battery did
 #   all the work — confirmed on the 15-Jun 07:00-08:00 event, 4.22 kWh all from battery,
