@@ -138,13 +138,20 @@ class TestDriveVppExport(unittest.TestCase):
         p.modbus.night_export.assert_called_once()
         p.modbus.daytime_export.assert_not_called()
 
-    def test_charge_cap_clamped_non_negative(self):
-        """Surplus just over target -> tiny positive cap, never negative."""
-        p = self._mk(pv_w=4500, home_w=200)        # surplus 4300 (>= 4000+400)
+    def test_bank_entry_charge_cap_is_surplus_minus_target(self):
+        """At the bank entry threshold (surplus = target+HYST) cap = surplus-target, >= 0."""
+        p = self._mk(pv_w=4500, home_w=100)        # surplus 4400 = target+HYST -> bank
         p._drive_vpp_export()
         self.assertEqual(p.store["vpp_export_submode"], "bank")
         self.assertGreaterEqual(p.store["vpp_bank_charge_cap_w"], 0)
-        self.assertEqual(p.store["vpp_bank_charge_cap_w"], 300)
+        self.assertEqual(p.store["vpp_bank_charge_cap_w"], 400)
+
+    def test_inband_no_prior_mode_defaults_discharge(self):
+        """In the [target, target+HYST) band with no prior sub-mode, default to
+        discharge so the export is guaranteed (don't gamble on self-consumption)."""
+        p = self._mk(pv_w=4300, home_w=100)        # surplus 4200, prev None
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "discharge")
 
     def test_hysteresis_holds_submode_in_band(self):
         """In the +/-400W band around target, keep the previous sub-mode (no flap)."""
@@ -156,6 +163,14 @@ class TestDriveVppExport(unittest.TestCase):
         p2 = self._mk(pv_w=4900, home_w=800, prev_sub="bank", prev_cap=100)
         p2._drive_vpp_export()
         self.assertEqual(p2.store["vpp_export_submode"], "bank")
+
+    def test_bank_drops_to_discharge_below_target(self):
+        """Latched in bank but surplus fell below target -> discharge, so the
+        battery tops the export up (guarantee). Was the <=target-HYST gap."""
+        p = self._mk(pv_w=4400, home_w=700, prev_sub="bank", prev_cap=0)   # surplus 3700 < 4000
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "discharge")
+        p.modbus.daytime_export.assert_called_once()
 
     def test_bank_cap_deadband_no_rewrite(self):
         """Already banking with a near-identical cap -> no fresh charge-limit write."""

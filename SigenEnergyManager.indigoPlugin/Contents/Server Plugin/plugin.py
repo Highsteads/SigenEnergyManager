@@ -7,7 +7,16 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        15-06-2026
-# Version:     5.30.0
+# Version:     5.30.1
+# 5.30.1 — Guarantee the full export across ALL PV. Closes a hysteresis gap in 5.30.0:
+#   the band was (target-HYST, target+HYST) and HELD the previous sub-mode, so if PV fell
+#   from above the cap to just below it (surplus in 3.6-4.0 kW) while latched in "bank",
+#   self-consumption would export only the surplus (~3.7 kW), not the full target — bank
+#   mode never discharges to top up. Now: drop to "discharge" the instant surplus < target
+#   (battery tops the grid up to the target), and apply the +HYST margin only on ENTERING
+#   bank (so a brief PV spike can't flap us into 0x02). Net guarantee, battery permitting:
+#   PV=0 -> battery exports the target; PV<target -> PV + battery = target; PV>target ->
+#   target exported + surplus banked. +2 unit tests (test_plugin).
 # 5.30.0 — Daytime VPP export now BANKS the surplus instead of curtailing it. New
 #   _drive_vpp_export() re-evaluates every manager tick during VPP_ACTIVE and picks a
 #   sub-mode from live PV vs the export target:
@@ -4352,16 +4361,23 @@ class Plugin(indigo.PluginBase):
         home_w    = int(inv.get("homePowerWatts", 0))
         surplus_w = max(0, pv_w - home_w)
 
+        # Guarantee the full export: the instant surplus < target, use discharge so
+        # the battery tops the grid up to the target (bank mode / self-consumption
+        # will NOT discharge to export, so it would fall short). Only ENTER bank when
+        # surplus is comfortably above target (>= target + HYST) — that one-sided
+        # margin stops a brief PV spike flapping us into 0x02. Once banking, hold it
+        # down to target (in the [target, target+HYST) band bank still exports the
+        # full target, just banks a little less), then drop to discharge below target.
         HYST_W   = 400
         prev_sub = self.store.get("vpp_export_submode")
         if not daytime:
             sub = "discharge"
+        elif surplus_w < target_w:
+            sub = "discharge"
         elif surplus_w >= target_w + HYST_W:
             sub = "bank"
-        elif surplus_w <= target_w - HYST_W:
-            sub = "discharge"
         else:
-            sub = prev_sub or ("bank" if surplus_w >= target_w else "discharge")
+            sub = prev_sub or "discharge"   # band [target, target+HYST): hold prev
 
         if sub == "bank":
             charge_cap_w = max(0, surplus_w - target_w)
