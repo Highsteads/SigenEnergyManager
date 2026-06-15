@@ -7,7 +7,24 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        15-06-2026
-# Version:     5.29.2
+# Version:     5.30.0
+# 5.30.0 — Daytime VPP export now BANKS the surplus instead of curtailing it. New
+#   _drive_vpp_export() re-evaluates every manager tick during VPP_ACTIVE and picks a
+#   sub-mode from live PV vs the export target:
+#     • "bank" (daytime, PV surplus >= target): Max Self Consumption (mode 0x02) with the
+#       battery charge limit capped to (surplus - target). The inverter exports the full
+#       target to the grid (held at the DNO cap) AND banks the PV above the target into
+#       the battery — same mechanism as Solar Overflow. Live-proven 15-Jun at 10 kW PV:
+#       export 4.06 kW + battery charge 4.94 kW + home 1.05 kW, ZERO curtailment.
+#     • "discharge" (dark window, or PV surplus < target): the v5.29.x path — mode 0x05
+#       (PV-first) + charge 0 daytime, or 0x06 (ESS-first) dark — battery tops the export
+#       up to the target. Guarantees the paid dispatch when PV can't cover it.
+#   Hysteresis (+/-400 W) around the crossover stops mode flapping; Modbus only writes on
+#   a sub-mode change or a charge-cap shift > 300 W. vpp_export_mode tracks the live mode
+#   (0x02/0x05/0x06) so _verify_ems_registers maintains the right one. New
+#   "Force VPP Export Drive (test)" action exercises the integrated driver on hardware.
+#   6 new unit tests (test_plugin). This SUPERSEDES 5.29.1's always-curtail behaviour for
+#   high-PV daytime events while keeping its guaranteed-export floor for low PV.
 # 5.29.2 — Register-map corrections from a deep-dive review against Sigenergy Modbus
 #   Protocol V2.9 (2026-05-13), the revision after our V2.8 baseline. Doc/label only,
 #   NO behaviour change: REMOTE_EMS_MODES 0x07 is "Reserved" (was mislabelled "AI Mode";
@@ -3138,25 +3155,15 @@ class Plugin(indigo.PluginBase):
                     self._trigger_event("exportStarted")
 
         elif action == ACTION_VPP_EXPORT:
-            # VPP event window: self-drive 4 kW export (inverter DNO firmware caps
-            # grid flow). The state machine starts night_export on entry to
-            # VPP_ACTIVE; this re-asserts it idempotently each manager tick so a
-            # transient drop self-heals. The discharge floor was set at pre-charge
-            # (next-day reserve) — leave it. Axle settle on the meter so this counts
+            # VPP event window: self-drive the export, re-evaluated each tick by
+            # _drive_vpp_export() which picks bank-surplus (mode 0x02 + charge cap,
+            # daytime with ample PV) or discharge (0x05/0x06) from live PV vs the
+            # export target. The discharge floor was set at pre-charge (next-day
+            # reserve) — leave it. Axle settle on the meter so this counts
             # identically; their own dispatch is ignored.
             if not prev_export:
                 log(f"[Manager] VPP export — {decision.reason}")
-                inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-                # Match the mode the state machine chose at VPP_ACTIVE entry
-                # (0x05 PV-first for daytime, 0x06 ESS-first for dark). Default
-                # 0x06 if the flag is missing (late-detection / restart path).
-                if self.store.get("vpp_export_mode", 0x06) == 0x05:
-                    ok = self.modbus.daytime_export(inv_max_w)
-                else:
-                    ok = self.modbus.night_export(inv_max_w)
-                if ok:
-                    self.store["export_active"] = True
-                    self._trigger_event("exportStarted")
+            self._drive_vpp_export()
 
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
@@ -4246,8 +4253,10 @@ class Plugin(indigo.PluginBase):
             self.modbus.set_self_consumption()
         self._restore_discharge_cutoff()
 
-        self.store["export_active"] = False
-        self.store["vpp_active"]    = False
+        self.store["export_active"]        = False
+        self.store["vpp_active"]           = False
+        self.store["vpp_export_submode"]   = None
+        self.store["vpp_bank_charge_cap_w"] = -1
         self._vpp_transition(VPP_IDLE)
         self.store["vpp_event"]     = None
         self.store["had_vpp_today"] = True
@@ -4286,38 +4295,107 @@ class Plugin(indigo.PluginBase):
         # the meter reading so exporting it ourselves counts identically — and
         # their cloud dispatch proved unreliable (no-show 10-Jun-2026; Axle
         # acknowledged a SigEnergy-API fault that may not be fixed before the next
-        # event). We drive night_export here for a prompt start at T-2min, and the
-        # manager's ACTION_VPP_EXPORT override re-asserts it idempotently each tick.
-        # The discharge floor (next-day reserve) was set at pre-charge time.
+        # event). _drive_vpp_export() does the actual driving here for a prompt
+        # start at T-2min, and the manager's ACTION_VPP_EXPORT override re-runs it
+        # each tick. The discharge floor (next-day reserve) was set at pre-charge.
         if new_state == VPP_ACTIVE:
             if self.store.get("solar_overflow_active"):
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
-            inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
 
-            # Daytime windows export PV-first (mode 0x05): the grid dispatch is
-            # sourced from PV before touching the battery, so PV keeps running
-            # and the battery is preserved — yet the full (paid) dispatch is
-            # still guaranteed (battery covers any shortfall, and behaves exactly
-            # like night_export when PV is zero). Dark windows stay on ESS-First
-            # (mode 0x06) where there is no PV to draw on anyway.
-            event      = self.store.get("vpp_event") or {}
-            is_daytime = self._event_is_daytime(event.get("start_time"))
-            self.store["vpp_export_mode"] = 0x05 if is_daytime else 0x06
+            # Latch whether this is a daylight window (set once at entry). The live
+            # sub-mode (bank-surplus vs discharge) is then re-decided every tick by
+            # _drive_vpp_export from real PV/home; vpp_export_mode tracks the actual
+            # mode register (0x02/0x05/0x06) for the verify loop.
+            event = self.store.get("vpp_event") or {}
+            self.store["vpp_is_daytime"]       = self._event_is_daytime(event.get("start_time"))
+            self.store["vpp_export_submode"]   = None    # force a mode log on first drive
+            self.store["vpp_bank_charge_cap_w"] = -1
+            log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
+                f"({'daytime' if self.store['vpp_is_daytime'] else 'dark'} window, "
+                "DNO-capped; Axle dispatch ignored).")
+            self._drive_vpp_export()
 
-            if self.modbus:
-                ok = (self.modbus.daytime_export(inv_max_w) if is_daytime
-                      else self.modbus.night_export(inv_max_w))
-                if ok:
-                    self.store["export_active"] = True
+    def _drive_vpp_export(self):
+        """Self-drive the VPP export, re-evaluated each manager tick during VPP_ACTIVE.
 
-            if is_daytime:
-                log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
-                    "(mode 0x05 PV-first, DNO-capped 4 kW; PV runs, battery covers "
-                    "shortfall; Axle dispatch ignored).")
-            else:
-                log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
-                    "(mode 0x06 ESS-first, DNO-capped 4 kW; Axle dispatch ignored).")
+        Two sub-modes, chosen from live PV vs the export target:
+
+        - "bank"  (daytime, PV surplus >= target): stay in Max Self Consumption
+          (mode 0x02) and CAP the battery charge to (surplus - target). The
+          inverter then exports the target to the grid (held at the DNO cap) and
+          banks only the PV above the target — full paid export AND the battery
+          charges, with no PV curtailment. This is the same mechanism as Solar
+          Overflow (proven on hardware 15-Jun-2026: PV 5.75 kW -> home 0.61 +
+          export 4.00 + battery charge 1.13).
+
+        - "discharge" (dark window, or PV surplus < target): issue a discharge
+          command so the battery tops the export up to the target — daytime uses
+          mode 0x05 (PV-first) with charge pinned to 0; dark uses 0x06 (ESS-first).
+
+        Hysteresis (HYST_W) around the crossover stops the mode flapping when PV
+        hovers at the target. Modbus is only written on a sub-mode change or when
+        the bank charge cap shifts beyond a deadband, so re-running every tick is
+        cheap. The grid export is held at the DNO cap by the inverter's
+        commissioned export limit in every sub-mode.
+        """
+        if not self.modbus:
+            return
+
+        first      = not self.store.get("export_active")
+        inv_max_w  = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+        target_w   = int(_as_float(self.pluginPrefs.get("maxExportKw"), 4.0) * 1000)
+        daytime    = bool(self.store.get("vpp_is_daytime"))
+
+        inv       = self.latest_inverter_data or {}
+        pv_w      = int(inv.get("pvPowerWatts", 0))
+        home_w    = int(inv.get("homePowerWatts", 0))
+        surplus_w = max(0, pv_w - home_w)
+
+        HYST_W   = 400
+        prev_sub = self.store.get("vpp_export_submode")
+        if not daytime:
+            sub = "discharge"
+        elif surplus_w >= target_w + HYST_W:
+            sub = "bank"
+        elif surplus_w <= target_w - HYST_W:
+            sub = "discharge"
+        else:
+            sub = prev_sub or ("bank" if surplus_w >= target_w else "discharge")
+
+        if sub == "bank":
+            charge_cap_w = max(0, surplus_w - target_w)
+            if prev_sub != "bank":
+                # Switch into Max Self Consumption (resets limits to inv_max), then
+                # apply the charge cap below. vpp_export_mode tracks 0x02 for verify.
+                self.modbus.set_self_consumption()
+                self.store["vpp_export_mode"]       = 0x02
+                self.store["vpp_bank_charge_cap_w"] = -1   # force the cap write below
+                log(f"[VPP] Bank-surplus export — PV {pv_w}W, home {home_w}W, surplus "
+                    f"{surplus_w}W >= target {target_w}W: mode 0x02, charge cap "
+                    f"{charge_cap_w}W (export {target_w}W from PV, bank the rest).")
+            prev_cap = self.store.get("vpp_bank_charge_cap_w", -1)
+            if abs(prev_cap - charge_cap_w) > 300:
+                self.modbus.set_charge_limit(charge_cap_w, quiet=True)
+                self.store["vpp_bank_charge_cap_w"] = charge_cap_w
+        else:
+            if prev_sub != "discharge":
+                if daytime:
+                    self.modbus.daytime_export(inv_max_w)   # mode 0x05 + charge 0
+                    self.store["vpp_export_mode"] = 0x05
+                else:
+                    self.modbus.night_export(inv_max_w)     # mode 0x06
+                    self.store["vpp_export_mode"] = 0x06
+                self.store["vpp_bank_charge_cap_w"] = -1
+                log(f"[VPP] Discharge export — PV {pv_w}W, home {home_w}W, surplus "
+                    f"{surplus_w}W < target {target_w}W: mode "
+                    f"{'0x05 PV-first' if daytime else '0x06 ESS-first'}, battery tops "
+                    f"the export up to {target_w}W.")
+
+        self.store["vpp_export_submode"] = sub
+        if first:
+            self.store["export_active"] = True
+            self._trigger_event("exportStarted")
 
     # ================================================================
     # Midnight Tasks
@@ -5237,6 +5315,23 @@ class Plugin(indigo.PluginBase):
             if self.modbus and self.modbus.daytime_export(inv_max_w):
                 self.store["export_active"] = True
                 self.store["import_active"] = False
+
+    def actionForceVppExportTest(self, action):
+        """Action: exercise the live VPP export driver (auto bank vs discharge) for testing.
+
+        Forces a daytime VPP context and runs _drive_vpp_export() once against the
+        current live PV/home, so the inverter picks the same sub-mode it would in a
+        real daytime event: bank-surplus (mode 0x02 + charge cap) when PV exceeds the
+        export target, or discharge (0x05) when it doesn't. Pause the manager first to
+        hold it; restore with Set Self-Consumption then Resume Battery Manager.
+        """
+        with self._state_lock:
+            self.store["vpp_is_daytime"]        = True
+            self.store["vpp_export_submode"]    = None
+            self.store["vpp_bank_charge_cap_w"] = -1
+            log("[Action] Force VPP export drive (test) — daytime context; live PV "
+                "decides bank vs discharge")
+            self._drive_vpp_export()
 
     def actionSetSelfConsumption(self, action):
         """Action: Return to self-consumption mode."""

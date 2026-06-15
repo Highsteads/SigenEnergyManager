@@ -90,5 +90,81 @@ class TestConfigCoercion(unittest.TestCase):
         self.assertEqual(plugin._as_int("port", 8080), 8080)
 
 
+class TestDriveVppExport(unittest.TestCase):
+    """_drive_vpp_export sub-mode decision: bank-surplus (mode 0x02 + charge cap)
+    when daytime PV surplus >= export target, else discharge (0x05 daytime /
+    0x06 dark). Charge cap = surplus - target, clamped >= 0. Hysteresis holds the
+    sub-mode in the band around the target."""
+
+    TARGET_W = 4000   # maxExportKw 4.0
+
+    def _mk(self, pv_w, home_w, daytime=True, prev_sub=None, prev_cap=-1):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.modbus = MagicMock()
+        p.latest_inverter_data = {"pvPowerWatts": pv_w, "homePowerWatts": home_w}
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "maxExportKw": "4.0"}
+        p.store = {"export_active": True, "vpp_is_daytime": daytime,
+                   "vpp_export_submode": prev_sub, "vpp_bank_charge_cap_w": prev_cap}
+        p._trigger_event = lambda *a, **k: None
+        return p
+
+    def _charge_cap_writes(self, p):
+        return [c.args[0] for c in p.modbus.set_charge_limit.call_args_list]
+
+    def test_high_pv_picks_bank_and_caps_charge(self):
+        """Daytime, surplus 8952 >> 4000 -> bank: mode 0x02, charge cap = surplus-target."""
+        p = self._mk(pv_w=9630, home_w=678)        # surplus 8952
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "bank")
+        p.modbus.set_self_consumption.assert_called_once()
+        self.assertEqual(p.store["vpp_bank_charge_cap_w"], 8952 - self.TARGET_W)
+        self.assertIn(8952 - self.TARGET_W, self._charge_cap_writes(p))
+        p.modbus.daytime_export.assert_not_called()
+        p.modbus.night_export.assert_not_called()
+
+    def test_low_pv_daytime_picks_discharge_0x05(self):
+        """Daytime, surplus 1200 < 4000 -> discharge via daytime_export (mode 0x05)."""
+        p = self._mk(pv_w=2000, home_w=800)        # surplus 1200
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "discharge")
+        p.modbus.daytime_export.assert_called_once()
+        p.modbus.set_self_consumption.assert_not_called()
+
+    def test_dark_window_always_discharge_0x06(self):
+        """Dark window -> discharge via night_export (mode 0x06) regardless of PV."""
+        p = self._mk(pv_w=0, home_w=600, daytime=False)
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "discharge")
+        p.modbus.night_export.assert_called_once()
+        p.modbus.daytime_export.assert_not_called()
+
+    def test_charge_cap_clamped_non_negative(self):
+        """Surplus just over target -> tiny positive cap, never negative."""
+        p = self._mk(pv_w=4500, home_w=200)        # surplus 4300 (>= 4000+400)
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "bank")
+        self.assertGreaterEqual(p.store["vpp_bank_charge_cap_w"], 0)
+        self.assertEqual(p.store["vpp_bank_charge_cap_w"], 300)
+
+    def test_hysteresis_holds_submode_in_band(self):
+        """In the +/-400W band around target, keep the previous sub-mode (no flap)."""
+        # surplus 4100 is within [3600, 4400]; was discharging -> stays discharge
+        p = self._mk(pv_w=4900, home_w=800, prev_sub="discharge")   # surplus 4100
+        p._drive_vpp_export()
+        self.assertEqual(p.store["vpp_export_submode"], "discharge")
+        # same surplus but previously banking -> stays bank
+        p2 = self._mk(pv_w=4900, home_w=800, prev_sub="bank", prev_cap=100)
+        p2._drive_vpp_export()
+        self.assertEqual(p2.store["vpp_export_submode"], "bank")
+
+    def test_bank_cap_deadband_no_rewrite(self):
+        """Already banking with a near-identical cap -> no fresh charge-limit write."""
+        # surplus 5000 -> cap 1000; prev cap 1100 (within 300 deadband) -> no write
+        p = self._mk(pv_w=5800, home_w=800, prev_sub="bank", prev_cap=1100)
+        p._drive_vpp_export()
+        p.modbus.set_self_consumption.assert_not_called()   # no sub-mode change
+        self.assertEqual(len(self._charge_cap_writes(p)), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

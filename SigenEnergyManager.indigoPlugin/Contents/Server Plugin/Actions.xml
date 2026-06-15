@@ -29,6 +29,11 @@
         <CallbackMethod>actionForceDaytimeExport</CallbackMethod>
     </Action>
 
+    <Action id="forceVppExportTest" deviceFilter="self.sigenergyInverter">
+        <Name>Force VPP Export Drive (auto bank/discharge, test)</Name>
+        <CallbackMethod>actionForceVppExportTest</CallbackMethod>
+    </Action>
+
     <Action id="setSelfConsumption" deviceFilter="self.sigenergyInverter">
         <Name>Set Self-Consumption Mode</Name>
         <CallbackMethod>actionSetSelfConsumption</CallbackMethod>
