@@ -4,8 +4,12 @@
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
-# Date:        21-06-2026 16:00 BST
-# Version:     1.2
+# Date:        21-06-2026 17:00 BST
+# Version:     1.3
+#
+# v1.3 (21-06-2026) — GraphQL queries parameterised (variables, not raw
+#   account/key string-interpolation); import-vs-export classified by MPAN not
+#   just the OUTGOING code; first active agreement wins; zoneinfo TZ fallback.
 #
 # v1.2 (21-06-2026) — get_account_financials negative-caches failures
 #   (FINANCIALS_NEG_CACHE_TTL) and returns the last good value, so a Kraken
@@ -371,13 +375,16 @@ class OctopusAPI:
         """
         try:
             try:
-                import pytz
-                tz_l = pytz.timezone("Europe/London")
-                day_start = tz_l.localize(
-                    datetime.strptime(date_str, "%Y-%m-%d")
-                )
-            except ImportError:
-                day_start = datetime.strptime(date_str, "%Y-%m-%d")
+                from zoneinfo import ZoneInfo
+                day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                    tzinfo=ZoneInfo("Europe/London"))
+            except Exception:
+                try:
+                    import pytz
+                    day_start = pytz.timezone("Europe/London").localize(
+                        datetime.strptime(date_str, "%Y-%m-%d"))
+                except Exception:
+                    day_start = datetime.strptime(date_str, "%Y-%m-%d")
             day_end = day_start + timedelta(days=1)
             period_from = day_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
             period_to   = day_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -507,15 +514,16 @@ class OctopusAPI:
 
         query = json.dumps({
             "query": (
-                f'{{ account(accountNumber: "{self.account_id}") {{'
-                f"  balance"
-                f"  electricityAgreements(active: true) {{ meterPoint {{ mpan }} tariff {{ __typename"
-                f"    ...on StandardTariff   {{ tariffCode displayName standingCharge unitRate }}"
-                f"    ...on HalfHourlyTariff {{ tariffCode displayName standingCharge }} }} }}"
-                f"  gasAgreements(active: true) {{ tariff {{ __typename"
-                f"    ...on GasTariffType {{ tariffCode displayName standingCharge unitRate }} }} }}"
-                f"}}}}"
-            )
+                "query ($a: String!) { account(accountNumber: $a) {"
+                "  balance"
+                "  electricityAgreements(active: true) { meterPoint { mpan } tariff { __typename"
+                "    ...on StandardTariff   { tariffCode displayName standingCharge unitRate }"
+                "    ...on HalfHourlyTariff { tariffCode displayName standingCharge } } }"
+                "  gasAgreements(active: true) { tariff { __typename"
+                "    ...on GasTariffType { tariffCode displayName standingCharge unitRate } } }"
+                "}}"
+            ),
+            "variables": {"a": self.account_id},
         })
         try:
             response = requests.post(
@@ -550,14 +558,25 @@ class OctopusAPI:
             t    = agr.get("tariff") or {}
             code = t.get("tariffCode", "") or ""
             mpan = ((agr.get("meterPoint") or {}).get("mpan")) or ""
-            is_export = ("OUTGOING" in code.upper()
-                         or (self.export_mpan and mpan == self.export_mpan))
-            if is_export:
-                result["export"] = {
-                    "unit_p":       _safe_float(t.get("unitRate")),
-                    "display_name": t.get("displayName"),
-                }
+            # Classify import vs export: the import MPAN is definitive; otherwise
+            # the export MPAN, the OUTGOING product family, or simply "a meter
+            # point that isn't our import meter" all mark it as export.
+            if mpan and self.mpan and mpan == self.mpan:
+                is_export = False
+            elif self.export_mpan and mpan == self.export_mpan:
+                is_export = True
+            elif "OUTGOING" in code.upper():
+                is_export = True
             else:
+                is_export = bool(mpan and self.mpan and mpan != self.mpan)
+            # First active agreement wins (active:true should return one each).
+            if is_export:
+                if result["export"] is None:
+                    result["export"] = {
+                        "unit_p":       _safe_float(t.get("unitRate")),
+                        "display_name": t.get("displayName"),
+                    }
+            elif result["elec"] is None:
                 result["elec"] = {
                     "standing_p":   _safe_float(t.get("standingCharge")),
                     "unit_p":       _safe_float(t.get("unitRate")),
@@ -566,6 +585,8 @@ class OctopusAPI:
                 }
 
         for agr in acct.get("gasAgreements", []) or []:
+            if result["gas"] is not None:
+                break
             t = agr.get("tariff") or {}
             result["gas"] = {
                 "standing_p":   _safe_float(t.get("standingCharge")),
@@ -899,7 +920,8 @@ class OctopusAPI:
             return None
 
         mutation = json.dumps({
-            "query": f'mutation {{ obtainKrakenToken(input: {{ APIKey: "{self.api_key}" }}) {{ token }} }}'
+            "query": "mutation ($k: String!) { obtainKrakenToken(input: { APIKey: $k }) { token } }",
+            "variables": {"k": self.api_key},
         })
         try:
             response = requests.post(
@@ -953,15 +975,16 @@ class OctopusAPI:
 
         query = json.dumps({
             "query": (
-                f'{{ account(accountNumber: "{self.account_id}") {{'
-                f"  electricityAgreements(active: true) {{"
-                f"    tariff {{"
-                f"      ...on TariffType       {{ displayName productCode tariffCode }}"
-                f"      ...on HalfHourlyTariff {{ displayName productCode tariffCode }}"
-                f"    }}"
-                f"  }}"
-                f"}}}}"
-            )
+                "query ($a: String!) { account(accountNumber: $a) {"
+                "  electricityAgreements(active: true) {"
+                "    tariff {"
+                "      ...on TariffType       { displayName productCode tariffCode }"
+                "      ...on HalfHourlyTariff { displayName productCode tariffCode }"
+                "    }"
+                "  }"
+                "}}"
+            ),
+            "variables": {"a": self.account_id},
         })
         try:
             response = requests.post(

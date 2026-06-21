@@ -356,5 +356,49 @@ class TestWholeHouseSummary(unittest.TestCase):
         self.assertEqual(out["balance_gbp"], 392.39)
 
 
+class TestWholeHouseEdges(unittest.TestCase):
+    """covered== boundary and _wh_card_from_row partial-row coalescing."""
+
+    def _settle(self, rows, octo):
+        import json, tempfile, shutil, os as _os
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(_os.path.join(tmp, "daily_history.json"), "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            _mk_plugin(tmp, octo)._settle_whole_house_costs()
+            with open(_os.path.join(tmp, "daily_history.json"), encoding="utf-8") as f:
+                return {r["date"]: r for r in json.load(f)}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _yest(self):
+        from datetime import timedelta
+        return (_london_today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def test_covered_boundary_zero_equals(self):
+        d1 = self._yest()
+        zero = {"elec": {"standing_p": 0.0, "unit_p": 0.0},
+                "gas": {"unit_p": 0.0, "standing_p": 0.0},
+                "export": {"unit_p": 12.0}, "balance_gbp": 0.0}
+        octo = _FakeOcto(fin=zero, gas={"m3": 0.0, "kwh": 0.0, "slots": 48})
+        r = self._settle([{"date": d1, "rate_today_p": 0.0,
+                           "export_rate_p": 12.0, "grid_export_kwh": 0.0}], octo)[d1]
+        self.assertEqual(r["whole_house_bill_gbp"], 0.0)
+        self.assertEqual(r["export_revenue_gbp"], 0.0)
+        self.assertTrue(r["covered"])          # export 0 >= bill 0 (the boundary)
+
+    def test_not_covered_when_short(self):
+        d1 = self._yest()
+        r = self._settle([{"date": d1, "rate_today_p": 23.478,
+                           "export_rate_p": 12.0, "grid_export_kwh": 1.0}], _FakeOcto())[d1]
+        self.assertFalse(r["covered"])         # ~£0.12 export vs ~£1.45 bill
+
+    def test_partial_settled_row_coalesces(self):
+        c = plugin.Plugin._wh_card_from_row({"cost_settled": True})
+        self.assertEqual(c["electric_gbp"], 0.0)   # `or 0.0` coalescing
+        self.assertEqual(c["gas_gbp"], 0.0)
+        self.assertIsNone(c["bill_gbp"])           # missing passthrough stays None
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,7 +7,19 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        21-06-2026
-# Version:     5.31.1
+# Version:     5.31.2
+# 5.31.2 — Whole-house cost deep-review medium/low batch: atomic daily_history.json
+#   writes (_atomic_write_json — temp + fsync + os.replace, both settle and
+#   midnight writers, so a crash can't truncate the never-pruned history);
+#   settle float() of API kWh guarded (one bad day skips, not aborts the cycle);
+#   _whole_house_summary caches the history parse by file mtime (it runs every
+#   ~5s on /api/status) and bounds today's gas estimate to the last 7 days.
+#   octopus_api 1.2->1.3: GraphQL queries parameterised (variables, not raw
+#   string-interpolation of account/key), import-vs-export classified by MPAN
+#   (not just OUTGOING), first-active-agreement wins, zoneinfo TZ fallback.
+#   +11 tests (175 pass): financials error/empty/errors paths, MPAN
+#   classification, force-bypass, gas-zero boundary, covered== boundary,
+#   partial-row coalescing. Pairs with Dashboards v2.14.1.
 # 5.31.1 — Whole-house cost hardening (deep-review highs batch): (1) settle now
 #   values each day's STANDING + GAS rates at the rate saved on the day
 #   (elec_standing_p_day/gas_unit_p_day/gas_standing_p_day, captured in
@@ -794,6 +806,20 @@ def _as_int(value, fallback):
         return int(fallback)
     except (TypeError, ValueError):
         return fallback
+
+
+def _atomic_write_json(path, data, indent=2):
+    """Write JSON atomically: serialise to a sibling temp file, fsync, then
+    os.replace() over the target.  A crash mid-write can never truncate the
+    destination (matters for the never-pruned daily_history.json)."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo variables
 
 # Storm-level hierarchy (mirrors storm_watch._LEVELS)
@@ -1739,8 +1765,12 @@ class Plugin(indigo.PluginBase):
             except (TypeError, ValueError):
                 export_rate_p = fin_export_p if fin_export_p is not None else 12.0
 
-            import_kwh = float(imp["kwh"])
-            gas_kwh    = float(gas["kwh"])
+            try:
+                import_kwh = float(imp["kwh"])
+                gas_kwh    = float(gas["kwh"])
+            except (TypeError, ValueError):
+                self.logger.debug(f"[CostSettle] non-numeric kWh for {date_str}; skipping")
+                continue
             gas_m3     = gas.get("m3")
             try:
                 export_kwh = float(rec.get("grid_export_kwh", 0.0))
@@ -1786,8 +1816,7 @@ class Plugin(indigo.PluginBase):
 
         if settled_n:
             try:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(records, f, indent=2)
+                _atomic_write_json(path, records)
                 log(f"[CostSettle] Settled whole-house cost for {settled_n} day(s)")
             except Exception as e:
                 log(f"[CostSettle] Cannot write daily history: {e}", level="ERROR")
@@ -1844,13 +1873,25 @@ class Plugin(indigo.PluginBase):
                 gas_unit_p     = fin["gas"].get("unit_p")
                 gas_standing_p = fin["gas"].get("standing_p")
 
+        # /api/status hits this every ~5s but daily_history.json only changes at
+        # midnight / on a settle, so cache the parse keyed by the file's mtime.
         path = os.path.join(self.data_dir, "daily_history.json")
-        records = []
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                records = json.load(f)
-        except (OSError, ValueError):
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        if (getattr(self, "_wh_hist_mtime", None) == mtime
+                and getattr(self, "_wh_hist_cache", None) is not None):
+            records = self._wh_hist_cache
+        else:
             records = []
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+            except (OSError, ValueError):
+                records = []
+            self._wh_hist_cache = records
+            self._wh_hist_mtime = mtime
         by_date  = {r.get("date"): r for r in records if r.get("date")}
         settled  = [r for r in records if r.get("cost_settled")]
 
@@ -1868,9 +1909,13 @@ class Plugin(indigo.PluginBase):
         out["yesterday_date"] = y_str
         out["yesterday"]      = self._wh_card_from_row(by_date.get(y_str))
 
-        # ---- Gas estimate for today: most recent settled gas_kwh ----
+        # ---- Gas estimate for today: most recent settled gas_kwh within the
+        # last 7 days (don't estimate today's gas off a stale fortnight-old day).
         gas_today_kwh = None
+        gas_cutoff = (today - timedelta(days=7)).strftime("%Y-%m-%d")
         for r in sorted(settled, key=lambda x: x.get("date", ""), reverse=True):
+            if r.get("date", "") < gas_cutoff:
+                break
             if r.get("gas_kwh") is not None:
                 try:
                     gas_today_kwh = float(r["gas_kwh"])
@@ -4919,8 +4964,7 @@ class Plugin(indigo.PluginBase):
         # explicitly asked to never lose history.  No pruning.
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(records, f, indent=2)
+            _atomic_write_json(path, records)
         except Exception as e:
             log(f"Cannot write daily history: {e}", level="ERROR")
 

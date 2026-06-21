@@ -145,5 +145,85 @@ class TestPerDayConsumption(unittest.TestCase):
         self.assertIsNone(api.get_gas_kwh_for_date("2026-06-20"))
 
 
+class TestFinancialsErrorPaths(unittest.TestCase):
+    def setUp(self):
+        self.api = _make_api()
+        self.api._get_kraken_token = lambda: "tok"
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def test_http_not_ok_returns_none(self):
+        octopus_api.requests.post.return_value = _FakeResp(_LEDGER, ok=False, status=500)
+        self.assertIsNone(self.api.get_account_financials(force=True))
+
+    def test_empty_account_returns_none(self):
+        octopus_api.requests.post.return_value = _FakeResp({"data": {"account": None}})
+        self.assertIsNone(self.api.get_account_financials(force=True))
+
+    def test_graphql_errors_returns_none(self):
+        octopus_api.requests.post.return_value = _FakeResp({"errors": [{"message": "bad"}]})
+        self.assertIsNone(self.api.get_account_financials(force=True))
+
+    def test_failure_stamps_negative_cache(self):
+        octopus_api.requests.post.return_value = _FakeResp({"data": {"account": None}})
+        self.api.get_account_financials(force=True)
+        self.assertGreater(self.api._financials_neg_at, 0)
+
+    def test_force_bypasses_cache(self):
+        octopus_api.requests.post.return_value = _FakeResp(_LEDGER)
+        self.api.get_account_financials(force=True)
+        octopus_api.requests.post.reset_mock()
+        self.api.get_account_financials(force=True)      # force -> hits network again
+        octopus_api.requests.post.assert_called()
+
+
+class TestFinancialsClassification(unittest.TestCase):
+    """Import vs export classification, incl. the MPAN-match path (not just OUTGOING)."""
+
+    def setUp(self):
+        self.api = _make_api()
+        self.api._get_kraken_token = lambda: "tok"
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def _ledger(self, second_mpan, second_code):
+        return {"data": {"account": {"balance": 0, "gasAgreements": [],
+            "electricityAgreements": [
+                {"meterPoint": {"mpan": "1591059073620"},
+                 "tariff": {"__typename": "StandardTariff", "tariffCode": "E-1R-SILVER-26-04-01-F",
+                            "displayName": "Tracker", "standingCharge": 61.5, "unitRate": 23.0}},
+                {"meterPoint": {"mpan": second_mpan},
+                 "tariff": {"__typename": "StandardTariff", "tariffCode": second_code,
+                            "displayName": "Exp", "standingCharge": 0.0, "unitRate": 12.0}},
+            ]}}}
+
+    def test_export_by_mpan_without_outgoing_code(self):
+        octopus_api.requests.post.return_value = _FakeResp(self._ledger("1574300590436", "E-1R-WEIRD-F"))
+        fin = self.api.get_account_financials(force=True)
+        self.assertEqual(fin["export"]["unit_p"], 12.0)
+        self.assertEqual(fin["elec"]["unit_p"], 23.0)   # import unaffected
+
+    def test_unknown_mpan_treated_as_export(self):
+        octopus_api.requests.post.return_value = _FakeResp(self._ledger("9999999999999", "E-1R-WEIRD-F"))
+        fin = self.api.get_account_financials(force=True)
+        self.assertEqual(fin["export"]["unit_p"], 12.0)
+        self.assertEqual(fin["elec"]["unit_p"], 23.0)
+
+
+class TestGasZeroBoundary(unittest.TestCase):
+    def test_gas_zero_m3_is_settleable_zero(self):
+        api = _make_api()
+        api._sum_consumption_for_date = lambda url, d: {"value": 0.0, "slots": 48}
+        out = api.get_gas_kwh_for_date("2026-06-20")
+        self.assertEqual(out["m3"], 0.0)
+        self.assertEqual(out["kwh"], 0.0)      # 0.0, not None — a real zero-gas day settles
+
+
 if __name__ == "__main__":
     unittest.main()
