@@ -212,5 +212,149 @@ class TestWholeHouseCard(unittest.TestCase):
         self.assertIsNone(plugin.Plugin._wh_card_from_row(None))
 
 
+# ---- Helpers for the settle / summary tests (build Plugin without __init__) ----
+class _FakeOcto:
+    def __init__(self, fin="default", gas=("default")):
+        self._fin = {
+            "elec":   {"standing_p": 61.51824, "unit_p": 23.478},
+            "gas":    {"unit_p": 6.58413, "standing_p": 29.06169},
+            "export": {"unit_p": 12.0}, "balance_gbp": 392.39,
+        } if fin == "default" else fin
+        self._gas = {"m3": 0.716, "kwh": 8.03, "slots": 48} if gas == "default" else gas
+
+    def get_account_financials(self, force=False):
+        return self._fin
+
+    def get_import_kwh_for_date(self, d):
+        return {"kwh": 0.066, "slots": 48}
+
+    def get_gas_kwh_for_date(self, d):
+        return self._gas
+
+
+def _mk_plugin(tmp, octo, store=None):
+    p = plugin.Plugin.__new__(plugin.Plugin)
+    p.octopus = octo
+    p.data_dir = tmp
+    p.logger = MagicMock()
+    p.store = store if store is not None else {}
+    return p
+
+
+def _london_today():
+    from datetime import datetime
+    try:
+        import pytz
+        return datetime.now(pytz.timezone("Europe/London")).date()
+    except ImportError:
+        return datetime.now().date()
+
+
+class TestSettleWholeHouseCosts(unittest.TestCase):
+    """_settle_whole_house_costs — the money-bearing settle (plugin.py)."""
+
+    def _run(self, rows, octo=None):
+        import json, tempfile, shutil, os as _os
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(_os.path.join(tmp, "daily_history.json"), "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            _mk_plugin(tmp, octo or _FakeOcto())._settle_whole_house_costs()
+            with open(_os.path.join(tmp, "daily_history.json"), encoding="utf-8") as f:
+                return {r["date"]: r for r in json.load(f)}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _yesterday(self):
+        from datetime import timedelta
+        return (_london_today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def test_settles_and_computes_bill(self):
+        d1 = self._yesterday()
+        r = self._run([{"date": d1, "rate_today_p": 23.478,
+                        "export_rate_p": 12.0, "grid_export_kwh": 36.0}])[d1]
+        self.assertTrue(r["cost_settled"])
+        # 0.066*23.478/100 + 61.518/100 + 8.03*6.58413/100 + 29.062/100 ~= 1.45
+        self.assertAlmostEqual(r["whole_house_bill_gbp"], 1.45, delta=0.02)
+        self.assertAlmostEqual(r["export_revenue_gbp"], 4.32, delta=0.01)
+        self.assertTrue(r["covered"])
+
+    def test_per_day_rates_preferred_over_ledger(self):
+        d1 = self._yesterday()
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "export_rate_p": 12.0,
+                        "grid_export_kwh": 10.0, "elec_standing_p_day": 50.0,
+                        "gas_unit_p_day": 6.0, "gas_standing_p_day": 25.0}])[d1]
+        self.assertEqual(r["elec_standing_gbp"], 0.50)   # not the ledger's 0.62
+        self.assertEqual(r["gas_standing_gbp"], 0.25)    # not the ledger's 0.29
+
+    def test_gas_unsettled_not_frozen(self):
+        d1 = self._yesterday()
+        octo = _FakeOcto(gas={"m3": None, "kwh": None, "slots": 0})
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
+        self.assertFalse(r.get("cost_settled", False))
+
+    def test_no_ledger_skips(self):
+        d1 = self._yesterday()
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}],
+                      _FakeOcto(fin=None))[d1]
+        self.assertFalse(r.get("cost_settled", False))
+
+
+class TestWholeHouseSummary(unittest.TestCase):
+    """_whole_house_summary — the /api/status block."""
+
+    def _summary(self, rows, store=None):
+        import json, tempfile, shutil, os as _os
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(_os.path.join(tmp, "daily_history.json"), "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            p = _mk_plugin(tmp, _FakeOcto(),
+                           store or {"grid_import_daily_kwh": 0.05, "grid_export_daily_kwh": 20.0})
+            return p._whole_house_summary(import_rate_p=23.478, export_rate_p=12.0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _settled_row(self, date, bill, exp, covered):
+        return {"date": date, "month": date[:7], "cost_settled": True,
+                "whole_house_bill_gbp": bill, "export_revenue_gbp": exp,
+                "wh_net_gbp": round(exp - bill, 2), "covered": covered, "gas_kwh": 8.0,
+                "elec_unit_cost_gbp": 0.02, "elec_standing_gbp": 0.62,
+                "gas_unit_cost_gbp": 0.53, "gas_standing_gbp": 0.29}
+
+    def test_today_provisional_balance_and_yesterday(self):
+        from datetime import timedelta
+        d1 = (_london_today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        out = self._summary([self._settled_row(d1, 1.45, 4.42, True)])
+        self.assertEqual(out["balance_gbp"], 392.39)
+        self.assertIsNotNone(out["today"])
+        self.assertTrue(out["today"]["provisional"])
+        self.assertTrue(out["today"]["gas_estimated"])        # estimated from the settled row
+        self.assertIsNotNone(out["yesterday"])
+        self.assertEqual(out["yesterday"]["bill_gbp"], 1.45)
+        self.assertFalse(out["yesterday"]["provisional"])
+
+    def test_month_aggregation_and_self_funded(self):
+        from datetime import timedelta
+        t = _london_today(); mp = t.strftime("%Y-%m")
+        raw = [self._settled_row((t - timedelta(days=k)).strftime("%Y-%m-%d"),
+                                 1.40, (3.0 if k != 2 else 0.50), k != 2) for k in range(0, 3)]
+        out = self._summary(raw)
+        this_month = [r for r in raw if r["date"][:7] == mp]
+        self.assertEqual(out["month"]["bill_gbp"], round(sum(r["whole_house_bill_gbp"] for r in this_month), 2))
+        self.assertEqual(out["month"]["export_gbp"], round(sum(r["export_revenue_gbp"] for r in this_month), 2))
+        self.assertEqual(out["month"]["in_credit"], out["month"]["export_gbp"] >= out["month"]["bill_gbp"])
+        self.assertEqual(out["self_funded"]["covered_days"], sum(1 for r in this_month if r["covered"]))
+        self.assertEqual(out["self_funded"]["settled_days"], len(this_month))
+        self.assertEqual(len(out["series30"]), 3)   # series30 is all settled, month-agnostic
+
+    def test_empty_history_safe(self):
+        out = self._summary([])
+        self.assertIsNone(out["yesterday"])
+        self.assertIsNone(out["month"])
+        self.assertEqual(out["series30"], [])
+        self.assertEqual(out["balance_gbp"], 392.39)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

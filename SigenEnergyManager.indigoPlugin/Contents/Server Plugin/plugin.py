@@ -7,7 +7,18 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        21-06-2026
-# Version:     5.31.0
+# Version:     5.31.1
+# 5.31.1 — Whole-house cost hardening (deep-review highs batch): (1) settle now
+#   values each day's STANDING + GAS rates at the rate saved on the day
+#   (elec_standing_p_day/gas_unit_p_day/gas_standing_p_day, captured in
+#   _write_daily_history) rather than the current ledger snapshot — frozen days
+#   stay correct across a tariff/price-cap change; falls back to the current
+#   ledger only for older/backfilled rows. (2) get_account_financials now
+#   negative-caches failures (FINANCIALS_NEG_CACHE_TTL) and returns the stale
+#   value, so a Kraken outage no longer makes /api/status fire a GraphQL request
+#   every ~5s. (3) _whole_house_summary call isolated in get_dashboard_data so a
+#   fault in the new block can't blank the rest of /api/status. +7 tests
+#   (TestSettleWholeHouseCosts, TestWholeHouseSummary); 164 pass. octopus_api 1.1->1.2.
 # 5.31.0 — Whole-house cost (gas + electric, incl. standing charges). New
 #   /api/status economics.whole_house block: today (provisional), yesterday
 #   (settled), month-to-date net, days self-funded, account balance and a
@@ -1519,16 +1530,23 @@ class Plugin(indigo.PluginBase):
                 export_rate_p          = export_rate_p,
                 fallback_import_rate_p = import_rate_p,
             )
+            # Isolated so a fault in the (newer, network-touching) whole-house
+            # block can never blank the rest of /api/status.
+            try:
+                whole_house = self._whole_house_summary(
+                    import_rate_p = import_rate_p,
+                    export_rate_p = export_rate_p,
+                )
+            except Exception as exc:
+                self.logger.debug(f"[WholeHouse] summary failed: {exc}")
+                whole_house = None
             economics = {
                 "today":           today_econ,
                 "yesterday":       yesterday_econ,
                 "yesterday_date":  yesterday_date,
                 "periods":         periods,
                 "calendar_months": calendar_months,
-                "whole_house":     self._whole_house_summary(
-                    import_rate_p = import_rate_p,
-                    export_rate_p = export_rate_p,
-                ),
+                "whole_house":     whole_house,
             }
 
             return {
@@ -1647,8 +1665,9 @@ class Plugin(indigo.PluginBase):
 
         For each recent day not yet cost-settled, fetch Octopus settled grid-import
         and gas consumption, value them at the rate in force on that day (the saved
-        rate_today_p for elec; current standing/gas/export rates from the Kraken
-        ledger), compute the whole-house bill, and freeze the row.  Gas is the
+        rate_today_p for elec unit, and the standing + gas rates saved on the day
+        in daily_history, falling back to the current Kraken ledger only for older
+        rows), compute the whole-house bill, and freeze the row.  Gas is the
         gating signal — a day only settles once Octopus has its gas data.  Export
         revenue uses the Sigen-measured daily export (final at midnight, ~0.02%
         accurate) so it needs no settlement wait.
@@ -1728,10 +1747,23 @@ class Plugin(indigo.PluginBase):
             except (TypeError, ValueError):
                 export_kwh = 0.0
 
+            # Standing charges + gas unit rate: prefer the value saved on the
+            # day (tariff-change-proof); fall back to the current ledger only for
+            # older / backfilled rows that predate per-day capture.
+            def _day_rate(key, fallback):
+                v = rec.get(key)
+                try:
+                    return float(v) if v is not None else fallback
+                except (TypeError, ValueError):
+                    return fallback
+            day_elec_standing_p = _day_rate("elec_standing_p_day", elec_standing_p)
+            day_gas_unit_p      = _day_rate("gas_unit_p_day",      gas_unit_p)
+            day_gas_standing_p  = _day_rate("gas_standing_p_day",  gas_standing_p)
+
             elec_unit_cost = import_kwh * elec_unit_p / 100.0
-            elec_standing  = elec_standing_p / 100.0
-            gas_unit_cost  = gas_kwh * gas_unit_p / 100.0
-            gas_standing   = gas_standing_p / 100.0
+            elec_standing  = day_elec_standing_p / 100.0
+            gas_unit_cost  = gas_kwh * day_gas_unit_p / 100.0
+            gas_standing   = day_gas_standing_p / 100.0
             bill           = elec_unit_cost + elec_standing + gas_unit_cost + gas_standing
             export_rev     = export_kwh * export_rate_p / 100.0
             net            = export_rev - bill
@@ -4829,6 +4861,22 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             export_rate_p = 12.0
 
+        # Capture the standing charges + gas unit rate in force on this day, so
+        # the whole-house settle values each frozen day at its OWN rates rather
+        # than whatever the ledger reads when the settle pass later runs.  A
+        # tariff or price-cap change must never retroactively re-value past days.
+        day_elec_standing_p = day_gas_unit_p = day_gas_standing_p = None
+        try:
+            _fin = self.octopus.get_account_financials() if self.octopus else None
+        except Exception:
+            _fin = None
+        if _fin:
+            if _fin.get("elec"):
+                day_elec_standing_p = _fin["elec"].get("standing_p")
+            if _fin.get("gas"):
+                day_gas_unit_p     = _fin["gas"].get("unit_p")
+                day_gas_standing_p = _fin["gas"].get("standing_p")
+
         record = {
             "date":                 date_str,
             "month":                date_str[:7],
@@ -4848,6 +4896,9 @@ class Plugin(indigo.PluginBase):
             "tariff":     self.latest_rates_data.get("tariff_info", {}).get("tariff_key", "?"),
             "rate_today_p":   self.latest_rates_data.get("tracker", {}).get("today_p"),
             "export_rate_p":  round(export_rate_p, 4),
+            "elec_standing_p_day": day_elec_standing_p,
+            "gas_unit_p_day":      day_gas_unit_p,
+            "gas_standing_p_day":  day_gas_standing_p,
             "import_events": 1 if self.store.get("had_import_today", False) else 0,
             "export_events": self.store.get("export_count_today", 0),
             "vpp_event":  self.store.get("had_vpp_today", False),

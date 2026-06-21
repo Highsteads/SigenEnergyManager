@@ -4,8 +4,12 @@
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
-# Date:        21-06-2026 13:00 BST
-# Version:     1.1
+# Date:        21-06-2026 16:00 BST
+# Version:     1.2
+#
+# v1.2 (21-06-2026) — get_account_financials negative-caches failures
+#   (FINANCIALS_NEG_CACHE_TTL) and returns the last good value, so a Kraken
+#   outage can't make the dashboard's /api/status poll hammer the API.
 #
 # v1.1 (21-06-2026) — whole-house cost support:
 #   • get_account_financials() — bill-exact standing/unit rates (elec, gas,
@@ -49,6 +53,7 @@ REQUEST_TIMEOUT   = 15   # seconds
 RATES_CACHE_TTL       = 1800   # 30 min - rates change daily but check frequently for tomorrow
 CONSUMPTION_CACHE_TTL = 86400  # 24 hours - consumption profile updated daily
 FINANCIALS_CACHE_TTL  = 1800   # 30 min - standing/unit rates change at most daily; balance slowly
+FINANCIALS_NEG_CACHE_TTL = 120 # 2 min - debounce failures so /api/status can't hammer Kraken
 
 # Gas volume (m3) -> kWh conversion.  Octopus bills gas in kWh but the
 # consumption API returns m3 for metric SMETS meters.  kWh = m3 * VCF * CV / 3.6.
@@ -165,6 +170,7 @@ class OctopusAPI:
         self._kraken_token_at  = 0.0
         self._financials_cache    = None   # Kraken ledger rates + balance
         self._financials_cache_at = 0.0
+        self._financials_neg_at   = 0.0    # last failure (negative-cache debounce)
 
         # Rate-limit tracker.  Octopus permits roughly 100 requests/hour per
         # endpoint family.  We're nowhere near that under normal poll cadence
@@ -462,6 +468,13 @@ class OctopusAPI:
     # Public: Account financials (Kraken ledger — bill-exact)
     # ================================================================
 
+    def _financials_failed(self, now):
+        """Stamp the negative-cache window and return the last good value (stale)
+        or None if financials were never successfully fetched.  Prevents a Kraken
+        outage from making every /api/status poll fire a fresh GraphQL request."""
+        self._financials_neg_at = now
+        return self._financials_cache
+
     def get_account_financials(self, force=False):
         """Bill-exact standing/unit rates + account balance from the Kraken ledger.
 
@@ -482,11 +495,15 @@ class OctopusAPI:
         if (not force and self._financials_cache is not None
                 and now - self._financials_cache_at < FINANCIALS_CACHE_TTL):
             return self._financials_cache
+        # Debounce failures: after a recent failure return the last good value
+        # (or None) without re-hitting the network on every /api/status poll.
+        if not force and now - self._financials_neg_at < FINANCIALS_NEG_CACHE_TTL:
+            return self._financials_cache
         if not self.api_key or not self.account_id:
-            return None
+            return self._financials_failed(now)
         token = self._get_kraken_token()
         if not token:
-            return None
+            return self._financials_failed(now)
 
         query = json.dumps({
             "query": (
@@ -510,18 +527,18 @@ class OctopusAPI:
             )
             if not response.ok:
                 self.logger.debug(f"Kraken financials query failed: HTTP {response.status_code}")
-                return None
+                return self._financials_failed(now)
             payload = response.json()
         except (requests.RequestException, ValueError) as e:
             self.logger.debug(f"Kraken financials error: {e}")
-            return None
+            return self._financials_failed(now)
 
         acct = ((payload or {}).get("data") or {}).get("account") or {}
         if not acct:
             errs = (payload or {}).get("errors")
             if errs:
                 self.logger.debug(f"Kraken financials GraphQL errors: {errs}")
-            return None
+            return self._financials_failed(now)
 
         result = {"elec": None, "export": None, "gas": None, "balance_gbp": None}
 
