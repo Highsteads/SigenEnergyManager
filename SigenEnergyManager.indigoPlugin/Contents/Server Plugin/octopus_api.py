@@ -3,9 +3,17 @@
 # Filename:    octopus_api.py
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        26-03-2026 15:30 GMT
-# Version:     1.0
+# Author:      CliveS & Claude Opus 4.8
+# Date:        21-06-2026 13:00 BST
+# Version:     1.1
+#
+# v1.1 (21-06-2026) — whole-house cost support:
+#   • get_account_financials() — bill-exact standing/unit rates (elec, gas,
+#     export) + account balance from the Kraken ledger via active:true
+#     agreements (survives tariff changes with no config change).
+#   • get_import_kwh_for_date() / get_gas_kwh_for_date() — per-day settled
+#     consumption, mirroring get_export_kwh_for_date(); gas m3->kWh via a
+#     configurable calorific factor.
 #
 # Octopus REST v1 API: https://docs.octopus.energy/rest/guides/endpoints/
 # Kraken GraphQL API: https://api.octopus.energy/v1/graphql/
@@ -40,6 +48,16 @@ REQUEST_TIMEOUT   = 15   # seconds
 # Cache TTLs
 RATES_CACHE_TTL       = 1800   # 30 min - rates change daily but check frequently for tomorrow
 CONSUMPTION_CACHE_TTL = 86400  # 24 hours - consumption profile updated daily
+FINANCIALS_CACHE_TTL  = 1800   # 30 min - standing/unit rates change at most daily; balance slowly
+
+# Gas volume (m3) -> kWh conversion.  Octopus bills gas in kWh but the
+# consumption API returns m3 for metric SMETS meters.  kWh = m3 * VCF * CV / 3.6.
+# CV (calorific value, MJ/m3) varies slightly by region/day and is printed on each
+# bill; default 39.5 gives ~11.19 kWh/m3.  Override via the gas_kwh_per_m3 ctor arg
+# to match your bill exactly.
+GAS_VCF          = 1.02264
+GAS_CALORIFIC_MJ = 39.5
+GAS_KWH_PER_M3   = GAS_VCF * GAS_CALORIFIC_MJ / 3.6   # ~11.19
 
 # Tariff key constants
 TARIFF_TRACKER  = "tracker"
@@ -75,6 +93,14 @@ class OctopusApiError(Exception):
     pass
 
 
+def _safe_float(value, default=None):
+    """Coerce to float, returning default on None / non-numeric."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class OctopusAPI:
     """Octopus Energy API client for SigenEnergyManager.
 
@@ -89,25 +115,38 @@ class OctopusAPI:
     """
 
     def __init__(self, api_key, account_id, mpan, serial,
-                 region="F", data_dir=None, logger=None):
+                 region="F", data_dir=None, logger=None,
+                 gas_mprn="", gas_serial="",
+                 export_mpan="", export_serial="",
+                 gas_kwh_per_m3=GAS_KWH_PER_M3):
         """Initialise Octopus API client.
 
         Args:
-            api_key:    Octopus API key (sk_live_...)
-            account_id: Octopus account number (A-XXXXXXXX)
-            mpan:       13-digit electricity meter point number
-            serial:     Electricity meter serial number
-            region:     Grid region code A-P (default F = North East)
-            data_dir:   Cache directory
-            logger:     Logger instance
+            api_key:        Octopus API key (sk_live_...)
+            account_id:     Octopus account number (A-XXXXXXXX)
+            mpan:           13-digit electricity import meter point number
+            serial:         Electricity import meter serial number
+            region:         Grid region code A-P (default F = North East)
+            data_dir:       Cache directory
+            logger:         Logger instance
+            gas_mprn:       Gas meter point reference number (optional)
+            gas_serial:     Gas meter serial number (optional)
+            export_mpan:    Electricity export meter point number (optional)
+            export_serial:  Electricity export meter serial number (optional)
+            gas_kwh_per_m3: m3->kWh calorific factor (default ~11.19)
         """
-        self.api_key    = api_key
-        self.account_id = account_id
-        self.mpan       = mpan
-        self.serial     = serial
-        self.region     = region.upper()
-        self.data_dir   = data_dir or ""
-        self.logger     = logger or logging.getLogger("SigenEnergyManager.Octopus")
+        self.api_key        = api_key
+        self.account_id     = account_id
+        self.mpan           = mpan
+        self.serial         = serial
+        self.region         = region.upper()
+        self.data_dir       = data_dir or ""
+        self.logger         = logger or logging.getLogger("SigenEnergyManager.Octopus")
+        self.gas_mprn       = gas_mprn or ""
+        self.gas_serial     = gas_serial or ""
+        self.export_mpan    = export_mpan or ""
+        self.export_serial  = export_serial or ""
+        self.gas_kwh_per_m3 = _safe_float(gas_kwh_per_m3, GAS_KWH_PER_M3) or GAS_KWH_PER_M3
 
         # HTTP Basic auth header (api_key as username, empty password)
         if api_key:
@@ -124,6 +163,8 @@ class OctopusAPI:
         self._tariff_cache_at  = 0.0
         self._kraken_token     = None
         self._kraken_token_at  = 0.0
+        self._financials_cache    = None   # Kraken ledger rates + balance
+        self._financials_cache_at = 0.0
 
         # Rate-limit tracker.  Octopus permits roughly 100 requests/hour per
         # endpoint family.  We're nowhere near that under normal poll cadence
@@ -311,17 +352,17 @@ class OctopusAPI:
     # Public: Export-MPAN consumption (v5.19+)
     # ================================================================
 
-    def get_export_kwh_for_date(self, date_str, export_mpan, export_serial):
-        """Sum all half-hourly export readings for one local (Europe/London) day.
+    def _sum_consumption_for_date(self, url, date_str):
+        """Sum all half-hourly readings at `url` for one local (Europe/London) day.
 
-        Octopus settles export readings over ~24-48h, so callers should only
-        query dates that are at least 3 calendar days old. Returns:
-            { "kwh": float, "slots": int }   on success
-            { "kwh": None,  "slots": 0 }     if no data yet (unsettled / missing)
-            None                              on auth/network failure
+        Shared by the import / export / gas per-day helpers.  Octopus settles
+        readings over ~24-48h, so callers should only query dates at least a
+        couple of calendar days old.  Returns:
+            { "value": float, "slots": int }   on success (value in the meter's
+                                                native unit: kWh for elec, m3 for gas)
+            { "value": None,  "slots": 0 }      if no data yet (unsettled / missing)
+            None                                 on auth/network failure
         """
-        if not export_mpan or not export_serial:
-            return None
         try:
             try:
                 import pytz
@@ -337,10 +378,6 @@ class OctopusAPI:
         except ValueError:
             return None
 
-        url = (
-            f"{OCTOPUS_API_BASE}/electricity-meter-points/{export_mpan}/"
-            f"meters/{export_serial}/consumption/"
-        )
         params = {
             "period_from": period_from,
             "period_to":   period_to,
@@ -350,25 +387,179 @@ class OctopusAPI:
         try:
             intervals = self._paginate(url, params, authenticated=True)
         except Exception as exc:
-            self.logger.debug(f"[Octopus] Export consumption fetch failed for {date_str}: {exc}")
+            self.logger.debug(f"[Octopus] Consumption fetch failed for {date_str} @ {url}: {exc}")
             return None
         if intervals is None:
             return None
         if not intervals:
-            return {"kwh": None, "slots": 0}
+            return {"value": None, "slots": 0}
 
         total = 0.0
         slots = 0
         for interval in intervals:
             try:
-                kwh = float(interval.get("consumption", 0))
-                if kwh < 0:
+                v = float(interval.get("consumption", 0))
+                if v < 0:
                     continue
-                total += kwh
+                total += v
                 slots += 1
             except (TypeError, ValueError):
                 continue
-        return {"kwh": round(total, 3), "slots": slots}
+        return {"value": round(total, 3), "slots": slots}
+
+    def get_export_kwh_for_date(self, date_str, export_mpan, export_serial):
+        """Sum all half-hourly export readings for one local (Europe/London) day.
+
+        Returns { "kwh": float|None, "slots": int } or None on failure.
+        """
+        if not export_mpan or not export_serial:
+            return None
+        url = (
+            f"{OCTOPUS_API_BASE}/electricity-meter-points/{export_mpan}/"
+            f"meters/{export_serial}/consumption/"
+        )
+        r = self._sum_consumption_for_date(url, date_str)
+        if r is None:
+            return None
+        return {"kwh": r["value"], "slots": r["slots"]}
+
+    def get_import_kwh_for_date(self, date_str):
+        """Sum grid-import kWh for one local day (settled data only).
+
+        Returns { "kwh": float|None, "slots": int } or None on failure.
+        """
+        if not self.mpan or not self.serial:
+            return None
+        url = (
+            f"{OCTOPUS_API_BASE}/electricity-meter-points/{self.mpan}/"
+            f"meters/{self.serial}/consumption/"
+        )
+        r = self._sum_consumption_for_date(url, date_str)
+        if r is None:
+            return None
+        return {"kwh": r["value"], "slots": r["slots"]}
+
+    def get_gas_kwh_for_date(self, date_str):
+        """Sum gas consumption for one local day, returning both m3 and kWh.
+
+        Octopus returns m3 for metric SMETS meters; kWh = m3 * gas_kwh_per_m3.
+        Returns { "m3": float|None, "kwh": float|None, "slots": int } or None.
+        """
+        if not self.gas_mprn or not self.gas_serial:
+            return None
+        url = (
+            f"{OCTOPUS_API_BASE}/gas-meter-points/{self.gas_mprn}/"
+            f"meters/{self.gas_serial}/consumption/"
+        )
+        r = self._sum_consumption_for_date(url, date_str)
+        if r is None:
+            return None
+        m3  = r["value"]
+        kwh = round(m3 * self.gas_kwh_per_m3, 3) if m3 is not None else None
+        return {"m3": m3, "kwh": kwh, "slots": r["slots"]}
+
+    # ================================================================
+    # Public: Account financials (Kraken ledger — bill-exact)
+    # ================================================================
+
+    def get_account_financials(self, force=False):
+        """Bill-exact standing/unit rates + account balance from the Kraken ledger.
+
+        Uses the account's ACTIVE agreements (active:true), so it always reflects
+        the tariff currently in force and survives a tariff change with no config
+        change.  Import vs export is distinguished by meter-point MPAN.  All rates
+        in pence inc-VAT; balance in GBP (positive = in credit).  Returns:
+            {
+              "elec":   {"standing_p","unit_p","tariff_code","display_name"} | None,
+              "export": {"unit_p","display_name"} | None,
+              "gas":    {"standing_p","unit_p","tariff_code","display_name"} | None,
+              "balance_gbp": float | None,
+            }
+        or None on auth/network failure.  Note: for Tracker the elec unit_p is
+        TODAY's rate (changes daily) — use the dated rate endpoints for history.
+        """
+        now = time.time()
+        if (not force and self._financials_cache is not None
+                and now - self._financials_cache_at < FINANCIALS_CACHE_TTL):
+            return self._financials_cache
+        if not self.api_key or not self.account_id:
+            return None
+        token = self._get_kraken_token()
+        if not token:
+            return None
+
+        query = json.dumps({
+            "query": (
+                f'{{ account(accountNumber: "{self.account_id}") {{'
+                f"  balance"
+                f"  electricityAgreements(active: true) {{ meterPoint {{ mpan }} tariff {{ __typename"
+                f"    ...on StandardTariff   {{ tariffCode displayName standingCharge unitRate }}"
+                f"    ...on HalfHourlyTariff {{ tariffCode displayName standingCharge }} }} }}"
+                f"  gasAgreements(active: true) {{ tariff {{ __typename"
+                f"    ...on GasTariffType {{ tariffCode displayName standingCharge unitRate }} }} }}"
+                f"}}}}"
+            )
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL,
+                data=query.encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"JWT {token}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if not response.ok:
+                self.logger.debug(f"Kraken financials query failed: HTTP {response.status_code}")
+                return None
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            self.logger.debug(f"Kraken financials error: {e}")
+            return None
+
+        acct = ((payload or {}).get("data") or {}).get("account") or {}
+        if not acct:
+            errs = (payload or {}).get("errors")
+            if errs:
+                self.logger.debug(f"Kraken financials GraphQL errors: {errs}")
+            return None
+
+        result = {"elec": None, "export": None, "gas": None, "balance_gbp": None}
+
+        bal = acct.get("balance")
+        if isinstance(bal, (int, float)):
+            result["balance_gbp"] = round(bal / 100.0, 2)
+
+        for agr in acct.get("electricityAgreements", []) or []:
+            t    = agr.get("tariff") or {}
+            code = t.get("tariffCode", "") or ""
+            mpan = ((agr.get("meterPoint") or {}).get("mpan")) or ""
+            is_export = ("OUTGOING" in code.upper()
+                         or (self.export_mpan and mpan == self.export_mpan))
+            if is_export:
+                result["export"] = {
+                    "unit_p":       _safe_float(t.get("unitRate")),
+                    "display_name": t.get("displayName"),
+                }
+            else:
+                result["elec"] = {
+                    "standing_p":   _safe_float(t.get("standingCharge")),
+                    "unit_p":       _safe_float(t.get("unitRate")),
+                    "tariff_code":  code,
+                    "display_name": t.get("displayName"),
+                }
+
+        for agr in acct.get("gasAgreements", []) or []:
+            t = agr.get("tariff") or {}
+            result["gas"] = {
+                "standing_p":   _safe_float(t.get("standingCharge")),
+                "unit_p":       _safe_float(t.get("unitRate")),
+                "tariff_code":  t.get("tariffCode", "") or "",
+                "display_name": t.get("displayName"),
+            }
+
+        self._financials_cache    = result
+        self._financials_cache_at = now
+        return result
 
     # ================================================================
     # Internal: Tracker Rates

@@ -77,6 +77,18 @@
     <Field id="octopusExportInfo" type="label">
         <Label>Export MPAN/serial are optional. When set, the plugin compares the inverter's daily export against Octopus's settled half-hourly readings (last 7 settled days, ±5% tolerance) on the Export Sync dashboard card. Settlement typically takes 24-48 h, so the most recent three days are skipped.</Label>
     </Field>
+    <Field id="octopusGasMprn" type="textfield" defaultValue="">
+        <Label>Gas MPRN (10-11 digits, optional):</Label>
+    </Field>
+    <Field id="octopusGasSerial" type="textfield" defaultValue="">
+        <Label>Gas meter serial:</Label>
+    </Field>
+    <Field id="gasKwhPerM3" type="textfield" defaultValue="">
+        <Label>Gas calorific factor (kWh per m3, optional — default ~11.19). Set this to the exact figure on your Octopus bill for penny-accurate gas costs.</Label>
+    </Field>
+    <Field id="octopusGasInfo" type="label">
+        <Label>Gas MPRN/serial are optional. When set, the Whole-house cost dashboard card adds your settled daily gas cost (unit + standing charge) to the electric cost, valued from the Octopus account ledger. Gas settles roughly a day in arrears, so today's gas figure is an estimate until then.</Label>
+    </Field>
     <Field id="octopusRegion" type="menu" defaultValue="F">
         <Label>Grid region:</Label>
         <List>

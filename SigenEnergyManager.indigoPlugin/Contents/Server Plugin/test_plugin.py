@@ -181,5 +181,36 @@ class TestDriveVppExport(unittest.TestCase):
         self.assertEqual(len(self._charge_cap_writes(p)), 0)
 
 
+class TestWholeHouseCard(unittest.TestCase):
+    """Plugin._wh_card_from_row — turns a cost-settled daily_history row into the
+    dashboard card dict (v5.31.0). Pure/static, so no Indigo instance needed."""
+
+    SETTLED = {
+        "date": "2026-06-20", "cost_settled": True,
+        "elec_unit_cost_gbp": 0.02, "elec_standing_gbp": 0.62,
+        "gas_unit_cost_gbp": 0.53, "gas_standing_gbp": 0.29,
+        "whole_house_bill_gbp": 1.45, "export_revenue_gbp": 4.42,
+        "wh_net_gbp": 2.97, "covered": True,
+    }
+
+    def test_sums_and_passthrough(self):
+        c = plugin.Plugin._wh_card_from_row(self.SETTLED)
+        self.assertEqual(c["electric_gbp"], 0.64)     # 0.02 + 0.62
+        self.assertEqual(c["gas_gbp"], 0.82)          # 0.53 + 0.29
+        self.assertEqual(c["bill_gbp"], 1.45)
+        self.assertEqual(c["export_gbp"], 4.42)
+        self.assertEqual(c["net_gbp"], 2.97)
+        self.assertTrue(c["covered"])
+        self.assertFalse(c["provisional"])
+        self.assertFalse(c["gas_estimated"])
+
+    def test_unsettled_row_returns_none(self):
+        self.assertIsNone(plugin.Plugin._wh_card_from_row(
+            {"date": "2026-06-21", "grid_export_kwh": 5.0}))
+
+    def test_none_row_returns_none(self):
+        self.assertIsNone(plugin.Plugin._wh_card_from_row(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

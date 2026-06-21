@@ -6,8 +6,20 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        15-06-2026
-# Version:     5.30.1
+# Date:        21-06-2026
+# Version:     5.31.0
+# 5.31.0 — Whole-house cost (gas + electric, incl. standing charges). New
+#   /api/status economics.whole_house block: today (provisional), yesterday
+#   (settled), month-to-date net, days self-funded, account balance and a
+#   30-day bill-vs-export series. A 6-hourly settle pass (_settle_whole_house_costs)
+#   freezes each day's cost into daily_history.json once Octopus settles it,
+#   valued at the rate that applied on the day so a tariff change never re-writes
+#   history. Rates + balance come bill-exact from the Kraken account ledger
+#   (octopus_api.get_account_financials, active:true). Gas valued from settled
+#   m3 consumption via a configurable calorific factor; gas has no live meter so
+#   today's gas is estimated from the latest settled day. New OCTOPUS_GAS_MPRN /
+#   OCTOPUS_GAS_SERIAL secrets + octopusGasMprn / octopusGasSerial / gasKwhPerM3
+#   config fields. Pairs with Dashboards v2.14.0 'Whole-house cost' card.
 # 5.30.1 — Guarantee the full export across ALL PV. Closes a hysteresis gap in 5.30.0:
 #   the band was (target-HYST, target+HYST) and HELD the previous sub-mode, so if PV fell
 #   from above the cap to just below it (surplus in 3.6-4.0 kW) while latched in "bank",
@@ -620,6 +632,14 @@ try:
 except ImportError:
     OCTOPUS_EXPORT_SERIAL = ""
 try:
+    from IndigoSecrets import OCTOPUS_GAS_MPRN
+except ImportError:
+    OCTOPUS_GAS_MPRN = ""
+try:
+    from IndigoSecrets import OCTOPUS_GAS_SERIAL
+except ImportError:
+    OCTOPUS_GAS_SERIAL = ""
+try:
     from IndigoSecrets import AXLE_API_KEY
 except ImportError:
     AXLE_API_KEY = ""
@@ -672,7 +692,7 @@ except ImportError:
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
 from openmeteo_forecast import OpenMeteoForecast
-from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE
+from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, GAS_KWH_PER_M3
 from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
@@ -727,6 +747,7 @@ MANAGER_EVAL_INTERVAL     = 60    # evaluation cadence — independent of poll c
 FORECAST_FETCH_INTERVAL   = 1800  # 30 minutes (Open-Meteo: 10,000 calls/day free)
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
+COST_SETTLE_INTERVAL      = 21600 # 6 hours - backfill settled whole-house costs into daily_history
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
@@ -891,9 +912,11 @@ class Plugin(indigo.PluginBase):
         self.forecast  = None
         self.octopus  = None
         self.manager  = BatteryManager()
-        # Export MPAN/serial — populated by _init_modules
+        # Export + gas MPAN/serial — populated by _init_modules
         self.export_mpan   = ""
         self.export_serial = ""
+        self.gas_mprn      = ""
+        self.gas_serial    = ""
         self.axle     = None
 
         # Indigo trigger registry — populated by triggerStartProcessing/Stop.
@@ -928,6 +951,7 @@ class Plugin(indigo.PluginBase):
         self.store["last_profile"]   = 0.0
         self.store["last_vpp"]            = 0.0
         self.store["last_acc_save"]       = 0.0
+        self.store["last_cost_settle"]    = 0.0
         self.store["last_manager_action"] = ""
         self.store["last_overflow_cap_w"] = 0
 
@@ -1501,6 +1525,10 @@ class Plugin(indigo.PluginBase):
                 "yesterday_date":  yesterday_date,
                 "periods":         periods,
                 "calendar_months": calendar_months,
+                "whole_house":     self._whole_house_summary(
+                    import_rate_p = import_rate_p,
+                    export_rate_p = export_rate_p,
+                ),
             }
 
             return {
@@ -1613,6 +1641,270 @@ class Plugin(indigo.PluginBase):
             "net_today_gbp":      _gbp(net_p),
             "solar_benefit_gbp":  _gbp(benefit_p),
         }
+
+    def _settle_whole_house_costs(self):
+        """Backfill settled whole-house cost fields into daily_history.json rows.
+
+        For each recent day not yet cost-settled, fetch Octopus settled grid-import
+        and gas consumption, value them at the rate in force on that day (the saved
+        rate_today_p for elec; current standing/gas/export rates from the Kraken
+        ledger), compute the whole-house bill, and freeze the row.  Gas is the
+        gating signal — a day only settles once Octopus has its gas data.  Export
+        revenue uses the Sigen-measured daily export (final at midnight, ~0.02%
+        accurate) so it needs no settlement wait.
+        """
+        if not self.octopus:
+            return
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not records:
+            return
+
+        try:
+            fin = self.octopus.get_account_financials()
+        except Exception as exc:
+            self.logger.debug(f"[CostSettle] financials fetch failed: {exc}")
+            return
+        if not fin or not fin.get("elec") or not fin.get("gas"):
+            self.logger.debug("[CostSettle] No ledger rates yet — skipping this cycle")
+            return
+        elec_standing_p = fin["elec"].get("standing_p")
+        fin_elec_unit_p = fin["elec"].get("unit_p")
+        gas_unit_p      = fin["gas"].get("unit_p")
+        gas_standing_p  = fin["gas"].get("standing_p")
+        fin_export_p    = (fin.get("export") or {}).get("unit_p")
+        if None in (elec_standing_p, gas_unit_p, gas_standing_p):
+            self.logger.debug("[CostSettle] Ledger missing standing/gas rates — skipping")
+            return
+
+        by_date = {r.get("date"): r for r in records if r.get("date")}
+        try:
+            import pytz
+            today = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("Europe/London")).date()
+        except ImportError:
+            today = datetime.now().date()
+
+        settled_n = 0
+        for offset in range(1, self.COST_SETTLE_WINDOW_DAYS + 1):
+            date_str = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            rec = by_date.get(date_str)
+            if rec is None or rec.get("cost_settled"):
+                continue
+            try:
+                imp = self.octopus.get_import_kwh_for_date(date_str)
+                gas = self.octopus.get_gas_kwh_for_date(date_str)
+            except Exception as exc:
+                self.logger.debug(f"[CostSettle] consumption fetch error {date_str}: {exc}")
+                continue
+            # Gas gates settlement; import should also be present on a settled day.
+            if not gas or gas.get("kwh") is None:
+                continue
+            if not imp or imp.get("kwh") is None:
+                continue
+
+            # Elec unit rate that applied on this day (saved at midnight); fall
+            # back to the current ledger rate only if the row never captured one.
+            try:
+                elec_unit_p = float(rec.get("rate_today_p"))
+            except (TypeError, ValueError):
+                elec_unit_p = fin_elec_unit_p
+            if elec_unit_p is None:
+                continue
+            try:
+                export_rate_p = float(rec.get("export_rate_p"))
+            except (TypeError, ValueError):
+                export_rate_p = fin_export_p if fin_export_p is not None else 12.0
+
+            import_kwh = float(imp["kwh"])
+            gas_kwh    = float(gas["kwh"])
+            gas_m3     = gas.get("m3")
+            try:
+                export_kwh = float(rec.get("grid_export_kwh", 0.0))
+            except (TypeError, ValueError):
+                export_kwh = 0.0
+
+            elec_unit_cost = import_kwh * elec_unit_p / 100.0
+            elec_standing  = elec_standing_p / 100.0
+            gas_unit_cost  = gas_kwh * gas_unit_p / 100.0
+            gas_standing   = gas_standing_p / 100.0
+            bill           = elec_unit_cost + elec_standing + gas_unit_cost + gas_standing
+            export_rev     = export_kwh * export_rate_p / 100.0
+            net            = export_rev - bill
+
+            rec.update({
+                "import_kwh_octo":      round(import_kwh, 3),
+                "gas_m3":               round(gas_m3, 3) if gas_m3 is not None else None,
+                "gas_kwh":              round(gas_kwh, 3),
+                "elec_unit_cost_gbp":   round(elec_unit_cost, 2),
+                "elec_standing_gbp":    round(elec_standing, 2),
+                "gas_unit_cost_gbp":    round(gas_unit_cost, 2),
+                "gas_standing_gbp":     round(gas_standing, 2),
+                "whole_house_bill_gbp": round(bill, 2),
+                "export_revenue_gbp":   round(export_rev, 2),
+                "wh_net_gbp":           round(net, 2),
+                "covered":              bool(export_rev >= bill),
+                "cost_settled":         True,
+            })
+            settled_n += 1
+
+        if settled_n:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(records, f, indent=2)
+                log(f"[CostSettle] Settled whole-house cost for {settled_n} day(s)")
+            except Exception as e:
+                log(f"[CostSettle] Cannot write daily history: {e}", level="ERROR")
+
+    @staticmethod
+    def _wh_card_from_row(rec):
+        """Build the whole-house card dict from a cost-settled daily_history row."""
+        if not rec or not rec.get("cost_settled"):
+            return None
+        eu = rec.get("elec_unit_cost_gbp") or 0.0
+        es = rec.get("elec_standing_gbp")  or 0.0
+        gu = rec.get("gas_unit_cost_gbp")  or 0.0
+        gs = rec.get("gas_standing_gbp")   or 0.0
+        return {
+            "electric_unit_gbp":     round(eu, 2),
+            "electric_standing_gbp": round(es, 2),
+            "electric_gbp":          round(eu + es, 2),
+            "gas_unit_gbp":          round(gu, 2),
+            "gas_standing_gbp":      round(gs, 2),
+            "gas_gbp":               round(gu + gs, 2),
+            "bill_gbp":              rec.get("whole_house_bill_gbp"),
+            "export_gbp":            rec.get("export_revenue_gbp"),
+            "net_gbp":               rec.get("wh_net_gbp"),
+            "covered":               rec.get("covered"),
+            "provisional":           False,
+            "gas_estimated":         False,
+        }
+
+    def _whole_house_summary(self, import_rate_p, export_rate_p):
+        """Whole-house cost block for /api/status.
+
+        Returns today (provisional), yesterday (settled where available),
+        month-to-date net, days self-funded, account balance and the 30-day
+        bill-vs-export series.  Fields are None when data isn't available yet.
+        """
+        out = {
+            "today": None, "yesterday": None, "yesterday_date": "",
+            "month": None, "self_funded": None, "balance_gbp": None,
+            "series30": [],
+        }
+        try:
+            fin = self.octopus.get_account_financials() if self.octopus else None
+        except Exception:
+            fin = None
+
+        elec_standing_p = gas_unit_p = gas_standing_p = None
+        fin_elec_unit_p = None
+        if fin:
+            out["balance_gbp"] = fin.get("balance_gbp")
+            if fin.get("elec"):
+                elec_standing_p = fin["elec"].get("standing_p")
+                fin_elec_unit_p = fin["elec"].get("unit_p")
+            if fin.get("gas"):
+                gas_unit_p     = fin["gas"].get("unit_p")
+                gas_standing_p = fin["gas"].get("standing_p")
+
+        path = os.path.join(self.data_dir, "daily_history.json")
+        records = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError):
+            records = []
+        by_date  = {r.get("date"): r for r in records if r.get("date")}
+        settled  = [r for r in records if r.get("cost_settled")]
+
+        try:
+            import pytz
+            now_local = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("Europe/London"))
+        except ImportError:
+            now_local = datetime.now()
+        today      = now_local.date()
+        month_pref = today.strftime("%Y-%m")
+
+        # ---- Yesterday (settled row preferred) ----
+        y_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        out["yesterday_date"] = y_str
+        out["yesterday"]      = self._wh_card_from_row(by_date.get(y_str))
+
+        # ---- Gas estimate for today: most recent settled gas_kwh ----
+        gas_today_kwh = None
+        for r in sorted(settled, key=lambda x: x.get("date", ""), reverse=True):
+            if r.get("gas_kwh") is not None:
+                try:
+                    gas_today_kwh = float(r["gas_kwh"])
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        # ---- Today (provisional) ----
+        elec_unit_p_today = import_rate_p if import_rate_p is not None else fin_elec_unit_p
+        if elec_standing_p is not None and gas_standing_p is not None and gas_unit_p is not None:
+            try:
+                imp_kwh = float(self.store.get("grid_import_daily_kwh", 0.0))
+                exp_kwh = float(self.store.get("grid_export_daily_kwh", 0.0))
+            except (TypeError, ValueError):
+                imp_kwh = exp_kwh = 0.0
+            eu = (imp_kwh * elec_unit_p_today / 100.0) if elec_unit_p_today is not None else 0.0
+            es = elec_standing_p / 100.0
+            gu = (gas_today_kwh * gas_unit_p / 100.0) if gas_today_kwh is not None else 0.0
+            gs = gas_standing_p / 100.0
+            bill = eu + es + gu + gs
+            exp  = exp_kwh * (export_rate_p if export_rate_p else 12.0) / 100.0
+            out["today"] = {
+                "electric_unit_gbp":     round(eu, 2),
+                "electric_standing_gbp": round(es, 2),
+                "electric_gbp":          round(eu + es, 2),
+                "gas_unit_gbp":          round(gu, 2),
+                "gas_standing_gbp":      round(gs, 2),
+                "gas_gbp":               round(gu + gs, 2),
+                "bill_gbp":              round(bill, 2),
+                "export_gbp":            round(exp, 2),
+                "net_gbp":               round(exp - bill, 2),
+                "covered":               bool(exp >= bill),
+                "provisional":           True,
+                "gas_estimated":         gas_today_kwh is not None,
+            }
+
+        # ---- Month to date (settled rows this month) ----
+        m_rows = [r for r in settled if (r.get("month") == month_pref
+                                         or str(r.get("date", "")).startswith(month_pref))]
+        if m_rows:
+            bill_sum = sum(float(r.get("whole_house_bill_gbp") or 0.0) for r in m_rows)
+            exp_sum  = sum(float(r.get("export_revenue_gbp")   or 0.0) for r in m_rows)
+            covered_days = sum(1 for r in m_rows if r.get("covered"))
+            out["month"] = {
+                "bill_gbp":   round(bill_sum, 2),
+                "export_gbp": round(exp_sum, 2),
+                "net_gbp":    round(exp_sum - bill_sum, 2),
+                "in_credit":  bool(exp_sum >= bill_sum),
+                "days":       len(m_rows),
+            }
+            out["self_funded"] = {
+                "covered_days": covered_days,
+                "settled_days": len(m_rows),
+            }
+
+        # ---- 30-day bill-vs-export series ----
+        recent = sorted(settled, key=lambda x: x.get("date", ""))[-30:]
+        out["series30"] = [
+            {
+                "date":   r.get("date"),
+                "bill":   round(float(r.get("whole_house_bill_gbp") or 0.0), 2),
+                "export": round(float(r.get("export_revenue_gbp")   or 0.0), 2),
+            }
+            for r in recent
+        ]
+        return out
 
     def _period_economics_summary(self, export_rate_p, fallback_import_rate_p):
         """Roll up weekly / monthly / yearly economics from daily_history.json.
@@ -1998,6 +2290,7 @@ class Plugin(indigo.PluginBase):
     # callbacks, etc.) don't hammer the Octopus API.
     EXPORT_SYNC_WINDOW_DAYS    = 7
     EXPORT_SYNC_SETTLE_DAYS    = 3
+    COST_SETTLE_WINDOW_DAYS    = 5   # attempt to settle whole-house cost for the last N days
     EXPORT_SYNC_TOLERANCE_PCT  = 5.0
     EXPORT_SYNC_MIN_DAY_KWH    = 0.5    # below this daily total the % is noise, skip drift check
     EXPORT_SYNC_CACHE_TTL      = 6 * 3600   # 6 h — re-check four times/day at most
@@ -2379,6 +2672,11 @@ class Plugin(indigo.PluginBase):
             if now - self.store["last_profile"] >= OCTOPUS_PROFILE_INTERVAL:
                 self._refresh_consumption_profile()
                 self.store["last_profile"] = now
+
+            # 5b. Whole-house cost settle (every 6h — backfill settled gas/import/cost)
+            if now - self.store.get("last_cost_settle", 0.0) >= COST_SETTLE_INTERVAL:
+                self._settle_whole_house_costs()
+                self.store["last_cost_settle"] = now
 
             # 6. VPP polling (adaptive)
             vpp_interval = self._vpp_poll_interval()
@@ -5776,6 +6074,8 @@ class Plugin(indigo.PluginBase):
             ("OCTOPUS_SERIAL",        OCTOPUS_SERIAL),
             ("OCTOPUS_EXPORT_MPAN",   OCTOPUS_EXPORT_MPAN),
             ("OCTOPUS_EXPORT_SERIAL", OCTOPUS_EXPORT_SERIAL),
+            ("OCTOPUS_GAS_MPRN",      OCTOPUS_GAS_MPRN),
+            ("OCTOPUS_GAS_SERIAL",    OCTOPUS_GAS_SERIAL),
             ("AXLE_API_KEY",          AXLE_API_KEY),
             ("PUSHOVER_USER_TOKEN",   PUSHOVER_USER_TOKEN),
             ("SIGENERGY_IP",        SIGENERGY_IP),
@@ -5950,6 +6250,15 @@ class Plugin(indigo.PluginBase):
         # Optional: if blank, the export-sync feature is silently disabled.
         self.export_mpan   = OCTOPUS_EXPORT_MPAN   or prefs.get("octopusExportMpan", "")
         self.export_serial = OCTOPUS_EXPORT_SERIAL or prefs.get("octopusExportSerial", "")
+        self.gas_mprn      = OCTOPUS_GAS_MPRN       or prefs.get("octopusGasMprn", "")
+        self.gas_serial    = OCTOPUS_GAS_SERIAL     or prefs.get("octopusGasSerial", "")
+        # Gas m3->kWh calorific factor (override on the bill's exact figure).
+        try:
+            gas_kwh_per_m3 = float(prefs.get("gasKwhPerM3", "") or 0.0)
+        except (TypeError, ValueError):
+            gas_kwh_per_m3 = 0.0
+        if gas_kwh_per_m3 <= 0:
+            gas_kwh_per_m3 = GAS_KWH_PER_M3
 
         axle_key   = AXLE_API_KEY or prefs.get("axleApiKey", "")
 
@@ -6030,6 +6339,11 @@ class Plugin(indigo.PluginBase):
             region=region,
             data_dir=self.data_dir,
             logger=self.logger,
+            gas_mprn=self.gas_mprn,
+            gas_serial=self.gas_serial,
+            export_mpan=self.export_mpan,
+            export_serial=self.export_serial,
+            gas_kwh_per_m3=gas_kwh_per_m3,
         )
 
         # Axle VPP
