@@ -7,7 +7,14 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        22-06-2026
-# Version:     5.31.5
+# Version:     5.31.6
+# 5.31.6 — Solar card data: /api/status solar block now also carries
+#   actual_today_kwh, peak_w + peak_time (new daily peak-PV tracking, mirrors
+#   peak_soc — init/update/midnight-reset/persist), lifetime_kwh and total_kwp.
+#   Feeds the new Dashboards Solar card (today vs forecast, now/peak, tomorrow,
+#   yield/kWp, self-sufficiency, forecast accuracy, lifetime). Per-array forecast
+#   + measured per-string DEFERRED to a daylight probe (PV=0 at night; inverter
+#   reports a '4' count at reg 31025-ish, promising for 4 PV inputs). 179 tests.
 # 5.31.5 — Whole-house cost: an unsettled recent day (Yesterday before its gas
 #   settles) now shows a PROVISIONAL card from the row's Sigen-measured
 #   import/export (complete at midnight) + estimated gas, instead of a blank
@@ -1019,6 +1026,8 @@ class Plugin(indigo.PluginBase):
         self.store["home_daily_kwh"]            = 0.0
         self.store["peak_soc"]                  = 0.0
         self.store["min_soc"]                   = 100.0
+        self.store["peak_pv_w"]                 = 0
+        self.store["peak_pv_time"]              = ""
         self.store["today_date"]                = datetime.now().strftime("%Y-%m-%d")
         # Lifetime total anchors for daily delta computation (set on first Modbus read)
         self.store["pv_lifetime_start_kwh"]     = None
@@ -1610,6 +1619,11 @@ class Plugin(indigo.PluginBase):
                     "tomorrow_surplus_kwh":  round(tomorrow_surplus, 1),
                     "tomorrow_revenue_gbp":  tomorrow_revenue_gbp,
                     "export_rate_p":         round(export_rate_p, 2),
+                    "actual_today_kwh":      round(self.store.get("pv_daily_kwh", 0.0), 2),
+                    "peak_w":                self.store.get("peak_pv_w", 0),
+                    "peak_time":             self.store.get("peak_pv_time", ""),
+                    "lifetime_kwh":          inv.get("pvLifetimeKwh"),
+                    "total_kwp":             self._total_kwp(),
                 },
                 "grid": {
                     "power_w": grid_w,
@@ -1847,6 +1861,15 @@ class Plugin(indigo.PluginBase):
                 log(f"[CostSettle] Settled whole-house cost for {settled_n} day(s)")
             except Exception as e:
                 log(f"[CostSettle] Cannot write daily history: {e}", level="ERROR")
+
+    def _total_kwp(self):
+        """Sum of configured PV array peak power (kWp) — for the solar yield figure."""
+        try:
+            if self.forecast and getattr(self.forecast, "arrays", None):
+                return round(sum(float(a.get("kwp", 0)) for a in self.forecast.arrays), 2)
+        except Exception:
+            pass
+        return 0.0
 
     @staticmethod
     def _wh_card_from_row(rec):
@@ -3032,6 +3055,15 @@ class Plugin(indigo.PluginBase):
             self.store["peak_soc"] = soc
         if soc < self.store["min_soc"]:
             self.store["min_soc"] = soc
+
+        # --- Peak PV tracking (max generation today + the time it hit) ---
+        try:
+            pv_w = int(data.get("pvPowerWatts", 0) or 0)
+        except (TypeError, ValueError):
+            pv_w = 0
+        if pv_w > self.store.get("peak_pv_w", 0):
+            self.store["peak_pv_w"]    = pv_w
+            self.store["peak_pv_time"] = datetime.now().strftime("%H:%M")
 
     # ================================================================
     # Manager Evaluation
@@ -4956,6 +4988,8 @@ class Plugin(indigo.PluginBase):
         self.store["home_daily_kwh"]            = 0.0
         self.store["peak_soc"]                  = 0.0
         self.store["min_soc"]                   = 100.0
+        self.store["peak_pv_w"]                 = 0
+        self.store["peak_pv_time"]              = ""
         self.store["today_date"]                = today
         # Clear lifetime anchors — next poll will re-snapshot at the new day's baseline
         self.store["pv_lifetime_start_kwh"]     = None
@@ -6616,6 +6650,8 @@ class Plugin(indigo.PluginBase):
             "home_daily_kwh":            self.store["home_daily_kwh"],
             "peak_soc":                  self.store["peak_soc"],
             "min_soc":                   self.store["min_soc"],
+            "peak_pv_w":                 self.store.get("peak_pv_w", 0),
+            "peak_pv_time":              self.store.get("peak_pv_time", ""),
             "today_date":                self.store["today_date"],
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
@@ -6645,6 +6681,8 @@ class Plugin(indigo.PluginBase):
                 self.store["home_daily_kwh"]            = data.get("home_daily_kwh", 0.0)
                 self.store["peak_soc"]                  = data.get("peak_soc", 0.0)
                 self.store["min_soc"]                   = data.get("min_soc", 100.0)
+                self.store["peak_pv_w"]                 = data.get("peak_pv_w", 0)
+                self.store["peak_pv_time"]              = data.get("peak_pv_time", "")
                 self.store["today_date"]                = today
                 # Restore lifetime anchors so delta computation continues correctly
                 self.store["pv_lifetime_start_kwh"]     = data.get("pv_lifetime_start_kwh")
