@@ -366,9 +366,19 @@ class TestWholeHouseSummary(unittest.TestCase):
     def test_empty_history_safe(self):
         out = self._summary([])
         self.assertIsNone(out["yesterday"])
+        self.assertIsNone(out["day_before"])
         self.assertIsNone(out["month"])
         self.assertEqual(out["series30"], [])
         self.assertEqual(out["balance_gbp"], 392.39)
+
+    def test_day_before(self):
+        from datetime import timedelta
+        d2 = (_london_today() - timedelta(days=2)).strftime("%Y-%m-%d")
+        out = self._summary([self._settled_row(d2, 1.30, 3.00, True)])
+        self.assertEqual(out["day_before_date"], d2)
+        self.assertIsNotNone(out["day_before"])
+        self.assertEqual(out["day_before"]["bill_gbp"], 1.30)
+        self.assertFalse(out["day_before"]["provisional"])
 
 
 class TestWholeHouseEdges(unittest.TestCase):

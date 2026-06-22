@@ -7,7 +7,11 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        22-06-2026
-# Version:     5.31.3
+# Version:     5.31.4
+# 5.31.4 — Whole-house cost: /api/status now also exposes `day_before` +
+#   `day_before_date` (the settled day before yesterday) so the dashboard can
+#   show Today / Yesterday / Day-before. Reliably complete given the ~1-day
+#   settlement lag. +1 test (178). Pairs with Dashboards v2.14.3.
 # 5.31.3 — Whole-house cost: don't freeze a partially-settled day. The settle
 #   pass gated only on "gas data present", so the most recent day (Octopus
 #   settles ~a day in arrears, often just the first 1-2 half-hour slots past
@@ -1869,6 +1873,7 @@ class Plugin(indigo.PluginBase):
         """
         out = {
             "today": None, "yesterday": None, "yesterday_date": "",
+            "day_before": None, "day_before_date": "",
             "month": None, "self_funded": None, "balance_gbp": None,
             "series30": [],
         }
@@ -1923,6 +1928,11 @@ class Plugin(indigo.PluginBase):
         y_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
         out["yesterday_date"] = y_str
         out["yesterday"]      = self._wh_card_from_row(by_date.get(y_str))
+
+        # ---- Day before yesterday (settled — reliably complete given the lag) ----
+        d2_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+        out["day_before_date"] = d2_str
+        out["day_before"]      = self._wh_card_from_row(by_date.get(d2_str))
 
         # ---- Gas estimate for today: most recent settled gas_kwh within the
         # last 7 days (don't estimate today's gas off a stale fortnight-old day).
