@@ -214,19 +214,20 @@ class TestWholeHouseCard(unittest.TestCase):
 
 # ---- Helpers for the settle / summary tests (build Plugin without __init__) ----
 class _FakeOcto:
-    def __init__(self, fin="default", gas=("default")):
+    def __init__(self, fin="default", gas="default", slots=48):
         self._fin = {
             "elec":   {"standing_p": 61.51824, "unit_p": 23.478},
             "gas":    {"unit_p": 6.58413, "standing_p": 29.06169},
             "export": {"unit_p": 12.0}, "balance_gbp": 392.39,
         } if fin == "default" else fin
-        self._gas = {"m3": 0.716, "kwh": 8.03, "slots": 48} if gas == "default" else gas
+        self._slots = slots
+        self._gas = {"m3": 0.716, "kwh": 8.03, "slots": slots} if gas == "default" else gas
 
     def get_account_financials(self, force=False):
         return self._fin
 
     def get_import_kwh_for_date(self, d):
-        return {"kwh": 0.066, "slots": 48}
+        return {"kwh": 0.066, "slots": self._slots}
 
     def get_gas_kwh_for_date(self, d):
         return self._gas
@@ -298,6 +299,20 @@ class TestSettleWholeHouseCosts(unittest.TestCase):
         r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}],
                       _FakeOcto(fin=None))[d1]
         self.assertFalse(r.get("cost_settled", False))
+
+    def test_partial_day_not_frozen(self):
+        # Octopus has only the first hour of the day (2 of 48 half-hour slots) —
+        # must NOT freeze a near-zero bill (the 21-Jun-2026 premature-settle bug).
+        d1 = self._yesterday()
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}],
+                      _FakeOcto(slots=2))[d1]
+        self.assertFalse(r.get("cost_settled", False))
+
+    def test_complete_day_freezes(self):
+        d1 = self._yesterday()
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}],
+                      _FakeOcto(slots=48))[d1]
+        self.assertTrue(r["cost_settled"])
 
 
 class TestWholeHouseSummary(unittest.TestCase):

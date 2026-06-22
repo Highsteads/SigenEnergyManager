@@ -6,8 +6,16 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        21-06-2026
-# Version:     5.31.2
+# Date:        22-06-2026
+# Version:     5.31.3
+# 5.31.3 — Whole-house cost: don't freeze a partially-settled day. The settle
+#   pass gated only on "gas data present", so the most recent day (Octopus
+#   settles ~a day in arrears, often just the first 1-2 half-hour slots past
+#   midnight) was frozen with a near-zero bill PERMANENTLY (cost_settled). Now
+#   requires COST_SETTLE_MIN_SLOTS (46 of 48 half-hours) for BOTH import and gas
+#   before freezing; the 21-Jun-2026 premature row was un-settled to re-settle
+#   when complete. +2 tests (177 pass). Pairs with Dashboards v2.14.2 (Chart.js
+#   "Canvas already in use" fix on the 30-day bar).
 # 5.31.2 — Whole-house cost deep-review medium/low batch: atomic daily_history.json
 #   writes (_atomic_write_json — temp + fsync + os.replace, both settle and
 #   midnight writers, so a crash can't truncate the never-pruned history);
@@ -1751,6 +1759,13 @@ class Plugin(indigo.PluginBase):
                 continue
             if not imp or imp.get("kwh") is None:
                 continue
+            # Only freeze a (near-)complete day. Octopus settles ~a day in
+            # arrears, so the most recent day often has just the first hour or
+            # two of half-hour slots — freezing that would lock in a near-zero
+            # bill permanently (cost_settled). Wait until the day is whole.
+            if (imp.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS
+                    or gas.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS):
+                continue
 
             # Elec unit rate that applied on this day (saved at midnight); fall
             # back to the current ledger rate only if the row never captured one.
@@ -2368,6 +2383,7 @@ class Plugin(indigo.PluginBase):
     EXPORT_SYNC_WINDOW_DAYS    = 7
     EXPORT_SYNC_SETTLE_DAYS    = 3
     COST_SETTLE_WINDOW_DAYS    = 5   # attempt to settle whole-house cost for the last N days
+    COST_SETTLE_MIN_SLOTS      = 46  # require a (near-)complete day (48 half-hours) before freezing
     EXPORT_SYNC_TOLERANCE_PCT  = 5.0
     EXPORT_SYNC_MIN_DAY_KWH    = 0.5    # below this daily total the % is noise, skip drift check
     EXPORT_SYNC_CACHE_TTL      = 6 * 3600   # 6 h — re-check four times/day at most
