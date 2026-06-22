@@ -7,7 +7,15 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        22-06-2026
-# Version:     5.31.4
+# Version:     5.31.5
+# 5.31.5 — Whole-house cost: an unsettled recent day (Yesterday before its gas
+#   settles) now shows a PROVISIONAL card from the row's Sigen-measured
+#   import/export (complete at midnight) + estimated gas, instead of a blank
+#   "awaiting settlement". Electric + export are accurate; only gas is estimated
+#   until Octopus settles, then the frozen settled row takes over. New
+#   _wh_build_card / _wh_provisional_from_row helpers (today now uses the shared
+#   builder too). +1 test (179). Pairs with Dashboards v2.14.6 (tag flips
+#   settled<->provisional).
 # 5.31.4 — Whole-house cost: /api/status now also exposes `day_before` +
 #   `day_before_date` (the settled day before yesterday) so the dashboard can
 #   show Today / Yesterday / Day-before. Reliably complete given the ~1-day
@@ -1864,6 +1872,55 @@ class Plugin(indigo.PluginBase):
             "gas_estimated":         False,
         }
 
+    @staticmethod
+    def _wh_build_card(import_kwh, export_kwh, elec_unit_p, export_rate_p,
+                       elec_standing_p, gas_kwh, gas_unit_p, gas_standing_p,
+                       provisional, gas_estimated):
+        """Assemble a whole-house card dict from kWh + rates (None-safe)."""
+        eu = (import_kwh * elec_unit_p / 100.0) if (import_kwh is not None and elec_unit_p is not None) else 0.0
+        es = (elec_standing_p / 100.0) if elec_standing_p is not None else 0.0
+        gu = (gas_kwh * gas_unit_p / 100.0) if (gas_kwh is not None and gas_unit_p is not None) else 0.0
+        gs = (gas_standing_p / 100.0) if gas_standing_p is not None else 0.0
+        bill = eu + es + gu + gs
+        exp  = (export_kwh or 0.0) * (export_rate_p if export_rate_p else 12.0) / 100.0
+        return {
+            "electric_unit_gbp":     round(eu, 2),
+            "electric_standing_gbp": round(es, 2),
+            "electric_gbp":          round(eu + es, 2),
+            "gas_unit_gbp":          round(gu, 2),
+            "gas_standing_gbp":      round(gs, 2),
+            "gas_gbp":               round(gu + gs, 2),
+            "bill_gbp":              round(bill, 2),
+            "export_gbp":            round(exp, 2),
+            "net_gbp":               round(exp - bill, 2),
+            "covered":               bool(exp >= bill),
+            "provisional":           provisional,
+            "gas_estimated":         gas_estimated,
+        }
+
+    def _wh_provisional_from_row(self, rec, elec_standing_p, gas_unit_p,
+                                 gas_standing_p, gas_est_kwh, fin_elec_unit_p):
+        """Provisional card for a not-yet-settled recent day, from the row's
+        Sigen-measured import/export (complete at midnight) plus an estimated gas
+        figure.  Electric and export are accurate; only gas is an estimate until
+        Octopus settles the day, at which point the settled row takes over."""
+        def _f(v, d=None):
+            try:
+                return float(v) if v is not None else d
+            except (TypeError, ValueError):
+                return d
+        imp_kwh       = _f(rec.get("grid_import_kwh"), 0.0)
+        exp_kwh       = _f(rec.get("grid_export_kwh"), 0.0)
+        elec_unit_p   = _f(rec.get("rate_today_p"), fin_elec_unit_p)
+        export_rate_p = _f(rec.get("export_rate_p"), 12.0)
+        es_p          = _f(rec.get("elec_standing_p_day"), elec_standing_p)
+        gu_p          = _f(rec.get("gas_unit_p_day"), gas_unit_p)
+        gs_p          = _f(rec.get("gas_standing_p_day"), gas_standing_p)
+        return self._wh_build_card(imp_kwh, exp_kwh, elec_unit_p, export_rate_p,
+                                   es_p, gas_est_kwh, gu_p, gs_p,
+                                   provisional=True,
+                                   gas_estimated=(gas_est_kwh is not None))
+
     def _whole_house_summary(self, import_rate_p, export_rate_p):
         """Whole-house cost block for /api/status.
 
@@ -1924,31 +1981,43 @@ class Plugin(indigo.PluginBase):
         today      = now_local.date()
         month_pref = today.strftime("%Y-%m")
 
-        # ---- Yesterday (settled row preferred) ----
-        y_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        out["yesterday_date"] = y_str
-        out["yesterday"]      = self._wh_card_from_row(by_date.get(y_str))
-
-        # ---- Day before yesterday (settled — reliably complete given the lag) ----
-        d2_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
-        out["day_before_date"] = d2_str
-        out["day_before"]      = self._wh_card_from_row(by_date.get(d2_str))
-
-        # ---- Gas estimate for today: most recent settled gas_kwh within the
-        # last 7 days (don't estimate today's gas off a stale fortnight-old day).
-        gas_today_kwh = None
+        # ---- Gas estimate: most recent settled gas_kwh within the last 7 days,
+        # used for any day whose gas hasn't settled yet (today + recent days). ----
+        gas_est_kwh = None
         gas_cutoff = (today - timedelta(days=7)).strftime("%Y-%m-%d")
         for r in sorted(settled, key=lambda x: x.get("date", ""), reverse=True):
             if r.get("date", "") < gas_cutoff:
                 break
             if r.get("gas_kwh") is not None:
                 try:
-                    gas_today_kwh = float(r["gas_kwh"])
+                    gas_est_kwh = float(r["gas_kwh"])
                     break
                 except (TypeError, ValueError):
                     continue
 
-        # ---- Today (provisional) ----
+        def _day_card(date_str):
+            """Settled row if frozen, else a provisional card from the row's
+            Sigen-measured import/export (complete at midnight) + estimated gas —
+            so yesterday shows accurate electric + export while gas still settles."""
+            rec = by_date.get(date_str)
+            settled_card = self._wh_card_from_row(rec)
+            if settled_card:
+                return settled_card
+            if rec is None:
+                return None
+            return self._wh_provisional_from_row(
+                rec, elec_standing_p, gas_unit_p, gas_standing_p,
+                gas_est_kwh, fin_elec_unit_p)
+
+        # ---- Yesterday + day before ----
+        y_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        out["yesterday_date"] = y_str
+        out["yesterday"]      = _day_card(y_str)
+        d2_str = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+        out["day_before_date"] = d2_str
+        out["day_before"]      = _day_card(d2_str)
+
+        # ---- Today (provisional, from live Sigen totals) ----
         elec_unit_p_today = import_rate_p if import_rate_p is not None else fin_elec_unit_p
         if elec_standing_p is not None and gas_standing_p is not None and gas_unit_p is not None:
             try:
@@ -1956,26 +2025,10 @@ class Plugin(indigo.PluginBase):
                 exp_kwh = float(self.store.get("grid_export_daily_kwh", 0.0))
             except (TypeError, ValueError):
                 imp_kwh = exp_kwh = 0.0
-            eu = (imp_kwh * elec_unit_p_today / 100.0) if elec_unit_p_today is not None else 0.0
-            es = elec_standing_p / 100.0
-            gu = (gas_today_kwh * gas_unit_p / 100.0) if gas_today_kwh is not None else 0.0
-            gs = gas_standing_p / 100.0
-            bill = eu + es + gu + gs
-            exp  = exp_kwh * (export_rate_p if export_rate_p else 12.0) / 100.0
-            out["today"] = {
-                "electric_unit_gbp":     round(eu, 2),
-                "electric_standing_gbp": round(es, 2),
-                "electric_gbp":          round(eu + es, 2),
-                "gas_unit_gbp":          round(gu, 2),
-                "gas_standing_gbp":      round(gs, 2),
-                "gas_gbp":               round(gu + gs, 2),
-                "bill_gbp":              round(bill, 2),
-                "export_gbp":            round(exp, 2),
-                "net_gbp":               round(exp - bill, 2),
-                "covered":               bool(exp >= bill),
-                "provisional":           True,
-                "gas_estimated":         gas_today_kwh is not None,
-            }
+            out["today"] = self._wh_build_card(
+                imp_kwh, exp_kwh, elec_unit_p_today, export_rate_p,
+                elec_standing_p, gas_est_kwh, gas_unit_p, gas_standing_p,
+                provisional=True, gas_estimated=(gas_est_kwh is not None))
 
         # ---- Month to date (settled rows this month) ----
         m_rows = [r for r in settled if (r.get("month") == month_pref

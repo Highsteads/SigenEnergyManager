@@ -380,6 +380,20 @@ class TestWholeHouseSummary(unittest.TestCase):
         self.assertEqual(out["day_before"]["bill_gbp"], 1.30)
         self.assertFalse(out["day_before"]["provisional"])
 
+    def test_yesterday_provisional_when_unsettled(self):
+        # Row exists (written at midnight) but Octopus hasn't settled it yet —
+        # show a provisional card from Sigen import/export, not a blank.
+        from datetime import timedelta
+        y = (_london_today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        out = self._summary([{"date": y, "month": y[:7], "grid_import_kwh": 0.07,
+                              "grid_export_kwh": 36.0, "rate_today_p": 23.478,
+                              "export_rate_p": 12.0}])
+        c = out["yesterday"]
+        self.assertIsNotNone(c)                       # not blank
+        self.assertTrue(c["provisional"])
+        self.assertEqual(c["electric_standing_gbp"], 0.62)   # ledger standing
+        self.assertAlmostEqual(c["export_gbp"], 4.32, delta=0.01)  # 36 kWh x 12p
+
 
 class TestWholeHouseEdges(unittest.TestCase):
     """covered== boundary and _wh_card_from_row partial-row coalescing."""
