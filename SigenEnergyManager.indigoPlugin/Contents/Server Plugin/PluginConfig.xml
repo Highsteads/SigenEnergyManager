@@ -211,6 +211,23 @@
         <Label>During quiet hours, INFO-level (non-emergency) Pushover alerts are suppressed. HIGH-priority alerts (storm amber/red, VPP release failure) always fire regardless.</Label>
     </Field>
 
+    <Field id="separator_powercut" type="separator"/>
+    <Field id="label_powercut" type="label">
+        <Label>POWER-CUT NOTIFICATIONS</Label>
+    </Field>
+    <Field id="label_powercut_info" type="label">
+        <Label>When the inverter reports the grid has been lost (the house islands onto the battery) and again when mains power is restored, send an alert. The Pushover alert uses the settings above and is sent at normal priority, so it respects quiet hours. Email is sent via the Email+ SMTP device. Note: a longer outage may also take your broadband down, in which case the alert is delivered once connectivity returns.</Label>
+    </Field>
+    <Field id="powerCutNotify" type="checkbox" defaultValue="true">
+        <Label>Notify on grid lost / restored:</Label>
+    </Field>
+    <Field id="powerCutEmailRecipient" type="textfield" defaultValue="">
+        <Label>Email recipient:</Label>
+    </Field>
+    <Field id="powerCutEmailInfo" type="label">
+        <Label>Email recipient address. IndigoSecrets.py (POWERCUT_EMAIL) takes priority over this field. Leave both blank to send Pushover only.</Label>
+    </Field>
+
     <Field id="separator_dashboard" type="separator"/>
     <Field id="label_dashboard" type="label">
         <Label>WEB DASHBOARD</Label>

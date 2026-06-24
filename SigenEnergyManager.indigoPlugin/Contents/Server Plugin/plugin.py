@@ -7,7 +7,14 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        24-06-2026
-# Version:     5.32.0
+# Version:     5.33.0
+# 5.33.0 — Power-cut notifications. When the inverter reports the grid has been lost
+#   (the house islands onto the battery) and again when mains power is restored, send a
+#   Pushover alert (normal priority, so it respects the configured quiet hours) and an
+#   email. Recipient resolves IndigoSecrets.POWERCUT_EMAIL first, then the new
+#   powerCutEmailRecipient pref; toggle via powerCutNotify (default on). Both sends are
+#   best-effort and never break the poll loop — note a longer outage may also drop the
+#   broadband, in which case the alert lands once connectivity returns.
 # 5.32.0 — Single source of truth for the flood-export gate. battery_manager gains
 #   _compute_flood_preview (pure, no daytime guard, no side effects) — the ONE place the
 #   gate math now lives; _check_flood_prevention consumes it (control behaviour unchanged,
@@ -706,6 +713,10 @@ try:
     from IndigoSecrets import PUSHOVER_USER_TOKEN
 except ImportError:
     PUSHOVER_USER_TOKEN = ""
+try:
+    from IndigoSecrets import POWERCUT_EMAIL
+except ImportError:
+    POWERCUT_EMAIL = ""
 try:
     from IndigoSecrets import SIGENERGY_IP
 except ImportError:
@@ -2928,6 +2939,7 @@ class Plugin(indigo.PluginBase):
                 self.store["power_cut_events"] = self.store["power_cut_events"][-100:]
             log(f"[PowerCut] Grid lost — entering {new_grid_status} mode",
                 level="WARNING")
+            self._send_power_cut_notification("lost", detail=new_grid_status)
         elif prev_grid_status != "On-grid" and new_grid_status == "On-grid":
             # Outage ended
             started = self.store.get("power_cut_started_at")
@@ -2957,6 +2969,7 @@ class Plugin(indigo.PluginBase):
                 level="WARNING",
             )
             self._trigger_event("powerCutLockoutStarted")
+            self._send_power_cut_notification("restored", detail=duration_str)
         self.store["grid_status_prev"] = new_grid_status
 
         # Update daily energy accumulators
@@ -3547,6 +3560,55 @@ class Plugin(indigo.PluginBase):
                 log("[Pushover] plugin not enabled — alert not sent", level="ERROR")
         except Exception as exc:
             log(f"[Pushover] send failed: {exc}", level="ERROR")
+
+    def _resolve_powercut_email(self):
+        """Return the power-cut email recipient, preferring IndigoSecrets.py
+        (POWERCUT_EMAIL) over the powerCutEmailRecipient PluginConfig field.
+        Returns '' when neither is set (email is then skipped)."""
+        return (POWERCUT_EMAIL or self.pluginPrefs.get("powerCutEmailRecipient", "") or "").strip()
+
+    def _send_power_cut_notification(self, kind, detail=""):
+        """Alert on a grid-status transition via Pushover + email.
+
+        kind     — "lost" when mains power drops (house islands onto the battery)
+                   or "restored" when it returns.
+        detail   — the off-grid mode string on loss (e.g. "Off-grid (auto)"), or
+                   the pre-formatted duration suffix on restoration (e.g.
+                   " (duration 83s)") as built by the caller.
+
+        Pushover is sent at normal priority so it honours the configured quiet
+        hours. Both sends are best-effort: a failure (most likely when the outage
+        also took the broadband down) is logged and swallowed so the poll loop
+        never dies — the alert then lands once connectivity returns.
+        """
+        if not self.pluginPrefs.get("powerCutNotify", True):
+            return
+
+        local_now = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+        if kind == "lost":
+            title   = "Power cut — grid lost"
+            message = (f"Mains power lost at {local_now}. The house is now running "
+                       f"on the Sigenergy battery ({detail}).")
+        else:
+            title   = "Power restored"
+            message = f"Mains power restored at {local_now}{detail}."
+
+        # Pushover — normal priority, so quiet hours are respected.
+        try:
+            self._send_pushover(title, message, priority="0")
+        except Exception as exc:
+            log(f"[PowerCut] Pushover notify failed: {exc}", level="WARNING")
+
+        # Email via the Email+ SMTP device (best-effort — needs connectivity).
+        recipient = self._resolve_powercut_email()
+        if recipient:
+            try:
+                indigo.server.sendEmailTo(recipient, subject=title, body=message)
+                log(f"[PowerCut] Email sent to {recipient}")
+            except Exception as exc:
+                log(f"[PowerCut] Email to {recipient} failed: {exc}", level="WARNING")
+        else:
+            log("[PowerCut] No email recipient configured — email step skipped")
 
     def _check_storm_watch(self):
         """
