@@ -227,6 +227,12 @@
     <Field id="powerCutEmailInfo" type="label">
         <Label>Email recipient address. IndigoSecrets.py (POWERCUT_EMAIL) takes priority over this field. Leave both blank to send Pushover only.</Label>
     </Field>
+    <Field id="powerCutLockoutSocFloor" type="textfield" defaultValue="85">
+        <Label>Export lockout SOC floor (%):</Label>
+    </Field>
+    <Field id="powerCutLockoutSocFloorInfo" type="label">
+        <Label>After the grid is restored, export is held off for a few hours as a precaution — but only while the battery is below this percentage. At or above it, export resumes so flood-prevention can shed surplus and a near-full battery doesn't reach 100% and clip solar. Default 85.</Label>
+    </Field>
 
     <Field id="separator_dashboard" type="separator"/>
     <Field id="label_dashboard" type="label">

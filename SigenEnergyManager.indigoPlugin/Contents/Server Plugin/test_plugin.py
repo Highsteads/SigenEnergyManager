@@ -89,6 +89,19 @@ class TestConfigCoercion(unittest.TestCase):
     def test_as_int_garbage_returns_fallback(self):
         self.assertEqual(plugin._as_int("port", 8080), 8080)
 
+    # --- _num_state: real number stored + decimalPlaces hint, no uiValue ---
+    def test_num_state_rounds_value_with_dp(self):
+        st = plugin._num_state("batterySoc", 99.59999999999999, 1)
+        self.assertEqual(st["key"], "batterySoc")
+        self.assertEqual(st["value"], 99.6)
+        self.assertEqual(st["decimalPlaces"], 1)
+        self.assertNotIn("uiValue", st)               # avoids a <state>_ui history column
+
+    def test_num_state_guards_bad_value(self):
+        st = plugin._num_state("x", None, 2)
+        self.assertEqual(st["value"], 0.0)
+        self.assertEqual(st["decimalPlaces"], 2)
+
 
 class TestDriveVppExport(unittest.TestCase):
     """_drive_vpp_export sub-mode decision: bank-surplus (mode 0x02 + charge cap)
@@ -463,6 +476,27 @@ class TestPowerCutExportLockoutSocFloor(unittest.TestCase):
 
     def test_default_floor_is_85(self):
         self.assertEqual(plugin.POWER_CUT_LOCKOUT_SOC_FLOOR, 85.0)
+
+
+class TestLockoutSocFloorPref(unittest.TestCase):
+    """v5.35.0: the SOC floor is configurable (powerCutLockoutSocFloor), guarded."""
+
+    class _Stub:
+        def __init__(self, prefs):
+            self.pluginPrefs = prefs
+
+    def _floor(self, prefs):
+        return plugin.Plugin._power_cut_lockout_soc_floor(self._Stub(prefs))
+
+    def test_blank_uses_default(self):
+        self.assertEqual(self._floor({}), plugin.POWER_CUT_LOCKOUT_SOC_FLOOR)
+
+    def test_pref_overrides(self):
+        self.assertEqual(self._floor({"powerCutLockoutSocFloor": "70"}), 70.0)
+
+    def test_garbage_falls_back(self):
+        self.assertEqual(self._floor({"powerCutLockoutSocFloor": "abc"}),
+                         plugin.POWER_CUT_LOCKOUT_SOC_FLOOR)
 
 
 if __name__ == "__main__":

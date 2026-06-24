@@ -1166,12 +1166,15 @@ function update(d) {
   const chipGrid = document.getElementById('chip-grid');
   const chipMode = document.getElementById('chip-mode');
   if (chipGrid) {
-    const pcOngoing = d.power_cut && d.power_cut.ongoing;
-    const pcLock    = d.power_cut && d.power_cut.lockout_active;
+    const pcOngoing    = d.power_cut && d.power_cut.ongoing;
+    // Show "Lockout" only when export is ACTUALLY held off. During the post-cut
+    // window a battery at/above the SOC floor keeps exporting (flood-prevention),
+    // which is not a lockout from the user's point of view — show "On Grid".
+    const pcSuppressed = d.power_cut && d.power_cut.export_suppressed;
     if (pcOngoing) {
       chipGrid.textContent = 'Grid Down';
       chipGrid.className   = 'flow-chip alert';
-    } else if (pcLock) {
+    } else if (pcSuppressed) {
       chipGrid.textContent = 'Lockout';
       chipGrid.className   = 'flow-chip warn';
     } else {

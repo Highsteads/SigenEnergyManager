@@ -13,28 +13,31 @@
             </Field>
         </ConfigUI>
         <States>
+            <!-- Numeric telemetry states (Number/Integer) so Indigo's built-in
+                 history (indigo_history.sqlite) records them as chartable columns.
+                 Categorical/text states (emsWorkMode, gridStatus, etc.) stay String. -->
             <State id="batterySoc">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Battery SOC changed</TriggerLabel>
                 <ControlPageLabel>Battery SOC (%)</ControlPageLabel>
             </State>
             <State id="pvPowerWatts">
-                <ValueType>String</ValueType>
+                <ValueType>Integer</ValueType>
                 <TriggerLabel>PV power changed</TriggerLabel>
                 <ControlPageLabel>PV Power (W)</ControlPageLabel>
             </State>
             <State id="gridPowerWatts">
-                <ValueType>String</ValueType>
+                <ValueType>Integer</ValueType>
                 <TriggerLabel>Grid power changed</TriggerLabel>
                 <ControlPageLabel>Grid Power (W, +import/-export)</ControlPageLabel>
             </State>
             <State id="batteryPowerWatts">
-                <ValueType>String</ValueType>
+                <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery power changed</TriggerLabel>
                 <ControlPageLabel>Battery Power (W, +charge/-discharge)</ControlPageLabel>
             </State>
             <State id="homePowerWatts">
-                <ValueType>String</ValueType>
+                <ValueType>Integer</ValueType>
                 <TriggerLabel>Home power changed</TriggerLabel>
                 <ControlPageLabel>Home Consumption (W)</ControlPageLabel>
             </State>
@@ -64,62 +67,62 @@
                 <ControlPageLabel>Plant Running State</ControlPageLabel>
             </State>
             <State id="batterySoh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Battery health changed</TriggerLabel>
                 <ControlPageLabel>Battery SOH (%)</ControlPageLabel>
             </State>
             <State id="batteryTempC">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Battery temp changed</TriggerLabel>
                 <ControlPageLabel>Battery Temp (degC)</ControlPageLabel>
             </State>
             <State id="batteryCellVoltage">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Cell voltage changed</TriggerLabel>
                 <ControlPageLabel>Avg Cell Voltage (V)</ControlPageLabel>
             </State>
             <State id="batteryMaxTempC">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Battery max temp changed</TriggerLabel>
                 <ControlPageLabel>Battery Max Temp (degC)</ControlPageLabel>
             </State>
             <State id="batteryMinTempC">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Battery min temp changed</TriggerLabel>
                 <ControlPageLabel>Battery Min Temp (degC)</ControlPageLabel>
             </State>
             <State id="dischargeCutoffSoc">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Discharge cutoff changed</TriggerLabel>
                 <ControlPageLabel>Discharge Cutoff SOC (%)</ControlPageLabel>
             </State>
             <State id="batteryDailyChargeKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily charge changed</TriggerLabel>
                 <ControlPageLabel>Battery Daily Charge (kWh)</ControlPageLabel>
             </State>
             <State id="batteryDailyDischargeKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily discharge changed</TriggerLabel>
                 <ControlPageLabel>Battery Daily Discharge (kWh)</ControlPageLabel>
             </State>
             <State id="pvDailyKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily PV changed</TriggerLabel>
                 <ControlPageLabel>PV Daily (kWh)</ControlPageLabel>
             </State>
             <State id="gridDailyImportKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily import changed</TriggerLabel>
                 <ControlPageLabel>Grid Daily Import (kWh)</ControlPageLabel>
             </State>
             <State id="gridDailyExportKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily export changed</TriggerLabel>
                 <ControlPageLabel>Grid Daily Export (kWh)</ControlPageLabel>
             </State>
             <State id="homeDailyKwh">
-                <ValueType>String</ValueType>
+                <ValueType>Number</ValueType>
                 <TriggerLabel>Daily home changed</TriggerLabel>
                 <ControlPageLabel>Home Daily (kWh)</ControlPageLabel>
             </State>

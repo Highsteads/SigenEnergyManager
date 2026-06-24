@@ -7,7 +7,21 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        24-06-2026
-# Version:     5.34.0
+# Version:     5.35.0
+# 5.35.0 — Comprehensive numeric telemetry for SQL history + tidy-ups.
+#   • All numeric inverter telemetry states (batterySoc, *PowerWatts, temps, cell voltage,
+#     SoH, cutoff, daily kWh) changed from ValueType=String to Number/Integer and written
+#     as real numbers (guarded via _as_int/_as_float), so Indigo's built-in history
+#     (indigo_history.sqlite) records them as chartable columns. Previously every state was
+#     a String so nothing but gridOnline charted. Categorical states (emsWorkMode, gridStatus,
+#     etc.) stay String. No separate DB (InfluxDB/Postgres) — SQLite + the plugin's own
+#     half-hourly energy_timeseries.db cover it.
+#   • SOC floor for the post-cut export lockout is now configurable (powerCutLockoutSocFloor
+#     pref, default 85, guarded by _power_cut_lockout_soc_floor()).
+#   • Cosmetic: the Live Power Flow "Lockout" chip now keys off power_cut.export_suppressed,
+#     not the time window — so a battery exporting above the SOC floor shows "On Grid", not
+#     "Lockout".  Numeric states carry a clean uiValue (_num_state) so the device UI shows
+#     "99.6" not "99.59999999999999".  +5 tests (193).
 # 5.34.0 — Power-cut export lockout is now SOC-aware + grid-online SQL state.
 #   (1) The 4-hour post-restore export lockout previously killed ALL export, so a
 #   near-full battery (e.g. 92%) under good solar would climb to 100% and clip
@@ -867,6 +881,20 @@ def _as_int(value, fallback):
         return fallback
 
 
+def _num_state(key, value, dp):
+    """Build a numeric device-state dict that stores the real number (so Indigo's
+    history charts it) with a `decimalPlaces` hint so the device UI renders it
+    cleanly (e.g. '99.6', not the raw float '99.59999999999999'). We deliberately
+    do NOT set an explicit uiValue — that would make the history log a separate
+    `<state>_ui` text column. decimalPlaces alone is the idiomatic Indigo pattern
+    (matches the first-party Ecowitt etc.). Coercion is guarded."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = 0.0
+    return {"key": key, "value": round(v, dp), "decimalPlaces": dp}
+
+
 def _atomic_write_json(path, data, indent=2):
     """Write JSON atomically: serialise to a sibling temp file, fsync, then
     os.replace() over the target.  A crash mid-write can never truncate the
@@ -1719,7 +1747,7 @@ class Plugin(indigo.PluginBase):
                     "ongoing": self.store.get("power_cut_started_at") is not None,
                     "lockout_active": self.store.get("power_cut_lockout_active", False),
                     "export_suppressed": self.store.get("power_cut_export_suppressed", False),
-                    "lockout_soc_floor": POWER_CUT_LOCKOUT_SOC_FLOOR,
+                    "lockout_soc_floor": self._power_cut_lockout_soc_floor(),
                 },
                 "forecast_accuracy": (
                     self.forecast.get_accuracy_summary(window_days=7)
@@ -2781,11 +2809,11 @@ class Plugin(indigo.PluginBase):
 
         if type_id == "sigenergyInverter":
             dev.updateStatesOnServer([
-                {"key": "batterySoc",        "value": "0.0"},
-                {"key": "pvPowerWatts",      "value": "0"},
-                {"key": "gridPowerWatts",    "value": "0"},
-                {"key": "batteryPowerWatts", "value": "0"},
-                {"key": "homePowerWatts",    "value": "0"},
+                {"key": "batterySoc",        "value": 0.0},
+                {"key": "pvPowerWatts",      "value": 0},
+                {"key": "gridPowerWatts",    "value": 0},
+                {"key": "batteryPowerWatts", "value": 0},
+                {"key": "homePowerWatts",    "value": 0},
                 {"key": "modbusConnected",   "value": "False"},
                 {"key": "lastUpdate",        "value": "Initialising..."},
             ])
@@ -3001,7 +3029,7 @@ class Plugin(indigo.PluginBase):
             log(
                 f"[PowerCut] Grid restored after outage — export locked for "
                 f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution "
-                f"(unless SOC ≥ {POWER_CUT_LOCKOUT_SOC_FLOOR:.0f}%, when export "
+                f"(unless SOC ≥ {self._power_cut_lockout_soc_floor():.0f}%, when export "
                 f"resumes to protect solar)",
                 level="WARNING",
             )
@@ -3229,6 +3257,13 @@ class Plugin(indigo.PluginBase):
         except OSError as exc:
             self.logger.warning(f"[FloodPreview] Cannot write {path}: {exc}")
 
+    def _power_cut_lockout_soc_floor(self):
+        """SOC floor (%) above which export resumes during the post-cut lockout.
+        Reads the powerCutLockoutSocFloor pref, guarded, defaulting to the
+        POWER_CUT_LOCKOUT_SOC_FLOOR constant."""
+        return _as_float(self.pluginPrefs.get("powerCutLockoutSocFloor"),
+                         POWER_CUT_LOCKOUT_SOC_FLOOR)
+
     def _resolve_export_lockout(self, soc_pct=None):
         """Apply the post-power-cut export lockout (returns export_enabled bool).
 
@@ -3275,7 +3310,8 @@ class Plugin(indigo.PluginBase):
                 soc_val = float(soc_pct)
         except (TypeError, ValueError):
             soc_val = None
-        suppressed = _export_locked_out(within_window, soc_val, POWER_CUT_LOCKOUT_SOC_FLOOR)
+        soc_floor  = self._power_cut_lockout_soc_floor()
+        suppressed = _export_locked_out(within_window, soc_val, soc_floor)
         if suppressed:
             export_enabled = False
 
@@ -3284,7 +3320,7 @@ class Plugin(indigo.PluginBase):
         prev_suppressed = bool(self.store.get("power_cut_export_suppressed", False))
         if within_window and prev_suppressed and not suppressed:
             log(
-                f"[PowerCut] SOC {soc_val:.0f}% ≥ {POWER_CUT_LOCKOUT_SOC_FLOOR:.0f}% "
+                f"[PowerCut] SOC {soc_val:.0f}% ≥ {soc_floor:.0f}% "
                 f"floor — export re-enabled during lockout to protect solar",
             )
         self.store["power_cut_export_suppressed"] = suppressed
@@ -5496,29 +5532,33 @@ class Plugin(indigo.PluginBase):
         dev = self._find_device("sigenergyInverter")
         if not dev:
             return
+        # Numeric states are written as real numbers (not str()) so Indigo's
+        # built-in history records them as chartable columns. Coercion is guarded
+        # via _as_int/_as_float so a missing/odd Modbus value can never crash the
+        # state write. Categorical states (emsWorkMode, gridStatus, etc.) stay str.
         states = [
             {"key": "emsWorkMode",              "value": str(data.get("emsWorkMode", ""))},
             {"key": "gridSensorConnected",      "value": str(data.get("gridSensorConnected", False))},
-            {"key": "gridPowerWatts",           "value": str(data.get("gridPowerWatts", 0))},
+            {"key": "gridPowerWatts",           "value": _as_int(data.get("gridPowerWatts"), 0)},
             {"key": "gridStatus",               "value": str(data.get("gridStatus", ""))},
             {"key": "gridOnline",               "value": 1 if str(data.get("gridStatus", "")).startswith("On-grid") else 0},
-            {"key": "batterySoc",               "value": str(data.get("batterySoc", 0.0))},
-            {"key": "pvPowerWatts",             "value": str(data.get("pvPowerWatts", 0))},
-            {"key": "batteryPowerWatts",        "value": str(data.get("batteryPowerWatts", 0))},
-            {"key": "homePowerWatts",           "value": str(data.get("homePowerWatts", 0))},
+            _num_state("batterySoc",               _as_float(data.get("batterySoc"), 0.0),            1),
+            {"key": "pvPowerWatts",             "value": _as_int(data.get("pvPowerWatts"), 0)},
+            {"key": "batteryPowerWatts",        "value": _as_int(data.get("batteryPowerWatts"), 0)},
+            {"key": "homePowerWatts",           "value": _as_int(data.get("homePowerWatts"), 0)},
             {"key": "plantRunningState",        "value": str(data.get("plantRunningState", ""))},
-            {"key": "dischargeCutoffSoc",       "value": str(data.get("dischargeCutoffSoc", 0.0))},
-            {"key": "batterySoh",               "value": str(data.get("batterySoh", 0.0))},
-            {"key": "batteryTempC",             "value": str(data.get("batteryTempC", 0.0))},
-            {"key": "batteryCellVoltage",       "value": str(data.get("batteryCellVoltage", 0.0))},
-            {"key": "batteryMaxTempC",          "value": str(data.get("batteryMaxTempC", 0.0))},
-            {"key": "batteryMinTempC",          "value": str(data.get("batteryMinTempC", 0.0))},
-            {"key": "batteryDailyChargeKwh",    "value": str(data.get("batteryDailyChargeKwh", 0.0))},
-            {"key": "batteryDailyDischargeKwh", "value": str(data.get("batteryDailyDischargeKwh", 0.0))},
-            {"key": "pvDailyKwh",               "value": str(round(self.store["pv_daily_kwh"], 2))},
-            {"key": "gridDailyImportKwh",       "value": str(round(self.store["grid_import_daily_kwh"], 2))},
-            {"key": "gridDailyExportKwh",       "value": str(round(self.store["grid_export_daily_kwh"], 2))},
-            {"key": "homeDailyKwh",             "value": str(round(self.store["home_daily_kwh"], 2))},
+            _num_state("dischargeCutoffSoc",       _as_float(data.get("dischargeCutoffSoc"), 0.0),    1),
+            _num_state("batterySoh",               _as_float(data.get("batterySoh"), 0.0),            1),
+            _num_state("batteryTempC",             _as_float(data.get("batteryTempC"), 0.0),          1),
+            _num_state("batteryCellVoltage",       _as_float(data.get("batteryCellVoltage"), 0.0),    3),
+            _num_state("batteryMaxTempC",          _as_float(data.get("batteryMaxTempC"), 0.0),       1),
+            _num_state("batteryMinTempC",          _as_float(data.get("batteryMinTempC"), 0.0),       1),
+            _num_state("batteryDailyChargeKwh",    _as_float(data.get("batteryDailyChargeKwh"), 0.0), 2),
+            _num_state("batteryDailyDischargeKwh", _as_float(data.get("batteryDailyDischargeKwh"), 0.0), 2),
+            _num_state("pvDailyKwh",               self.store["pv_daily_kwh"],          2),
+            _num_state("gridDailyImportKwh",       self.store["grid_import_daily_kwh"], 2),
+            _num_state("gridDailyExportKwh",       self.store["grid_export_daily_kwh"], 2),
+            _num_state("homeDailyKwh",             self.store["home_daily_kwh"],        2),
             {"key": "modbusConnected",          "value": "True"},
             {"key": "lastUpdate",               "value": data.get("lastUpdate", "")},
         ]
