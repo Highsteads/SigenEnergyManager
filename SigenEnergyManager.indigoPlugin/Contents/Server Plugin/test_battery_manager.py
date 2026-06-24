@@ -941,6 +941,96 @@ class TestFloodPrevention(unittest.TestCase):
         self.assertEqual(decision.action, ACTION_START_EXPORT)
         self.assertEqual(decision.power_watts, 3600)
 
+    # ── compute_flood_preview (single source of truth for the advisory) ────────
+
+    def test_flood_preview_would_fire_matches_live_decision(self):
+        """The published preview's would_fire must agree with the live decision: when
+        the night gate fires, would_fire is True and the numbers reflect the refill day."""
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_tomorrow_kwh = self.sunny_tomorrow,
+            now_hour               = 22,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+        )
+        decision = self.bm.evaluate(snapshot)
+        preview  = self.bm.compute_flood_preview(snapshot)
+
+        self.assertEqual(decision.action, ACTION_START_EXPORT)
+        self.assertTrue(preview["would_fire"])
+        self.assertTrue(preview["forecast_gate_pass"])
+        self.assertEqual(preview["refill_label"], "Tomorrow")
+        self.assertAlmostEqual(preview["refill_solar_kwh"], self.sunny_tomorrow, places=1)
+        self.assertAlmostEqual(preview["refill_demand_kwh"], 22.0, places=1)
+
+    def test_flood_preview_is_forward_looking_during_daytime(self):
+        """KEY property: the preview ignores the daytime guard so a 20:00 (still-daylight)
+        advisory run gets a real 'would it fire tonight' signal. evaluate() returns
+        self-consumption during daytime, but the preview's would_fire is still True."""
+        today_str    = _today_str()
+        tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = True,
+            corrected_tomorrow_kwh = self.sunny_tomorrow,
+            now_hour               = 13,
+            forecast_p50           = _make_sunny_p50(dusk_hour=19),
+            dawn_times             = {
+                today_str:    _now(hour=6),
+                tomorrow_str: _tomorrow_dawn(hour=6),
+            },
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+        )
+        decision = self.bm.evaluate(snapshot)
+        preview  = self.bm.compute_flood_preview(snapshot)
+
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)   # daytime: doesn't act
+        self.assertTrue(preview["would_fire"])                      # but would, tonight
+
+    def test_flood_preview_post_midnight_uses_today_refill_day(self):
+        """23/24-Jun-2026 regression at the preview level: post-midnight the gate must use
+        TODAY's (refill-day) forecast, not the day-after. Poor today -> would_fire False and
+        refill_label 'Today' — this is exactly what the advisory now reports verbatim."""
+        today_str = _today_str()
+        snapshot = _make_snapshot(
+            soc_pct                = 72.0,
+            export_enabled         = True,
+            corrected_today_kwh    = 61.3,                # 2.77x of 22 — below the 3x gate
+            corrected_tomorrow_kwh = self.sunny_tomorrow, # day-after looks great, irrelevant
+            now_hour               = 1,                   # 01:45-ish — post-midnight
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+            dawn_times             = {today_str: _now(hour=6)},
+        )
+        decision = self.bm.evaluate(snapshot)
+        preview  = self.bm.compute_flood_preview(snapshot)
+
+        self.assertNotEqual(decision.action, ACTION_START_EXPORT)
+        self.assertFalse(preview["would_fire"])
+        self.assertFalse(preview["forecast_gate_pass"])
+        self.assertEqual(preview["refill_label"], "Today")
+        self.assertAlmostEqual(preview["refill_solar_kwh"], 61.3, places=1)
+        self.assertLess(preview["ratio"], 3.0)
+
+    def test_flood_preview_export_disabled_blocks_would_fire(self):
+        """Export-MPAN lockout (e.g. post power-cut) -> would_fire False even on a sunny
+        high-SOC night, so the advisory can't promise an export during the lockout."""
+        snapshot = _make_snapshot(
+            soc_pct                = 70.0,
+            export_enabled         = False,
+            corrected_tomorrow_kwh = self.sunny_tomorrow,
+            now_hour               = 22,
+            weekday_kwh            = 22.0,
+            weekend_kwh            = 22.0,
+        )
+        preview = self.bm.compute_flood_preview(snapshot)
+
+        self.assertFalse(preview["would_fire"])
+        self.assertFalse(preview["export_enabled"])
+        self.assertTrue(preview["forecast_gate_pass"])   # forecast is fine; MPAN is the blocker
+
     # ── Continue / stop logic ─────────────────────────────────────────────────
 
     def test_flood_prev_continues_when_active_and_above_target(self):

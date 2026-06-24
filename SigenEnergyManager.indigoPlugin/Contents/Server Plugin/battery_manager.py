@@ -5,8 +5,16 @@
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        10-06-2026
-# Version:     3.6
+# Date:        24-06-2026
+# Version:     3.7
+# 3.7 — _compute_flood_preview: the flood-export gate math extracted into one pure,
+#       side-effect-free method (no daytime guard) — the single source of truth.
+#       _check_flood_prevention now consumes it (control behaviour unchanged) and the
+#       plugin publishes it (sigen_flood_preview.json) so the openmeteo advisory reports
+#       the SAME gate instead of re-deriving it and drifting (the 23/24-Jun-2026 case).
+#       compute_flood_preview() is the public entry (recomputes the pure 24h balance so
+#       evaluate()'s control path is untouched). would_fire = the gate minus the daytime
+#       guard, so a daytime advisory run gets a forward 'would it fire tonight' signal.
 # 3.6 — VPP override now self-drives the export window (ACTION_VPP_EXPORT) instead
 #       of standing down for Axle. Axle settle on the meter reading so exporting it
 #       ourselves counts identically, and their cloud dispatch is unreliable (no-show
@@ -1180,61 +1188,26 @@ class BatteryManager:
         register (HOLD_ESS_DISCHARGE_CUTOFF) to target_soc_pct so the battery stops
         automatically. The cutoff is reset to health_floor on return to self-consumption.
         """
-        # Nighttime only — daytime export handled by solar overflow
+        # Nighttime only — daytime export handled by solar overflow. The gate MATH
+        # lives in _compute_flood_preview (the single source of truth plugin.py also
+        # publishes for the openmeteo advisory); here we apply the nighttime guard and
+        # turn a would_fire=True preview into an actionable START_EXPORT decision.
         if balance.is_daytime:
             return None
 
-        # Export MPAN required
-        if not snapshot.export_enabled:
+        preview = self._compute_flood_preview(snapshot, balance)
+        if not preview["would_fire"]:
             return None
 
-        # Safety gate: the *refill day* must be abundantly sunny to guarantee solar
-        # refill. Without this, pre-draining could leave the battery short and force
-        # reimport at full Tracker price — wiping out the export revenue.
-        # With export@12p and Tracker import@23p+, reimporting even half the exported
-        # kWh wipes the revenue. Require 3x need so only genuinely excellent days qualify.
-        #
-        # The refill day is the day the *next dawn* falls on (in local time):
-        #   pre-midnight pre-drain  → dawn is tomorrow → check tomorrow's forecast
-        #   post-midnight pre-drain → dawn is today    → check today's forecast
-        # The earlier bug (21-May-2026) used tomorrow_solar_kwh in both cases, so a
-        # 00:25 check on a poor-today/sunny-tomorrow pair would dump the battery and
-        # then fail to refill it from today's weak sun.
-        #
-        # Axle VPP export scheduled on the refill day is added to refill demand,
-        # so the gate refuses pre-drain when the refill day can't cover house
-        # consumption + the VPP export at 3x safety margin.
-        refill_solar_kwh, refill_need_kwh, refill_vpp_kwh = self._refill_day_view(
-            snapshot, balance
-        )
-        refill_demand_kwh = refill_need_kwh + refill_vpp_kwh
-        if refill_solar_kwh < FLOOD_PREV_FORECAST_MULT * refill_demand_kwh:
-            return None
+        effective_target  = preview["effective_target_pct"]
+        refill_solar_kwh  = preview["refill_solar_kwh"]
+        refill_need_kwh   = preview["refill_need_kwh"]
+        refill_vpp_kwh    = preview["refill_vpp_kwh"]
+        refill_demand_kwh = preview["refill_demand_kwh"]
+        export_kwh        = preview["expected_export_kwh"]
+        revenue_gbp       = preview["expected_revenue_gbp"]
+        refill_label      = preview["refill_label"]
 
-        # Effective target: respect storm/seasonal SOC floor.
-        # If dawn_target_pct was raised above the default (e.g. storm → 50%),
-        # drain to that floor instead of the hard-coded 40%.
-        effective_target = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
-
-        # If the floor is at or above the trigger threshold there is too little
-        # headroom to bother — storm resilience takes priority over flood prevention.
-        if effective_target >= FLOOD_PREV_SOC_THRESHOLD_PCT:
-            return None
-
-        # Already drained to (or below) effective target — nothing to do
-        if snapshot.current_soc_pct <= effective_target:
-            return None
-
-        # SOC must be above threshold to warrant pre-drain
-        if snapshot.current_soc_pct < FLOOD_PREV_SOC_THRESHOLD_PCT:
-            return None
-
-        # Estimate export quantity and revenue
-        cap_kwh     = snapshot.capacity_kwh
-        export_kwh  = (snapshot.current_soc_pct - effective_target) / 100.0 * cap_kwh
-        revenue_gbp = export_kwh * 12.0 / 100.0   # 12p/kWh flat Outgoing rate
-
-        refill_label = self._refill_day_label(snapshot, balance)
         if refill_vpp_kwh > 0.01:
             demand_str = (
                 f"{refill_demand_kwh:.1f} kWh = house {refill_need_kwh:.1f} "
@@ -1257,6 +1230,81 @@ class BatteryManager:
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
+
+    def _compute_flood_preview(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> dict:
+        """Pure flood-export gate evaluation — NO nighttime guard, NO side effects.
+
+        Single source of truth for the flood-prevention gate. _check_flood_prevention
+        applies the nighttime guard and builds the START_EXPORT Decision from this;
+        plugin.py publishes the returned dict (sigen_flood_preview.json) so the
+        openmeteo advisory reports the SAME gate the plugin acts on rather than
+        re-deriving it and drifting — the 23/24-Jun-2026 "promised export that never
+        ran" case, where the advisory used the plugin's day+2 'tomorrow' states at
+        01:45 instead of the refill day (today).
+
+        Conditions (same algebra _check_flood_prevention used before, minus daytime):
+          - Export MPAN active
+          - refill_solar >= FLOOD_PREV_FORECAST_MULT × (refill_need + refill_vpp)
+          - effective_target < FLOOD_PREV_SOC_THRESHOLD_PCT (storm floor leaves headroom)
+          - current SOC > effective_target (something to drain)
+          - current SOC >= FLOOD_PREV_SOC_THRESHOLD_PCT (worth draining)
+
+        would_fire answers "would the gate drain the battery if it were night now,
+        with the current forecast and SOC". The daytime guard is deliberately omitted
+        so a 20:00 (still-daylight) advisory run gets a forward signal for tonight.
+        """
+        refill_solar_kwh, refill_need_kwh, refill_vpp_kwh = self._refill_day_view(
+            snapshot, balance
+        )
+        refill_demand_kwh  = refill_need_kwh + refill_vpp_kwh
+        gate_threshold_kwh = FLOOD_PREV_FORECAST_MULT * refill_demand_kwh
+        ratio              = (refill_solar_kwh / refill_demand_kwh) if refill_demand_kwh > 0 else 0.0
+        effective_target   = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
+        soc                = snapshot.current_soc_pct
+
+        forecast_gate_pass = refill_solar_kwh >= gate_threshold_kwh
+        target_headroom_ok = effective_target < FLOOD_PREV_SOC_THRESHOLD_PCT
+        soc_gate_pass      = (soc >= FLOOD_PREV_SOC_THRESHOLD_PCT) and (soc > effective_target)
+        would_fire         = bool(
+            snapshot.export_enabled
+            and forecast_gate_pass
+            and target_headroom_ok
+            and soc_gate_pass
+        )
+        export_kwh = (
+            max(0.0, (soc - effective_target) / 100.0 * snapshot.capacity_kwh)
+            if would_fire else 0.0
+        )
+        return {
+            "refill_label":         self._refill_day_label(snapshot, balance),
+            "refill_solar_kwh":     round(refill_solar_kwh, 2),
+            "refill_need_kwh":      round(refill_need_kwh, 2),
+            "refill_vpp_kwh":       round(refill_vpp_kwh, 2),
+            "refill_demand_kwh":    round(refill_demand_kwh, 2),
+            "gate_mult":            FLOOD_PREV_FORECAST_MULT,
+            "gate_threshold_kwh":   round(gate_threshold_kwh, 2),
+            "ratio":                round(ratio, 3),
+            "soc_threshold_pct":    FLOOD_PREV_SOC_THRESHOLD_PCT,
+            "target_pct":           FLOOD_PREV_TARGET_PCT,
+            "effective_target_pct": round(effective_target, 1),
+            "current_soc_pct":      round(soc, 1),
+            "export_enabled":       bool(snapshot.export_enabled),
+            "forecast_gate_pass":   bool(forecast_gate_pass),
+            "soc_gate_pass":        bool(soc_gate_pass),
+            "target_headroom_ok":   bool(target_headroom_ok),
+            "would_fire":           would_fire,
+            "expected_export_kwh":  round(export_kwh, 2),
+            "expected_revenue_gbp": round(export_kwh * 12.0 / 100.0, 2),
+        }
+
+    def compute_flood_preview(self, snapshot: ManagerSnapshot) -> dict:
+        """Public entry: flood-export gate preview for the current snapshot, for
+        plugin.py to publish to the advisory. Recomputes the (pure, side-effect-free)
+        24h balance so evaluate()'s control path is left completely untouched."""
+        balance = self._calculate_24h_balance(snapshot)
+        return self._compute_flood_preview(snapshot, balance)
 
     def _continue_flood_prevention(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance

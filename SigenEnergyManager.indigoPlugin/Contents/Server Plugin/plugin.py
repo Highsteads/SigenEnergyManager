@@ -6,8 +6,17 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        22-06-2026
-# Version:     5.31.6
+# Date:        24-06-2026
+# Version:     5.32.0
+# 5.32.0 — Single source of truth for the flood-export gate. battery_manager gains
+#   _compute_flood_preview (pure, no daytime guard, no side effects) — the ONE place the
+#   gate math now lives; _check_flood_prevention consumes it (control behaviour unchanged,
+#   183 tests green). Each manager tick publishes the gate it acts on to
+#   sigen_flood_preview.json (_publish_flood_preview, atomic write) so the openmeteo advisory
+#   reports the SAME gate verbatim instead of re-deriving and drifting — the 23/24-Jun-2026
+#   "promised an export that never ran" case (advisory used the day+2 'tomorrow' states at
+#   01:45 instead of the refill day). 4 new contract tests lock the preview to the live
+#   decision (incl. the forward-looking daytime property + the regression).
 # 5.31.6 — Solar card data: /api/status solar block now also carries
 #   actual_today_kwh, peak_w + peak_time (new daily peak-PV tracking, mirrors
 #   peak_soc — init/update/midnight-reset/persist), lifetime_kwh and total_kwp.
@@ -3130,6 +3139,45 @@ class Plugin(indigo.PluginBase):
 
         # 9. Push device state
         self._update_manager_device(decision, snapshot)
+
+        # 10. Publish the flood-export gate preview for the openmeteo advisory so it
+        #     reports the SAME gate the manager acts on (single source of truth — stops
+        #     the advisory re-deriving and drifting; see the 23/24-Jun-2026 case).
+        self._publish_flood_preview(snapshot, decision)
+
+    def _publish_flood_preview(self, snapshot, decision):
+        """Write sigen_flood_preview.json so openmeteo_battery_optimiser.py can report
+        the flood-export gate verbatim instead of re-deriving it.  Best-effort and
+        side-effect-free with respect to control — any failure is logged and swallowed
+        so it can never disrupt the manager tick.  Published every tick (incl. daytime)
+        because the preview is forward-looking: would_fire answers "would the gate drain
+        tonight given the current forecast and SOC", which is exactly what the advisory's
+        20:00 (still-daylight) run needs."""
+        try:
+            preview = self.manager.compute_flood_preview(snapshot)
+        except Exception as exc:
+            self.logger.debug(f"[FloodPreview] compute failed: {exc!r}")
+            return
+        try:
+            today_export_kwh = float(
+                self.latest_inverter_data.get("gridDailyExportKwh", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            today_export_kwh = 0.0
+        preview["today_export_kwh"] = round(today_export_kwh, 2)
+        preview["export_active"]    = bool(getattr(snapshot, "export_active", False))
+        preview["decision_action"]  = decision.action
+        preview["generated_at"]     = datetime.now(timezone.utc).isoformat()
+        preview["plugin_version"]   = self.pluginVersion
+        path = ("/Library/Application Support/Perceptive Automation/"
+                "Python Scripts/sigen_flood_preview.json")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(preview, f, indent=2)
+            os.replace(tmp, path)   # atomic — readers never see a half-written file
+        except OSError as exc:
+            self.logger.warning(f"[FloodPreview] Cannot write {path}: {exc}")
 
     def _resolve_export_lockout(self):
         """Apply the post-power-cut export lockout (returns export_enabled bool).
