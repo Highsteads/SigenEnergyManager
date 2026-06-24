@@ -53,6 +53,11 @@
                 <TriggerLabel>Grid status changed</TriggerLabel>
                 <ControlPageLabel>Grid Status</ControlPageLabel>
             </State>
+            <State id="gridOnline">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Grid online (1/0) changed</TriggerLabel>
+                <ControlPageLabel>Grid Online (1=on-grid, 0=power cut)</ControlPageLabel>
+            </State>
             <State id="plantRunningState">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Plant state changed</TriggerLabel>

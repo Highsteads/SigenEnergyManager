@@ -439,5 +439,31 @@ class TestWholeHouseEdges(unittest.TestCase):
         self.assertIsNone(c["bill_gbp"])           # missing passthrough stays None
 
 
+class TestPowerCutExportLockoutSocFloor(unittest.TestCase):
+    """v5.34.0: the post-cut export lockout is held only while SOC < floor, so a
+    near-full battery still exports (protects solar from being clipped at 100%)."""
+
+    def test_no_window_never_suppresses(self):
+        # Outside the lockout window export is free regardless of SOC.
+        self.assertFalse(plugin._export_locked_out(False, 10.0, 85.0))
+        self.assertFalse(plugin._export_locked_out(False, None, 85.0))
+
+    def test_in_window_below_floor_suppresses(self):
+        self.assertTrue(plugin._export_locked_out(True, 84.9, 85.0))
+        self.assertTrue(plugin._export_locked_out(True, 50.0, 85.0))
+
+    def test_in_window_at_or_above_floor_allows(self):
+        # The case CliveS hit: 92% battery in the window must still export.
+        self.assertFalse(plugin._export_locked_out(True, 85.0, 85.0))
+        self.assertFalse(plugin._export_locked_out(True, 92.0, 85.0))
+
+    def test_unknown_soc_fails_safe(self):
+        # An unknown SOC inside the window must NOT fail-open.
+        self.assertTrue(plugin._export_locked_out(True, None, 85.0))
+
+    def test_default_floor_is_85(self):
+        self.assertEqual(plugin.POWER_CUT_LOCKOUT_SOC_FLOOR, 85.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

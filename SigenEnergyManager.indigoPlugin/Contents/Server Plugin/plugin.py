@@ -7,7 +7,19 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        24-06-2026
-# Version:     5.33.0
+# Version:     5.34.0
+# 5.34.0 — Power-cut export lockout is now SOC-aware + grid-online SQL state.
+#   (1) The 4-hour post-restore export lockout previously killed ALL export, so a
+#   near-full battery (e.g. 92%) under good solar would climb to 100% and clip
+#   generation we could have exported. The lockout now holds export off only while
+#   SOC < POWER_CUT_LOCKOUT_SOC_FLOOR (85%); at/above the floor export resumes so
+#   flood-prevention can shed surplus and protect solar. New pure `_export_locked_out`
+#   helper (fail-safe: unknown SOC suppresses); `_resolve_export_lockout(soc_pct)`;
+#   store flag `power_cut_lockout_active` now tracks the time WINDOW (cleared-event
+#   fires once on expiry) with `power_cut_export_suppressed` for the live state.
+#   (2) New numeric `gridOnline` device state (1=on-grid, 0=power cut) so SQL Logger
+#   can chart a clean power-cut timeline — the existing states are all strings and
+#   don't chart. Not written on modbus-offline (offline != a real cut).
 # 5.33.0 — Power-cut notifications. When the inverter reports the grid has been lost
 #   (the house islands onto the battery) and again when mains power is restored, send a
 #   Pushover alert (normal priority, so it respects the configured quiet hours) and an
@@ -880,6 +892,27 @@ STORM_SOC_AMBER  = 80.0
 
 # Power cut lockout: suppress export for this many hours after grid is restored
 POWER_CUT_LOCKOUT_HOURS = 4.0
+# During that window, hold the export ban ONLY while SOC is below this floor.
+# Above it, let export resume so flood-prevention can shed surplus — otherwise a
+# near-full battery (e.g. 92%) under good solar would hit 100% and clip generation
+# we could have exported. Below the floor there is no flood risk, so the
+# precaution holds.
+POWER_CUT_LOCKOUT_SOC_FLOOR = 85.0
+
+
+def _export_locked_out(within_window, soc_pct, soc_floor):
+    """Pure decision: should export be suppressed by the post-power-cut lockout?
+
+    Suppress while inside the post-restore window AND the battery is below the
+    SOC floor. At/above the floor, allow export (flood-prevention protects the
+    solar). An unknown SOC fails safe (suppress) — the lockout must never
+    fail-open. Returns True = export suppressed.
+    """
+    if not within_window:
+        return False
+    if soc_pct is None:
+        return True
+    return soc_pct < soc_floor
 
 
 # VPP state machine values
@@ -1685,6 +1718,8 @@ class Plugin(indigo.PluginBase):
                     "events":  (self.store.get("power_cut_events", []) or [])[-10:],
                     "ongoing": self.store.get("power_cut_started_at") is not None,
                     "lockout_active": self.store.get("power_cut_lockout_active", False),
+                    "export_suppressed": self.store.get("power_cut_export_suppressed", False),
+                    "lockout_soc_floor": POWER_CUT_LOCKOUT_SOC_FLOOR,
                 },
                 "forecast_accuracy": (
                     self.forecast.get_accuracy_summary(window_days=7)
@@ -2965,7 +3000,9 @@ class Plugin(indigo.PluginBase):
             self.pluginPrefs["powerRestoredTime"]  = now_utc.isoformat()
             log(
                 f"[PowerCut] Grid restored after outage — export locked for "
-                f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution",
+                f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution "
+                f"(unless SOC ≥ {POWER_CUT_LOCKOUT_SOC_FLOOR:.0f}%, when export "
+                f"resumes to protect solar)",
                 level="WARNING",
             )
             self._trigger_event("powerCutLockoutStarted")
@@ -3122,8 +3159,8 @@ class Plugin(indigo.PluginBase):
 
         soc_pct = self.latest_inverter_data.get("batterySoc", 0.0)
 
-        # 1. Power cut lockout
-        export_enabled = self._resolve_export_lockout()
+        # 1. Power cut lockout (SOC-aware — see _resolve_export_lockout)
+        export_enabled = self._resolve_export_lockout(soc_pct)
 
         # 2. VPP reserve
         vpp_reserved_kwh = self._compute_vpp_reserved_kwh()
@@ -3192,21 +3229,29 @@ class Plugin(indigo.PluginBase):
         except OSError as exc:
             self.logger.warning(f"[FloodPreview] Cannot write {path}: {exc}")
 
-    def _resolve_export_lockout(self):
+    def _resolve_export_lockout(self, soc_pct=None):
         """Apply the post-power-cut export lockout (returns export_enabled bool).
+
+        For POWER_CUT_LOCKOUT_HOURS after the grid is restored, export is held
+        off as a precaution — BUT only while SOC is below
+        POWER_CUT_LOCKOUT_SOC_FLOOR. At/above the floor export resumes so
+        flood-prevention can shed surplus and we don't clip solar by letting a
+        near-full battery hit 100%. The `power_cut_lockout_active` store flag
+        tracks the time WINDOW (so the cleared-event fires once on expiry, not
+        when SOC merely crosses the floor); `power_cut_export_suppressed` tracks
+        whether export is actually held off right now.
 
         Defensive parsing: a hand-edited or corrupt pluginPrefs value (naive ISO,
         garbage string, or wrong type) must NEVER fail-open and let export
         resume during the lockout window. On parse failure we clear the bad
         value (so it doesn't block forever) and resume normal operation.
 
-        Side effects: updates `power_cut_lockout_active` store flag and fires
-        `powerCutLockoutCleared` trigger event when the lockout transitions
-        from active to cleared.
+        Side effects: updates the two store flags and fires the
+        `powerCutLockoutCleared` trigger event when the window expires.
         """
         export_enabled = bool(self.pluginPrefs.get("exportEnabled", False))
         prt_str        = self.pluginPrefs.get("powerRestoredTime", "")
-        lockout_active = False
+        within_window  = False
 
         if prt_str and export_enabled:
             try:
@@ -3214,9 +3259,7 @@ class Plugin(indigo.PluginBase):
                 if power_restored.tzinfo is None:
                     power_restored = power_restored.replace(tzinfo=timezone.utc)
                 hours_since = (datetime.now(timezone.utc) - power_restored).total_seconds() / 3600.0
-                if hours_since < POWER_CUT_LOCKOUT_HOURS:
-                    export_enabled = False
-                    lockout_active = True
+                within_window = hours_since < POWER_CUT_LOCKOUT_HOURS
             except (ValueError, TypeError, AttributeError) as exc:
                 log(
                     f"[PowerCut] Bad powerRestoredTime in prefs ({exc!r}) — "
@@ -3225,14 +3268,36 @@ class Plugin(indigo.PluginBase):
                 )
                 self.pluginPrefs["powerRestoredTime"] = ""
 
-        # Detect lockout-cleared transition for Indigo trigger event
+        # SOC floor: within the window, suppress export only while SOC is low.
+        soc_val = None
+        try:
+            if soc_pct is not None:
+                soc_val = float(soc_pct)
+        except (TypeError, ValueError):
+            soc_val = None
+        suppressed = _export_locked_out(within_window, soc_val, POWER_CUT_LOCKOUT_SOC_FLOOR)
+        if suppressed:
+            export_enabled = False
+
+        # One-shot INFO when the SOC floor first lets export resume mid-window,
+        # so the log explains why export is running during a lockout.
+        prev_suppressed = bool(self.store.get("power_cut_export_suppressed", False))
+        if within_window and prev_suppressed and not suppressed:
+            log(
+                f"[PowerCut] SOC {soc_val:.0f}% ≥ {POWER_CUT_LOCKOUT_SOC_FLOOR:.0f}% "
+                f"floor — export re-enabled during lockout to protect solar",
+            )
+        self.store["power_cut_export_suppressed"] = suppressed
+
+        # Detect lockout-window-cleared transition for the Indigo trigger event.
+        # Tied to the WINDOW (not the SOC override) so it fires once on expiry.
         prev_lockout = bool(self.store.get("power_cut_lockout_active", False))
-        if prev_lockout and not lockout_active:
+        if prev_lockout and not within_window:
             log("[PowerCut] Export lockout cleared — normal operation resumed")
             self.store["power_cut_lockout_active"] = False
             self._trigger_event("powerCutLockoutCleared")
         else:
-            self.store["power_cut_lockout_active"] = lockout_active
+            self.store["power_cut_lockout_active"] = within_window
 
         return export_enabled
 
@@ -5436,6 +5501,7 @@ class Plugin(indigo.PluginBase):
             {"key": "gridSensorConnected",      "value": str(data.get("gridSensorConnected", False))},
             {"key": "gridPowerWatts",           "value": str(data.get("gridPowerWatts", 0))},
             {"key": "gridStatus",               "value": str(data.get("gridStatus", ""))},
+            {"key": "gridOnline",               "value": 1 if str(data.get("gridStatus", "")).startswith("On-grid") else 0},
             {"key": "batterySoc",               "value": str(data.get("batterySoc", 0.0))},
             {"key": "pvPowerWatts",             "value": str(data.get("pvPowerWatts", 0))},
             {"key": "batteryPowerWatts",        "value": str(data.get("batteryPowerWatts", 0))},
