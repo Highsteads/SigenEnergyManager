@@ -6,8 +6,8 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        24-06-2026
-# Version:     5.35.0
+# Date:        26-06-2026
+# Version:     5.38.2
 # 5.35.0 — Comprehensive numeric telemetry for SQL history + tidy-ups.
 #   • All numeric inverter telemetry states (batterySoc, *PowerWatts, temps, cell voltage,
 #     SoH, cutoff, daily kWh) changed from ValueType=String to Number/Integer and written
@@ -1023,6 +1023,23 @@ def _local_time(dt, fmt="%H:%M"):
         return dt.strftime(fmt)   # fallback: still UTC but won't crash
 
 
+def _local_today_str():
+    """Return today's date (YYYY-MM-DD) in Europe/London, matching _check_midnight.
+
+    The midnight rollover and the accumulator save both stamp today_date in
+    Europe/London. The initialiser and the on-disk accumulator restore must use
+    the SAME basis — a naive datetime.now() on a UTC-hosted server is the previous
+    day for the first hour after local midnight in BST, which would make the loader
+    reject (and silently drop) a fresh day's accumulators on a restart in that window.
+    """
+    try:
+        import pytz
+        return datetime.now(timezone.utc).astimezone(
+            pytz.timezone("Europe/London")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
 class Plugin(indigo.PluginBase):
     """SigenEnergyManager Indigo Plugin.
 
@@ -1109,7 +1126,7 @@ class Plugin(indigo.PluginBase):
         self.store["min_soc"]                   = 100.0
         self.store["peak_pv_w"]                 = 0
         self.store["peak_pv_time"]              = ""
-        self.store["today_date"]                = datetime.now().strftime("%Y-%m-%d")
+        self.store["today_date"]                = _local_today_str()
         # Lifetime total anchors for daily delta computation (set on first Modbus read)
         self.store["pv_lifetime_start_kwh"]     = None
         self.store["import_lifetime_start_kwh"] = None
@@ -1146,7 +1163,10 @@ class Plugin(indigo.PluginBase):
         self.store["hh_anchor_home_kwh"]   = None  # cumulative home at last slot boundary
         self.store["hh_anchor_soc_pct"]    = None  # SOC at start of current slot
         self.store["storm_level"]         = "none" # current storm level
-        self.store["storm_alerted_level"] = "none" # level at which alert was sent
+        # Defaults; _load_accumulators() restores the persisted values (accumulators.json
+        # is the plugin's reliable cross-restart store — written every poll) so an
+        # already-active warning does not re-send its Pushover on every plugin restart.
+        self.store["storm_alerted_level"] = "none" # level at which alert was last sent
 
         # Power cut detection
         self.store["grid_status_prev"] = "On-grid"  # previous poll's gridStatus
@@ -1511,23 +1531,12 @@ class Plugin(indigo.PluginBase):
                 self.web_dashboard.stop()
             except Exception as exc:
                 log(f"[Web] Dashboard stop error on sleep: {exc}", level="ERROR")
+        # Return to the safe self-consumption baseline AND release any raised
+        # discharge-cutoff floor / VPP engagement (see _disengage_to_safe_baseline),
+        # so an unattended sleep can't strand the battery above a raised SOC and
+        # force grid import. The manager re-evaluates and re-applies on wake.
+        self._disengage_to_safe_baseline("Sleep")
         if self.modbus and self.modbus.connected:
-            try:
-                self.modbus.set_self_consumption()
-                log("[Sleep] Inverter returned to self-consumption mode")
-            except Exception as exc:
-                log(f"[Sleep] set_self_consumption failed: {exc}", level="WARNING")
-            # Also reset any raised discharge cutoff (flood-prev / storm / VPP floor)
-            # to the health floor. set_self_consumption clears the forced MODE but not
-            # the cutoff register; a cutoff left high would lock the battery above that
-            # SOC and force grid import for the whole sleep. The manager re-evaluates
-            # and re-applies on wake if conditions still warrant it.
-            try:
-                health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
-                self.modbus.set_discharge_cutoff(health_floor)
-                log(f"[Sleep] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
-            except Exception as exc:
-                log(f"[Sleep] discharge-cutoff reset failed: {exc}", level="WARNING")
             try:
                 self.modbus.disconnect()
             except Exception:
@@ -1831,15 +1840,17 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[CostSettle] financials fetch failed: {exc}")
             return
-        if not fin or not fin.get("elec") or not fin.get("gas"):
+        has_gas_meter = bool(self.octopus.gas_mprn and self.octopus.gas_serial)
+        if not fin or not fin.get("elec") or (has_gas_meter and not fin.get("gas")):
             self.logger.debug("[CostSettle] No ledger rates yet — skipping this cycle")
             return
         elec_standing_p = fin["elec"].get("standing_p")
         fin_elec_unit_p = fin["elec"].get("unit_p")
-        gas_unit_p      = fin["gas"].get("unit_p")
-        gas_standing_p  = fin["gas"].get("standing_p")
+        gas_unit_p      = (fin.get("gas") or {}).get("unit_p")     if has_gas_meter else 0.0
+        gas_standing_p  = (fin.get("gas") or {}).get("standing_p") if has_gas_meter else 0.0
         fin_export_p    = (fin.get("export") or {}).get("unit_p")
-        if None in (elec_standing_p, gas_unit_p, gas_standing_p):
+        # Electricity rates are always required; gas rates only when a gas meter exists.
+        if elec_standing_p is None or (has_gas_meter and None in (gas_unit_p, gas_standing_p)):
             self.logger.debug("[CostSettle] Ledger missing standing/gas rates — skipping")
             return
 
@@ -1863,18 +1874,32 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 self.logger.debug(f"[CostSettle] consumption fetch error {date_str}: {exc}")
                 continue
-            # Gas gates settlement; import should also be present on a settled day.
-            if not gas or gas.get("kwh") is None:
-                continue
+            # Import (electricity) must be present and is the DAY-COMPLETENESS signal:
+            # a smart electricity meter always reports half-hourly, so 46+ of 48 slots
+            # means the day is whole. Octopus settles ~a day in arrears, so the most
+            # recent day often has only the first hour or two — freezing that would lock
+            # in a near-zero bill permanently (cost_settled). Wait until the day is whole.
             if not imp or imp.get("kwh") is None:
                 continue
-            # Only freeze a (near-)complete day. Octopus settles ~a day in
-            # arrears, so the most recent day often has just the first hour or
-            # two of half-hour slots — freezing that would lock in a near-zero
-            # bill permanently (cost_settled). Wait until the day is whole.
-            if (imp.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS
-                    or gas.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS):
+            if imp.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS:
                 continue
+
+            # Gas: gate on PRESENCE of a settled kWh, NOT a 46-slot half-hourly count.
+            # Many SMETS1 / daily-read gas meters report ONE reading per day (slots=1),
+            # which can never reach 46 — gating on slots strands those users on an
+            # estimate forever. A user with no gas meter settles on electricity alone.
+            if has_gas_meter:
+                if not gas or gas.get("kwh") is None:
+                    continue   # gas meter configured but not settled yet — wait
+                try:
+                    gas_kwh = float(gas["kwh"])
+                except (TypeError, ValueError):
+                    self.logger.debug(f"[CostSettle] non-numeric gas kWh for {date_str}; skipping")
+                    continue
+                gas_m3 = gas.get("m3")
+            else:
+                gas_kwh = 0.0
+                gas_m3  = None
 
             # Elec unit rate that applied on this day (saved at midnight); fall
             # back to the current ledger rate only if the row never captured one.
@@ -1891,11 +1916,9 @@ class Plugin(indigo.PluginBase):
 
             try:
                 import_kwh = float(imp["kwh"])
-                gas_kwh    = float(gas["kwh"])
             except (TypeError, ValueError):
-                self.logger.debug(f"[CostSettle] non-numeric kWh for {date_str}; skipping")
+                self.logger.debug(f"[CostSettle] non-numeric import kWh for {date_str}; skipping")
                 continue
-            gas_m3     = gas.get("m3")
             try:
                 export_kwh = float(rec.get("grid_export_kwh", 0.0))
             except (TypeError, ValueError):
@@ -2124,8 +2147,12 @@ class Plugin(indigo.PluginBase):
         out["day_before"]      = _day_card(d2_str)
 
         # ---- Today (provisional, from live Sigen totals) ----
+        # Gas rates are only required when a gas meter exists — an electricity-only
+        # user still gets a today card (the None-safe card treats gas cost as 0).
+        has_gas = bool(self.octopus and self.octopus.gas_mprn and self.octopus.gas_serial)
         elec_unit_p_today = import_rate_p if import_rate_p is not None else fin_elec_unit_p
-        if elec_standing_p is not None and gas_standing_p is not None and gas_unit_p is not None:
+        if elec_standing_p is not None and (not has_gas or
+                (gas_standing_p is not None and gas_unit_p is not None)):
             try:
                 imp_kwh = float(self.store.get("grid_import_daily_kwh", 0.0))
                 exp_kwh = float(self.store.get("grid_export_daily_kwh", 0.0))
@@ -2134,7 +2161,7 @@ class Plugin(indigo.PluginBase):
             out["today"] = self._wh_build_card(
                 imp_kwh, exp_kwh, elec_unit_p_today, export_rate_p,
                 elec_standing_p, gas_est_kwh, gas_unit_p, gas_standing_p,
-                provisional=True, gas_estimated=(gas_est_kwh is not None))
+                provisional=True, gas_estimated=(gas_est_kwh is not None and has_gas))
 
         # ---- Month to date (settled rows this month) ----
         m_rows = [r for r in settled if (r.get("month") == month_pref
@@ -2391,7 +2418,18 @@ class Plugin(indigo.PluginBase):
             return self._compute_daily_economics(0, 0, 0, None, None), ""
         if not records:
             return self._compute_daily_economics(0, 0, 0, None, None), ""
-        yest = records[-1]
+        # Look up YESTERDAY by date, not records[-1] — after a missed-midnight restart
+        # (Mac asleep over midnight) the last row may be the day before, mislabelling
+        # the "yesterday" card. Fall back to the most recent row if the date is absent.
+        try:
+            import pytz
+            today_local = datetime.now(timezone.utc).astimezone(
+                pytz.timezone("Europe/London")).date()
+        except Exception:
+            today_local = datetime.now().date()
+        y_str   = (today_local - timedelta(days=1)).strftime("%Y-%m-%d")
+        by_date = {r.get("date"): r for r in records if r.get("date")}
+        yest = by_date.get(y_str) or records[-1]
         date_str = yest.get("date", "")
         rate_p   = None
         try:
@@ -2551,8 +2589,10 @@ class Plugin(indigo.PluginBase):
     # callbacks, etc.) don't hammer the Octopus API.
     EXPORT_SYNC_WINDOW_DAYS    = 7
     EXPORT_SYNC_SETTLE_DAYS    = 3
-    COST_SETTLE_WINDOW_DAYS    = 5   # attempt to settle whole-house cost for the last N days
-    COST_SETTLE_MIN_SLOTS      = 46  # require a (near-)complete day (48 half-hours) before freezing
+    COST_SETTLE_WINDOW_DAYS    = 14  # settle whole-house cost for the last N days — wide enough
+                                     # that a day whose gas/import settles late (Octopus can lag
+                                     # several days, esp. daily-read gas) is not permanently missed
+    COST_SETTLE_MIN_SLOTS      = 46  # require a (near-)complete electricity day (48 half-hours)
     EXPORT_SYNC_TOLERANCE_PCT  = 5.0
     EXPORT_SYNC_MIN_DAY_KWH    = 0.5    # below this daily total the % is noise, skip drift check
     EXPORT_SYNC_CACHE_TTL      = 6 * 3600   # 6 h — re-check four times/day at most
@@ -2985,11 +3025,16 @@ class Plugin(indigo.PluginBase):
         self.latest_inverter_data = data
 
         # Detect grid-status transitions in either direction so the power-cut
-        # log captures both the start and end of every outage.
+        # log captures both the start and end of every outage.  Key the edges on a
+        # GENUINE off-grid status (register 30009 = 1/2 → "Off-grid …") and on an
+        # in-progress-outage flag, NOT on "any value that isn't On-grid": a transient
+        # unmapped read ("Unknown (N)") must not fire a false outage notification, and
+        # an Unknown→On-grid blip must not fire a false "restored".
         new_grid_status  = data.get("gridStatus", "On-grid")
-        prev_grid_status = self.store.get("grid_status_prev", "On-grid")
+        in_outage        = self.store.get("power_cut_started_at") is not None
+        is_off_grid      = new_grid_status.startswith("Off-grid")
         now_utc          = datetime.now(timezone.utc)
-        if prev_grid_status == "On-grid" and new_grid_status != "On-grid":
+        if is_off_grid and not in_outage:
             # Outage started
             self.store["power_cut_started_at"] = now_utc
             event_str = (
@@ -3003,8 +3048,8 @@ class Plugin(indigo.PluginBase):
             log(f"[PowerCut] Grid lost — entering {new_grid_status} mode",
                 level="WARNING")
             self._send_power_cut_notification("lost", detail=new_grid_status)
-        elif prev_grid_status != "On-grid" and new_grid_status == "On-grid":
-            # Outage ended
+        elif in_outage and new_grid_status == "On-grid":
+            # Outage ended (we were genuinely off-grid and the grid is now back)
             started = self.store.get("power_cut_started_at")
             duration_str = ""
             if started:
@@ -3024,16 +3069,24 @@ class Plugin(indigo.PluginBase):
                 self.store["power_cut_events"] = self.store["power_cut_events"][-100:]
             self.store["power_cut_started_at"]  = None
             self.store["power_restored_time"]   = now_utc
-            self.store["power_cut_lockout_active"] = True
-            self.pluginPrefs["powerRestoredTime"]  = now_utc.isoformat()
-            log(
-                f"[PowerCut] Grid restored after outage — export locked for "
-                f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution "
-                f"(unless SOC ≥ {self._power_cut_lockout_soc_floor():.0f}%, when export "
-                f"resumes to protect solar)",
-                level="WARNING",
-            )
-            self._trigger_event("powerCutLockoutStarted")
+            # Only arm the export lockout if export is actually enabled — otherwise
+            # there is nothing to lock out and _resolve_export_lockout would fire a
+            # phantom 'lockout cleared' on its next pass.
+            export_pref = bool(self.pluginPrefs.get("exportEnabled", False))
+            if export_pref:
+                self.store["power_cut_lockout_active"] = True
+                self.pluginPrefs["powerRestoredTime"]  = now_utc.isoformat()
+                log(
+                    f"[PowerCut] Grid restored after outage — export locked for "
+                    f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution "
+                    f"(unless SOC ≥ {self._power_cut_lockout_soc_floor():.0f}%, when export "
+                    f"resumes to protect solar)",
+                    level="WARNING",
+                )
+                self._trigger_event("powerCutLockoutStarted")
+            else:
+                log("[PowerCut] Grid restored after outage (export disabled — "
+                    "no export lockout needed)", level="WARNING")
             self._send_power_cut_notification("restored", detail=duration_str)
         self.store["grid_status_prev"] = new_grid_status
 
@@ -3284,11 +3337,14 @@ class Plugin(indigo.PluginBase):
         Side effects: updates the two store flags and fires the
         `powerCutLockoutCleared` trigger event when the window expires.
         """
-        export_enabled = bool(self.pluginPrefs.get("exportEnabled", False))
+        export_pref    = bool(self.pluginPrefs.get("exportEnabled", False))
         prt_str        = self.pluginPrefs.get("powerRestoredTime", "")
         within_window  = False
 
-        if prt_str and export_enabled:
+        # The lockout WINDOW is purely time-based (decoupled from the export pref) so
+        # the cleared-event fires on real expiry, not immediately when export happens
+        # to be disabled. Suppression below still only applies when export is enabled.
+        if prt_str:
             try:
                 power_restored = datetime.fromisoformat(prt_str)
                 if power_restored.tzinfo is None:
@@ -3303,7 +3359,8 @@ class Plugin(indigo.PluginBase):
                 )
                 self.pluginPrefs["powerRestoredTime"] = ""
 
-        # SOC floor: within the window, suppress export only while SOC is low.
+        # SOC floor: within the window, suppress export only while SOC is low AND
+        # export is actually enabled (nothing to suppress otherwise).
         soc_val = None
         try:
             if soc_pct is not None:
@@ -3311,9 +3368,8 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             soc_val = None
         soc_floor  = self._power_cut_lockout_soc_floor()
-        suppressed = _export_locked_out(within_window, soc_val, soc_floor)
-        if suppressed:
-            export_enabled = False
+        suppressed = export_pref and _export_locked_out(within_window, soc_val, soc_floor)
+        export_enabled = export_pref and not suppressed
 
         # One-shot INFO when the SOC floor first lets export resume mid-window,
         # so the log explains why export is running during a lockout.
@@ -3449,6 +3505,7 @@ class Plugin(indigo.PluginBase):
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
+            export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), 12.0),
             weekday_kwh        = weekday_pref,
             weekend_kwh        = weekend_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
@@ -3713,12 +3770,21 @@ class Plugin(indigo.PluginBase):
 
     def _check_storm_watch(self):
         """
-        Poll Open-Meteo and MeteoAlarm for incoming wind/storm risk.
-        Updates self.store['storm_level'] and sends a Pushover alert when
-        the level escalates.  Sends an all-clear when level drops back to 'none'.
+        Poll the MeteoAlarm CAP feed for incoming wind/storm risk covering the
+        configured site.  Updates self.store['storm_level'] and sends a Pushover
+        alert when the level escalates.  Sends an all-clear when it drops to 'none'.
         """
+        loc_name = self.pluginPrefs.get("siteLocationName") or "your area"
+        site_lat = (SITE_LATITUDE if SITE_LATITUDE is not None
+                    else _as_float(self.pluginPrefs.get("siteLatitude"), None))
+        site_lon = (SITE_LONGITUDE if SITE_LONGITUDE is not None
+                    else _as_float(self.pluginPrefs.get("siteLongitude"), None))
         try:
-            new_level, reason = check_storm_level()
+            if site_lat is not None and site_lon is not None:
+                new_level, reason = check_storm_level(site_lat, site_lon, loc_name)
+            else:
+                # No configured coordinates — fall back to storm_watch's defaults.
+                new_level, reason = check_storm_level(location_name=loc_name)
         except Exception as exc:
             log(f"[Storm] check_storm_level() raised: {exc}", level="WARNING")
             return
@@ -3728,6 +3794,10 @@ class Plugin(indigo.PluginBase):
 
         self.store["storm_level"] = new_level
 
+        # Escalate a feed-format-drift report to WARNING so a future MeteoAlarm schema
+        # change can't silently disable storm watch the way the 2026 change did.
+        if "unrecognised" in reason:
+            log(f"[Storm] {reason}", level="WARNING")
         log(f"[Storm] Level={new_level}  prev={prev_level}")
         indigo.server.log(f"  {reason}")
 
@@ -3740,7 +3810,7 @@ class Plugin(indigo.PluginBase):
             if new_level == "yellow":
                 title = "Storm Watch - Yellow"
                 body  = (
-                    f"A yellow-level wind risk is forecast for Medomsley. "
+                    f"A yellow-level wind risk is forecast for {loc_name}. "
                     f"Battery will be charged to {STORM_SOC_YELLOW:.0f}% and "
                     f"export suspended until the risk passes.\n\n{reason}"
                 )
@@ -3763,16 +3833,18 @@ class Plugin(indigo.PluginBase):
                 priority = "1"   # high priority
             self._send_pushover(title, body, priority)
             self.store["storm_alerted_level"] = new_level
+            self._save_accumulators()   # persist NOW so a restart can't re-send this alert
 
         # De-escalation: level dropped back to none after an alert was sent
         elif new_level == "none" and alerted_idx > 0:
             self._send_pushover(
                 "Storm Watch Cleared",
-                "Storm/wind risk has passed for Medomsley. "
+                f"Storm/wind risk has passed for {loc_name}. "
                 "Normal battery management and export schedule resumed.",
                 priority="0",
             )
             self.store["storm_alerted_level"] = "none"
+            self._save_accumulators()
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
@@ -3948,8 +4020,12 @@ class Plugin(indigo.PluginBase):
                     self.store["import_active"]     = False
                     self.store["import_target_soc"] = 0.0
                 else:
-                    log(f"[Manager] Holding import - SOC {current_soc:.1f}% / target {target_soc:.0f}%",
-                        level="DEBUG")
+                    # self.logger.debug respects Indigo's debug-logging toggle; the
+                    # module log() helper passes a string level to indigo.server.log
+                    # (which wants a logging int), so "DEBUG" there prints regardless.
+                    self.logger.debug(
+                        f"[Manager] Holding import - SOC {current_soc:.1f}% / "
+                        f"target {target_soc:.0f}%")
             elif prev_export:
                 # Flood prevention complete, export disabled, or other export end
                 flood_target = self.store.get("flood_prev_target_soc")
@@ -4400,6 +4476,13 @@ class Plugin(indigo.PluginBase):
         """Poll Axle API and advance VPP state machine."""
         if not self.axle or not self.pluginPrefs.get("axleEnabled", False):
             return
+        # While the manager is paused the VPP state machine must not advance — pause
+        # already stood down any active window and disengaged the inverter, so a
+        # pre-charge (force-charge + raised cutoff) or a new window starting here
+        # would drive the hardware behind a 'Paused' label. Resume re-detects an
+        # in-progress Axle window via the late-detection path.
+        if self.store.get("manager_paused", False):
+            return
 
         event         = self.axle.get_next_event()
         now           = datetime.now(timezone.utc)
@@ -4471,6 +4554,11 @@ class Plugin(indigo.PluginBase):
             )
             self.store["vpp_event"] = event
             self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
+            # Pre-charge was skipped, so set the discharge cutoff here too — otherwise
+            # vpp_cutoff_raised stays False and _verify_ems_registers would reset the
+            # cutoff to the health floor mid-window, letting a late-detected NIGHT event
+            # over-discharge below the dawn reserve.
+            self._set_vpp_discharge_cutoff(event, is_daytime=self._event_is_daytime(start_time))
             self._vpp_transition(VPP_ACTIVE)
             self.store["vpp_active"] = True
             self._trigger_event("vppStarted")
@@ -4943,6 +5031,54 @@ class Plugin(indigo.PluginBase):
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
             log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
 
+    def _disengage_to_safe_baseline(self, reason):
+        """Return the inverter to the safe self-consumption baseline AND release any
+        raised discharge-cutoff floor (flood-prevention / storm / VPP), standing
+        down any in-flight VPP export.
+
+        Used by both prepare_to_sleep() and pause.  set_self_consumption() clears
+        the forced MODE and the charge/discharge LIMIT registers, but NOT the
+        discharge-cutoff SOC register — so a cutoff left raised (e.g. a 30% flood
+        pre-drain target, or a VPP pre-charge floor) would lock the battery above
+        that SOC for the whole hands-off period and force grid import, defeating the
+        self-sufficiency KPI under a 'safe' label.  This helper resets the cutoff to
+        the health floor and clears the raised-floor flags so the manager re-evaluates
+        cleanly on wake/resume.  Best-effort; never raises (a hands-off transition
+        must always complete).
+        """
+        # 1. Stand down any VPP engagement first.  For an ACTIVE window _end_vpp_export
+        #    already restores the cutoff + records the wrap-up; earlier states just drop
+        #    back to IDLE so a later resume/wake re-detects the window if it's still open.
+        vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        if vpp_state == VPP_ACTIVE:
+            try:
+                self._end_vpp_export(datetime.now(timezone.utc),
+                                     self.store.get("vpp_event"))
+            except Exception as exc:
+                log(f"[{reason}] VPP stand-down failed: {exc}", level="WARNING")
+        elif vpp_state != VPP_IDLE:
+            self.store["vpp_event"]  = None
+            self.store["vpp_active"] = False
+            self._vpp_transition(VPP_IDLE)
+        # 2. Safe baseline mode + reset the discharge cutoff to the health floor.
+        if self.modbus and self.modbus.connected:
+            try:
+                self.modbus.set_self_consumption()
+            except Exception as exc:
+                log(f"[{reason}] set_self_consumption failed: {exc}", level="WARNING")
+            try:
+                health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+                self.modbus.set_discharge_cutoff(health_floor)
+                log(f"[{reason}] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
+            except Exception as exc:
+                log(f"[{reason}] discharge-cutoff reset failed: {exc}", level="WARNING")
+        # 3. Clear the raised-floor flags so _verify_ems_registers manages the cutoff
+        #    again on the next evaluate (it defers while flood/VPP floors are flagged).
+        self._set_flood_prev_target(None)
+        self.store["vpp_cutoff_raised"] = False
+        self.store["import_active"]     = False
+        self.store["export_active"]     = False
+
     def _end_vpp_export(self, now, event):
         """Stop the self-driven VPP export at window end (+2-min tail).
 
@@ -5121,12 +5257,7 @@ class Plugin(indigo.PluginBase):
         Europe/London if the host runs UTC, causing accumulators to roll over
         on the wrong calendar day around BST/UTC boundaries.
         """
-        try:
-            import pytz
-            _tz_l = pytz.timezone("Europe/London")
-            today = datetime.now(timezone.utc).astimezone(_tz_l).strftime("%Y-%m-%d")
-        except ImportError:
-            today = datetime.now().strftime("%Y-%m-%d")
+        today = _local_today_str()   # Europe/London (shared with init + accumulator restore)
         if today == self.store["today_date"]:
             return  # Not yet midnight
 
@@ -5541,7 +5672,9 @@ class Plugin(indigo.PluginBase):
             {"key": "gridSensorConnected",      "value": str(data.get("gridSensorConnected", False))},
             {"key": "gridPowerWatts",           "value": _as_int(data.get("gridPowerWatts"), 0)},
             {"key": "gridStatus",               "value": str(data.get("gridStatus", ""))},
-            {"key": "gridOnline",               "value": 1 if str(data.get("gridStatus", "")).startswith("On-grid") else 0},
+            # 0 only on a GENUINE off-grid status — an unmapped "Unknown (N)" read must
+            # not chart a false power cut (mirrors the _poll_modbus edge detection).
+            {"key": "gridOnline",               "value": 0 if str(data.get("gridStatus", "")).startswith("Off-grid") else 1},
             _num_state("batterySoc",               _as_float(data.get("batterySoc"), 0.0),            1),
             {"key": "pvPowerWatts",             "value": _as_int(data.get("pvPowerWatts"), 0)},
             {"key": "batteryPowerWatts",        "value": _as_int(data.get("batteryPowerWatts"), 0)},
@@ -5874,8 +6007,12 @@ class Plugin(indigo.PluginBase):
             home   = round(self.store.get("home_daily_kwh",         0.0), 2)
             peak   = round(self.store.get("peak_soc",               0.0), 1)
             minsoc = round(self.store.get("min_soc",              100.0), 1)
-            sself  = (round((1 - imp / home) * 100, 1)
-                      if home > 0 else 0.0)
+            # Self-sufficiency = share of home load NOT met by grid import. On a
+            # zero-load day (home=0) nothing was needed from the grid, so that's 100%
+            # — matches the dashboard's get_dashboard_data computation (was 0.0 here,
+            # an inconsistency between the Indigo variable and the dashboard).
+            sself  = (round(max(0.0, (1 - imp / home) * 100), 1)
+                      if home > 0 else 100.0)
 
             decision = self.latest_decision
             action   = str(decision.action)  if decision else ""
@@ -6004,9 +6141,11 @@ class Plugin(indigo.PluginBase):
                         _as_float(self.pluginPrefs.get("inverterMaxKw"), "10.0")
                     )
             elif type_id == "forceExport":
+                # powerKw is the discharge HEADROOM (grid export is DNO-capped) —
+                # default it to the inverter max so the dialog opens at full export.
                 if not values.get("powerKw"):
                     values["powerKw"] = str(
-                        _as_float(self.pluginPrefs.get("maxExportKw"), "4.0")
+                        _as_float(self.pluginPrefs.get("inverterMaxKw"), "10.0")
                     )
         except Exception as exc:
             self.logger.debug(f"getActionConfigUiValues fallback: {exc}")
@@ -6017,23 +6156,36 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def actionForceGridImport(self, action):
-        """Action: Force immediate grid import."""
+        """Action: Force immediate grid import. Clamps to the bounds the ConfigUI
+        labels promise (power 0..inverterMaxKw, target SOC 10..100%)."""
         with self._state_lock:
-            props     = action.props
-            power_kw  = _as_float(props.get("powerKw"), 10.0)
-            target_soc = _as_float(props.get("targetSocPct"), 80.0)
-            log(f"[Action] Force grid import: {power_kw}kW to {target_soc:.0f}% SOC")
+            props      = action.props
+            inv_max_kw = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
+            power_kw   = min(max(0.0, _as_float(props.get("powerKw"), inv_max_kw)), inv_max_kw)
+            target_soc = min(max(10.0, _as_float(props.get("targetSocPct"), 80.0)), 100.0)
+            log(f"[Action] Force grid import: {power_kw:.1f}kW to {target_soc:.0f}% SOC")
             if self.modbus and self.modbus.force_charge(int(power_kw * 1000)):
                 self.store["import_active"]     = True
                 self.store["import_target_soc"] = target_soc
                 self.store["export_active"]     = False
 
     def actionForceExport(self, action):
-        """Action: Force immediate grid export."""
+        """Action: Force immediate grid export at the DNO cap (test).
+
+        night_export sets the battery DISCHARGE limit; grid export itself is capped
+        automatically by the inverter's commissioned DNO limit (no grid-export
+        setpoint is written). So the powerKw field sets the discharge HEADROOM —
+        default = inverter max, which exports the full DNO allocation; a lower value
+        limits how hard the battery can discharge (grid export then = headroom minus
+        house load). The field used to be ignored entirely (always inverter max)."""
         with self._state_lock:
-            inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-            log("[Action] Force export: night_export mode")
-            if self.modbus and self.modbus.night_export(inv_max_w):
+            inv_max_kw  = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
+            power_kw    = min(max(0.0, _as_float(action.props.get("powerKw"), inv_max_kw)),
+                              inv_max_kw)
+            discharge_w = int(power_kw * 1000)
+            log(f"[Action] Force export: discharge limit {power_kw:.1f}kW "
+                f"(grid export auto-capped at the DNO limit)")
+            if self.modbus and self.modbus.night_export(discharge_w):
                 self.store["export_active"]  = True
                 self.store["import_active"]  = False
 
@@ -6108,21 +6260,20 @@ class Plugin(indigo.PluginBase):
                 "managerStatus", value="Paused" if paused else "Running"
             )
         if paused:
+            # Hand the inverter back to the safe baseline AND release any raised
+            # discharge-cutoff floor (flood-prev / storm / VPP) + stand down any
+            # in-flight VPP export — the same disengage prepare_to_sleep() uses.
+            # Without the cutoff release a 'Paused' manager could leave the battery
+            # locked above a raised SOC and silently force grid import for the whole
+            # pause. import_active/export_active are cleared inside the helper.
             if self.modbus and self.modbus.connected:
-                try:
-                    self.modbus.set_self_consumption()
-                    log(f"[Pause] Manager paused ({source}) — inverter returned "
-                        f"to self-consumption; holding hands-off until resumed.")
-                except Exception as exc:
-                    log(f"[Pause] set_self_consumption failed on pause: {exc}",
-                        level="WARNING")
+                log(f"[Pause] Manager paused ({source}) — inverter returned to "
+                    f"self-consumption and raised floors released; holding hands-off "
+                    f"until resumed.")
             else:
-                log(f"[Pause] Manager paused ({source}) — modbus offline, "
-                    f"inverter left as-is.")
-            # Clear forced-mode store flags (mirrors actionReturnToLocalEms) so a
-            # later resume re-evaluates from a clean baseline.
-            self.store["import_active"] = False
-            self.store["export_active"] = False
+                log(f"[Pause] Manager paused ({source}) — modbus offline, inverter "
+                    f"left as-is; raised-floor flags cleared.")
+            self._disengage_to_safe_baseline("Pause")
         elif was_paused:
             # Resume: re-evaluate now rather than waiting up to MANAGER_EVAL_INTERVAL.
             self.store["last_manager"] = 0.0
@@ -6695,11 +6846,7 @@ class Plugin(indigo.PluginBase):
         # is NO built-in default.  If both are unset the forecast feature is
         # skipped with a clear ERROR.  Array specs remain in source for v5 —
         # a per-array UI is on the v6 roadmap.
-        def _as_float(value, fallback):
-            try:
-                return float(value) if value not in (None, "") else fallback
-            except (TypeError, ValueError):
-                return fallback
+        # Uses the module-level _as_float (handles a None fallback correctly).
         site_lat = SITE_LATITUDE  if SITE_LATITUDE  is not None else _as_float(prefs.get("siteLatitude"),  None)
         site_lon = SITE_LONGITUDE if SITE_LONGITUDE is not None else _as_float(prefs.get("siteLongitude"), None)
         # Optional per-array JSON override.  Strict shape check — every entry
@@ -6768,6 +6915,7 @@ class Plugin(indigo.PluginBase):
             export_mpan=self.export_mpan,
             export_serial=self.export_serial,
             gas_kwh_per_m3=gas_kwh_per_m3,
+            gas_unit=(self.pluginPrefs.get("gasMeterUnit") or "m3"),
         )
 
         # Axle VPP
@@ -6872,6 +7020,10 @@ class Plugin(indigo.PluginBase):
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
             "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
+            # Storm state is NOT day-specific (a warning can span midnight) — persist it
+            # so a restart during an active warning doesn't re-send the Pushover.
+            "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
+            "storm_level":               self.store.get("storm_level", "none"),
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -6888,7 +7040,13 @@ class Plugin(indigo.PluginBase):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            today = datetime.now().strftime("%Y-%m-%d")
+            # Storm state is restored regardless of day (a warning can span midnight),
+            # so a restart during an active warning won't re-send the Pushover.
+            if data.get("storm_alerted_level"):
+                self.store["storm_alerted_level"] = data.get("storm_alerted_level")
+            if data.get("storm_level"):
+                self.store["storm_level"] = data.get("storm_level")
+            today = _local_today_str()   # Europe/London, matches the save/midnight basis
             if data.get("today_date") == today:
                 # Same day — restore accumulators and lifetime anchors
                 self.store["pv_daily_kwh"]              = data.get("pv_daily_kwh", 0.0)

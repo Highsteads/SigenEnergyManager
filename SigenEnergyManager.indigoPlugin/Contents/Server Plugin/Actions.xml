@@ -18,8 +18,8 @@
         <Name>Force Grid Export</Name>
         <CallbackMethod>actionForceExport</CallbackMethod>
         <ConfigUI>
-            <Field id="powerKw" type="textfield" defaultValue="4.0">
-                <Label>Export power (kW, max 4.0 DNO limit):</Label>
+            <Field id="powerKw" type="textfield" defaultValue="10.0">
+                <Label>Battery discharge limit (kW, default = inverter max). Grid export is auto-capped at your DNO limit; lower this only to throttle the battery.</Label>
             </Field>
         </ConfigUI>
     </Action>

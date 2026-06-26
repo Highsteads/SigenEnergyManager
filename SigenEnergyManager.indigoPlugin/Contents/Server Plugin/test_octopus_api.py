@@ -144,6 +144,33 @@ class TestPerDayConsumption(unittest.TestCase):
         api = octopus_api.OctopusAPI(api_key="k", account_id="A", mpan="m", serial="s")
         self.assertIsNone(api.get_gas_kwh_for_date("2026-06-20"))
 
+    def test_gas_unit_kwh_skips_conversion(self):
+        # A kWh-reporting meter must NOT be multiplied by the calorific factor.
+        api = octopus_api.OctopusAPI(api_key="k", account_id="A", mpan="m", serial="s",
+                                     gas_mprn="g", gas_serial="s", gas_unit="kwh")
+        api._sum_consumption_for_date = lambda url, d: {"value": 8.0, "slots": 48}
+        out = api.get_gas_kwh_for_date("2026-06-20")
+        self.assertEqual(out["kwh"], 8.0)                       # NOT 8 * 11.19
+        self.assertAlmostEqual(out["m3"], round(8.0 / octopus_api.GAS_KWH_PER_M3, 3), places=3)
+
+    def test_gas_unit_defaults_to_m3(self):
+        api = octopus_api.OctopusAPI(api_key="k", account_id="A", mpan="m", serial="s",
+                                     gas_mprn="g", gas_serial="s")
+        self.assertEqual(api.gas_unit, "m3")
+
+    def test_gas_unit_invalid_falls_back_to_m3(self):
+        api = octopus_api.OctopusAPI(api_key="k", account_id="A", mpan="m", serial="s",
+                                     gas_unit="furlongs")
+        self.assertEqual(api.gas_unit, "m3")
+
+    def test_gas_daily_granularity_one_slot(self):
+        # A daily-read meter returns ONE reading; get_gas_kwh_for_date still returns a
+        # kWh (the plugin settle gate no longer requires 46 gas slots).
+        self.api._sum_consumption_for_date = lambda url, d: {"value": 2.5, "slots": 1}
+        out = self.api.get_gas_kwh_for_date("2026-06-20")
+        self.assertEqual(out["slots"], 1)
+        self.assertIsNotNone(out["kwh"])
+
 
 class TestFinancialsErrorPaths(unittest.TestCase):
     def setUp(self):
@@ -209,11 +236,22 @@ class TestFinancialsClassification(unittest.TestCase):
         self.assertEqual(fin["export"]["unit_p"], 12.0)
         self.assertEqual(fin["elec"]["unit_p"], 23.0)   # import unaffected
 
-    def test_unknown_mpan_treated_as_export(self):
+    def test_unknown_mpan_not_assumed_export(self):
+        # A second meter that is neither the export MPAN nor OUTGOING-coded must NOT be
+        # assumed to be export — a user with a SECOND import supply would otherwise have
+        # it mis-tagged and its tariff mistaken for the export rate. (Was the old buggy
+        # "any non-import meter is export" heuristic.)
         octopus_api.requests.post.return_value = _FakeResp(self._ledger("9999999999999", "E-1R-WEIRD-F"))
         fin = self.api.get_account_financials(force=True)
+        self.assertIsNone(fin["export"])                # no positive export evidence
+        self.assertEqual(fin["elec"]["unit_p"], 23.0)   # import meter unaffected
+
+    def test_export_by_outgoing_code(self):
+        # OUTGOING in the product code IS positive export evidence.
+        octopus_api.requests.post.return_value = _FakeResp(
+            self._ledger("9999999999999", "E-1R-OUTGOING-VAR-24-10-26-F"))
+        fin = self.api.get_account_financials(force=True)
         self.assertEqual(fin["export"]["unit_p"], 12.0)
-        self.assertEqual(fin["elec"]["unit_p"], 23.0)
 
 
 class TestGasZeroBoundary(unittest.TestCase):

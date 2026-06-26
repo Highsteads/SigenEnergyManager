@@ -480,6 +480,60 @@ class TestSignedRegisterDecode(unittest.TestCase):
         self.assertEqual(self.modbus._read_int32(30000), 65536)
 
 
+from sigenergy_modbus import PLANT_BATTERY_SOC, PLANT_ESS_SOH   # noqa: E402
+
+
+class TestReadAllPartial(unittest.TestCase):
+    """read_all() must NEVER fabricate a 0 — the phantom-0%-SOC force-charge guard.
+    A partial read that drops a CRITICAL register returns None (so _poll_modbus keeps
+    the last-known-good snapshot, NOT a fake 0% SOC); a non-critical drop returns a
+    dict omitting that key; a majority-failed read marks the connection disconnected."""
+
+    def _mk(self, fail_addrs=()):
+        m = SigenergyModbus("192.168.1.49")
+        m._connected         = True
+        m._last_request_time = 0
+        m._sleep             = lambda _s: None
+        fail = set(fail_addrs)
+
+        def _rd(default):
+            def _f(register, slave=None, *a, **k):
+                return None if register in fail else default
+            return _f
+        # Benign non-zero value for every read primitive; failed addresses -> None.
+        for name in ("_read_uint16", "_read_int16", "_read_int32",
+                     "_read_uint32", "_read_uint64"):
+            setattr(m, name, _rd(100))
+        return m
+
+    def test_all_present_returns_dict(self):
+        data = self._mk().read_all()
+        self.assertIsNotNone(data)
+        self.assertIn("batterySoc", data)
+
+    def test_missing_critical_soc_returns_none_connection_kept(self):
+        m = self._mk(fail_addrs={PLANT_BATTERY_SOC})
+        self.assertIsNone(m.read_all())          # never act on fabricated 0% SOC
+        self.assertTrue(m._connected)            # healthy link, just a transient drop
+
+    def test_missing_noncritical_soh_returns_dict_without_key(self):
+        data = self._mk(fail_addrs={PLANT_ESS_SOH}).read_all()
+        self.assertIsNotNone(data)
+        self.assertNotIn("batterySoh", data)
+        self.assertIn("batterySoc", data)        # critical data still delivered
+
+    def test_majority_errors_marks_disconnected(self):
+        m = SigenergyModbus("192.168.1.49")
+        m._connected         = True
+        m._last_request_time = 0
+        m._sleep             = lambda _s: None
+        for name in ("_read_uint16", "_read_int16", "_read_int32",
+                     "_read_uint32", "_read_uint64"):
+            setattr(m, name, lambda *a, **k: None)   # everything fails
+        self.assertIsNone(m.read_all())
+        self.assertFalse(m._connected)
+
+
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
     unittest.main(verbosity=2)

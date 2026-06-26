@@ -14,6 +14,7 @@ import os
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 # ---- Mock the Indigo runtime + pymodbus so plugin.py imports standalone ----
@@ -227,7 +228,13 @@ class TestWholeHouseCard(unittest.TestCase):
 
 # ---- Helpers for the settle / summary tests (build Plugin without __init__) ----
 class _FakeOcto:
-    def __init__(self, fin="default", gas="default", slots=48):
+    # Models a gas-having user (a real OctopusAPI always exposes these attributes;
+    # the settle / summary code keys "does this user have gas" off the gas meter id).
+    gas_mprn   = "g-mprn"
+    gas_serial = "g-serial"
+
+    def __init__(self, fin="default", gas="default", slots=48, gas_mprn="g-mprn",
+                 gas_serial="g-serial"):
         self._fin = {
             "elec":   {"standing_p": 61.51824, "unit_p": 23.478},
             "gas":    {"unit_p": 6.58413, "standing_p": 29.06169},
@@ -235,6 +242,8 @@ class _FakeOcto:
         } if fin == "default" else fin
         self._slots = slots
         self._gas = {"m3": 0.716, "kwh": 8.03, "slots": slots} if gas == "default" else gas
+        self.gas_mprn   = gas_mprn
+        self.gas_serial = gas_serial
 
     def get_account_financials(self, force=False):
         return self._fin
@@ -320,6 +329,27 @@ class TestSettleWholeHouseCosts(unittest.TestCase):
         r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}],
                       _FakeOcto(slots=2))[d1]
         self.assertFalse(r.get("cost_settled", False))
+
+    def test_daily_granularity_gas_settles(self):
+        # A daily-read gas meter reports ONE reading (slots=1) while electricity is the
+        # complete-day signal (48 slots). The day MUST still settle — gating gas on 46
+        # slots would strand daily-read meters on an estimate forever (H2).
+        d1 = self._yesterday()
+        octo = _FakeOcto(gas={"m3": 2.5, "kwh": 28.0, "slots": 1})  # import keeps 48 slots
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
+        self.assertTrue(r["cost_settled"])
+        self.assertGreater(r["gas_unit_cost_gbp"], 0.0)
+
+    def test_no_gas_meter_settles_on_electricity(self):
+        # A user with no gas meter settles on electricity alone (gas component = 0),
+        # rather than the day never settling because gas data is absent.
+        d1 = self._yesterday()
+        octo = _FakeOcto(gas_mprn="", gas_serial="",
+                         gas={"m3": None, "kwh": None, "slots": 0})
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
+        self.assertTrue(r["cost_settled"])
+        self.assertEqual(r["gas_unit_cost_gbp"], 0.0)
+        self.assertEqual(r["gas_standing_gbp"], 0.0)
 
     def test_complete_day_freezes(self):
         d1 = self._yesterday()
@@ -497,6 +527,199 @@ class TestLockoutSocFloorPref(unittest.TestCase):
     def test_garbage_falls_back(self):
         self.assertEqual(self._floor({"powerCutLockoutSocFloor": "abc"}),
                          plugin.POWER_CUT_LOCKOUT_SOC_FLOOR)
+
+
+class TestResolveExportLockout(unittest.TestCase):
+    """_resolve_export_lockout — the post-power-cut export lockout WRAPPER (the pure
+    core _export_locked_out is tested separately). Window is time-based; suppression
+    requires export enabled AND SOC below the floor; the cleared-event fires once on
+    real window expiry; a corrupt powerRestoredTime fails closed-then-clears."""
+
+    def _mk(self, export_enabled=True, restored_minutes_ago=None,
+            powerRestoredTime=None, prev_suppressed=False, prev_lockout=False,
+            soc_floor="85"):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.pluginPrefs = {"exportEnabled": export_enabled,
+                         "powerCutLockoutSocFloor": soc_floor}
+        if powerRestoredTime is not None:
+            p.pluginPrefs["powerRestoredTime"] = powerRestoredTime
+        elif restored_minutes_ago is not None:
+            prt = datetime.now(timezone.utc) - timedelta(minutes=restored_minutes_ago)
+            p.pluginPrefs["powerRestoredTime"] = prt.isoformat()
+        else:
+            p.pluginPrefs["powerRestoredTime"] = ""
+        p.store = {"power_cut_export_suppressed": prev_suppressed,
+                   "power_cut_lockout_active": prev_lockout}
+        p._events = []
+        p._trigger_event = lambda name: p._events.append(name)
+        return p
+
+    def test_within_window_low_soc_suppresses_export(self):
+        # Restored 60 min ago (window 4h), SOC 50 < 85 floor -> export held off.
+        p = self._mk(restored_minutes_ago=60)
+        self.assertFalse(p._resolve_export_lockout(50.0))
+        self.assertTrue(p.store["power_cut_export_suppressed"])
+        self.assertTrue(p.store["power_cut_lockout_active"])
+
+    def test_within_window_high_soc_allows_export(self):
+        # SOC 90 >= 85 floor -> export resumes mid-window to protect solar.
+        p = self._mk(restored_minutes_ago=60, prev_suppressed=True)
+        self.assertTrue(p._resolve_export_lockout(90.0))
+        self.assertFalse(p.store["power_cut_export_suppressed"])
+
+    def test_within_window_unknown_soc_fails_safe(self):
+        # Unknown SOC must fail safe (suppress), never fail-open.
+        p = self._mk(restored_minutes_ago=60)
+        self.assertFalse(p._resolve_export_lockout(None))
+        self.assertTrue(p.store["power_cut_export_suppressed"])
+
+    def test_window_expiry_fires_cleared_event_once(self):
+        # Restored 5h ago (> 4h window) with the lockout previously active.
+        p = self._mk(restored_minutes_ago=300, prev_lockout=True)
+        self.assertTrue(p._resolve_export_lockout(50.0))   # window expired -> export ok
+        self.assertFalse(p.store["power_cut_lockout_active"])
+        self.assertEqual(p._events.count("powerCutLockoutCleared"), 1)
+
+    def test_corrupt_restored_time_clears_and_resumes(self):
+        # A garbage pluginPrefs value must clear itself and NOT hold export off.
+        p = self._mk(powerRestoredTime="not-a-timestamp")
+        self.assertTrue(p._resolve_export_lockout(50.0))
+        self.assertEqual(p.pluginPrefs["powerRestoredTime"], "")
+
+    def test_export_disabled_short_circuits(self):
+        # Export disabled by pref -> always False, and nothing suppressed spuriously.
+        p = self._mk(export_enabled=False, restored_minutes_ago=60)
+        self.assertFalse(p._resolve_export_lockout(50.0))
+        self.assertFalse(p.store["power_cut_export_suppressed"])
+
+    def test_soc_exactly_at_floor_allows_export(self):
+        # 85 is NOT below the 85 floor -> export allowed (boundary).
+        p = self._mk(restored_minutes_ago=60)
+        self.assertTrue(p._resolve_export_lockout(85.0))
+
+
+class TestDisengageToSafeBaseline(unittest.TestCase):
+    """_disengage_to_safe_baseline — pause/sleep must release a raised discharge-cutoff
+    floor (flood-prev / storm / VPP) to the health floor and clear the raised-floor
+    flags, or the battery stays hardware-locked above that SOC and forces grid import."""
+
+    def _mk(self, vpp_state="idle", connected=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.modbus = MagicMock()
+        p.modbus.connected = connected
+        p.pluginPrefs = {"batteryHealthCutoff": "1"}
+        p.store = {"vpp_state": vpp_state, "vpp_event": None, "vpp_active": False,
+                   "vpp_cutoff_raised": True, "flood_prev_target_soc": 30.0,
+                   "import_active": True, "export_active": True}
+        p._events = []
+        p._trigger_event = lambda name: p._events.append(name)
+        return p
+
+    def test_resets_cutoff_to_health_floor_and_clears_flags(self):
+        p = self._mk()
+        p._disengage_to_safe_baseline("Pause")
+        p.modbus.set_discharge_cutoff.assert_called_with(1.0)
+        self.assertFalse(p.store["vpp_cutoff_raised"])
+        self.assertIsNone(p.store["flood_prev_target_soc"])
+        self.assertEqual(p.pluginPrefs["floodPrevTargetSoc"], "")
+        self.assertFalse(p.store["import_active"])
+        self.assertFalse(p.store["export_active"])
+
+    def test_modbus_offline_still_clears_flags(self):
+        # No modbus write possible, but the raised-floor flags must still clear so the
+        # next online evaluate re-asserts the health floor.
+        p = self._mk(connected=False)
+        p._disengage_to_safe_baseline("Pause")
+        p.modbus.set_discharge_cutoff.assert_not_called()
+        self.assertFalse(p.store["vpp_cutoff_raised"])
+        self.assertIsNone(p.store["flood_prev_target_soc"])
+
+
+class TestUpdateInverterDevice(unittest.TestCase):
+    """_update_inverter_device — the String->Number telemetry write path. Numeric
+    states must be written as real numbers (so Indigo history charts them), gridOnline
+    must derive 1/0 from the grid status, and categorical states stay strings."""
+
+    def _run(self, data):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        dev = MagicMock()
+        p._find_device = lambda which: dev
+        p.store = {"pv_daily_kwh": 3.4, "grid_import_daily_kwh": 0.02,
+                   "grid_export_daily_kwh": 2.6, "home_daily_kwh": 7.9}
+        p._update_inverter_device(data)
+        states = dev.updateStatesOnServer.call_args[0][0]
+        return {s["key"]: s for s in states}, dev
+
+    def test_numeric_states_written_as_numbers(self):
+        st, _ = self._run({"batterySoc": 58.8, "gridPowerWatts": 2,
+                           "gridStatus": "On-grid"})
+        self.assertIsInstance(st["batterySoc"]["value"], float)   # number, not str
+        self.assertEqual(st["batterySoc"]["value"], 58.8)
+        self.assertIsInstance(st["gridPowerWatts"]["value"], int)
+        # categorical stays a string
+        self.assertIsInstance(st["gridStatus"]["value"], str)
+
+    def test_grid_online_on_grid_is_1(self):
+        st, _ = self._run({"gridStatus": "On-grid"})
+        self.assertEqual(st["gridOnline"]["value"], 1)
+
+    def test_grid_online_off_grid_is_0(self):
+        st, _ = self._run({"gridStatus": "Off-grid (auto)"})
+        self.assertEqual(st["gridOnline"]["value"], 0)
+
+    def test_grid_online_unknown_is_1(self):
+        # An unmapped "Unknown (N)" read must NOT chart a false power cut.
+        st, _ = self._run({"gridStatus": "Unknown (9)"})
+        self.assertEqual(st["gridOnline"]["value"], 1)
+
+    def test_no_device_is_safe(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p._find_device = lambda which: None
+        p._update_inverter_device({"batterySoc": 50.0})   # must not raise
+
+
+class TestVppOverlapHours(unittest.TestCase):
+    """_vpp_overlap_hours — pro-rates a VPP event across local dates (feeds the
+    flood-prevention refill capacity). A midnight-spanning event must split correctly."""
+
+    def test_event_within_one_day(self):
+        d = datetime(2026, 6, 26, 0, 0)
+        s = datetime(2026, 6, 26, 18, 0)
+        e = datetime(2026, 6, 26, 19, 30)
+        self.assertAlmostEqual(plugin.Plugin._vpp_overlap_hours(s, e, d.date()), 1.5)
+
+    def test_event_spanning_midnight_splits(self):
+        s = datetime(2026, 6, 26, 22, 0)
+        e = datetime(2026, 6, 27, 1, 0)      # 3h total, 22:00->01:00
+        d1 = plugin.Plugin._vpp_overlap_hours(s, e, datetime(2026, 6, 26).date())
+        d2 = plugin.Plugin._vpp_overlap_hours(s, e, datetime(2026, 6, 27).date())
+        self.assertAlmostEqual(d1, 2.0)      # 22:00-24:00
+        self.assertAlmostEqual(d2, 1.0)      # 00:00-01:00
+        self.assertAlmostEqual(d1 + d2, 3.0)
+
+    def test_no_overlap_is_zero(self):
+        s = datetime(2026, 6, 26, 18, 0)
+        e = datetime(2026, 6, 26, 19, 0)
+        self.assertEqual(plugin.Plugin._vpp_overlap_hours(s, e, datetime(2026, 6, 28).date()), 0.0)
+
+
+class TestDriveVppExportStartLatch(unittest.TestCase):
+    """The first _drive_vpp_export tick (export_active False) must latch export_active
+    True and fire the exportStarted trigger — the existing TestDriveVppExport always
+    pre-sets export_active=True so that path was never exercised."""
+
+    def test_first_drive_latches_and_fires_exportStarted(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.modbus = MagicMock()
+        p.latest_inverter_data = {"pvPowerWatts": 9630, "homePowerWatts": 678}
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "maxExportKw": "4.0"}
+        p.store = {"export_active": False, "vpp_is_daytime": True,
+                   "vpp_export_submode": None, "vpp_bank_charge_cap_w": -1}
+        fired = []
+        p._trigger_event = lambda name: fired.append(name)
+        p._drive_vpp_export()
+        self.assertTrue(p.store["export_active"])
+        self.assertIn("exportStarted", fired)
 
 
 if __name__ == "__main__":

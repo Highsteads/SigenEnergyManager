@@ -138,6 +138,7 @@ class ManagerSnapshot:
     health_cutoff_pct:  float = 1.0      # hardware discharge floor
     export_enabled:     bool  = False    # export MPAN active
     max_export_kw:      float = 4.0      # DNO export cap (kW)
+    export_rate_p:      float = 12.0     # live export unit rate (p/kWh), for advisory revenue
 
     # Daily consumption estimates (24h sufficiency model)
     weekday_kwh:        float = 22.0     # Mon-Fri daily load
@@ -417,6 +418,18 @@ class BatteryManager:
         overnight.
         """
         if snapshot.vpp_active:
+            # Don't self-drive a VPP export while export is currently disabled — a
+            # post-power-cut lockout (or a storm override) forces export_enabled
+            # False as a precaution, and that safety gate must win over the ~£1/kWh
+            # VPP payment. Stand down to self-consumption; the window resumes
+            # automatically once export is re-enabled (e.g. SOC clears the lockout
+            # floor). Holding the battery here also maximises post-cut resilience.
+            if not snapshot.export_enabled:
+                return Decision(
+                    action = ACTION_SELF_CONSUMPTION,
+                    reason = "VPP event active but export currently disabled "
+                             "(power-cut lockout / storm) — standing down",
+                )
             # Self-drive the export window instead of standing down. Axle settle on
             # the meter reading, so exporting it ourselves counts identically — and
             # their cloud dispatch proved unreliable (no-show 10-Jun-2026, Axle
@@ -494,12 +507,17 @@ class BatteryManager:
         now             = snapshot.now
 
         # ── Local time for day-of-week ──────────────────────────────────────
+        # (ImportError, Exception) was redundant — Exception already covers it and
+        # masked real tz errors. Try pytz, then stdlib zoneinfo (correct in GMT too).
         try:
             import pytz
-            _tz       = pytz.timezone("Europe/London")
-            local_now = now.astimezone(_tz)
-        except (ImportError, Exception):
-            local_now = now
+            local_now = now.astimezone(pytz.timezone("Europe/London"))
+        except Exception:
+            try:
+                from zoneinfo import ZoneInfo
+                local_now = now.astimezone(ZoneInfo("Europe/London"))
+            except Exception:
+                local_now = now
 
         today_str = local_now.date().strftime("%Y-%m-%d")
 
@@ -512,10 +530,12 @@ class BatteryManager:
         tomorrow_need_kwh = snapshot.weekend_kwh if tomorrow_weekday >= 5 else snapshot.weekday_kwh
 
         # ── Find next dawn (forward-scan prevents BST/UTC date mismatch) ────
+        # dawn_times is keyed by LOCAL date, so scan from local_now.date(), not the
+        # UTC now.date() (which is a day behind in the 00:00-01:00 BST window).
         dawn_dt = None
         for _days in range(3):
             _candidate = snapshot.dawn_times.get(
-                (now.date() + timedelta(days=_days)).strftime("%Y-%m-%d")
+                (local_now.date() + timedelta(days=_days)).strftime("%Y-%m-%d")
             )
             if _candidate is not None and _candidate > now:
                 dawn_dt = _candidate
@@ -1296,7 +1316,7 @@ class BatteryManager:
             "target_headroom_ok":   bool(target_headroom_ok),
             "would_fire":           would_fire,
             "expected_export_kwh":  round(export_kwh, 2),
-            "expected_revenue_gbp": round(export_kwh * 12.0 / 100.0, 2),
+            "expected_revenue_gbp": round(export_kwh * (snapshot.export_rate_p or 12.0) / 100.0, 2),
         }
 
     def compute_flood_preview(self, snapshot: ManagerSnapshot) -> dict:

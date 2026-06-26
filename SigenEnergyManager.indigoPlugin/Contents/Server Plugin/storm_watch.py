@@ -5,16 +5,18 @@
 #              Polls the MeteoAlarm CAP Atom feed — the official Met Office
 #              warning source for the UK (free, no API key required).
 #              Each CAP entry is filtered by polygon to confirm the warning
-#              area actually covers Medomsley, County Durham before acting.
-#              Onset time is checked: warnings are only acted on when the
+#              area actually covers the configured site before acting.
+#              Severity is read from the current feed schema (cap:event colour +
+#              cap:severity) with a legacy awareness_* fallback and a schema-drift
+#              guard. Onset time is checked: warnings are only acted on when the
 #              storm is due within STORM_ACTIVATE_HOURS (default 24h), so
 #              early announcements do not prematurely alter battery behaviour.
 #              Met Office warnings are calibrated for real disruption/power-cut
 #              risk, avoiding false positives from ordinary windy days.
 #              Returns a severity string: "none", "yellow", "amber", or "red".
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        05-04-2026
-# Version:     1.3
+# Author:      CliveS & Claude Opus 4.8
+# Date:        26-06-2026
+# Version:     1.4 (MeteoAlarm cap:event/cap:severity schema + drift guard)
 
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -112,26 +114,47 @@ def _warning_covers_location(entry, ns, lat, lon):
 # MeteoAlarm CAP feed (official Met Office UK warnings)
 # ============================================================
 
-# MeteoAlarm numeric awareness-level codes -> severity string
+# MeteoAlarm severity mapping.
+#
+# The MeteoAlarm feed schema CHANGED (confirmed live 26-Jun-2026): the old
+# <cap:awareness_type> / <cap:awareness_level> elements are no longer served. The
+# current feed carries <cap:event> (e.g. "Yellow thunderstorm warning") + a CAP
+# <cap:severity> (Minor/Moderate/Severe/Extreme). We classify from the colour word
+# in the event/title FIRST (most direct — MeteoAlarm titles are literally colour-led),
+# then fall back to cap:severity, then to the legacy numeric awareness code. Keeping
+# all three paths means a future schema flip can't silently disable storm watch again.
+
+# Legacy MeteoAlarm numeric awareness-level codes -> severity string (fallback)
 _MA_LEVEL_MAP = {"2": "yellow", "3": "amber", "4": "red"}
 
-# MeteoAlarm awareness types to consider (wind-related hazards)
-_WIND_TYPES = {"wind", "thunderstorm", "thunderstorms", "rain-flooding"}
+# CAP severity -> colour, used when the title carries no explicit colour word
+_MA_SEVERITY_MAP = {"minor": "yellow", "moderate": "yellow",
+                    "severe": "amber", "extreme": "red"}
+
+# Hazard keywords (matched against cap:event / atom:title) that carry genuine
+# power-cut / disruption risk — the reason storm watch exists.
+_WIND_TYPES = {"wind", "thunderstorm", "thunderstorms", "storm",
+               "snow", "ice", "rain", "flooding"}
 
 
 # ============================================================
 # Public API
 # ============================================================
 
-def check_storm_level():
+def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"):
     """
-    Check the MeteoAlarm CAP feed for active wind/storm warnings covering
-    Medomsley, County Durham (54.882N, 1.818W).
+    Check the MeteoAlarm CAP feed for active wind/storm warnings covering the
+    site at (lat, lon).
+
+    Args:
+        lat, lon       site coordinates (default the module's Medomsley constants;
+                       the plugin passes its own configured site coordinates).
+        location_name  label used in the human-readable reason string.
 
     Filters for:
-      - wind/thunderstorm awareness types only
+      - wind/storm/snow/ice hazards only (power-cut risk)
       - non-expired warnings
-      - warnings whose CAP polygon covers our location
+      - warnings whose CAP polygon covers the site
 
     Returns:
         level  (str): "none", "yellow", "amber", or "red"
@@ -156,31 +179,67 @@ def check_storm_level():
         "cap":  "urn:oasis:names:tc:emergency:cap:1.2",
     }
 
-    now_utc      = datetime.now(timezone.utc)
-    horizon_utc  = now_utc + timedelta(hours=STORM_ACTIVATE_HOURS)
-    highest      = "none"
-    reasons      = []
-    pending      = []   # warnings that exist but are beyond the activation horizon
+    now_utc       = datetime.now(timezone.utc)
+    horizon_utc   = now_utc + timedelta(hours=STORM_ACTIVATE_HOURS)
+    highest       = "none"
+    reasons       = []
+    pending       = []   # warnings that exist but are beyond the activation horizon
+    entries_total = 0    # CAP entries seen
+    entries_known = 0    # entries whose schema we could read (cap:event or awareness_type)
 
     for entry in root.findall(".//atom:entry", ns):
+        entries_total += 1
 
-        # --- Filter by awareness type (wind/storm only) ---
+        # --- Read the hazard text + level from whichever schema the feed uses ---
+        # Current MeteoAlarm: <cap:event>"Yellow thunderstorm warning"</cap:event>
+        #                     + <cap:severity>Moderate</cap:severity>
+        # Legacy MeteoAlarm:  <cap:awareness_type> + <cap:awareness_level>"2; Yellow; …"
+        event_el = entry.find(".//cap:event", ns)
         atype_el = entry.find(".//cap:awareness_type", ns)
-        if atype_el is None or not atype_el.text:
-            continue
-        atype_lower = atype_el.text.strip().lower()
-        if not any(w in atype_lower for w in _WIND_TYPES):
+        title_el = entry.find("atom:title", ns)
+
+        if event_el is not None and event_el.text:
+            hazard_text  = event_el.text.strip()
+            known_schema = True
+        elif atype_el is not None and atype_el.text:
+            hazard_text  = atype_el.text.strip()
+            known_schema = True
+        elif title_el is not None and title_el.text:
+            # Title alone still carries hazard + colour ("Yellow thunderstorm warning…")
+            hazard_text  = title_el.text.strip()
+            known_schema = False
+        else:
+            hazard_text  = ""
+            known_schema = False
+
+        if known_schema:
+            entries_known += 1
+        if not hazard_text:
             continue
 
-        # --- Map awareness level ---
-        alevel_el = entry.find(".//cap:awareness_level", ns)
-        if alevel_el is None or not alevel_el.text:
+        # --- Hazard filter (power-cut-relevant only) ---
+        hazard_lower = hazard_text.lower()
+        if not any(w in hazard_lower for w in _WIND_TYPES):
             continue
-        # Format: "2; Yellow; Moderate" — numeric code is the first token
-        code  = alevel_el.text.strip().split(";")[0].strip()
-        level = _MA_LEVEL_MAP.get(code)
+
+        # --- Severity: colour word in the event/title first, then cap:severity,
+        #     then the legacy numeric awareness code ---
+        level = None
+        for colour in ("red", "amber", "yellow"):   # worst-first
+            if colour in hazard_lower:
+                level = colour
+                break
         if level is None:
-            continue   # Green (code "1") or unknown — skip
+            sev_el = entry.find(".//cap:severity", ns)
+            if sev_el is not None and sev_el.text:
+                level = _MA_SEVERITY_MAP.get(sev_el.text.strip().lower())
+        if level is None:
+            alevel_el = entry.find(".//cap:awareness_level", ns)
+            if alevel_el is not None and alevel_el.text:
+                code  = alevel_el.text.strip().split(";")[0].strip()
+                level = _MA_LEVEL_MAP.get(code)
+        if level is None:
+            continue   # Green / unknown severity — skip
 
         # --- Skip expired warnings ---
         expires_el = entry.find(".//cap:expires", ns)
@@ -194,8 +253,8 @@ def check_storm_level():
             except (ValueError, OverflowError):
                 pass   # Cannot parse — include conservatively
 
-        # --- Location check: does this warning's polygon cover Medomsley? ---
-        if not _warning_covers_location(entry, ns, LATITUDE, LONGITUDE):
+        # --- Location check: does this warning's polygon cover the site? ---
+        if not _warning_covers_location(entry, ns, lat, lon):
             continue   # Warning is for another part of the UK — ignore
 
         # --- Onset horizon check: only activate if storm is within 24 hours ---
@@ -212,10 +271,9 @@ def check_storm_level():
                 except (ValueError, OverflowError):
                     pass
 
-        # Collect title for logging
-        title_el = entry.find("atom:title", ns)
-        title    = (title_el.text.strip() if title_el is not None and title_el.text
-                    else atype_el.text.strip())
+        # Title for logging (full title preferred, else the hazard text)
+        title = (title_el.text.strip() if title_el is not None and title_el.text
+                 else hazard_text)
 
         if onset_dt is not None and onset_dt > horizon_utc:
             # Storm is forecast but still more than STORM_ACTIVATE_HOURS away
@@ -233,8 +291,16 @@ def check_storm_level():
         else:
             reasons.append(f"MeteoAlarm {level.upper()}: {title}")
 
+    # Schema-drift guard: a non-empty feed where NO entry exposed a readable schema
+    # means MeteoAlarm changed its format again (the awareness_* -> event/severity
+    # change of 2026 silently disabled this feature for weeks). Surface it loudly via
+    # a distinctive reason the caller escalates to WARNING, so it can't go unnoticed.
+    if entries_total > 0 and entries_known == 0:
+        return "none", (f"MeteoAlarm feed format unrecognised — {entries_total} "
+                        f"entries, 0 parseable (storm_watch parser may need updating)")
+
     if highest == "none":
-        base = "MeteoAlarm: no active wind/storm warnings covering Medomsley"
+        base = f"MeteoAlarm: no active wind/storm warnings covering {location_name}"
         if pending:
             base += " | " + " | ".join(pending[:2])
         return "none", base

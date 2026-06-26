@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 # Filename:    axle_api.py
 # Description: Axle VPP REST API client - polls for export event schedule
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        09-04-2026
-# Version:     1.1
+# Author:      CliveS & Claude Opus 4.8
+# Date:        26-06-2026
+# Version:     1.2
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
-# Changes: Updated logger name to SigenEnergyManager
+# Changes: Updated logger name to SigenEnergyManager; _parse_dt guards non-string input
 
 import logging
 import requests
@@ -170,7 +170,9 @@ class AxleAPI:
 
     def _parse_dt(self, dt_str):
         """Parse an ISO-8601 datetime string to a tz-aware UTC datetime."""
-        if not dt_str:
+        if not dt_str or not isinstance(dt_str, str):
+            # A numeric/dict value (malformed API response) would otherwise raise
+            # AttributeError on .replace() and escape the ValueError/TypeError guard.
             return None
         try:
             dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))

@@ -4,8 +4,8 @@
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
-# Date:        21-06-2026 17:00 BST
-# Version:     1.3
+# Date:        26-06-2026
+# Version:     1.4 (gas_unit m3/kwh selection — avoids ~11x overstatement on kWh meters)
 #
 # v1.3 (21-06-2026) — GraphQL queries parameterised (variables, not raw
 #   account/key string-interpolation); import-vs-export classified by MPAN not
@@ -127,7 +127,7 @@ class OctopusAPI:
                  region="F", data_dir=None, logger=None,
                  gas_mprn="", gas_serial="",
                  export_mpan="", export_serial="",
-                 gas_kwh_per_m3=GAS_KWH_PER_M3):
+                 gas_kwh_per_m3=GAS_KWH_PER_M3, gas_unit="m3"):
         """Initialise Octopus API client.
 
         Args:
@@ -143,6 +143,10 @@ class OctopusAPI:
             export_mpan:    Electricity export meter point number (optional)
             export_serial:  Electricity export meter serial number (optional)
             gas_kwh_per_m3: m3->kWh calorific factor (default ~11.19)
+            gas_unit:       Native unit the gas meter reports — "m3" (metric SMETS,
+                            needs the calorific conversion) or "kwh" (some SMETS2
+                            report kWh directly, so the conversion must be skipped to
+                            avoid an ~11x overstatement). Default "m3".
         """
         self.api_key        = api_key
         self.account_id     = account_id
@@ -156,6 +160,9 @@ class OctopusAPI:
         self.export_mpan    = export_mpan or ""
         self.export_serial  = export_serial or ""
         self.gas_kwh_per_m3 = _safe_float(gas_kwh_per_m3, GAS_KWH_PER_M3) or GAS_KWH_PER_M3
+        self.gas_unit       = (gas_unit or "m3").strip().lower()
+        if self.gas_unit not in ("m3", "kwh"):
+            self.gas_unit = "m3"
 
         # HTTP Basic auth header (api_key as username, empty password)
         if api_key:
@@ -455,7 +462,10 @@ class OctopusAPI:
     def get_gas_kwh_for_date(self, date_str):
         """Sum gas consumption for one local day, returning both m3 and kWh.
 
-        Octopus returns m3 for metric SMETS meters; kWh = m3 * gas_kwh_per_m3.
+        The Octopus consumption value is in the meter's NATIVE unit: m3 for metric
+        SMETS meters (needs the calorific conversion) or kWh for meters that report
+        kWh directly. self.gas_unit selects which — applying the ~11x conversion to a
+        kWh-reporting meter would overstate gas cost ~11-fold.
         Returns { "m3": float|None, "kwh": float|None, "slots": int } or None.
         """
         if not self.gas_mprn or not self.gas_serial:
@@ -467,8 +477,16 @@ class OctopusAPI:
         r = self._sum_consumption_for_date(url, date_str)
         if r is None:
             return None
-        m3  = r["value"]
-        kwh = round(m3 * self.gas_kwh_per_m3, 3) if m3 is not None else None
+        value = r["value"]
+        if value is None:
+            return {"m3": None, "kwh": None, "slots": r["slots"]}
+        if self.gas_unit == "kwh":
+            # Meter already reports kWh — no conversion. m3 is back-derived for display.
+            kwh = round(value, 3)
+            m3  = round(value / self.gas_kwh_per_m3, 3) if self.gas_kwh_per_m3 else None
+        else:
+            m3  = value
+            kwh = round(value * self.gas_kwh_per_m3, 3)
         return {"m3": m3, "kwh": kwh, "slots": r["slots"]}
 
     # ================================================================
@@ -558,9 +576,11 @@ class OctopusAPI:
             t    = agr.get("tariff") or {}
             code = t.get("tariffCode", "") or ""
             mpan = ((agr.get("meterPoint") or {}).get("mpan")) or ""
-            # Classify import vs export: the import MPAN is definitive; otherwise
-            # the export MPAN, the OUTGOING product family, or simply "a meter
-            # point that isn't our import meter" all mark it as export.
+            # Classify import vs export. Require POSITIVE export evidence (the export
+            # MPAN, or an OUTGOING-family product code) — do NOT assume that any meter
+            # whose MPAN simply isn't our import meter is an export meter, or a user
+            # with a SECOND import supply would have it mis-tagged as export and its
+            # tariff mistaken for the export rate.
             if mpan and self.mpan and mpan == self.mpan:
                 is_export = False
             elif self.export_mpan and mpan == self.export_mpan:
@@ -568,7 +588,7 @@ class OctopusAPI:
             elif "OUTGOING" in code.upper():
                 is_export = True
             else:
-                is_export = bool(mpan and self.mpan and mpan != self.mpan)
+                is_export = False
             # First active agreement wins (active:true should return one each).
             if is_export:
                 if result["export"] is None:
@@ -621,8 +641,8 @@ class OctopusAPI:
         # Today's rate
         today_rate = self._fetch_current_rate(product_code, tariff_code)
 
-        # Tomorrow's rate (published around 16:00 each day)
-        tomorrow_date   = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+        # Tomorrow's rate (published around 16:00 each day) — Europe/London day
+        tomorrow_date   = self._london_today() + timedelta(days=1)
         tomorrow_slots  = self._fetch_rate_schedule(product_code, tariff_code, tomorrow_date)
         tomorrow_rate   = tomorrow_slots[0].get("value_inc_vat") if tomorrow_slots else None
 
@@ -632,6 +652,20 @@ class OctopusAPI:
         }
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
+
+    def _london_today(self):
+        """Today's date in Europe/London. Rate-schedule windows are LOCAL calendar
+        days — using the UTC date picks the wrong day in the 00:00-01:00 BST hour."""
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/London")).date()
+        except Exception:
+            try:
+                import pytz
+                return datetime.now(timezone.utc).astimezone(
+                    pytz.timezone("Europe/London")).date()
+            except Exception:
+                return datetime.now().date()
 
     def get_active_rate_schedule(self, force=False):
         """Today's and tomorrow's raw rate slots for the ACTIVE import tariff.
@@ -655,7 +689,7 @@ class OctopusAPI:
         if not product_code or not tariff_code:
             return {"product_code": product_code, "today_slots": [], "tomorrow_slots": []}
 
-        today_date    = datetime.now(timezone.utc).date()
+        today_date    = self._london_today()      # LOCAL day, not UTC
         tomorrow_date = today_date + timedelta(days=1)
         result = {
             "product_code":   product_code,

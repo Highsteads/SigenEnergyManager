@@ -528,9 +528,14 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
+        # read_all issues this many register reads per cycle (Phase A=10, B=6, D=4).
+        # Keep in step if reads are added/removed so the "more than half failed"
+        # disconnect threshold and the error-ratio log lines stay self-consistent.
+        TOTAL_READS  = 20
         total_errors = plant_errors + inv_errors
-        if total_errors > 8:  # more than half of 16 reads failed
-            self.logger.error(f"Too many Modbus errors ({total_errors}/16) - marking disconnected")
+        if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
+            self.logger.error(
+                f"Too many Modbus errors ({total_errors}/{TOTAL_READS}) - marking disconnected")
             self._connected = False
             return None
 
@@ -550,7 +555,7 @@ class SigenergyModbus:
         if missing_critical:
             self.logger.warning(
                 f"Partial Modbus read — critical register(s) missing "
-                f"{missing_critical} ({total_errors}/16 errors); keeping "
+                f"{missing_critical} ({total_errors}/{TOTAL_READS} errors); keeping "
                 f"last-known-good snapshot this cycle (not acting on partial data)."
             )
             return None
@@ -606,7 +611,7 @@ class SigenergyModbus:
 
         if verify:
             # Brief delay to let the inverter latch the new value before reading back.
-            time.sleep(0.15)
+            self._sleep(0.15)   # injected sleep — interruptible + mockable in tests
             try:
                 readback = self._read_uint16(register, slave=slave)
             except Exception as e:
@@ -657,7 +662,7 @@ class SigenergyModbus:
             return False
 
         if verify:
-            time.sleep(0.15)
+            self._sleep(0.15)   # injected sleep — interruptible + mockable in tests
             try:
                 readback = self._read_uint32(register, slave=slave)
             except Exception as e:

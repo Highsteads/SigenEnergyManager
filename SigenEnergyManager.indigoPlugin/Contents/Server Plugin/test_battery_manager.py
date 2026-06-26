@@ -453,15 +453,16 @@ class TestVppSuppression(unittest.TestCase):
         self.bm = BatteryManager()
 
     def test_vpp_active_self_drives_export(self):
-        """When VPP is active, self-drive the export window regardless of SOC.
+        """When VPP is active (and export enabled), self-drive the export regardless of SOC.
 
         v3.6: the override no longer stands down for Axle (their dispatch is
         unreliable and settlement is meter-based) — it drives the export itself.
         """
         snapshot = _make_snapshot(
-            soc_pct    = 5.0,   # would normally trigger import
-            vpp_active = True,
-            now_hour   = 20,
+            soc_pct        = 5.0,   # would normally trigger import
+            vpp_active     = True,
+            export_enabled = True,  # normal VPP window — export permitted
+            now_hour       = 20,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -471,12 +472,26 @@ class TestVppSuppression(unittest.TestCase):
     def test_vpp_export_takes_priority_over_import(self):
         """VPP export override wins even when SOC is low enough to want an import."""
         snapshot = _make_snapshot(
-            soc_pct    = 5.0,
-            vpp_active = True,
-            now_hour   = 8,
+            soc_pct        = 5.0,
+            vpp_active     = True,
+            export_enabled = True,
+            now_hour       = 8,
         )
         decision = self.bm.evaluate(snapshot)
         self.assertEqual(decision.action, ACTION_VPP_EXPORT)
+
+    def test_vpp_stands_down_when_export_locked_out(self):
+        """A power-cut lockout / storm forces export_enabled False — the VPP override
+        must stand down (safety beats the ~£1/kWh payment), not self-drive export."""
+        snapshot = _make_snapshot(
+            soc_pct        = 50.0,
+            vpp_active     = True,
+            export_enabled = False,   # post-cut lockout (or storm) in force
+            now_hour       = 20,
+        )
+        decision = self.bm.evaluate(snapshot)
+        self.assertEqual(decision.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("export currently disabled", decision.reason)
 
 
 class TestConsumptionEstimation(unittest.TestCase):

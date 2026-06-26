@@ -8,7 +8,7 @@
 #              needs only a simple constructor swap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        04-06-2026
-# Version:     1.5
+# Version:     1.6 (zoneinfo tz fallback, per-array cache day-shift guard, instance arrays)
 # 1.5 — HTTP 5xx (502/503/504) from Open-Meteo now logged at WARNING (transient
 #       server-side gateway blip; falls back to cached/partial forecast) instead
 #       of a red ERROR. 4xx still ERROR. Fixes recurring "HTTP 502" ERROR spam.
@@ -543,12 +543,25 @@ class OpenMeteoForecast:
         # Disk cache check
         cached = self._load_array_cache(array_cfg["name"])
         if cached:
-            age = time.time() - cached.get("cached_time", 0)
-            if age < CACHE_TTL:
+            age  = time.time() - cached.get("cached_time", 0)
+            data = cached.get("data", [])
+            # Day-shift guard (mirrors the combined cache): a cache written just before
+            # midnight has its first bucket dated yesterday, yet a 20-min-old cache
+            # loaded at 00:10 passes the age check — serving it as today's irradiance
+            # would feed the wrong day. Skip if the first bucket predates today (local).
+            fresh_day = True
+            if data:
+                try:
+                    first_date  = str(data[0][0])[:10]
+                    local_today = self._now_local().date().strftime("%Y-%m-%d")
+                    fresh_day   = first_date >= local_today
+                except Exception:
+                    fresh_day = True
+            if age < CACHE_TTL and fresh_day:
                 self.logger.debug(
                     f"[OpenMeteo] {array_cfg['name']}: disk cache (age {age:.0f}s)"
                 )
-                return cached.get("data", [])
+                return data
 
         params = {
             "latitude":   self.latitude,
@@ -782,8 +795,10 @@ class OpenMeteoForecast:
         Falls back to 1.0 if the records have zero total forecast (shouldn't
         happen because MIN_CALIBRATION_FORECAST_KWH excludes near-zero days).
         """
-        sum_actual   = sum(r["actual_kwh"]   for r in records)
-        sum_forecast = sum(r["forecast_kwh"] for r in records)
+        # Defensive .get (the rest of the module reads these records with .get) so a
+        # malformed record can't KeyError out of the whole bias-correction pass.
+        sum_actual   = sum(float(r.get("actual_kwh")   or 0.0) for r in records)
+        sum_forecast = sum(float(r.get("forecast_kwh") or 0.0) for r in records)
         if sum_forecast <= 0:
             return 1.0
         raw = sum_actual / sum_forecast
@@ -931,7 +946,7 @@ class OpenMeteoForecast:
                 "generated_at":         now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "source":               "open_meteo",
                 "cache_age_hours":      cache_age,
-                "arrays":               [a["name"] for a in ARRAYS],
+                "arrays":               [a["name"] for a in self.arrays],
                 "bias_factor":          self._correction_factor,
                 "bias_factor_today":    round(factor_today,    4),
                 "bias_factor_tomorrow": round(factor_tomorrow, 4),
@@ -975,8 +990,15 @@ class OpenMeteoForecast:
                 dt_local = LONDON_TZ.localize(dt_naive, is_dst=False)
                 dt_utc   = dt_local.astimezone(timezone.utc)
             else:
-                # Fallback: assume BST (UTC+1) — accurate April-October
-                dt_utc = dt_naive.replace(tzinfo=timezone.utc) - timedelta(hours=1)
+                # pytz unavailable — use the stdlib zoneinfo (Python 3.9+, always
+                # present on Indigo 3.13) for a CORRECT BST/GMT conversion. Only if
+                # that also fails drop to the crude +1h (which is wrong in winter/GMT).
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt_local = dt_naive.replace(tzinfo=ZoneInfo("Europe/London"))
+                    dt_utc   = dt_local.astimezone(timezone.utc)
+                except Exception:
+                    dt_utc = dt_naive.replace(tzinfo=timezone.utc) - timedelta(hours=1)
             return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             return None

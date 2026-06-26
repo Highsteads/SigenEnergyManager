@@ -45,6 +45,9 @@
     <Field id="siteLongitude" type="textfield" defaultValue="">
         <Label>Site longitude (degrees E, negative for W, e.g. -0.1246 for London):</Label>
     </Field>
+    <Field id="siteLocationName" type="textfield" defaultValue="">
+        <Label>Location name (used in storm-watch alerts, e.g. "Medomsley" — blank shows "your area"):</Label>
+    </Field>
     <Field id="siteArraysJson" type="textfield" defaultValue="">
         <Label>PV array specs (JSON list of {name, tilt, azimuth, kwp, shade}, blank = defaults):</Label>
     </Field>
@@ -86,8 +89,15 @@
     <Field id="gasKwhPerM3" type="textfield" defaultValue="">
         <Label>Gas calorific factor (kWh per m3, optional — default ~11.19). Set this to the exact figure on your Octopus bill for penny-accurate gas costs.</Label>
     </Field>
+    <Field id="gasMeterUnit" type="menu" defaultValue="m3">
+        <Label>Gas meter reports in:</Label>
+        <List>
+            <Option value="m3">Cubic metres (m3) — metric SMETS, applies the calorific factor above</Option>
+            <Option value="kwh">kWh — some SMETS2 meters report kWh directly (no conversion)</Option>
+        </List>
+    </Field>
     <Field id="octopusGasInfo" type="label">
-        <Label>Gas MPRN/serial are optional. When set, the Whole-house cost dashboard card adds your settled daily gas cost (unit + standing charge) to the electric cost, valued from the Octopus account ledger. Gas settles roughly a day in arrears, so today's gas figure is an estimate until then.</Label>
+        <Label>Gas MPRN/serial are optional. When set, the Whole-house cost dashboard card adds your settled daily gas cost (unit + standing charge) to the electric cost, valued from the Octopus account ledger. Gas settles roughly a day in arrears, so today's gas figure is an estimate until then. Daily-read gas meters (one reading per day) are supported. If you have no gas meter, the card shows electricity only.</Label>
     </Field>
     <Field id="octopusRegion" type="menu" defaultValue="F">
         <Label>Grid region:</Label>

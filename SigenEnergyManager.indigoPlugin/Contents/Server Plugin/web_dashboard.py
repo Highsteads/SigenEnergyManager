@@ -5,8 +5,8 @@
 #              Runs on port 8179. Exposes / (HTML) and /api/status (JSON).
 #              Started from plugin.startup(), stopped on plugin.shutdown().
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-06-2026
-# Version:     1.3
+# Date:        26-06-2026
+# Version:     1.4 (same-origin CORS, real HTTP error codes, JS null-safety)
 # 1.3 — NaN/Infinity-safe JSON (one non-finite float no longer breaks the whole live
 #       update); calendar view state (_calCurrentYear/_calYearsLoaded) hoisted to
 #       <script> scope so the selected year tab survives the 5s refresh; Back link
@@ -959,7 +959,12 @@ function setDots(leg, watts, forwardPositive) {
 
 function renderForecast(hourly) {
   const svg = document.getElementById('fc-svg');
-  const entries = Object.entries(hourly).sort((a,b)=>a[0].localeCompare(b[0]));
+  // Coerce every value to a finite kWh number up front — a null/non-numeric value
+  // (e.g. a non-finite float serialised as JSON null) would otherwise make
+  // kwh.toFixed throw and maxK become NaN, blanking the whole chart.
+  const entries = Object.entries(hourly)
+    .map(([k, v]) => [k, Number.isFinite(Number(v)) ? Number(v) : 0])
+    .sort((a,b)=>a[0].localeCompare(b[0]));
   if (!entries.length) { svg.innerHTML = '<text x="378" y="40" text-anchor="middle" fill="#374151" font-size="13">No forecast data</text>'; return; }
   // Values from /api/status hourly_forecast are ALREADY in kWh (plugin
   // converts from Wh in get_dashboard_data).  Pre-v5.11 code re-divided
@@ -974,6 +979,7 @@ function renderForecast(hourly) {
   let out = '';
   entries.forEach(([key, kwh], i) => {
     const hr  = parseInt(key.split(':')[0]);
+    if (!Number.isFinite(hr)) return;   // skip a malformed hour key
     const bh  = Math.max(1, Math.round((kwh/maxK)*chartH));
     const x   = 8 + i*(bw+2);
     const y   = chartH - bh;
@@ -1116,6 +1122,10 @@ let _calYearsLoaded = false;
 function update(d) {
   if (d.error) { document.getElementById('ts').textContent = 'Error: ' + d.error; return; }
   document.getElementById('ts').textContent = d.timestamp || '\u2014';
+
+  // Render alerts FIRST so a throw further down in this function can never suppress
+  // the alert banner (the soc_at_dawn_kwh null bug used to abort the whole render).
+  try { updateAlerts(d); } catch (e) {}
 
   // SOC ring
   const soc = d.battery ? d.battery.soc_pct : 0;
@@ -1267,7 +1277,9 @@ function update(d) {
     const dawnEl = document.getElementById('dec-dawn');
     dawnEl.textContent  = d.decision.dawn_viable ? 'Yes' : 'No';
     dawnEl.className    = 'dv ' + (d.decision.dawn_viable ? 'dawn-ok' : 'dawn-warn');
-    document.getElementById('dec-soc-dawn').textContent = d.decision.soc_at_dawn_kwh.toFixed(1) + ' kWh';
+    // soc_at_dawn_kwh can arrive null (non-finite -> JSON null via _json_safe);
+    // fmtKwh is null-safe, so this no longer throws and aborts the whole render.
+    document.getElementById('dec-soc-dawn').textContent = fmtKwh(d.decision.soc_at_dawn_kwh);
     document.getElementById('dec-reason').textContent   = d.decision.reason || '\u2014';
   }
 
@@ -1280,8 +1292,12 @@ function update(d) {
     document.getElementById('sum-exp').textContent  = s.export_kwh + ' kWh';
     document.getElementById('sum-peak').textContent = s.peak_soc + '%';
     document.getElementById('sum-min').textContent  = s.min_soc + '%';
-    document.getElementById('sum-ss').textContent   = s.self_suff + '%';
-    document.getElementById('ss-bar').style.width   = Math.min(100, s.self_suff) + '%';
+    // self_suff may be null/non-numeric — coerce so the bar width is a real % and
+    // the cell shows a dash rather than "null%".
+    const ssNum = Number(s.self_suff);
+    const ssOk  = Number.isFinite(ssNum);
+    document.getElementById('sum-ss').textContent   = ssOk ? ssNum + '%' : '—';
+    document.getElementById('ss-bar').style.width   = (ssOk ? Math.max(0, Math.min(100, ssNum)) : 0) + '%';
   }
 
   // Tariff
@@ -1492,8 +1508,8 @@ function update(d) {
       dateEl.textContent = '';
     }
   }
-
-  updateAlerts(d);
+  // (updateAlerts is called at the top of update() so it can't be suppressed by a
+  // render error further down.)
 }
 
 let countdown = 5;
@@ -1855,104 +1871,68 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # Set by WebDashboard.start() before the server thread launches.
     _plugin_ref = None
 
+    def _query(self):
+        return self.path.split("?", 1)[1] if "?" in self.path else ""
+
+    def _int_param(self, name, default, lo, hi):
+        for kv in self._query().split("&"):
+            if kv.startswith(name + "="):
+                try:
+                    return max(lo, min(hi, int(kv.split("=", 1)[1])))
+                except ValueError:
+                    return default
+        return default
+
+    def _send_api(self, producer):
+        """Run a data producer and send JSON with a meaningful HTTP STATUS, so the
+        browser consumers' `!r.ok` guards actually fire on failure. Errors used to
+        be returned as HTTP 200 with an {error} body, which those guards never caught
+        (they then tried to render the error object as data)."""
+        if self._plugin_ref is None:
+            self._send(503, "application/json", b'{"error":"plugin not ready"}')
+            return
+        try:
+            data = producer()
+            self._send(200, "application/json", json.dumps(_json_safe(data)).encode())
+        except Exception as exc:
+            self._send(500, "application/json", json.dumps({"error": str(exc)}).encode())
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", _DASHBOARD_BYTES)
 
         elif path == "/api/status":
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_data()
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_data())
 
         elif path == "/api/history":
             # Half-hourly slots for the last N hours (default 24h, max 168h).
-            # Reads from the plugin's energy_timeseries.db SQLite store.
-            hours = 24
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            for kv in qs.split("&"):
-                if kv.startswith("hours="):
-                    try:
-                        hours = max(1, min(168, int(kv.split("=", 1)[1])))
-                    except ValueError:
-                        pass
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_history(hours=hours)
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+            hours = self._int_param("hours", 24, 1, 168)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_history(hours=hours))
 
         elif path == "/api/calendar":
-            # Calendar-months summary for a specific year (default: current).
+            # Calendar-months summary for a specific year. Validate the param to a
+            # plain 4-digit year (URL-decoded) before passing it through, rather than
+            # forwarding arbitrary query text to the plugin.
+            import re as _re
+            from urllib.parse import unquote as _unquote
             year = ""
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            for kv in qs.split("&"):
+            for kv in self._query().split("&"):
                 if kv.startswith("year="):
-                    year = kv.split("=", 1)[1]
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_calendar(year or "")
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+                    year = _unquote(kv.split("=", 1)[1])
+            if not _re.fullmatch(r"\d{4}", year or ""):
+                year = ""
+            self._send_api(lambda: self._plugin_ref.get_dashboard_calendar(year))
 
         elif path == "/api/years":
-            # List of years with at least one daily-history record.
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_years()
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_years())
 
         elif path == "/api/daily":
-            # Daily totals for the last N days (default 30, max 365)
-            days = 30
-            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-            for kv in qs.split("&"):
-                if kv.startswith("days="):
-                    try:
-                        days = max(1, min(365, int(kv.split("=", 1)[1])))
-                    except ValueError:
-                        pass
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_daily(days=days)
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+            days = self._int_param("days", 30, 1, 365)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_daily(days=days))
 
         elif path == "/api/export-sync":
-            # Sigenergy vs Octopus export comparison for the last 7 settled
-            # days (D-3 to D-9). Cached on plugin side for 6 h.
-            if self._plugin_ref is None:
-                body = b'{"error":"plugin not ready"}'
-            else:
-                try:
-                    data = self._plugin_ref.get_dashboard_export_sync()
-                    body = json.dumps(_json_safe(data)).encode()
-                except Exception as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-            self._send(200, "application/json", body)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_export_sync())
 
         else:
             self._send(404, "text/plain", b"Not found")
@@ -1962,7 +1942,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # Same-origin only: the dashboard page and its /api endpoints are served from
+        # this same host:port (the Dashboards plugin iframes it), so no cross-origin
+        # header is needed. The previous wildcard `*` let ANY browser page read this
+        # server's energy/cost/SOC data — note the bind exposure is documented in the
+        # README; this drops the browser-CORS surface to same-origin.
         self.end_headers()
         self.wfile.write(body)
 

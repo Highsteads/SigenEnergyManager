@@ -484,8 +484,8 @@
             </State>
             <State id="vppLastExportKwh">
                 <ValueType>String</ValueType>
-                <TriggerLabel>VPP export changed</TriggerLabel>
-                <ControlPageLabel>Last VPP Export (kWh)</ControlPageLabel>
+                <TriggerLabel>VPP export (running) changed</TriggerLabel>
+                <ControlPageLabel>VPP Export Running (kWh)</ControlPageLabel>
             </State>
             <!-- Last VPP event summary (populated by _summarise_vpp_event
                  at each event's end, v5.18.2+). Lets the user see at a
@@ -498,8 +498,8 @@
             </State>
             <State id="lastVppExportKwh">
                 <ValueType>Float</ValueType>
-                <TriggerLabel>Last VPP export changed</TriggerLabel>
-                <ControlPageLabel>Last VPP Export (kWh)</ControlPageLabel>
+                <TriggerLabel>Last VPP event export changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Event Export (kWh)</ControlPageLabel>
             </State>
             <State id="lastVppPvKwh">
                 <ValueType>Float</ValueType>
