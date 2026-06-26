@@ -7,7 +7,17 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        26-06-2026
-# Version:     5.39.0
+# Version:     5.40.0
+# 5.40.0 — Storm reserve is now a FLAT 50% for ALL levels (was 50% yellow / 80% amber-red).
+#   CliveS's call: a storm should keep a 50% power-cut reserve and NEVER grid-charge above it.
+#   The overnight resilience-buffer import (flat-rate tariff only) tops the battery to the storm
+#   floor when below it; with amber/red previously at 80% a storm night would grid-charge to ~82%
+#   (costly, against the self-sufficiency KPI). STORM_SOC_AMBER 80→50 so the floor — and thus any
+#   storm-driven grid charging — is capped at 50% (tops to ~52% via the existing +2% anti-cycling
+#   guard; solar still fills above 50% for free, and export still reopens at the 85% release).
+#   Pushover storm alerts reworded to match (50% minimum reserve, no grid charge above it, export
+#   held off until nearly full — the old "export suspended" wording predated the 5.39.0 release).
+#   Tests updated for the flat-50 reserve (+1; 73 in test_plugin, 151 across suites).
 # 5.39.0 — Storm export suppression is now SOC-aware (mirrors the post-cut lockout floor).
 #   The storm override held export OFF for the entire duration of a wind/storm warning,
 #   regardless of SOC. With a near-full battery under good solar that rammed it to 100%
@@ -924,11 +934,16 @@ ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo var
 # Storm-level hierarchy (mirrors storm_watch._LEVELS)
 STORM_LEVELS = ["none", "yellow", "amber", "red"]
 
-# SOC targets applied when a Met Office warning covers our location
-# Yellow = watch level: charge to 50%, suspend exports
-# Amber/Red = significant disruption risk: charge to 80%, suspend exports
+# Storm reserve SOC — the minimum the battery is held at during a warning so the
+# house can ride out a power cut. CliveS's decision (26-Jun-2026): a FLAT 50% for
+# ALL levels (yellow/amber/red). The overnight resilience-buffer import tops the
+# battery up to this floor ONLY when below it and ONLY on a flat-rate tariff —
+# above 50% there is no storm-driven grid charging (a 50% reserve is enough
+# resilience; charging higher from the grid wastes money and self-sufficiency).
+# Both constants are deliberately equal — kept separate only so a future user
+# could re-differentiate severity without restructuring.
 STORM_SOC_YELLOW = 50.0
-STORM_SOC_AMBER  = 80.0
+STORM_SOC_AMBER  = 50.0
 
 # Storm export-suppression release point. The storm override holds export off so
 # the battery banks kWh ahead of a possible power cut — but ONLY while it is still
@@ -3878,24 +3893,27 @@ class Plugin(indigo.PluginBase):
                 title = "Storm Watch - Yellow"
                 body  = (
                     f"A yellow-level wind risk is forecast for {loc_name}. "
-                    f"Battery will be charged to {STORM_SOC_YELLOW:.0f}% and "
-                    f"export suspended until the risk passes.\n\n{reason}"
+                    f"Battery held at a {STORM_SOC_YELLOW:.0f}% minimum reserve "
+                    f"(no grid charging above that); export held off until the "
+                    f"battery is nearly full, as a precaution.\n\n{reason}"
                 )
                 priority = "0"
             elif new_level == "amber":
                 title = "Storm Warning - Amber"
                 body  = (
                     f"An amber-level wind/storm warning is active for your area. "
-                    f"Battery will be charged to {STORM_SOC_AMBER:.0f}% and "
-                    f"export suspended as a precaution against power cuts.\n\n{reason}"
+                    f"Battery held at a {STORM_SOC_AMBER:.0f}% minimum reserve "
+                    f"(no grid charging above that); export held off until the "
+                    f"battery is nearly full, against power cuts.\n\n{reason}"
                 )
                 priority = "1"   # high priority
             else:  # red
                 title = "Storm Warning - RED"
                 body  = (
-                    f"A RED storm warning is active for your area. "
-                    f"Battery will be charged to {STORM_SOC_AMBER:.0f}% and "
-                    f"all exports suspended. Power cut risk is high.\n\n{reason}"
+                    f"A RED storm warning is active for your area. Power cut risk "
+                    f"is high. Battery held at a {STORM_SOC_AMBER:.0f}% minimum "
+                    f"reserve (no grid charging above that); export held off until "
+                    f"the battery is nearly full.\n\n{reason}"
                 )
                 priority = "1"   # high priority
             self._send_pushover(title, body, priority)

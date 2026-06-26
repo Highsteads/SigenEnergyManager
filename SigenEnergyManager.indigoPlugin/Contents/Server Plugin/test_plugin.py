@@ -765,13 +765,16 @@ class TestStormExportRelease(unittest.TestCase):
         # Resilience floor still applies above the release point.
         self.assertGreaterEqual(s.dawn_target_pct, plugin.STORM_SOC_YELLOW)
 
-    def test_release_never_below_reserve_target(self):
-        # Amber reserve is 80%; release clamps up to 85, so 82% is still suppressed.
-        p = self._mk("amber")
-        s = self._snap()
-        p._apply_storm_override(s, 82.0)
-        self.assertFalse(s.export_enabled)
-        self.assertGreaterEqual(s.dawn_target_pct, plugin.STORM_SOC_AMBER)
+    def test_storm_reserve_is_flat_50_all_levels(self):
+        # CliveS 26-Jun: all storm levels reserve a FLAT 50% (amber/red no longer 80),
+        # and the storm floor is never raised above 50 — so no grid charge above 50%.
+        self.assertEqual(plugin.STORM_SOC_YELLOW, 50.0)
+        self.assertEqual(plugin.STORM_SOC_AMBER, 50.0)
+        for level in ("yellow", "amber", "red"):
+            p = self._mk(level)
+            s = self._snap(dawn=10.0)
+            p._apply_storm_override(s, 30.0)
+            self.assertEqual(s.dawn_target_pct, 50.0)   # raised to the 50% reserve, never above
 
     def test_amber_above_release_allows_export(self):
         p = self._mk("amber")
@@ -790,11 +793,14 @@ class TestStormExportRelease(unittest.TestCase):
         self.assertTrue(s2.export_enabled)
 
     def test_release_pref_cannot_drop_below_reserve(self):
-        # A misconfigured low release (40) must not let amber export at 70%.
+        # A misconfigured low release (40) must not let export resume below the 50% reserve.
         p = self._mk("amber", prefs={"stormExportReleasePct": "40"})
         s = self._snap()
-        p._apply_storm_override(s, 70.0)          # release = max(40, 80) = 80
+        p._apply_storm_override(s, 45.0)          # release = max(40, 50) = 50; 45 < 50 -> suppressed
         self.assertFalse(s.export_enabled)
+        s2 = self._snap()
+        p._apply_storm_override(s2, 55.0)         # 55 >= 50 -> allowed
+        self.assertTrue(s2.export_enabled)
 
     def test_bad_soc_fails_safe_to_suppressed(self):
         p = self._mk("red")
