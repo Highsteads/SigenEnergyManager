@@ -13,3 +13,7 @@ SigenEnergyManager.indigoPlugin/Contents/Packages/
 
 # Claude Code context file — local only
 CLAUDE.md
+
+# pytest cache
+.pytest_cache/
+**/.pytest_cache/

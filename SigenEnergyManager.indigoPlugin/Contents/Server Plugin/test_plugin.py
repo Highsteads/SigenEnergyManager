@@ -722,5 +722,87 @@ class TestDriveVppExportStartLatch(unittest.TestCase):
         self.assertIn("exportStarted", fired)
 
 
+class TestStormExportRelease(unittest.TestCase):
+    """_apply_storm_override suppresses export ONLY while SOC is below the release
+    point (default 85%, never below the active reserve target). At/above it the
+    reserve is banked, so export is left enabled and the dawn floor still applies."""
+
+    def _mk(self, level, prefs=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.pluginPrefs = prefs or {}
+        p.store = {
+            "storm_level": level,
+            "storm_override_logged_level": None,
+            "storm_export_suppressed": False,
+        }
+        p.logger = MagicMock()
+        return p
+
+    def _snap(self, dawn=10.0):
+        return types.SimpleNamespace(dawn_target_pct=dawn, export_enabled=True)
+
+    def test_no_storm_leaves_export_untouched(self):
+        p = self._mk("none")
+        s = self._snap()
+        p._apply_storm_override(s, 40.0)
+        self.assertTrue(s.export_enabled)
+        self.assertFalse(p.store["storm_export_suppressed"])
+
+    def test_yellow_below_release_suppresses(self):
+        p = self._mk("yellow")
+        s = self._snap()
+        p._apply_storm_override(s, 40.0)          # 40 < 85 release
+        self.assertFalse(s.export_enabled)         # export held off
+        self.assertTrue(p.store["storm_export_suppressed"])
+        self.assertGreaterEqual(s.dawn_target_pct, plugin.STORM_SOC_YELLOW)
+
+    def test_yellow_at_release_allows_export_but_keeps_floor(self):
+        p = self._mk("yellow")
+        s = self._snap()
+        p._apply_storm_override(s, 90.0)          # 90 >= 85 release
+        self.assertTrue(s.export_enabled)          # export re-enabled
+        self.assertFalse(p.store["storm_export_suppressed"])
+        # Resilience floor still applies above the release point.
+        self.assertGreaterEqual(s.dawn_target_pct, plugin.STORM_SOC_YELLOW)
+
+    def test_release_never_below_reserve_target(self):
+        # Amber reserve is 80%; release clamps up to 85, so 82% is still suppressed.
+        p = self._mk("amber")
+        s = self._snap()
+        p._apply_storm_override(s, 82.0)
+        self.assertFalse(s.export_enabled)
+        self.assertGreaterEqual(s.dawn_target_pct, plugin.STORM_SOC_AMBER)
+
+    def test_amber_above_release_allows_export(self):
+        p = self._mk("amber")
+        s = self._snap()
+        p._apply_storm_override(s, 90.0)
+        self.assertTrue(s.export_enabled)
+        self.assertFalse(p.store["storm_export_suppressed"])
+
+    def test_release_pct_pref_honoured(self):
+        p = self._mk("yellow", prefs={"stormExportReleasePct": "92"})
+        s = self._snap()
+        p._apply_storm_override(s, 88.0)          # 88 < 92 -> suppressed
+        self.assertFalse(s.export_enabled)
+        s2 = self._snap()
+        p._apply_storm_override(s2, 95.0)         # 95 >= 92 -> allowed
+        self.assertTrue(s2.export_enabled)
+
+    def test_release_pref_cannot_drop_below_reserve(self):
+        # A misconfigured low release (40) must not let amber export at 70%.
+        p = self._mk("amber", prefs={"stormExportReleasePct": "40"})
+        s = self._snap()
+        p._apply_storm_override(s, 70.0)          # release = max(40, 80) = 80
+        self.assertFalse(s.export_enabled)
+
+    def test_bad_soc_fails_safe_to_suppressed(self):
+        p = self._mk("red")
+        s = self._snap()
+        p._apply_storm_override(s, None)          # unknown SOC -> keep export off
+        self.assertFalse(s.export_enabled)
+        self.assertTrue(p.store["storm_export_suppressed"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

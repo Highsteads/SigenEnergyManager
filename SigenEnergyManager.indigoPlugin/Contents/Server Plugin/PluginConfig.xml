@@ -243,6 +243,12 @@
     <Field id="powerCutLockoutSocFloorInfo" type="label">
         <Label>After the grid is restored, export is held off for a few hours as a precaution — but only while the battery is below this percentage. At or above it, export resumes so flood-prevention can shed surplus and a near-full battery doesn't reach 100% and clip solar. Default 85.</Label>
     </Field>
+    <Field id="stormExportReleasePct" type="textfield" defaultValue="85">
+        <Label>Storm export release SOC (%):</Label>
+    </Field>
+    <Field id="stormExportReleasePctInfo" type="label">
+        <Label>During an active storm warning, export is held off so the battery banks charge ahead of a possible power cut — but only while it is below this percentage. At or above it the reserve is already banked, so export resumes (Solar Overflow throttles the charge and pushes surplus to grid) rather than ramming the battery to 100% and clipping every watt of PV above your export cap. Never drops below the storm reserve target (50% yellow / 80% amber-red). Default 85.</Label>
+    </Field>
 
     <Field id="separator_dashboard" type="separator"/>
     <Field id="label_dashboard" type="label">

@@ -7,7 +7,19 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        26-06-2026
-# Version:     5.38.2
+# Version:     5.39.0
+# 5.39.0 — Storm export suppression is now SOC-aware (mirrors the post-cut lockout floor).
+#   The storm override held export OFF for the entire duration of a wind/storm warning,
+#   regardless of SOC. With a near-full battery under good solar that rammed it to 100%
+#   (charge takes priority over export in self-consumption) and then clipped every watt of
+#   PV above the DNO export cap — and it thrashed Solar Overflow on/off every poll. Export
+#   is now suppressed ONLY while SOC < STORM_EXPORT_RELEASE_PCT (default 85, configurable via
+#   stormExportReleasePct, never below the active reserve target). At/above it the reserve is
+#   already banked, so export resumes — Solar Overflow throttles the charge and pushes surplus
+#   to grid so the battery creeps up with headroom instead of curtailing. One-shot INFO logs
+#   the mid-storm resume. Report exposes storm.export_suppressed + storm.export_release_pct.
+#   The openmeteo advisory needs no change — it already defers to the plugin's published
+#   export_enabled/would_fire verdict. +8 tests (73 in test_plugin).
 # 5.35.0 — Comprehensive numeric telemetry for SQL history + tidy-ups.
 #   • All numeric inverter telemetry states (batterySoc, *PowerWatts, temps, cell voltage,
 #     SoH, cutoff, daily kWh) changed from ValueType=String to Number/Integer and written
@@ -918,6 +930,18 @@ STORM_LEVELS = ["none", "yellow", "amber", "red"]
 STORM_SOC_YELLOW = 50.0
 STORM_SOC_AMBER  = 80.0
 
+# Storm export-suppression release point. The storm override holds export off so
+# the battery banks kWh ahead of a possible power cut — but ONLY while it is still
+# filling toward the reserve. At/above this SOC the reserve is effectively in, and
+# continuing to suppress export banks nothing extra: it just rams the battery to
+# 100% (charging takes priority over export in self-consumption), which then clips
+# every watt of PV above the 4 kW DNO export cap. Releasing here lets Solar Overflow
+# take over — it throttles the charge and pushes the surplus out at the full export
+# cap, so the battery creeps up slowly with headroom to spare instead of slamming
+# full and curtailing. Mirrors POWER_CUT_LOCKOUT_SOC_FLOOR, which solves the
+# identical "near-full battery clips solar" problem for the post-cut lockout.
+STORM_EXPORT_RELEASE_PCT = 85.0
+
 # Power cut lockout: suppress export for this many hours after grid is restored
 POWER_CUT_LOCKOUT_HOURS = 4.0
 # During that window, hold the export ban ONLY while SOC is below this floor.
@@ -1167,6 +1191,7 @@ class Plugin(indigo.PluginBase):
         # is the plugin's reliable cross-restart store — written every poll) so an
         # already-active warning does not re-send its Pushover on every plugin restart.
         self.store["storm_alerted_level"] = "none" # level at which alert was last sent
+        self.store["storm_export_suppressed"] = False  # is export held off right now?
 
         # Power cut detection
         self.store["grid_status_prev"] = "On-grid"  # previous poll's gridStatus
@@ -1750,6 +1775,8 @@ class Plugin(indigo.PluginBase):
                 },
                 "storm": {
                     "level": self.store.get("storm_level", "none"),
+                    "export_suppressed": self.store.get("storm_export_suppressed", False),
+                    "export_release_pct": self._storm_export_release_pct(),
                 },
                 "power_cut": {
                     "events":  (self.store.get("power_cut_events", []) or [])[-10:],
@@ -3253,7 +3280,7 @@ class Plugin(indigo.PluginBase):
 
         # 4. Seasonal + storm overrides (mutates snapshot)
         self._apply_seasonal_override(snapshot)
-        self._apply_storm_override(snapshot)
+        self._apply_storm_override(snapshot, soc_pct)
 
         # 5. Evaluate
         decision = self.manager.evaluate(snapshot)
@@ -3316,6 +3343,14 @@ class Plugin(indigo.PluginBase):
         POWER_CUT_LOCKOUT_SOC_FLOOR constant."""
         return _as_float(self.pluginPrefs.get("powerCutLockoutSocFloor"),
                          POWER_CUT_LOCKOUT_SOC_FLOOR)
+
+    def _storm_export_release_pct(self):
+        """SOC (%) at/above which the storm override stops suppressing export.
+        Reads the stormExportReleasePct pref, guarded, defaulting to the
+        STORM_EXPORT_RELEASE_PCT constant. Never allowed below the active storm
+        reserve target — the caller clamps with max(release, override_soc)."""
+        return _as_float(self.pluginPrefs.get("stormExportReleasePct"),
+                         STORM_EXPORT_RELEASE_PCT)
 
     def _resolve_export_lockout(self, soc_pct=None):
         """Apply the post-power-cut export lockout (returns export_enabled bool).
@@ -3552,8 +3587,18 @@ class Plugin(indigo.PluginBase):
                 log("[Seasonal] Winter buffer no longer active — back to summer floor")
             self.store["seasonal_override_applied"] = applied
 
-    def _apply_storm_override(self, snapshot):
-        """Raise dawn target and suppress exports during active storm warnings."""
+    def _apply_storm_override(self, snapshot, soc_pct):
+        """Raise dawn target and suppress exports during active storm warnings.
+
+        Export is suppressed ONLY while the battery is still filling toward the
+        storm reserve (SOC below the release point). At/above the release point
+        the reserve is banked, so holding export off achieves nothing for
+        resilience and merely rams the battery to 100% (charge takes priority
+        over export in self-consumption), clipping all PV above the DNO export
+        cap. Releasing lets Solar Overflow resume — throttling the charge and
+        pushing surplus to grid so the battery creeps up with headroom rather
+        than slamming full and curtailing. Mirrors the post-cut lockout floor.
+        """
         storm_level = self.store.get("storm_level", "none")
         if storm_level in ("amber", "red"):
             override_soc = STORM_SOC_AMBER
@@ -3561,18 +3606,40 @@ class Plugin(indigo.PluginBase):
             override_soc = STORM_SOC_YELLOW
         else:
             self.store["storm_override_logged_level"] = None
+            self.store["storm_export_suppressed"]     = False
             return
 
         snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
-        snapshot.export_enabled  = False   # never export during a storm
-        # Log only when the storm level changes — runs every 60s evaluate, and the
-        # level transition itself is already logged by _check_storm_watch.
-        if self.store.get("storm_override_logged_level") != storm_level:
+
+        # Release point can never sit below the active reserve target — below the
+        # target we genuinely want max charge (overflow off) to fill fast for a cut.
+        try:
+            soc_val = float(soc_pct)
+        except (TypeError, ValueError):
+            soc_val = 0.0   # unknown SOC — fail safe: keep export suppressed
+        release_pct = max(self._storm_export_release_pct(), override_soc)
+        suppress    = soc_val < release_pct
+        if suppress:
+            snapshot.export_enabled = False
+
+        # Log on storm-level change OR when the release point first lets export
+        # resume mid-storm, so the event log explains why export is running while
+        # a warning is active. Both are state changes, not a 60s heartbeat.
+        prev_suppressed = bool(self.store.get("storm_export_suppressed", False))
+        level_changed   = self.store.get("storm_override_logged_level") != storm_level
+        if level_changed:
             log(
-                f"[Storm] Storm override active (level={storm_level}): "
-                f"dawn target raised to {snapshot.dawn_target_pct:.0f}%, export suppressed"
+                f"[Storm] Storm override active (level={storm_level}): dawn target "
+                f"raised to {snapshot.dawn_target_pct:.0f}%, export "
+                f"{'suppressed' if suppress else f'allowed (SOC {soc_val:.0f}% >= {release_pct:.0f}% release)'}"
             )
             self.store["storm_override_logged_level"] = storm_level
+        elif prev_suppressed and not suppress:
+            log(
+                f"[Storm] SOC {soc_val:.0f}% >= {release_pct:.0f}% release point — "
+                f"export re-enabled during storm to protect solar (reserve already banked)"
+            )
+        self.store["storm_export_suppressed"] = suppress
 
     def _log_manager_decision(self, decision, snapshot, soc_pct):
         """Log manager decisions only on action change — no periodic heartbeat."""
