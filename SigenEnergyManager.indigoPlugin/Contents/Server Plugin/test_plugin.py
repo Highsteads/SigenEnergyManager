@@ -810,5 +810,63 @@ class TestStormExportRelease(unittest.TestCase):
         self.assertTrue(p.store["storm_export_suppressed"])
 
 
+class TestWriteCostVariables(unittest.TestCase):
+    """_write_cost_variables (v5.41) — republishes the orphaned Octopus cost/rate
+    variables from the Kraken ledger + the live economics (single source)."""
+
+    def _run(self, fin="default", econ=None):
+        import tempfile, shutil, types as _types
+        tmp = tempfile.mkdtemp()
+        try:
+            p = _mk_plugin(tmp, _FakeOcto(fin=fin))
+            p._ensure_var = lambda name, fid: name          # use the var NAME as its id
+            p.get_dashboard_data = lambda: {"economics": (econ or {})}
+            writes = {}
+            # The harness mocks indigo.variables (plural) but not indigo.variable
+            # (singular, what the writer uses) — install a capturing stand-in.
+            had = hasattr(plugin.indigo, "variable")
+            orig = getattr(plugin.indigo, "variable", None)
+            plugin.indigo.variable = _types.SimpleNamespace(
+                updateValue=lambda vid, val: writes.__setitem__(vid, val))
+            try:
+                p._write_cost_variables(0)
+            finally:
+                if had:
+                    plugin.indigo.variable = orig
+                else:
+                    delattr(plugin.indigo, "variable")
+            return writes
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_publishes_bill_exact_rates_and_costs(self):
+        econ = {"whole_house": {"today": {"electric_gbp": 0.62, "gas_gbp": 0.80,
+                                          "export_gbp": 1.45, "bill_gbp": 1.42}},
+                "periods": {"month": {"import_total_gbp": 0.48, "export_total_gbp": 86.22}}}
+        w = self._run(econ=econ)
+        self.assertEqual(w["elec_unit_rate_p"], "23.4780")        # live Tracker rate, not stale
+        self.assertEqual(w["elec_standing_charge_p"], "61.5182")
+        self.assertEqual(w["gas_unit_rate_p"], "6.5841")
+        self.assertEqual(w["gas_standing_charge_p"], "29.0617")
+        self.assertEqual(w["export_rate_p"], "12.0000")
+        self.assertEqual(w["export_rate"], "12.0000")             # legacy name the digest reads
+        self.assertEqual(w["account_balance_gbp"], "392.39")
+        self.assertEqual(w["elec_today_cost_gbp"], "0.62")
+        self.assertEqual(w["gas_today_cost_gbp"], "0.80")
+        self.assertEqual(w["export_today_revenue_gbp"], "1.45")
+        self.assertEqual(w["combined_today_actual_gbp"], "1.42")
+        self.assertEqual(w["elec_month_cost_gbp"], "0.48")
+        self.assertEqual(w["export_month_revenue_gbp"], "86.22")
+
+    def test_no_financials_is_graceful(self):
+        # Kraken down + no economics → no writes, no crash, nothing blanked.
+        self.assertEqual(self._run(fin=None, econ=None), {})
+
+    def test_costs_published_even_if_ledger_down(self):
+        w = self._run(fin=None, econ={"whole_house": {"today": {"electric_gbp": 0.62}}})
+        self.assertNotIn("elec_unit_rate_p", w)                   # no rate without the ledger
+        self.assertEqual(w["elec_today_cost_gbp"], "0.62")        # economics still published
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

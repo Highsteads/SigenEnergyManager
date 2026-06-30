@@ -6,8 +6,25 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        26-06-2026
-# Version:     5.40.0
+# Date:        30-06-2026
+# Version:     5.41.0
+# 5.41.0 — Publish the Octopus cost/rate variables (REVIVE). The elec_*/gas_*/
+#   export_*/account_balance Indigo variables had no active writer since their
+#   original script was retired, so they had gone stale — elec_unit_rate_p frozen
+#   weeks behind the live Tracker rate (read 11p while the ledger said 25.78p),
+#   account_balance_gbp stuck at 0. weekly_home_digest.py reads elec_unit_rate_p /
+#   export_rate, and get_dashboard_data's import-rate fallback reads
+#   elec_unit_rate_p, so both were silently using stale data. New
+#   _write_cost_variables (called from _write_energy_summary_variables, so the
+#   long-standing comment that elec_unit_rate_p is written every 30 min is now
+#   TRUE) republishes the bill-exact rates + balance from get_account_financials
+#   (the Kraken ledger — single source, no duplicate fetch/drift) and today/month
+#   costs from the live economics: elec_unit_rate_p, elec_standing_charge_p,
+#   gas_unit_rate_p, gas_standing_charge_p, export_rate_p (+ legacy export_rate),
+#   account_balance_gbp, elec_today_cost_gbp, gas_today_cost_gbp,
+#   export_today_revenue_gbp, combined_today_actual_gbp, elec_month_cost_gbp,
+#   export_month_revenue_gbp. Best-effort + fully guarded; a Kraken/economics
+#   hiccup leaves the values in place rather than blanking them.
 # 5.40.0 — Storm reserve is now a FLAT 50% for ALL levels (was 50% yellow / 80% amber-red).
 #   CliveS's call: a storm should keep a 50% power-cut reserve and NEVER grid-charge above it.
 #   The overnight resilience-buffer import (flat-rate tariff only) tops the battery to the storm
@@ -6122,9 +6139,85 @@ class Plugin(indigo.PluginBase):
                     except Exception as exc:
                         log(f"[Energy Vars] Update failed '{var_name}': {exc}",
                             level="WARNING")
+            # v5.41: republish the Octopus cost/rate variables from the bill-exact
+            # ledger + economics (they had no active writer and went stale).
+            self._write_cost_variables(folder_id)
         except Exception as exc:
             log(f"[Energy Vars] _write_energy_summary_variables failed: {exc}",
                 level="WARNING")
+
+    def _write_cost_variables(self, folder_id):
+        """v5.41: republish the orphaned Octopus cost/rate variables.
+
+        elec_*/gas_*/export_*/account_balance lost their writer when the old
+        Octopus consumption script was retired, so they froze (elec_unit_rate_p
+        weeks behind the live Tracker rate, account_balance_gbp stuck at 0).
+        weekly_home_digest.py and get_dashboard_data's import-rate fallback both
+        read elec_unit_rate_p, so keeping it live here makes this the single
+        source of truth. Rates + balance come from get_account_financials (the
+        Kraken ledger — already cached, no duplicate fetch); today/month costs
+        from the live economics (no recompute → no drift). Fully guarded so a
+        Kraken/economics hiccup leaves the values in place rather than blanking
+        them, and never disturbs the sigen_* writes that ran before it.
+        """
+        updates = []
+        # ---- bill-exact rates + balance (Kraken ledger, cached ~30 min) ----
+        try:
+            fin = self.octopus.get_account_financials() if self.octopus else None
+        except Exception as exc:
+            fin = None
+            log(f"[Cost Vars] financials fetch failed: {exc}", level="WARNING")
+        if fin:
+            elec = fin.get("elec") or {}
+            gas  = fin.get("gas") or {}
+            exp  = fin.get("export") or {}
+            if elec.get("unit_p") is not None:
+                updates.append(("elec_unit_rate_p", f"{float(elec['unit_p']):.4f}"))
+            if elec.get("standing_p") is not None:
+                updates.append(("elec_standing_charge_p", f"{float(elec['standing_p']):.4f}"))
+            if gas.get("unit_p") is not None:
+                updates.append(("gas_unit_rate_p", f"{float(gas['unit_p']):.4f}"))
+            if gas.get("standing_p") is not None:
+                updates.append(("gas_standing_charge_p", f"{float(gas['standing_p']):.4f}"))
+            if exp.get("unit_p") is not None:
+                rp = f"{float(exp['unit_p']):.4f}"
+                updates.append(("export_rate_p", rp))
+                updates.append(("export_rate",   rp))   # legacy name read by weekly_home_digest
+            if fin.get("balance_gbp") is not None:
+                updates.append(("account_balance_gbp", f"{float(fin['balance_gbp']):.2f}"))
+        # ---- today/month costs from the live economics (single source, no recompute) ----
+        try:
+            econ = (self.get_dashboard_data() or {}).get("economics") or {}
+            wh   = (econ.get("whole_house") or {}).get("today") or {}
+            mon  = (econ.get("periods") or {}).get("month") or {}
+
+            def _add(name, val):
+                if val is not None:
+                    try:
+                        updates.append((name, f"{float(val):.2f}"))
+                    except (TypeError, ValueError):
+                        pass
+            _add("elec_today_cost_gbp",       wh.get("electric_gbp"))
+            _add("gas_today_cost_gbp",        wh.get("gas_gbp"))
+            _add("export_today_revenue_gbp",  wh.get("export_gbp"))
+            _add("combined_today_actual_gbp", wh.get("bill_gbp"))
+            _add("elec_month_cost_gbp",       mon.get("import_total_gbp"))
+            _add("export_month_revenue_gbp",  mon.get("export_total_gbp"))
+        except Exception as exc:
+            log(f"[Cost Vars] economics read failed: {exc}", level="WARNING")
+        # ---- write ----
+        if not updates:
+            return
+        for name, value in updates:
+            vid = self._ensure_var(name, folder_id)
+            if vid:
+                try:
+                    indigo.variable.updateValue(vid, value)
+                except Exception as exc:
+                    log(f"[Cost Vars] update '{name}': {exc}", level="WARNING")
+        elec_rate = next((v for n, v in updates if n == "elec_unit_rate_p"), "—")
+        log(f"[Cost Vars] published {len(updates)} Octopus cost/rate variables "
+            f"(elec unit rate {elec_rate}p)")
 
     def _update_tariff_device(self, tariff_info, monitored):
         """Push Octopus tariff data to tariffMonitor device."""
