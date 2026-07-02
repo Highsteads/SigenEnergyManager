@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
 # Date:        02-07-2026
-# Version:     5.44.0
+# Version:     5.45.0
 # 5.41.0 — Publish the Octopus cost/rate variables (REVIVE). The elec_*/gas_*/
 #   export_*/account_balance Indigo variables had no active writer since their
 #   original script was retired, so they had gone stale — elec_unit_rate_p frozen
@@ -1636,10 +1636,16 @@ class Plugin(indigo.PluginBase):
     def get_dashboard_data(self):
         """Return a dict of live system data for the web dashboard /api/status."""
         try:
-            inv    = self.latest_inverter_data  or {}
-            fcast  = self.latest_forecast_data  or {}
-            rates  = self.latest_rates_data     or {}
-            dec    = self.latest_decision
+            # v5.45.0: millisecond snapshot under the lock, then the whole
+            # payload builds lock-free from consistent local copies — handler
+            # threads used to read store live (torn composite reads
+            # possible around the midnight counter reset).
+            with self._state_lock:
+                store  = dict(self.store)
+                inv    = self.latest_inverter_data  or {}
+                fcast  = self.latest_forecast_data  or {}
+                rates  = self.latest_rates_data     or {}
+                dec    = self.latest_decision
 
             tariff_info = rates.get("tariff_info", {})
             tracker     = rates.get("tracker", {})
@@ -1662,8 +1668,8 @@ class Plugin(indigo.PluginBase):
                 hourly[f"{hour:02d}:00"] = round(wh / 1000.0, 2)
 
             # Self-sufficiency
-            home_kwh   = self.store.get("home_daily_kwh", 0.0)
-            import_kwh = self.store.get("grid_import_daily_kwh", 0.0)
+            home_kwh   = store.get("home_daily_kwh", 0.0)
+            import_kwh = store.get("grid_import_daily_kwh", 0.0)
             if home_kwh > 0:
                 self_suff = round(max(0.0, (home_kwh - import_kwh) / home_kwh * 100.0), 1)
             else:
@@ -1675,7 +1681,7 @@ class Plugin(indigo.PluginBase):
             # Export rate defaults to 12p (Octopus Outgoing flat) — overridden if
             # the rates_data feed publishes a different export rate.
             tomorrow_solar = float(fcast.get("correctedTomorrowKwh", 0.0))
-            profile        = self.store.get("consumption_profile", []) or []
+            profile        = store.get("consumption_profile", []) or []
             tomorrow_need  = sum(profile) if len(profile) == 48 else 22.0
             tomorrow_surplus = max(0.0, tomorrow_solar - tomorrow_need)
             export_rate_p  = 12.0
@@ -1727,7 +1733,7 @@ class Plugin(indigo.PluginBase):
             today_econ = self._compute_daily_economics(
                 home_kwh      = home_kwh,
                 import_kwh    = import_kwh,
-                export_kwh    = float(self.store.get("grid_export_daily_kwh", 0.0)),
+                export_kwh    = float(store.get("grid_export_daily_kwh", 0.0)),
                 import_rate_p = import_rate_p,
                 export_rate_p = export_rate_p,
             )
@@ -1766,7 +1772,7 @@ class Plugin(indigo.PluginBase):
             # _apply_storm_override clamps it to the active reserve target
             # (max(pref, STORM_SOC_*)), so a pref below the reserve would show
             # a release percentage the override never honours during a storm.
-            storm_level_now   = self.store.get("storm_level", "none")
+            storm_level_now   = store.get("storm_level", "none")
             storm_release_now = self._storm_export_release_pct()
             if storm_level_now in ("amber", "red"):
                 storm_release_now = max(storm_release_now, STORM_SOC_AMBER)
@@ -1788,9 +1794,9 @@ class Plugin(indigo.PluginBase):
                     "tomorrow_surplus_kwh":  round(tomorrow_surplus, 1),
                     "tomorrow_revenue_gbp":  tomorrow_revenue_gbp,
                     "export_rate_p":         round(export_rate_p, 2),
-                    "actual_today_kwh":      round(self.store.get("pv_daily_kwh", 0.0), 2),
-                    "peak_w":                self.store.get("peak_pv_w", 0),
-                    "peak_time":             self.store.get("peak_pv_time", ""),
+                    "actual_today_kwh":      round(store.get("pv_daily_kwh", 0.0), 2),
+                    "peak_w":                store.get("peak_pv_w", 0),
+                    "peak_time":             store.get("peak_pv_time", ""),
                     "lifetime_kwh":          inv.get("pvLifetimeKwh"),
                     "total_kwp":             self._total_kwp(),
                 },
@@ -1814,29 +1820,29 @@ class Plugin(indigo.PluginBase):
                     "tomorrow_p":   tracker.get("tomorrow_p"),
                 },
                 "today_summary": {
-                    "pv_kwh":     round(self.store.get("pv_daily_kwh",          0.0), 2),
+                    "pv_kwh":     round(store.get("pv_daily_kwh",          0.0), 2),
                     "import_kwh": round(import_kwh,                                   2),
-                    "export_kwh": round(self.store.get("grid_export_daily_kwh", 0.0), 2),
+                    "export_kwh": round(store.get("grid_export_daily_kwh", 0.0), 2),
                     "home_kwh":   round(home_kwh,                                     2),
-                    "peak_soc":   round(self.store.get("peak_soc",            0.0), 1),
-                    "min_soc":    round(self.store.get("min_soc",           100.0), 1),
+                    "peak_soc":   round(store.get("peak_soc",            0.0), 1),
+                    "min_soc":    round(store.get("min_soc",           100.0), 1),
                     "self_suff":  self_suff,
                 },
                 "vpp": {
-                    "state":     self.store.get("vpp_state",  "idle"),
-                    "active":    self.store.get("vpp_active", False),
+                    "state":     store.get("vpp_state",  "idle"),
+                    "active":    store.get("vpp_active", False),
                     "event_str": "",
                 },
                 "storm": {
                     "level": storm_level_now,
-                    "export_suppressed": self.store.get("storm_export_suppressed", False),
+                    "export_suppressed": store.get("storm_export_suppressed", False),
                     "export_release_pct": storm_release_now,
                 },
                 "power_cut": {
-                    "events":  (self.store.get("power_cut_events", []) or [])[-10:],
-                    "ongoing": self.store.get("power_cut_started_at") is not None,
-                    "lockout_active": self.store.get("power_cut_lockout_active", False),
-                    "export_suppressed": self.store.get("power_cut_export_suppressed", False),
+                    "events":  (store.get("power_cut_events", []) or [])[-10:],
+                    "ongoing": store.get("power_cut_started_at") is not None,
+                    "lockout_active": store.get("power_cut_lockout_active", False),
+                    "export_suppressed": store.get("power_cut_export_suppressed", False),
                     "lockout_soc_floor": self._power_cut_lockout_soc_floor(),
                 },
                 "forecast_accuracy": (
@@ -1847,9 +1853,9 @@ class Plugin(indigo.PluginBase):
                 ),
                 "economics": economics,
                 "flags": {
-                    "export_active":         self.store.get("export_active",         False),
-                    "solar_overflow_active": self.store.get("solar_overflow_active", False),
-                    "import_active":         self.store.get("import_active",         False),
+                    "export_active":         store.get("export_active",         False),
+                    "solar_overflow_active": store.get("solar_overflow_active", False),
+                    "import_active":         store.get("import_active",         False),
                     # Live connection state — latest_inverter_data is kept at
                     # last-known-good on failure, so bool(inv) could never go
                     # false again after the first successful poll.
@@ -3016,9 +3022,9 @@ class Plugin(indigo.PluginBase):
         A failure in any single tick task must not kill the whole polling loop —
         one bad modbus read / forecast parse / VPP poll should be logged and
         retried on the next tick, not take the manager offline until a plugin
-        restart. StopThread still propagates so shutdown stays clean. (_tick
-        releases self._state_lock via its `with` block before any exception
-        reaches here, so the lock is never held across the retry.)
+        restart. StopThread still propagates so shutdown stays clean. (Since
+        v5.45.0 the tick does not hold _state_lock itself — each stage locks
+        only its merge section — so no lock is ever held across the retry.)
         """
         try:
             while True:
@@ -3045,84 +3051,110 @@ class Plugin(indigo.PluginBase):
     def _tick(self, now):
         """Called every 10 seconds. Dispatches all timed tasks.
 
-        Holds _state_lock for the duration of the tick so action callbacks
-        running on the main thread cannot interleave with store mutations.
+        v5.45.0 LOCKING MODEL: the tick no longer holds _state_lock for its
+        whole duration (it used to stall every action callback and dashboard
+        request behind a ~16-20s Modbus cycle or a slow HTTP fetch). Instead:
+          - network stages (_poll_modbus, _refresh_forecast,
+            _refresh_octopus_rates, _poll_vpp, _check_storm_watch,
+            _settle_whole_house_costs) run their I/O UNLOCKED and take the
+            lock only to merge results into the store;
+          - control stages (_evaluate_manager incl. verify+act,
+            _check_midnight, _check_scheduled_import) are SELF-LOCKING and run
+            entirely under the lock — hardware decisions must stay serialised
+            with the locked action callbacks;
+          - the last_* stamps below are scalar dict ops with the tick as the
+            only regular writer — safe without the lock.
+        Contract pinned by test_concurrency.py.
         """
-        with self._state_lock:
-            # Date rotation only needs checking every ~hour (Phase 4C).  Skipping
-            # the per-tick filesystem stat avoids 8,640 redundant calls/day.
-            if now - self.store.get("last_log_check", 0.0) >= 3600.0:
-                _ensure_plugin_log(self.data_dir)
-                self.store["last_log_check"] = now
+        # Date rotation only needs checking every ~hour (Phase 4C).  Skipping
+        # the per-tick filesystem stat avoids 8,640 redundant calls/day.
+        if now - self.store.get("last_log_check", 0.0) >= 3600.0:
+            _ensure_plugin_log(self.data_dir)
+            self.store["last_log_check"] = now
 
-            # 1. Modbus poll
-            if now - self.store["last_modbus"] >= getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL):
-                self._poll_modbus()
-                self.store["last_modbus"] = now
+        # 1. Modbus poll. Stamp BEFORE the call: the outage back-off inside
+        # _apply_modbus_result pushes last_modbus into the future, and
+        # stamping afterwards would clobber it (which is exactly what made
+        # the v5.43.0 back-off silently ineffective — caught in the v5.45.0
+        # locking review, pinned by test_outage_backoff_survives_the_tick).
+        if now - self.store["last_modbus"] >= getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL):
+            self.store["last_modbus"] = now
+            self._poll_modbus()
 
-            # 2. Solar forecast (before manager so decision always has fresh data)
-            if now - self.store["last_forecast"] >= FORECAST_FETCH_INTERVAL:
-                self._refresh_forecast()
-                self.store["last_forecast"] = now
+        # 2. Solar forecast (before manager so decision always has fresh data)
+        if now - self.store["last_forecast"] >= FORECAST_FETCH_INTERVAL:
+            self._refresh_forecast()
+            self.store["last_forecast"] = now
 
-            # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
-            if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
-                self._evaluate_manager()
-                self.store["last_manager"] = now
+        # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
+        if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
+            self._evaluate_manager()
+            self.store["last_manager"] = now
 
-            # 4. Octopus rates
-            if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
-                self._refresh_octopus_rates()
-                self.store["last_octopus"] = now
+        # 4. Octopus rates
+        if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
+            self._refresh_octopus_rates()
+            self.store["last_octopus"] = now
 
-            # 5. Consumption profile (daily)
-            if now - self.store["last_profile"] >= OCTOPUS_PROFILE_INTERVAL:
-                self._refresh_consumption_profile()
-                self.store["last_profile"] = now
+        # 5. Consumption profile (daily)
+        if now - self.store["last_profile"] >= OCTOPUS_PROFILE_INTERVAL:
+            self._refresh_consumption_profile()
+            self.store["last_profile"] = now
 
-            # 5b. Whole-house cost settle (every 6h — backfill settled gas/import/cost)
-            if now - self.store.get("last_cost_settle", 0.0) >= COST_SETTLE_INTERVAL:
-                self._settle_whole_house_costs()
-                self.store["last_cost_settle"] = now
+        # 5b. Whole-house cost settle (every 6h — backfill settled gas/import/cost)
+        if now - self.store.get("last_cost_settle", 0.0) >= COST_SETTLE_INTERVAL:
+            self._settle_whole_house_costs()
+            self.store["last_cost_settle"] = now
 
-            # 6. VPP polling (adaptive)
-            vpp_interval = self._vpp_poll_interval()
-            if now - self.store["last_vpp"] >= vpp_interval:
-                self._poll_vpp()
-                self.store["last_vpp"] = now
+        # 6. VPP polling (adaptive)
+        vpp_interval = self._vpp_poll_interval()
+        if now - self.store["last_vpp"] >= vpp_interval:
+            self._poll_vpp()
+            self.store["last_vpp"] = now
 
-            # 7. Accumulator save
-            if now - self.store["last_acc_save"] >= ACCUMULATOR_SAVE_INTERVAL:
-                self._save_accumulators()
-                self.store["last_acc_save"] = now
+        # 7. Accumulator save
+        if now - self.store["last_acc_save"] >= ACCUMULATOR_SAVE_INTERVAL:
+            self._save_accumulators()
+            self.store["last_acc_save"] = now
 
-            # 8. Daily midnight tasks
-            self._check_midnight()
+        # 8. Daily midnight tasks
+        self._check_midnight()
 
-            # 9. Check scheduled import
-            self._check_scheduled_import()
+        # 9. Check scheduled import
+        self._check_scheduled_import()
 
-            # 10. Storm watch (every 2 hours)
-            if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
-                self._check_storm_watch()
-                self.store["last_storm_watch"] = now
+        # 10. Storm watch (every 2 hours)
+        if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
+            self._check_storm_watch()
+            self.store["last_storm_watch"] = now
 
-            # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
-            if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
-                self._log_halfhourly_to_db()
-                self._write_energy_summary_variables()
-                self.store["last_energy_var"] = now
+        # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
+        if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
+            self._log_halfhourly_to_db()
+            self._write_energy_summary_variables()
+            self.store["last_energy_var"] = now
 
     # ================================================================
     # Modbus Polling
     # ================================================================
 
     def _poll_modbus(self):
-        """Read all inverter registers and update sigenergyInverter device states."""
+        """Read all inverter registers and update sigenergyInverter device states.
+
+        v5.45.0: the throttled read cycle (~16-20s) runs WITHOUT _state_lock —
+        only the merge of the result takes it. A locked callback commanding a
+        write mid-cycle interleaves safely (the modbus client serialises each
+        transaction internally).
+        """
         if not self.modbus:
             return
 
-        data = self.modbus.read_all()
+        data = self.modbus.read_all()   # NETWORK — unlocked
+        with self._state_lock:
+            self._apply_modbus_result(data)
+
+    def _apply_modbus_result(self, data):
+        """Merge a read_all() result into store/devices. Caller holds the lock."""
         if data is None:
             # Track consecutive failures: one WARNING at the transition (the
             # modbus layer's per-cycle lines cover detail), then widen the
@@ -3342,6 +3374,14 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _evaluate_manager(self):
+        # v5.45.0: the ENTIRE evaluate/verify/act path runs under the lock —
+        # a register-verify racing an action callback (e.g. Pause) could
+        # otherwise re-assert a stale mode. Control trades a few locked
+        # seconds per minute for serialisation; the bulk I/O lives elsewhere.
+        with self._state_lock:
+            return self._evaluate_manager_impl()
+
+    def _evaluate_manager_impl(self):
         """Run the battery manager decision engine and act on the result.
 
         Orchestrates:
@@ -3980,6 +4020,11 @@ class Plugin(indigo.PluginBase):
             log(f"[Storm] check_storm_level() raised: {exc}", level="WARNING")
             return
 
+        with self._state_lock:   # v5.45.0: poll unlocked, merge locked
+            self._apply_storm_result(new_level, reason)
+
+    def _apply_storm_result(self, new_level, reason):
+        """Merge a MeteoAlarm poll result. Caller holds the lock."""
         prev_level    = self.store.get("storm_level", "none")
         alerted_level = self.store.get("storm_alerted_level", "none")
 
@@ -4489,6 +4534,11 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_charge_cutoff(expected_charge_cutoff)
 
     def _check_scheduled_import(self):
+        # v5.45.0: commands hardware from store state — runs under the lock.
+        with self._state_lock:
+            return self._check_scheduled_import_impl()
+
+    def _check_scheduled_import_impl(self):
         """Check if a scheduled import time has arrived."""
         scheduled = self.store.get("import_scheduled_time")
         if scheduled is None:
@@ -4565,11 +4615,12 @@ class Plugin(indigo.PluginBase):
             tracker    = monitored.get("tracker", {})
             tariff_key = tariff_info.get("tariff_key", "?")
             today_rate = tracker.get("today_p")
-            _changed   = (tariff_key != self.store.get("_last_tariff_key")
-                          or today_rate != self.store.get("_last_tariff_rate"))
-            if _changed:
-                self.store["_last_tariff_key"]  = tariff_key
-                self.store["_last_tariff_rate"] = today_rate
+            with self._state_lock:   # v5.45.0: fetch unlocked, store merge locked
+                _changed   = (tariff_key != self.store.get("_last_tariff_key")
+                              or today_rate != self.store.get("_last_tariff_rate"))
+                if _changed:
+                    self.store["_last_tariff_key"]  = tariff_key
+                    self.store["_last_tariff_rate"] = today_rate
             if _changed or self.debug:
                 log(
                     f"[Octopus] Tariff: {tariff_info.get('display_name', tariff_key)} "
@@ -4652,6 +4703,12 @@ class Plugin(indigo.PluginBase):
         self.store["home_profile_count"][slot]     += 1
 
     def _refresh_consumption_profile(self, force=False):
+        # v5.45.0: reads the profile accumulators + writes the store — locked
+        # (no network; the accumulators are fed by the locked modbus merge).
+        with self._state_lock:
+            return self._refresh_consumption_profile_impl(force=force)
+
+    def _refresh_consumption_profile_impl(self, force=False):
         """Rebuild 48-slot consumption profile from accumulated inverter readings.
 
         Each slot (0=00:00, 1=00:30 … 47=23:30) holds the average homePowerWatts
@@ -4778,7 +4835,12 @@ class Plugin(indigo.PluginBase):
         if self.store.get("manager_paused", False):
             return
 
-        event         = self.axle.get_next_event()
+        event = self.axle.get_next_event()   # NETWORK — unlocked (v5.45.0)
+        with self._state_lock:
+            self._apply_vpp_event(event)
+
+    def _apply_vpp_event(self, event):
+        """Advance the VPP state machine for a fetched event. Caller holds the lock."""
         now           = datetime.now(timezone.utc)
         current_state = self.store["vpp_state"]
 
@@ -5552,6 +5614,11 @@ class Plugin(indigo.PluginBase):
     # ================================================================
 
     def _check_midnight(self):
+        # v5.45.0: accumulator rollover is a compound store mutation — locked.
+        with self._state_lock:
+            return self._check_midnight_impl()
+
+    def _check_midnight_impl(self):
         """Run once-daily tasks at local (Europe/London) midnight.
 
         Naive datetime.now() returns server-local time which may not match
@@ -6220,6 +6287,11 @@ class Plugin(indigo.PluginBase):
                     pass
 
     def _log_halfhourly_to_db(self):
+        # v5.45.0: reads/advances store anchors — locked (local sqlite, fast).
+        with self._state_lock:
+            return self._log_halfhourly_to_db_impl()
+
+    def _log_halfhourly_to_db_impl(self):
         """Append one half-hourly slot to energy_timeseries.db.
 
         Computes energy deltas since the last write. On the very first call
@@ -6321,12 +6393,13 @@ class Plugin(indigo.PluginBase):
         """
         try:
             folder_id = self._sigenergy_folder_id()
-            pv     = round(self.store.get("pv_daily_kwh",          0.0), 2)
-            imp    = round(self.store.get("grid_import_daily_kwh",  0.0), 2)
-            exp    = round(self.store.get("grid_export_daily_kwh",  0.0), 2)
-            home   = round(self.store.get("home_daily_kwh",         0.0), 2)
-            peak   = round(self.store.get("peak_soc",               0.0), 1)
-            minsoc = round(self.store.get("min_soc",              100.0), 1)
+            with self._state_lock:   # v5.45.0: snapshot the inputs, write unlocked
+                pv     = round(self.store.get("pv_daily_kwh",          0.0), 2)
+                imp    = round(self.store.get("grid_import_daily_kwh",  0.0), 2)
+                exp    = round(self.store.get("grid_export_daily_kwh",  0.0), 2)
+                home   = round(self.store.get("home_daily_kwh",         0.0), 2)
+                peak   = round(self.store.get("peak_soc",               0.0), 1)
+                minsoc = round(self.store.get("min_soc",              100.0), 1)
             # Self-sufficiency = share of home load NOT met by grid import. On a
             # zero-load day (home=0) nothing was needed from the grid, so that's 100%
             # — matches the dashboard's get_dashboard_data computation (was 0.0 here,
@@ -6791,17 +6864,18 @@ class Plugin(indigo.PluginBase):
 
     def actionRefreshForecast(self, action):
         """Action: Manual solar forecast refresh (Open-Meteo)."""
-        with self._state_lock:
-            log("[Action] Manual solar forecast refresh")
-            self._refresh_forecast(force=True)
-            self.store["last_forecast"] = time.time()
+        # v5.45.0: unlocked — the fetch runs outside the lock by design and
+        # the stamp write is a scalar dict op.
+        log("[Action] Manual solar forecast refresh")
+        self._refresh_forecast(force=True)
+        self.store["last_forecast"] = time.time()
 
     def actionRefreshOctopus(self, action):
         """Action: Manual Octopus rates refresh."""
-        with self._state_lock:
-            log("[Action] Manual Octopus rates refresh")
-            self._refresh_octopus_rates(force=True)
-            self.store["last_octopus"] = time.time()
+        # v5.45.0: unlocked — see actionRefreshForecast.
+        log("[Action] Manual Octopus rates refresh")
+        self._refresh_octopus_rates(force=True)
+        self.store["last_octopus"] = time.time()
 
     # ================================================================
     # Indigo Menu Callbacks
@@ -6815,13 +6889,15 @@ class Plugin(indigo.PluginBase):
         writes) concurrently on two threads.
         """
         log("[Menu] Refresh All: fetching solar forecast, Octopus and re-evaluating...")
-        with self._state_lock:
-            self._refresh_forecast(force=True)
-            self.store["last_forecast"] = time.time()
-            self._refresh_octopus_rates(force=True)
-            self.store["last_octopus"] = time.time()
-            self._evaluate_manager()
-            self.store["last_manager"] = time.time()
+        # v5.45.0: no outer lock — the fetches run unlocked by design and
+        # _evaluate_manager is self-locking, so holding the lock here would
+        # just stall callbacks behind two HTTP fetches for no protection.
+        self._refresh_forecast(force=True)
+        self.store["last_forecast"] = time.time()
+        self._refresh_octopus_rates(force=True)
+        self.store["last_octopus"] = time.time()
+        self._evaluate_manager()
+        self.store["last_manager"] = time.time()
         log("[Menu] Refresh All complete")
         return True
 
@@ -7578,6 +7654,14 @@ class Plugin(indigo.PluginBase):
         except Exception as e:
             self.logger.warning(f"Cannot save accumulators: {e}")
             return
+        # v5.45.0: build + write under the lock so the saved snapshot is
+        # internally consistent (RLock — locked callers nest fine; the
+        # atomic file write is local and fast).
+        with self._state_lock:
+            self._save_accumulators_locked(path)
+
+    def _save_accumulators_locked(self, path):
+        """Build + write the accumulators payload. Caller holds the lock."""
         data = {
             "pv_daily_kwh":              self.store["pv_daily_kwh"],
             "grid_import_daily_kwh":     self.store["grid_import_daily_kwh"],

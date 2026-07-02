@@ -12,6 +12,7 @@
 
 import os
 import sys
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -264,6 +265,7 @@ def _mk_plugin(tmp, octo, store=None):
     p.data_dir = tmp
     p.logger = MagicMock()
     p.store = store if store is not None else {}
+    p._state_lock = threading.RLock()   # v5.45.0: stages lock their merges
     return p
 
 
