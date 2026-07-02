@@ -623,6 +623,17 @@ class BatteryManager:
             remaining_solar_kwh *= snapshot.bias_factor
 
         # ── 24h surplus (export eligibility) ───────────────────────────────
+        # DELIBERATELY CONSERVATIVE (owner decision, 02-07-2026, closing the
+        # 26-Jun deferred item): need_24h is the full-calendar-day figure while
+        # the solar term spans only now->dusk — tomorrow-morning solar inside
+        # the true next-24h window is NOT counted. Evening evaluations
+        # therefore understate surplus and suppress marginal export
+        # eligibility, which errs in the KPI-safe direction (keep kWh in the
+        # battery over 12p export). The precise alternative (rolling-window
+        # need via _estimate_consumption_until + tomorrow's pre-noon solar)
+        # was considered and declined: it leans on the overnight forecast for
+        # tonight's export decision. Pinned by
+        # test_surplus_is_conservative_no_tomorrow_solar.
         surplus_kwh = current_soc_kwh + remaining_solar_kwh - need_24h_kwh
 
         # ── Home consumption from now to dusk (for solar overflow charge cap) ─
@@ -996,6 +1007,29 @@ class BatteryManager:
 
         if cheapest_viable:
             slot_dt, rate = cheapest_viable
+            # Round-trip break-even (v5.44.0): pre-charging loses ~6% in
+            # AC->DC->AC conversion, so the cheapest slot only beats letting
+            # the inverter pass grid straight to the house tomorrow when
+            # rate / efficiency undercuts tomorrow's daytime rates. Tracker
+            # and Flexible already gate on exactly this economics — Agile
+            # was the one path that imported unconditionally, which loses
+            # money on flat-ish Agile days (overnight 22p vs daytime 23p:
+            # 22 / 0.94 = 23.4p effective).
+            reference = self._agile_daytime_reference_rate(tariff, dawn_dt)
+            effective = rate / max(0.01, snapshot.efficiency)
+            if reference is not None and effective >= reference:
+                return Decision(
+                    action          = ACTION_SELF_CONSUMPTION,
+                    reason          = (
+                        f"Tomorrow shortfall — cheapest Agile slot {rate:.2f}p is "
+                        f"{effective:.2f}p after ~{(1 - snapshot.efficiency) * 100:.0f}% "
+                        f"conversion loss, vs {reference:.2f}p daytime average. "
+                        f"Grid imports direct to house instead; pre-charging would "
+                        f"cost more than it saves"
+                    ),
+                    dawn_viable     = True,
+                    soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+                )
             if slot_dt <= now + timedelta(minutes=5):
                 return Decision(
                     action         = ACTION_START_IMPORT,
@@ -1024,6 +1058,20 @@ class BatteryManager:
             power_watts    = 10000,
             target_soc_pct = target_soc,
         )
+
+    @staticmethod
+    def _agile_daytime_reference_rate(tariff: TariffData, dawn_dt):
+        """Mean of tomorrow's daytime Agile slots (dawn -> dawn+12h), the
+        passthrough price an overnight pre-charge competes against. Falls back
+        to today's rate when tomorrow's slots aren't published yet; None when
+        no reference exists (caller then imports ungated, as before v5.44.0).
+        """
+        if tariff.agile_slots and dawn_dt is not None:
+            day_rates = [r for dt, r in tariff.agile_slots
+                         if dawn_dt <= dt < dawn_dt + timedelta(hours=12)]
+            if day_rates:
+                return sum(day_rates) / len(day_rates)
+        return tariff.today_rate_p or None
 
     def _plan_flexible_import(
         self,

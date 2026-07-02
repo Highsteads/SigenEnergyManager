@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
 # Date:        02-07-2026
-# Version:     5.43.1
+# Version:     5.44.0
 # 5.41.0 — Publish the Octopus cost/rate variables (REVIVE). The elec_*/gas_*/
 #   export_*/account_balance Indigo variables had no active writer since their
 #   original script was retired, so they had gone stale — elec_unit_rate_p frozen

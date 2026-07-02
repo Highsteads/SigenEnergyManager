@@ -1326,6 +1326,81 @@ class TestResilienceBuffer(unittest.TestCase):
         self.assertIsNone(d)
 
 
+class TestAgileBreakEven(unittest.TestCase):
+    """v5.44.0: the Agile import planner must respect the ~6% round-trip loss —
+    the cheapest overnight slot only beats grid-to-house passthrough when
+    rate / efficiency undercuts tomorrow's daytime average. Tracker and
+    Flexible already gated on this economics; Agile imported unconditionally
+    (closing 26-Jun deferred item (b))."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _agile(self, overnight_p, daytime_p, today_rate_p=25.0, soc=20.0):
+        snapshot = _make_snapshot(soc_pct=soc, now_hour=20,
+                                  today_rate_p=today_rate_p)
+        snapshot.tariff.tariff_key = "agile"
+        dawn = _tomorrow_dawn(hour=7)
+        slots = []
+        if overnight_p is not None:
+            for h in (23, 24, 25):                       # tonight, before dawn
+                slots.append((_now(hour=20) + timedelta(hours=h - 20),
+                              overnight_p))
+        if daytime_p is not None:
+            for h in (3, 5, 7):                          # tomorrow daytime
+                slots.append((dawn + timedelta(hours=h), daytime_p))
+        snapshot.tariff.agile_slots = slots
+        balance = self.bm._calculate_24h_balance(snapshot)
+        return self.bm._plan_agile_import(snapshot, balance, target_soc=50.0)
+
+    def test_flat_agile_day_prefers_passthrough(self):
+        # 22p overnight / 23p daytime: 22 / 0.94 = 23.4p effective — importing
+        # costs MORE than letting the house pull from grid tomorrow.
+        d = self._agile(overnight_p=22.0, daytime_p=23.0)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("conversion loss", d.reason)
+
+    def test_steep_agile_day_still_imports(self):
+        # 12p overnight / 30p daytime: 12.77p effective — clear win, schedule it.
+        d = self._agile(overnight_p=12.0, daytime_p=30.0)
+        self.assertIn(d.action, (ACTION_SCHEDULE_IMPORT, ACTION_START_IMPORT))
+
+    def test_no_reference_rate_imports_ungated(self):
+        # No tomorrow slots published and no today rate — no reference to
+        # compare against, so behave as before v5.44.0 (import).
+        d = self._agile(overnight_p=22.0, daytime_p=None, today_rate_p=None)
+        self.assertIn(d.action, (ACTION_SCHEDULE_IMPORT, ACTION_START_IMPORT))
+
+    def test_break_even_boundary_exact(self):
+        # Effective cost exactly equal to the reference -> passthrough (the
+        # round trip buys nothing, so don't cycle the battery for free).
+        # 23.5 / 0.94 = 25.0 == daytime 25.0.
+        d = self._agile(overnight_p=23.5, daytime_p=25.0)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+
+
+class TestSurplusConservatism(unittest.TestCase):
+    """Characterisation: surplus_kwh is DELIBERATELY conservative (owner
+    decision 02-07-2026, closing 26-Jun deferred item (c)) — tomorrow-morning
+    solar inside the next-24h window is NOT counted, so evening export
+    eligibility is understated in the KPI-safe direction. If this test fails
+    because someone made the formula 'precise', that is a decision change
+    needing owner sign-off, not a bug fix."""
+
+    def test_surplus_is_conservative_no_tomorrow_solar(self):
+        bm = BatteryManager()
+        # 20:00, SOC 50% (17.52 kWh), weekday need 22 kWh, and a BIG tomorrow
+        # forecast that a 'precise' rolling-24h model would partially count.
+        snapshot = _make_snapshot(soc_pct=50.0, now_hour=20,
+                                  corrected_tomorrow_kwh=60.0)
+        balance = bm._calculate_24h_balance(snapshot)
+        # battery(17.52) + remaining_solar(0, night) - need(22) = -4.48:
+        # negative despite 60 kWh forecast tomorrow — deliberately so.
+        self.assertAlmostEqual(balance.surplus_kwh,
+                               17.52 - snapshot.weekday_kwh, places=1)
+        self.assertLess(balance.surplus_kwh, 0.0)
+
+
 class TestFloodContinuationGuards(unittest.TestCase):
     """v5.42: an in-progress flood pre-drain must respect overrides that arrive
     MID-drain — a storm warning that suppresses export or raises the mandated
