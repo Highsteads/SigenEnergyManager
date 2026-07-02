@@ -1110,10 +1110,14 @@ class SigenergyModbus:
     def set_charge_cutoff(self, soc_pct):
         """Set ESS maximum charge SOC (register 40047).
 
-        Battery will not charge above this SOC in Self Consumption mode.
-        Used to prevent the battery absorbing all surplus PV when export is active —
-        once the cutoff is reached, surplus PV flows to the grid naturally.
-        Restore to 100.0 when export stops to allow unrestricted charging.
+        HARDWARE-VERIFIED GLOBAL (supervised live test 02-07-2026): with the
+        cutoff below current SOC, charging is blocked in Max Self Consumption
+        (0x02: 5 kW PV charging collapsed to ~0 W within seconds, surplus went
+        to export) AND in Charge Grid First (0x03: a commanded 2 kW grid
+        charge held at 0 W battery power). So this register is a real crash
+        backstop for force_charge, not just a self-consumption trim.
+        Restore to 100.0 when the import/export ends to allow unrestricted
+        charging.
 
         Args:
             soc_pct: Maximum charge SOC % (0.0 - 100.0)
