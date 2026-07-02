@@ -28,13 +28,13 @@
     <Event id="vppStarted">
         <Name>VPP Event Started</Name>
         <TriggerLabel>Axle VPP export event is now active</TriggerLabel>
-        <Description>Fires when an Axle VPP export event becomes active. Battery manager suspends; Axle controls via Sigenergy cloud.</Description>
+        <Description>Fires when an Axle VPP export event becomes active. The plugin self-drives the export for the event window (Axle dispatch is ignored).</Description>
     </Event>
 
     <Event id="vppEnded">
         <Name>VPP Event Ended</Name>
         <TriggerLabel>Axle VPP export event completed</TriggerLabel>
-        <Description>Fires when an Axle VPP export event ends and battery manager control is restored.</Description>
+        <Description>Fires when an Axle VPP export event ends — the self-driven export stops and self-consumption resumes.</Description>
     </Event>
 
     <Event id="floodPreventionStarted">
@@ -52,13 +52,13 @@
     <Event id="powerCutLockoutStarted">
         <Name>Power Cut Lockout Started</Name>
         <TriggerLabel>4-hour export lockout active after grid restoration</TriggerLabel>
-        <Description>Fires when the grid is restored after a power cut. Export is suppressed for 4 hours as a precaution while grid stability is observed.</Description>
+        <Description>Fires when the grid is restored after a power cut. Export is suppressed for up to 4 hours while the battery SOC is below the configured floor (default 85%) — export resumes early once the floor is reached.</Description>
     </Event>
 
     <Event id="powerCutLockoutCleared">
         <Name>Power Cut Lockout Cleared</Name>
         <TriggerLabel>Power cut export lockout has expired</TriggerLabel>
-        <Description>Fires when the 4-hour post-grid-restore export lockout expires and normal export operation resumes.</Description>
+        <Description>Fires when the post-power-cut export lockout ends — the 4-hour window expired or SOC reached the configured floor — and normal export operation resumes.</Description>
     </Event>
 
 </Events>

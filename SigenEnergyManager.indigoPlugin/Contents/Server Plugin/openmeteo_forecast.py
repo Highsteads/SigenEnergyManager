@@ -96,13 +96,23 @@ ARRAYS = [
 
 INVERTER_CAP_KW = 10.0   # Sigenergy 10 kW inverter limit
 
+# Plausibility ceiling for a single GTI sample (W/m²). The solar constant is
+# ~1367 W/m²; cloud-edge enhancement can push ground-level readings a little
+# above clear-sky, so 1500 gives headroom while rejecting garbage-large values.
+GTI_MAX_WM2 = 1500.0
+
 # Performance ratio: accounts for inverter efficiency (~97%), wiring losses (~2%),
 # temperature derating (~3%), soiling (~2%). Shading is separate via shade factor above.
 PERFORMANCE_RATIO = 0.90
 
 # Open-Meteo API
 OPENMETEO_URL   = "https://api.open-meteo.com/v1/forecast"
-REQUEST_TIMEOUT = 30    # seconds per array call
+REQUEST_TIMEOUT = 10    # seconds per array call (Open-Meteo answers <1s;
+                        # 30s made a blackholed network stall a tick ~4 min)
+# Ceiling for serving DISK CACHE as a fetch-failure fallback. Beyond this the
+# cache is too stale to act on — better to report the failure than fabricate
+# a confident 'OK' forecast from day-old data.
+STALE_FALLBACK_TTL = 24 * 3600
 CACHE_TTL       = 1800  # 30 minutes — well within 10,000 call/day free tier
 RETRY_ATTEMPTS  = 2     # total attempts per array call (1 initial + 1 retry)
 RETRY_BACKOFF_S = 2     # seconds between attempts on transient network errors
@@ -189,13 +199,20 @@ class OpenMeteoForecast:
         self._cached_forecast = None
         self._cached_time     = 0.0
 
-        # Bias correction state
-        self._morning_forecast_kwh = 0.0  # captured at 00:05
+        # Per-cycle network short-circuit (reset in _fetch_all_arrays)
+        self._network_down_this_cycle = False
+
+        # Bias correction state. The morning baseline is captured on the FIRST
+        # complete fetch of each local day (a genuine day-ahead forecast), tagged
+        # with its date and persisted so a restart doesn't drop the day's record.
+        self._morning_forecast_kwh  = 0.0
+        self._morning_forecast_date = None
         self._correction_factor    = 1.0  # overall kWh-weighted scalar (display only)
         self._correction_bands     = [(c, 1.0) for c in BIAS_BAND_CENTRES_KWH]
 
         # Pre-warm in-memory cache from disk so restarts don't lose data
         self._load_combined_cache()
+        self._load_morning_baseline()
 
     # ================================================================
     # Public API
@@ -285,23 +302,48 @@ class OpenMeteoForecast:
         self._cached_forecast = combined
         self._cached_time     = now
 
+        # First complete fetch of each LOCAL day = that day's "morning" baseline
+        # for bias calibration (paired with the day's actual PV at the following
+        # midnight). The baseline used to be captured AT midnight from the ~23:30
+        # cache — a near-zero-lead hindcast of the day just ended, never the
+        # day-ahead forecast the calibration is supposed to grade (v5.43 fix).
+        today_str = self._now_local().strftime("%Y-%m-%d")
+        if self._morning_forecast_date != today_str:
+            self._morning_forecast_kwh  = combined.get("todayKwh", 0.0)
+            self._morning_forecast_date = today_str
+            self._save_morning_baseline()
+            self.logger.debug(
+                f"[OpenMeteo] Morning baseline captured for {today_str}: "
+                f"{self._morning_forecast_kwh:.1f} kWh"
+            )
+
         # Write forecast file for the battery optimiser script
         self._write_optimiser_file(combined)
 
         return self._enrich_forecast(combined)
 
-    def capture_morning_forecast(self):
-        """Record today's raw total kWh as the morning forecast baseline.
+    def _morning_baseline_path(self):
+        return os.path.join(self.data_dir, "morning_baseline.json")
 
-        Call this at ~00:05 each day. Used for end-of-day bias calibration.
-        """
-        if self._cached_forecast:
-            self._morning_forecast_kwh = self._cached_forecast.get("todayKwh", 0.0)
-            self.logger.debug(
-                f"[OpenMeteo] Captured morning forecast: {self._morning_forecast_kwh:.1f} kWh"
-            )
-        else:
-            self._morning_forecast_kwh = 0.0
+    def _save_morning_baseline(self):
+        """Persist the day's baseline so a restart doesn't drop the day's record."""
+        try:
+            self._atomic_write_json(self._morning_baseline_path(),
+                                    {"date": self._morning_forecast_date,
+                                     "forecast_kwh": self._morning_forecast_kwh})
+        except Exception as e:
+            self.logger.debug(f"[OpenMeteo] Baseline save failed: {e}")
+
+    def _load_morning_baseline(self):
+        try:
+            with open(self._morning_baseline_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            self._morning_forecast_date = data.get("date")
+            self._morning_forecast_kwh  = float(data.get("forecast_kwh", 0.0))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[OpenMeteo] Baseline load failed: {e}")
 
     def record_accuracy(self, actual_pv_kwh, date_str=None):
         """Record today's forecast vs actual PV for bias correction.
@@ -321,6 +363,18 @@ class OpenMeteoForecast:
 
         if date_str is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # The baseline must belong to the day being recorded — a mismatch means
+        # the day's capture was missed (restart before the first fetch, etc.)
+        # and pairing actual PV with another day's forecast would poison the
+        # bias bands. Skip rather than record garbage.
+        if self._morning_forecast_date != date_str:
+            self.logger.debug(
+                f"[OpenMeteo] Baseline date {self._morning_forecast_date} != "
+                f"{date_str} — skipping accuracy record for this day"
+            )
+            return
+
         today_str = date_str
         month_str = today_str[:7]
 
@@ -348,7 +402,10 @@ class OpenMeteoForecast:
         self._correction_bands  = self._compute_correction_bands(records)
         self._log_bands("Updated")
 
-        self._morning_forecast_kwh = 0.0
+        # Consumed — the new day's first complete fetch captures its own baseline.
+        self._morning_forecast_kwh  = 0.0
+        self._morning_forecast_date = None
+        self._save_morning_baseline()
 
     def load_correction_factor(self):
         """Load and compute correction factor + bands from saved accuracy records.
@@ -427,6 +484,7 @@ class OpenMeteoForecast:
         now_local = self._now_local()
         today     = now_local.date()
         tomorrow  = today + timedelta(days=1)
+        self._network_down_this_cycle = False   # per-cycle short-circuit flag
 
         # Accumulate combined kWh per local-time hour key before inverter cap
         # key format: "YYYY-MM-DD HH:00:00"
@@ -471,7 +529,9 @@ class OpenMeteoForecast:
 
         for key in sorted(hourly_raw.keys()):
             raw_kwh    = hourly_raw[key]
-            capped_kwh = min(raw_kwh, INVERTER_CAP_KW)
+            # Bound below as well as above — a negative sentinel that slipped
+            # through must not deflate the daily totals.
+            capped_kwh = min(max(raw_kwh, 0.0), INVERTER_CAP_KW)
             wh_int     = int(capped_kwh * 1000)
 
             try:
@@ -541,6 +601,7 @@ class OpenMeteoForecast:
             List of (time_str, gti_wm2) tuples in local time order, or None on failure.
         """
         # Disk cache check
+        fallback_data = None   # served on fetch failure if fresh enough (see below)
         cached = self._load_array_cache(array_cfg["name"])
         if cached:
             age  = time.time() - cached.get("cached_time", 0)
@@ -562,6 +623,21 @@ class OpenMeteoForecast:
                     f"[OpenMeteo] {array_cfg['name']}: disk cache (age {age:.0f}s)"
                 )
                 return data
+            # Pre-compute what a fetch-failure fallback may serve: the same
+            # fresh-day guard plus a 24h age ceiling. Previously every failure
+            # path returned the cache unconditionally, so a multi-day outage
+            # fabricated tomorrowKwh=0.0 stamped 'OK' (v5.43 fix).
+            if age < STALE_FALLBACK_TTL and fresh_day:
+                fallback_data = data
+
+        # A blackholed network fails each array serially (attempts x timeout);
+        # once one array exhausts its attempts on network errors, skip the live
+        # fetch for the remaining arrays this cycle and go straight to fallback.
+        if self._network_down_this_cycle:
+            self.logger.debug(
+                f"[OpenMeteo] {array_cfg['name']}: network down this cycle — "
+                f"skipping live fetch")
+            return fallback_data
 
         params = {
             "latitude":   self.latitude,
@@ -604,6 +680,7 @@ class OpenMeteoForecast:
                         f"error after {RETRY_ATTEMPTS} attempts — "
                         f"{type(e).__name__}: {e}"
                     )
+                    self._network_down_this_cycle = True
             except Exception as e:
                 # Unexpected — log at ERROR and don't retry
                 self.logger.error(
@@ -613,9 +690,7 @@ class OpenMeteoForecast:
 
         if response is None:
             # All attempts failed — fall back to cache if we have one
-            if cached:
-                return cached.get("data", [])
-            return None
+            return fallback_data
 
         try:
             if response.status_code != 200:
@@ -634,9 +709,7 @@ class OpenMeteoForecast:
                         f"[OpenMeteo] HTTP {response.status_code} for "
                         f"{array_cfg['name']}: {response.text[:200]}"
                     )
-                if cached:
-                    return cached.get("data", [])
-                return None
+                return fallback_data
 
             try:
                 data = response.json()
@@ -644,9 +717,7 @@ class OpenMeteoForecast:
                 self.logger.error(
                     f"[OpenMeteo] Malformed JSON for {array_cfg['name']}: {e}"
                 )
-                if cached:
-                    return cached.get("data", [])
-                return None
+                return fallback_data
             hourly = data.get("hourly", {})
             times  = hourly.get("time", [])
             gti    = hourly.get("global_tilted_irradiance", [])
@@ -656,14 +727,25 @@ class OpenMeteoForecast:
                     f"[OpenMeteo] Unexpected response for {array_cfg['name']}: "
                     f"{len(times)} times, {len(gti)} GTI values"
                 )
-                if cached:
-                    return cached.get("data", [])
-                return None
+                return fallback_data
 
-            result = [
-                (times[i], float(gti[i]) if gti[i] is not None else 0.0)
-                for i in range(len(times))
-            ]
+            result  = []
+            clamped = 0
+            for i in range(len(times)):
+                v = float(gti[i]) if gti[i] is not None else 0.0
+                # Plausibility clamp: negative sentinels deflate daily totals
+                # (and create negative hourly slots); garbage-large samples
+                # inflate them to physically impossible values — either way
+                # stamped 'OK' and cached. Bound each sample to [0, GTI_MAX_WM2].
+                cv = min(max(0.0, v), GTI_MAX_WM2)
+                if cv != v:
+                    clamped += 1
+                result.append((times[i], cv))
+            if clamped:
+                self.logger.debug(
+                    f"[OpenMeteo] {array_cfg['name']}: clamped {clamped} "
+                    f"implausible GTI samples to [0, {GTI_MAX_WM2:.0f}] W/m²"
+                )
 
             self._save_array_cache(array_cfg["name"], result)
             self.logger.debug(
@@ -675,9 +757,7 @@ class OpenMeteoForecast:
             self.logger.error(
                 f"[OpenMeteo] Error parsing response for {array_cfg['name']}: {e}"
             )
-            if cached:
-                return cached.get("data", [])
-            return None
+            return fallback_data
 
     # ================================================================
     # Enrichment & Empty Result
@@ -711,6 +791,27 @@ class OpenMeteoForecast:
         ]
         enriched["correctedTodayKwh"]    = round(raw_today    * factor_today,    1)
         enriched["correctedTomorrowKwh"] = round(raw_tomorrow * factor_tomorrow, 1)
+
+        # remainingTodayKwh / currentHourWatts / nextHourWatts are baked in at
+        # fetch time, but every cache-served and stale-fallback return passes
+        # through here — recompute them against the current clock from the
+        # hourly buckets so every serve path is time-correct.
+        hourly_today = combined.get("_hourly_p50_today") or {}
+        if hourly_today:
+            now_hour = self._now_local().replace(minute=0, second=0,
+                                                 microsecond=0, tzinfo=None)
+            remaining_kwh = 0.0
+            for key, wh in hourly_today.items():
+                try:
+                    if datetime.strptime(key, "%Y-%m-%d %H:%M:%S") >= now_hour:
+                        remaining_kwh += wh / 1000.0
+                except (ValueError, TypeError):
+                    continue
+            cur_key = now_hour.strftime("%Y-%m-%d %H:%M:%S")
+            nxt_key = (now_hour + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+            enriched["remainingTodayKwh"] = round(remaining_kwh, 1)
+            enriched["currentHourWatts"]  = hourly_today.get(cur_key, 0)
+            enriched["nextHourWatts"]     = hourly_today.get(nxt_key, 0)
         return enriched
 
     def _empty_forecast(self, reason=""):
@@ -902,27 +1003,28 @@ class OpenMeteoForecast:
         rather than re-binning each hourly value against the band table.
         """
         try:
-            now_utc       = datetime.now(timezone.utc)
-            today_date    = now_utc.date()
-            tomorrow_date = (now_utc + timedelta(days=1)).date()
+            now_utc = datetime.now(timezone.utc)
 
             today_slots    = []   # (utc_key, raw_kwh)
             tomorrow_slots = []
             raw_today_kwh    = 0.0
             raw_tomorrow_kwh = 0.0
 
-            for bucket_name, target_date, slot_list in (
-                ("_hourly_p50_today",    today_date,    today_slots),
-                ("_hourly_p50_tomorrow", tomorrow_date, tomorrow_slots),
+            for bucket_name, slot_list in (
+                ("_hourly_p50_today",    today_slots),
+                ("_hourly_p50_tomorrow", tomorrow_slots),
             ):
-                bucket = combined.get(bucket_name, {})
+                bucket   = combined.get(bucket_name, {})
+                # Which day a slot belongs to is decided by the bucket it came
+                # from — the buckets are already split by local date upstream.
+                is_today = (bucket_name == "_hourly_p50_today")
                 for local_key, wh_int in bucket.items():
                     utc_key = self._local_key_to_utc(local_key)
                     if utc_key is None:
                         continue
                     kwh = wh_int / 1000.0
                     slot_list.append((utc_key, kwh))
-                    if target_date == today_date:
+                    if is_today:
                         raw_today_kwh += kwh
                     else:
                         raw_tomorrow_kwh += kwh
@@ -959,8 +1061,9 @@ class OpenMeteoForecast:
                 "hourly":               hourly_out,
             }
 
-            with open(OPTIMISER_FORECAST_FILE, "w", encoding="utf-8") as f:
-                json.dump(forecast_doc, f, indent=2)
+            # Atomic write — an external scheduled script reads this file, so a
+            # concurrent read (or crash mid-write) must never see truncated JSON.
+            self._atomic_write_json(OPTIMISER_FORECAST_FILE, forecast_doc, indent=2)
 
             self.logger.debug(
                 f"[OpenMeteo] Wrote optimiser file: {len(hourly_out)} slots, "
@@ -1007,6 +1110,17 @@ class OpenMeteoForecast:
     # Disk Cache
     # ================================================================
 
+    @staticmethod
+    def _atomic_write_json(path, obj, indent=None):
+        """Write JSON via temp file + fsync + os.replace (atomic on APFS) so a
+        concurrent reader or a crash mid-write never sees truncated JSON."""
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
     def _array_cache_path(self, array_name):
         return os.path.join(self.data_dir, f"openmeteo_cache_{array_name}.json")
 
@@ -1029,8 +1143,7 @@ class OpenMeteoForecast:
     def _save_array_cache(self, array_name, data):
         path = self._array_cache_path(array_name)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"cached_time": time.time(), "data": data}, f)
+            self._atomic_write_json(path, {"cached_time": time.time(), "data": data})
         except Exception as e:
             self.logger.warning(f"[OpenMeteo] Cannot write array cache {array_name}: {e}")
 
@@ -1047,8 +1160,7 @@ class OpenMeteoForecast:
     def _save_accuracy_records(self, records):
         path = self._accuracy_path()
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(records, f, indent=2)
+            self._atomic_write_json(path, records, indent=2)
         except Exception as e:
             self.logger.error(f"[OpenMeteo] Cannot write accuracy records: {e}")
 
@@ -1136,8 +1248,7 @@ class OpenMeteoForecast:
         try:
             saveable = {k: v for k, v in combined.items() if not k.startswith("_dawn")}
             saveable["_cached_time"] = time.time()
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(saveable, f, indent=2)
+            self._atomic_write_json(path, saveable, indent=2)
         except Exception as e:
             self.logger.debug(f"[OpenMeteo] Cannot write combined cache: {e}")
 

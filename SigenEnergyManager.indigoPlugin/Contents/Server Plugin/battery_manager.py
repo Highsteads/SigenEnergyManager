@@ -412,10 +412,11 @@ class BatteryManager:
           - Flood-prevention export already running: continue or stop based on
             the live 24h balance (managed by _continue_flood_prevention).
 
-        The v3.x legacy "night export" branch was retired in v4.0 — any
-        export_active state without a flood_prev_target_soc is treated as the
-        flood-prevention path, since v4.x has no other reason to export
-        overnight.
+        The v3.x legacy "night export" branch was retired in v4.0 — an
+        export_active state WITHOUT a flood_prev_target_soc falls through to
+        normal evaluation (both conditions below are required); plugin.py's
+        prev_export transition handler stands the stray export down on the
+        resulting self-consumption decision.
         """
         if snapshot.vpp_active:
             # Don't self-drive a VPP export while export is currently disabled — a
@@ -569,12 +570,21 @@ class BatteryManager:
         # dusk_dt = end of the last meaningful solar hour (start + 1h), tz-aware
         dusk_dt = None
         if dusk_hour_naive is not None:
+            # Mirror the local_now pattern above: pytz, then stdlib zoneinfo,
+            # and only then the UTC stamp — the naive dusk time is Europe/London,
+            # so stamping it UTC directly runs an hour late in BST (extending
+            # is_daytime and hours_to_dusk by an hour).
             try:
                 import pytz
                 _tz_l   = pytz.timezone("Europe/London")
                 dusk_dt = _tz_l.localize(dusk_hour_naive + timedelta(hours=1))
-            except (ImportError, Exception):
-                dusk_dt = (dusk_hour_naive + timedelta(hours=1)).replace(tzinfo=timezone.utc)
+            except Exception:
+                try:
+                    from zoneinfo import ZoneInfo
+                    dusk_dt = (dusk_hour_naive + timedelta(hours=1)).replace(
+                        tzinfo=ZoneInfo("Europe/London"))
+                except Exception:
+                    dusk_dt = (dusk_hour_naive + timedelta(hours=1)).replace(tzinfo=timezone.utc)
 
         is_daytime = (
             today_dawn_dt is not None
@@ -602,6 +612,13 @@ class BatteryManager:
                 except ValueError:
                     continue
                 if now_hour <= key_dt <= dusk_hour_naive:
+                    # Pro-rate the current hour by minutes remaining — late in
+                    # the hour most of its energy has already been generated
+                    # and is either consumed or banked in current_soc_pct, so
+                    # counting the full slot double-counts it in surplus_kwh
+                    # and battery_at_dawn.
+                    if key_dt == now_hour:
+                        wh *= max(0.0, (60 - now_naive.minute) / 60.0)
                     remaining_solar_kwh += wh / 1000.0
             remaining_solar_kwh *= snapshot.bias_factor
 
@@ -1284,7 +1301,12 @@ class BatteryManager:
         effective_target   = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
         soc                = snapshot.current_soc_pct
 
-        forecast_gate_pass = refill_solar_kwh >= gate_threshold_kwh
+        # refill_demand_kwh > 0 required: with demand 0 (user enters 0 in both
+        # weekday/weekend kWh fields) the threshold is 0.0 and ANY forecast —
+        # including zero sun — would authorise a pre-drain. No demand estimate
+        # means no evidence the battery can refill, so the gate fails safe.
+        forecast_gate_pass = (refill_demand_kwh > 0
+                              and refill_solar_kwh >= gate_threshold_kwh)
         target_headroom_ok = effective_target < FLOOD_PREV_SOC_THRESHOLD_PCT
         soc_gate_pass      = (soc >= FLOOD_PREV_SOC_THRESHOLD_PCT) and (soc > effective_target)
         would_fire         = bool(
@@ -1342,6 +1364,27 @@ class BatteryManager:
         """
         target = snapshot.flood_prev_target_soc
 
+        # Export disabled mid-drain (storm override / power-cut lockout forced
+        # export_enabled False after the drain started) — that safety gate must
+        # win, exactly as it does for the VPP override above. Without this a
+        # calm-night drain to 40% keeps exporting the storm reserve on the night
+        # a power cut is most likely. Stopping routes through plugin.py's
+        # prev_export → SELF_CONSUMPTION branch, which resets the hardware
+        # discharge cutoff and clears the flood target.
+        if not snapshot.export_enabled:
+            return Decision(
+                action      = ACTION_SELF_CONSUMPTION,
+                reason      = (
+                    f"Flood prevention: aborting — export disabled mid-drain "
+                    f"(storm/lockout) at SOC {snapshot.current_soc_pct:.1f}%"
+                ),
+                dawn_viable = True,
+            )
+
+        # A storm override may have raised dawn_target_pct above the drain target
+        # after the drain started — never drain below the higher of the two.
+        effective_stop = max(target, snapshot.dawn_target_pct)
+
         # Dawn broke — stop now; ACTION_SOLAR_OVERFLOW first-entry handles cutoff reset
         if balance.is_daytime:
             return Decision(
@@ -1354,12 +1397,14 @@ class BatteryManager:
             )
 
         # Target SOC reached — hardware cutoff will have stopped the discharge;
-        # confirm and return to self-consumption
-        if snapshot.current_soc_pct <= target:
+        # confirm and return to self-consumption. effective_stop (not the raw
+        # target) so a mid-drain storm override's raised floor ends the drain
+        # early rather than draining through the mandated reserve.
+        if snapshot.current_soc_pct <= effective_stop:
             return Decision(
                 action      = ACTION_SELF_CONSUMPTION,
                 reason      = (
-                    f"Flood prevention: target {target:.0f}% reached "
+                    f"Flood prevention: target {effective_stop:.0f}% reached "
                     f"(SOC {snapshot.current_soc_pct:.1f}%) — returning to self-consumption"
                 ),
                 dawn_viable = True,
@@ -1371,7 +1416,8 @@ class BatteryManager:
             snapshot, balance
         )
         refill_demand_kwh = refill_need_kwh + refill_vpp_kwh
-        if refill_solar_kwh < FLOOD_PREV_FORECAST_MULT * refill_demand_kwh:
+        if (refill_demand_kwh <= 0
+                or refill_solar_kwh < FLOOD_PREV_FORECAST_MULT * refill_demand_kwh):
             refill_label = self._refill_day_label(snapshot, balance)
             vpp_note = f" + Axle {refill_vpp_kwh:.1f}" if refill_vpp_kwh > 0.01 else ""
             return Decision(
@@ -1392,11 +1438,11 @@ class BatteryManager:
             action          = ACTION_START_EXPORT,
             reason          = (
                 f"Flood prevention in progress: SOC {snapshot.current_soc_pct:.1f}% → "
-                f"{target:.0f}% target "
-                f"({snapshot.current_soc_pct - target:.1f}% remaining)"
+                f"{effective_stop:.0f}% target "
+                f"({snapshot.current_soc_pct - effective_stop:.1f}% remaining)"
             ),
             power_watts     = int(snapshot.max_export_kw * 1000),
-            target_soc_pct  = target,
+            target_soc_pct  = effective_stop,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
@@ -1455,23 +1501,3 @@ class BatteryManager:
                 candidate += timedelta(days=1)
             return candidate
 
-    @staticmethod
-    def _forecast_next_n_hours(
-        forecast_p50: Dict[str, int], now: datetime, n_hours: int = 2
-    ) -> int:
-        """Sum forecast Wh for the next n_hours from now."""
-        total    = 0
-        end_time = now + timedelta(hours=n_hours)
-
-        for key, wh in forecast_p50.items():
-            try:
-                dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
-                if now.tzinfo and dt.tzinfo is None:
-                    import pytz
-                    dt = pytz.timezone("Europe/London").localize(dt)
-                if now <= dt < end_time:
-                    total += wh
-            except (ValueError, TypeError):
-                continue
-
-        return total

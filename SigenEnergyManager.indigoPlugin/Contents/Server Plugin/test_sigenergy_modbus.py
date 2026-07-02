@@ -27,13 +27,18 @@ mock_modbus_module.client.ModbusTcpClient.return_value = mock_client_instance
 mock_modbus_module.exceptions.ModbusException      = Exception
 mock_modbus_module.exceptions.ConnectionException  = Exception
 
-sys.modules["pymodbus"]                   = mock_modbus_module
-sys.modules["pymodbus.client"]            = mock_modbus_module.client
-sys.modules["pymodbus.exceptions"]        = mock_modbus_module.exceptions
+# setdefault, not assignment — an unconditional assignment made the combined
+# suite ordering-dependent (clobbering the stub test_plugin.py may already have
+# installed and imported sigenergy_modbus against). The tests don't depend on
+# WHICH stub wins: _make_modbus() replaces modbus.client with its own mock.
+sys.modules.setdefault("pymodbus", mock_modbus_module)
+sys.modules.setdefault("pymodbus.client", sys.modules["pymodbus"].client)
+sys.modules.setdefault("pymodbus.exceptions", sys.modules["pymodbus"].exceptions)
 
 # Now safe to import
 from sigenergy_modbus import (
     SigenergyModbus,
+    HOLD_ESS_CHARGE_CUTOFF,
     HOLD_ESS_MAX_CHARGE,
     HOLD_ESS_MAX_DISCHARGE,
     HOLD_GRID_MAX_EXPORT_LIMIT,
@@ -47,7 +52,14 @@ from sigenergy_modbus import (
 # ============================================================
 
 def _make_modbus():
-    """Return a SigenergyModbus with a mocked pymodbus client, already connected."""
+    """Return a SigenergyModbus with a mocked pymodbus client, already connected.
+
+    The mock ECHOES writes: read_holding_registers returns whatever was last
+    written to the address (falling back to [0, 10000]). Since v5.43 a
+    verified write whose read-back disagrees returns False, so a mock that
+    never echoed would make every verify=True write look rejected. Tests can
+    reach the register store via mock_client._regs.
+    """
     modbus = SigenergyModbus("192.168.1.49")
     modbus._connected        = True
     modbus._last_request_time = 0   # bypass 1-second throttle
@@ -55,43 +67,68 @@ def _make_modbus():
 
     mock_client = MagicMock()
 
-    # All single-register writes succeed
+    regs = {}   # address -> stored word
+
     ok_result = MagicMock()
     ok_result.isError.return_value = False
-    mock_client.write_register.return_value  = ok_result
-    mock_client.write_registers.return_value = ok_result
 
-    # All reads return 10000W by default ([high=0, low=10000])
-    ok_read = MagicMock()
-    ok_read.isError.return_value = False
-    ok_read.registers             = [0, 10000]
-    mock_client.read_holding_registers.return_value = ok_read
+    def _write_register(address=None, value=None, device_id=None):
+        regs[address] = value
+        return ok_result
+
+    def _write_registers(address=None, values=None, device_id=None):
+        for i, v in enumerate(values or []):
+            regs[address + i] = v
+        return ok_result
+
+    def _read_holding(address=None, count=1, device_id=None):
+        defaults = [0, 10000, 0, 0]
+        r = MagicMock()
+        r.isError.return_value = False
+        r.registers = [regs.get(address + i, defaults[i] if i < len(defaults) else 0)
+                       for i in range(count)]
+        return r
+
+    mock_client.write_register.side_effect         = _write_register
+    mock_client.write_registers.side_effect        = _write_registers
+    mock_client.read_holding_registers.side_effect = _read_holding
+    mock_client._regs = regs
 
     modbus.client = mock_client
     return modbus, mock_client
 
 
 def _decode_write_registers_calls(mock_client, register):
-    """Return list of watt values written to a 32-bit register via write_registers."""
+    """Return list of watt values written to a 32-bit register via write_registers.
+
+    Explicit `in`-checks, not `.get(...) or ...` — a falsy kwarg (address 0,
+    values [0, 0]) must not silently fall through to the positional args and
+    misreport a zero write as None/missing.
+    """
     results = []
     for c in mock_client.write_registers.call_args_list:
         kwargs = c.kwargs if c.kwargs else {}
         args   = c.args   if c.args   else ()
-        addr   = kwargs.get("address") or (args[0] if args else None)
-        vals   = kwargs.get("values")  or (args[1] if len(args) > 1 else None)
+        addr   = kwargs["address"] if "address" in kwargs else (args[0] if args else None)
+        vals   = kwargs["values"]  if "values"  in kwargs else (args[1] if len(args) > 1 else None)
         if addr == register and vals is not None:
             results.append((vals[0] << 16) | vals[1])
     return results
 
 
 def _decode_single_register_calls(mock_client, register):
-    """Return list of values written to a 16-bit register via write_register."""
+    """Return list of values written to a 16-bit register via write_register.
+
+    Sentinel-aware lookup (see _decode_write_registers_calls) — value=0 via
+    kwargs (e.g. the EMS-disable write, register 40029 = 0) must be recorded
+    as 0, not dropped to None by a truthiness check.
+    """
     results = []
     for c in mock_client.write_register.call_args_list:
         kwargs = c.kwargs if c.kwargs else {}
         args   = c.args   if c.args   else ()
-        addr   = kwargs.get("address") or (args[0] if args else None)
-        val    = kwargs.get("value")   or (args[1] if len(args) > 1 else None)
+        addr   = kwargs["address"] if "address" in kwargs else (args[0] if args else None)
+        val    = kwargs["value"]   if "value"   in kwargs else (args[1] if len(args) > 1 else None)
         if addr == register:
             results.append(val)
     return results
@@ -234,6 +271,7 @@ class TestReadLimits(unittest.TestCase):
         ok_read = MagicMock()
         ok_read.isError.return_value = False
         ok_read.registers             = [0, 4000]   # 4000W
+        mock_client.read_holding_registers.side_effect  = None   # override echo harness
         mock_client.read_holding_registers.return_value = ok_read
 
         result = modbus.read_discharge_limit()
@@ -246,6 +284,7 @@ class TestReadLimits(unittest.TestCase):
         ok_read = MagicMock()
         ok_read.isError.return_value = False
         ok_read.registers             = [0, 7500]   # 7500W
+        mock_client.read_holding_registers.side_effect  = None   # override echo harness
         mock_client.read_holding_registers.return_value = ok_read
 
         result = modbus.read_charge_limit()
@@ -271,6 +310,7 @@ class TestReadLimits(unittest.TestCase):
         ok_read = MagicMock()
         ok_read.isError.return_value = False
         ok_read.registers             = [1, 4464]
+        mock_client.read_holding_registers.side_effect  = None   # override echo harness
         mock_client.read_holding_registers.return_value = ok_read
 
         result = modbus.read_discharge_limit()
@@ -451,6 +491,7 @@ class TestSignedRegisterDecode(unittest.TestCase):
         r = MagicMock()
         r.isError.return_value = False
         r.registers = registers
+        self.client.read_holding_registers.side_effect  = None   # override echo harness
         self.client.read_holding_registers.return_value = r
 
     # --- signed 16-bit ---
@@ -532,6 +573,95 @@ class TestReadAllPartial(unittest.TestCase):
             setattr(m, name, lambda *a, **k: None)   # everything fails
         self.assertIsNone(m.read_all())
         self.assertFalse(m._connected)
+
+
+class TestOutageBurstHandling(unittest.TestCase):
+    """v5.42: a transport-level failure (BrokenPipeError etc., NOT wrapped in
+    ModbusException by pymodbus) must mark the connection dead and abort the
+    rest of the read cycle — the live 01-Jul-2026 outage burned a throttled,
+    ERROR-logged read per register (~25s, 20 ERROR lines) before disconnecting.
+
+    The module-level ModbusException/ConnectionException names are rebound per
+    test because this harness aliases both to Exception (which would swallow
+    the generic branch under test)."""
+
+    def _distinct_exceptions(self):
+        import sigenergy_modbus as sm
+        class _Distinct(Exception):
+            pass
+        orig = (sm.ModbusException, sm.ConnectionException)
+        sm.ModbusException = sm.ConnectionException = _Distinct
+        return sm, orig
+
+    def test_generic_transport_error_marks_disconnected(self):
+        modbus, mock_client = _make_modbus()
+        sm, orig = self._distinct_exceptions()
+        try:
+            mock_client.read_holding_registers.side_effect = \
+                BrokenPipeError("[Errno 32] Broken pipe")
+            self.assertIsNone(modbus._read_uint16(30003))
+            self.assertFalse(modbus.connected)
+        finally:
+            sm.ModbusException, sm.ConnectionException = orig
+
+    def test_disconnected_guard_short_circuits_reads(self):
+        # Once _connected is False, read primitives return None WITHOUT touching
+        # the socket (no throttle sleep, no ERROR line per register).
+        modbus, mock_client = _make_modbus()
+        modbus._connected = False
+        self.assertIsNone(modbus._read_uint16(30003))
+        mock_client.read_holding_registers.assert_not_called()
+
+    def test_read_all_aborts_early_after_transport_failure(self):
+        # First register read raises BrokenPipeError -> whole cycle aborts:
+        # exactly ONE socket call, not 20.
+        modbus, mock_client = _make_modbus()
+        modbus.connect = lambda: False   # no mid-cycle reconnect
+        sm, orig = self._distinct_exceptions()
+        try:
+            mock_client.read_holding_registers.side_effect = \
+                BrokenPipeError("[Errno 32] Broken pipe")
+            self.assertIsNone(modbus.read_all())
+            self.assertEqual(mock_client.read_holding_registers.call_count, 1)
+        finally:
+            sm.ModbusException, sm.ConnectionException = orig
+
+
+class TestForceChargeCutoffBackstop(unittest.TestCase):
+    """v5.42: force_charge(cutoff_soc=) writes HOLD_ESS_CHARGE_CUTOFF (40047) as
+    a hardware ceiling so a plugin crash mid-import cannot grid-charge to 100%."""
+
+    def test_force_charge_writes_cutoff_when_given(self):
+        modbus, mock_client = _make_modbus()
+        self.assertTrue(modbus.force_charge(10000, cutoff_soc=52.0))
+        writes = [(c.kwargs.get("address"), c.kwargs.get("value"))
+                  for c in mock_client.write_register.call_args_list]
+        self.assertIn((HOLD_ESS_CHARGE_CUTOFF, 520), writes)   # gain 10
+
+    def test_force_charge_without_cutoff_leaves_register_alone(self):
+        modbus, mock_client = _make_modbus()
+        self.assertTrue(modbus.force_charge(10000))
+        addrs = [c.kwargs.get("address")
+                 for c in mock_client.write_register.call_args_list]
+        self.assertNotIn(HOLD_ESS_CHARGE_CUTOFF, addrs)
+
+    def test_cutoff_write_failure_does_not_fail_the_import(self):
+        # The backstop is best-effort: if the cutoff write fails the import must
+        # still report success (mode 0x03 is already latched — returning False
+        # would leave it running with the plugin believing no import started).
+        modbus, mock_client = _make_modbus()
+        ok_result = MagicMock()
+        ok_result.isError.return_value = False
+        bad_result = MagicMock()
+        bad_result.isError.return_value = True
+
+        def _write(address=None, value=None, device_id=None):
+            if address == HOLD_ESS_CHARGE_CUTOFF:
+                return bad_result
+            mock_client._regs[address] = value   # echo so verify passes
+            return ok_result
+        mock_client.write_register.side_effect = _write
+        self.assertTrue(modbus.force_charge(10000, cutoff_soc=52.0))
 
 
 if __name__ == "__main__":

@@ -338,12 +338,14 @@
             <State id="currentHourWatts">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Current hour forecast changed</TriggerLabel>
-                <ControlPageLabel>Current Hour (Wh)</ControlPageLabel>
+                <!-- Hourly Wh equals average W over the hour — label matches the
+                     state id; ids can't be renamed without breaking triggers. -->
+                <ControlPageLabel>Current Hour (W avg)</ControlPageLabel>
             </State>
             <State id="nextHourWatts">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Next hour forecast changed</TriggerLabel>
-                <ControlPageLabel>Next Hour (Wh)</ControlPageLabel>
+                <ControlPageLabel>Next Hour (W avg)</ControlPageLabel>
             </State>
             <State id="forecastStatus">
                 <ValueType>String</ValueType>

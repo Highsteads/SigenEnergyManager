@@ -6,7 +6,7 @@
         <CallbackMethod>actionForceGridImport</CallbackMethod>
         <ConfigUI>
             <Field id="powerKw" type="textfield" defaultValue="10.0">
-                <Label>Charge power (kW, max 10.0):</Label>
+                <Label>Charge power (kW, capped at your configured inverter max):</Label>
             </Field>
             <Field id="targetSocPct" type="textfield" defaultValue="80">
                 <Label>Target SOC (%, 10-100):</Label>

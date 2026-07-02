@@ -87,14 +87,16 @@ class AxleAPI:
                 )
                 return None
 
-            if response.status_code == 204 or not response.content:
-                self.logger.info("Axle poll: no event scheduled (204 / empty body)")
-                return None
-
-            if response.status_code != 200:
+            if response.status_code not in (200, 204):
+                # Error branch must precede the empty-body check — a 5xx with
+                # an empty body is an outage, not a routine "no event scheduled".
                 self.logger.error(
                     f"Axle API HTTP error: {response.status_code} - {response.text[:200]}"
                 )
+                return None
+
+            if response.status_code == 204 or not response.content:
+                self.logger.info("Axle poll: no event scheduled (204 / empty body)")
                 return None
 
             try:
@@ -118,16 +120,29 @@ class AxleAPI:
 
             duration_hrs = (end_time - start_time).total_seconds() / 3600.0
 
+            # Reject implausible windows — a swapped/equal timestamp pair would
+            # otherwise propagate a negative or zero duration into pre-charge
+            # SOC sizing and dashboard earnings arithmetic.
+            if duration_hrs <= 0 or duration_hrs > 24:
+                self.logger.warning(
+                    f"Axle API: implausible event window {start_time} -> {end_time} "
+                    f"({duration_hrs:.1f}h) — ignoring event"
+                )
+                return None
+
             try:
-                import pytz
-                _tz = pytz.timezone("Europe/London")
-                _s  = start_time.astimezone(_tz).strftime("%H:%M")
-                _e  = end_time.astimezone(_tz).strftime("%H:%M")
+                from zoneinfo import ZoneInfo
+                _tz  = ZoneInfo("Europe/London")
+                _s   = start_time.astimezone(_tz).strftime("%H:%M")
+                _e   = end_time.astimezone(_tz).strftime("%H:%M")
+                _lbl = end_time.astimezone(_tz).strftime("%Z")   # BST or GMT
             except Exception:
+                # Fallback formats the UTC datetimes — label them honestly.
                 _s, _e = start_time.strftime("%H:%M"), end_time.strftime("%H:%M")
+                _lbl   = "UTC"
             self.logger.debug(
                 f"Axle event: {data.get('import_export', '?')} "
-                f"{_s} - {_e} BST ({duration_hrs:.1f}h)"
+                f"{_s} - {_e} {_lbl} ({duration_hrs:.1f}h)"
             )
 
             # Optional fields added to Axle's API in Apr 2026:

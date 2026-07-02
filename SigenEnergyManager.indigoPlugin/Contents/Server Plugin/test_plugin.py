@@ -34,10 +34,13 @@ for _attr in ("kStateImageSel", "server", "devices", "variables", "kDeviceAction
     setattr(_indigo, _attr, MagicMock())
 sys.modules["indigo"] = _indigo
 
+# setdefault, not assignment — an unconditional assignment made the combined
+# suite ordering-dependent (this file would clobber the pymodbus stub another
+# test file had already installed and imported against).
 _pm = MagicMock()
-sys.modules["pymodbus"] = _pm
-sys.modules["pymodbus.client"] = _pm.client
-sys.modules["pymodbus.exceptions"] = _pm.exceptions
+sys.modules.setdefault("pymodbus", _pm)
+sys.modules.setdefault("pymodbus.client", sys.modules["pymodbus"].client)
+sys.modules.setdefault("pymodbus.exceptions", sys.modules["pymodbus"].exceptions)
 sys.modules.setdefault("requests", MagicMock())
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -586,6 +589,16 @@ class TestResolveExportLockout(unittest.TestCase):
         self.assertTrue(p._resolve_export_lockout(50.0))
         self.assertEqual(p.pluginPrefs["powerRestoredTime"], "")
 
+    def test_naive_restored_time_promoted_to_utc_not_cleared(self):
+        # A hand-edited NAIVE isoformat timestamp must be promoted to UTC and
+        # still enforce the lockout window — not treated as corrupt and cleared.
+        # (Was previously only pseudo-covered by a stdlib-only test.)
+        prt = (datetime.now(timezone.utc) - timedelta(minutes=60)).replace(tzinfo=None)
+        p = self._mk(powerRestoredTime=prt.isoformat())
+        self.assertFalse(p._resolve_export_lockout(50.0))   # inside 4h window
+        self.assertTrue(p.store["power_cut_export_suppressed"])
+        self.assertEqual(p.pluginPrefs["powerRestoredTime"], prt.isoformat())
+
     def test_export_disabled_short_circuits(self):
         # Export disabled by pref -> always False, and nothing suppressed spuriously.
         p = self._mk(export_enabled=False, restored_minutes_ago=60)
@@ -613,6 +626,9 @@ class TestDisengageToSafeBaseline(unittest.TestCase):
                    "import_active": True, "export_active": True}
         p._events = []
         p._trigger_event = lambda name: p._events.append(name)
+        # v5.43: _set_flood_prev_target persists via _save_accumulators (crash-
+        # safe copy) — stub it, this minimal harness has no data_dir/logger.
+        p._save_accumulators = lambda: None
         return p
 
     def test_resets_cutoff_to_health_floor_and_clears_flags(self):
@@ -809,6 +825,26 @@ class TestStormExportRelease(unittest.TestCase):
         self.assertFalse(s.export_enabled)
         self.assertTrue(p.store["storm_export_suppressed"])
 
+    def test_storm_never_lowers_higher_existing_floor(self):
+        # A higher pre-existing floor (e.g. a 60% winter buffer set by
+        # _apply_seasonal) must survive the max() — a storm can only RAISE the
+        # dawn target, never lower it to the 50% storm reserve.
+        p = self._mk("yellow")
+        s = self._snap(dawn=60.0)
+        p._apply_storm_override(s, 30.0)
+        self.assertEqual(s.dawn_target_pct, 60.0)
+
+    def test_storm_end_clears_suppression_flag(self):
+        # When the storm ends, a previously-set suppression flag must reset —
+        # export must not stay reported (or held) suppressed after the warning
+        # clears.
+        p = self._mk("none")
+        p.store["storm_export_suppressed"] = True
+        s = self._snap()
+        p._apply_storm_override(s, 40.0)
+        self.assertFalse(p.store["storm_export_suppressed"])
+        self.assertTrue(s.export_enabled)
+
 
 class TestWriteCostVariables(unittest.TestCase):
     """_write_cost_variables (v5.41) — republishes the orphaned Octopus cost/rate
@@ -820,7 +856,9 @@ class TestWriteCostVariables(unittest.TestCase):
         try:
             p = _mk_plugin(tmp, _FakeOcto(fin=fin))
             p._ensure_var = lambda name, fid: name          # use the var NAME as its id
-            p.get_dashboard_data = lambda: {"economics": (econ or {})}
+            # v5.43: the writer reads the minimal _cost_vars_economics helper
+            # (whole_house + periods only), not the full dashboard payload.
+            p._cost_vars_economics = lambda: (econ or {})
             writes = {}
             # The harness mocks indigo.variables (plural) but not indigo.variable
             # (singular, what the writer uses) — install a capturing stand-in.
@@ -866,6 +904,109 @@ class TestWriteCostVariables(unittest.TestCase):
         w = self._run(fin=None, econ={"whole_house": {"today": {"electric_gbp": 0.62}}})
         self.assertNotIn("elec_unit_rate_p", w)                   # no rate without the ledger
         self.assertEqual(w["elec_today_cost_gbp"], "0.62")        # economics still published
+
+    def test_month_vars_zero_when_no_rows_yet(self):
+        # 1st of the month before any daily_history row exists: days==0 means
+        # the month genuinely starts at zero — previously the write was
+        # skipped and the CLOSED month's totals showed all day (v5.43).
+        w = self._run(econ={"periods": {"month": {"days": 0,
+                                                  "import_total_gbp": None,
+                                                  "export_total_gbp": None}}})
+        self.assertEqual(w["elec_month_cost_gbp"], "0.00")
+        self.assertEqual(w["export_month_revenue_gbp"], "0.00")
+
+    def test_month_cost_prefers_whole_house_basis(self):
+        # Settled rows carry unit+standing — the month figure uses that basis
+        # (matching elec_today_cost_gbp) over the unit-only aggregate.
+        w = self._run(econ={"periods": {"month": {"days": 5,
+                                                  "import_total_gbp": 0.48,
+                                                  "elec_whole_house_total_gbp": 3.62,
+                                                  "export_total_gbp": 40.0}}})
+        self.assertEqual(w["elec_month_cost_gbp"], "3.62")
+
+
+class TestWriteEnergySummaryVariables(unittest.TestCase):
+    """_write_energy_summary_variables — the ~30-min writer of the sigen_*
+    variables, including the self-sufficiency KPI formula. Previously only its
+    _write_cost_variables callee was covered."""
+
+    def _run(self, store):
+        import tempfile, shutil, types as _types
+        tmp = tempfile.mkdtemp()
+        try:
+            p = _mk_plugin(tmp, None, store=store)
+            p._ensure_var           = lambda name, fid: name
+            p._sigenergy_folder_id  = lambda: 0
+            p._write_cost_variables = lambda folder_id: None   # covered separately
+            p.latest_decision       = None
+            writes = {}
+            had  = hasattr(plugin.indigo, "variable")
+            orig = getattr(plugin.indigo, "variable", None)
+            plugin.indigo.variable = _types.SimpleNamespace(
+                updateValue=lambda vid, val: writes.__setitem__(vid, val))
+            try:
+                p._write_energy_summary_variables()
+            finally:
+                if had:
+                    plugin.indigo.variable = orig
+                else:
+                    delattr(plugin.indigo, "variable")
+            return writes
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_normal_day_self_sufficiency(self):
+        w = self._run({"pv_daily_kwh": 41.24, "grid_import_daily_kwh": 0.05,
+                       "home_daily_kwh": 7.9, "grid_export_daily_kwh": 20.0,
+                       "peak_soc": 94.4, "min_soc": 67.6})
+        # (1 - 0.05/7.9) * 100 = 99.4 (rounded 1dp)
+        self.assertEqual(w["sigen_today_self_suff_pct"], "99.4")
+        self.assertEqual(w["sigen_today_pv_kwh"], "41.24")
+
+    def test_zero_home_load_is_100pct(self):
+        # Nothing was needed from the grid on a zero-load day — 100%, matching
+        # the dashboard computation (was 0.0 here, an inconsistency).
+        w = self._run({"home_daily_kwh": 0.0, "grid_import_daily_kwh": 0.0})
+        self.assertEqual(w["sigen_today_self_suff_pct"], "100.0")
+
+    def test_import_exceeding_home_clamps_to_zero(self):
+        w = self._run({"home_daily_kwh": 1.0, "grid_import_daily_kwh": 5.0})
+        self.assertEqual(w["sigen_today_self_suff_pct"], "0.0")
+
+    def test_every_value_written_is_str(self):
+        w = self._run({"pv_daily_kwh": 1.5, "grid_import_daily_kwh": 0.1,
+                       "home_daily_kwh": 3.0})
+        for name, value in w.items():
+            self.assertIsInstance(value, str, name)
+
+    def test_one_failing_write_does_not_abort_the_rest(self):
+        import tempfile, shutil, types as _types
+        tmp = tempfile.mkdtemp()
+        try:
+            p = _mk_plugin(tmp, None, store={"home_daily_kwh": 3.0})
+            p._ensure_var           = lambda name, fid: name
+            p._sigenergy_folder_id  = lambda: 0
+            p._write_cost_variables = lambda folder_id: None
+            p.latest_decision       = None
+            writes = {}
+
+            def _upd(vid, val):
+                if vid == "sigen_today_pv_kwh":
+                    raise RuntimeError("boom")
+                writes[vid] = val
+            had  = hasattr(plugin.indigo, "variable")
+            orig = getattr(plugin.indigo, "variable", None)
+            plugin.indigo.variable = _types.SimpleNamespace(updateValue=_upd)
+            try:
+                p._write_energy_summary_variables()
+            finally:
+                if had:
+                    plugin.indigo.variable = orig
+                else:
+                    delattr(plugin.indigo, "variable")
+            self.assertIn("sigen_today_self_suff_pct", writes)   # later writes still ran
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

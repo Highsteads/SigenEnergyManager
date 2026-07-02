@@ -16,10 +16,23 @@ import http.server
 import json
 import logging
 import math
+import os
 import socketserver
 import threading
 
 DASHBOARD_PORT = 8179
+
+# Bundled Chart.js (chart.umd.min.js, v4.4.0) served from /chart.js so the
+# charts render without internet — a broadband outage is precisely when
+# someone checks their battery dashboard. Loaded once at import; if the file
+# is missing the route 404s and the page falls back to the jsdelivr CDN.
+_CHARTJS_BYTES = b""
+try:
+    _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    with open(os.path.join(_here, "chart.umd.min.js"), "rb") as _f:
+        _CHARTJS_BYTES = _f.read()
+except OSError:
+    pass
 
 
 def _json_safe(obj):
@@ -546,11 +559,14 @@ header h1{
 <body>
 <header>
   <div class="hdr-left">
-    <a class="nav-btn" href="#" onclick="location.href=location.protocol+'//'+location.hostname+':8176/public/dashboards/index.html';return false;">&larr; Back</a>
+    <!-- Only useful when the page was navigated to FROM somewhere (e.g. a
+         dashboard hub iframing/linking this page) — hidden otherwise, so
+         users without a referrer never see a dead button. -->
+    <a class="nav-btn" href="#" id="back-btn" style="display:none" onclick="history.back();return false;">&larr; Back</a>
   </div>
   <div class="hdr-center">
     <h1>&#9889; Sigenergy Monitor</h1>
-    <span class="topbar-status"><span class="ts">Updated <span id="ts">&#8212;</span></span> &middot; Next refresh <span id="cdwn">30</span>s</span>
+    <span class="topbar-status"><span class="ts">Updated <span id="ts">&#8212;</span></span> &middot; Next refresh <span id="cdwn">5</span>s</span>
   </div>
   <div class="hdr-right">
     <button class="nav-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" aria-label="Back to top">&uarr; Top</button>
@@ -892,7 +908,14 @@ header h1{
     </table>
   </section>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Chart.js is bundled and served locally (/chart.js) so the charts still
+       render during a broadband outage; the CDN is a fallback only. -->
+  <script src="/chart.js"></script>
+  <script>
+  if (typeof Chart === "undefined") {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"><\\/script>');
+  }
+  </script>
 
   <!-- Charts row (v5.2) -->
   <section class="card chart-card">
@@ -1512,6 +1535,13 @@ function update(d) {
   // render error further down.)
 }
 
+// Show the Back button only when there is somewhere to go back TO —
+// document.referrer is empty on a direct/bookmarked visit.
+if (document.referrer) {
+  const bb = document.getElementById('back-btn');
+  if (bb) bb.style.display = '';
+}
+
 let countdown = 5;
 function startCountdown() {
   setInterval(() => {
@@ -1864,12 +1894,32 @@ class _DashboardTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads      = True
 
+    def handle_error(self, request, client_address):
+        """Swallow routine client-disconnect exceptions (tab closed mid-write,
+        phone locked during the 5s poll) instead of socketserver's default
+        full traceback to stderr; anything else still gets the traceback."""
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            logging.getLogger("Sigenergy").debug(
+                f"[Web] Client {client_address} disconnected: {exc}")
+            return
+        super().handle_error(request, client_address)
+
 
 class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     """Request handler for the Sigenergy web dashboard."""
 
     # Set by WebDashboard.start() before the server thread launches.
     _plugin_ref = None
+
+    # Per-connection socket timeout: reaps dead/half-open connections so a
+    # slowloris-style client can't pin ThreadingMixIn threads indefinitely.
+    timeout = 30
+
+    # Keep-alive: Content-Length is always sent (_send), so the browser's 5s
+    # poll can reuse one TCP connection instead of a fresh handshake per poll.
+    protocol_version = "HTTP/1.1"
 
     def _query(self):
         return self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -1891,16 +1941,32 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         if self._plugin_ref is None:
             self._send(503, "application/json", b'{"error":"plugin not ready"}')
             return
+        # Produce the body FIRST, then send exactly once: a client that
+        # disconnects mid-write raises BrokenPipeError after headers are out,
+        # and attempting a second (500) response on the dead socket only
+        # raises again into socketserver's handle_error.
         try:
-            data = producer()
-            self._send(200, "application/json", json.dumps(_json_safe(data)).encode())
+            code, body = 200, json.dumps(_json_safe(producer())).encode()
         except Exception as exc:
-            self._send(500, "application/json", json.dumps({"error": str(exc)}).encode())
+            code, body = 500, json.dumps({"error": str(exc)}).encode()
+        try:
+            self._send(code, "application/json", body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return   # client went away mid-write — nothing useful to do
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", _DASHBOARD_BYTES)
+
+        elif path == "/chart.js":
+            # Bundled Chart.js — keeps the charts working with no internet.
+            # 404 if the bundled file is missing; the page then falls back
+            # to the jsdelivr CDN.
+            if _CHARTJS_BYTES:
+                self._send(200, "application/javascript; charset=utf-8", _CHARTJS_BYTES)
+            else:
+                self._send(404, "text/plain", b"Not found")
 
         elif path == "/api/status":
             self._send_api(lambda: self._plugin_ref.get_dashboard_data())
@@ -1981,6 +2047,9 @@ class WebDashboard:
         )
 
     def stop(self):
+        # Re-arm the 503 'plugin not ready' guard so late requests during (or
+        # after) a stop/start cycle can't hit a half-stopped plugin.
+        _DashboardHandler._plugin_ref = None
         if self._server:
             try:
                 self._server.shutdown()

@@ -14,10 +14,11 @@
 #              Met Office warnings are calibrated for real disruption/power-cut
 #              risk, avoiding false positives from ordinary windy days.
 #              Returns a severity string: "none", "yellow", "amber", or "red".
-# Author:      CliveS & Claude Opus 4.8
-# Date:        26-06-2026
-# Version:     1.4 (MeteoAlarm cap:event/cap:severity schema + drift guard)
+# Author:      CliveS & Claude Fable 5
+# Date:        02-07-2026
+# Version:     1.5 (failure paths return None — caller holds previous level, no false all-clear)
 
+import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -133,8 +134,17 @@ _MA_SEVERITY_MAP = {"minor": "yellow", "moderate": "yellow",
 
 # Hazard keywords (matched against cap:event / atom:title) that carry genuine
 # power-cut / disruption risk — the reason storm watch exists.
+# Matched on WORD BOUNDARIES: bare substring matching made "ice" match
+# notice/service and "rain" match training — the title-fallback path feeds
+# whole sentences into this matcher, exactly where loose matching bites.
 _WIND_TYPES = {"wind", "thunderstorm", "thunderstorms", "storm",
                "snow", "ice", "rain", "flooding"}
+_HAZARD_RE = re.compile(
+    r"\b(" + "|".join(sorted(_WIND_TYPES, key=len, reverse=True)) + r")\b")
+
+# Colour words likewise on word boundaries ("red" is a substring of
+# predicted/hundred/covered); worst of ALL matches wins, not first-found.
+_COLOUR_RE = re.compile(r"\b(red|amber|yellow)\b")
 
 
 # ============================================================
@@ -157,8 +167,12 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
       - warnings whose CAP polygon covers the site
 
     Returns:
-        level  (str): "none", "yellow", "amber", or "red"
-        reason (str): human-readable explanation
+        level  (str|None): "none", "yellow", "amber", or "red" — or None when the
+                           check FAILED (feed unreachable, XML unparseable, or
+                           schema drift). None means "unknown", NOT all-clear:
+                           the caller must hold its previous level rather than
+                           dropping an active storm reserve on a flaky poll.
+        reason (str):      human-readable explanation
     """
     url = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-united-kingdom"
     try:
@@ -166,12 +180,12 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
         with urllib.request.urlopen(req, timeout=15) as resp:
             xml_bytes = resp.read()
     except Exception as exc:
-        return "none", f"MeteoAlarm unavailable: {exc}"
+        return None, f"MeteoAlarm unavailable: {exc}"
 
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
-        return "none", f"MeteoAlarm XML parse error: {exc}"
+        return None, f"MeteoAlarm XML parse error: {exc}"
 
     # Atom + CAP namespaces used in MeteoAlarm feeds
     ns = {
@@ -217,18 +231,16 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
         if not hazard_text:
             continue
 
-        # --- Hazard filter (power-cut-relevant only) ---
+        # --- Hazard filter (power-cut-relevant only, word-boundary match) ---
         hazard_lower = hazard_text.lower()
-        if not any(w in hazard_lower for w in _WIND_TYPES):
+        if not _HAZARD_RE.search(hazard_lower):
             continue
 
         # --- Severity: colour word in the event/title first, then cap:severity,
         #     then the legacy numeric awareness code ---
         level = None
-        for colour in ("red", "amber", "yellow"):   # worst-first
-            if colour in hazard_lower:
-                level = colour
-                break
+        for colour in _COLOUR_RE.findall(hazard_lower):
+            level = colour if level is None else _level_max(level, colour)
         if level is None:
             sev_el = entry.find(".//cap:severity", ns)
             if sev_el is not None and sev_el.text:
@@ -295,9 +307,14 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
     # means MeteoAlarm changed its format again (the awareness_* -> event/severity
     # change of 2026 silently disabled this feature for weeks). Surface it loudly via
     # a distinctive reason the caller escalates to WARNING, so it can't go unnoticed.
-    if entries_total > 0 and entries_known == 0:
-        return "none", (f"MeteoAlarm feed format unrecognised — {entries_total} "
-                        f"entries, 0 parseable (storm_watch parser may need updating)")
+    # Fire it only when NOTHING usable was extracted — entries parsed via the
+    # atom:title fallback still yield valid levels/pending items, and discarding
+    # a real title-parsed warning is exactly the failure this guard exists to stop.
+    if entries_total > 0 and entries_known == 0 and highest == "none" and not pending:
+        return None, (f"MeteoAlarm feed format unrecognised — {entries_total} "
+                      f"entries, 0 parseable (storm_watch parser may need updating)")
+    if entries_known == 0 and highest != "none":
+        reasons.append("(parsed from titles only — MeteoAlarm schema may have drifted)")
 
     if highest == "none":
         base = f"MeteoAlarm: no active wind/storm warnings covering {location_name}"

@@ -105,17 +105,20 @@ class TestStormWatchLegacyAndGuards(unittest.TestCase):
 
     def test_schema_drift_guard_flags_unparseable_feed(self):
         # Entries present but with NO cap:event / awareness_type / title -> the
-        # parser can read nothing, so it must SHOUT rather than silently say "none".
+        # parser can read nothing. v1.5: that is a FAILURE (None), not "none" —
+        # the caller holds its previous level instead of dropping a live reserve.
         entry = "<entry><id>urn:x</id><updated>2026-01-01T00:00:00Z</updated></entry>"
         level, reason = _run(_feed(entry + entry))
-        self.assertEqual(level, "none")
+        self.assertIsNone(level)
         self.assertIn("unrecognised", reason)
 
     def test_location_name_used_in_reason(self):
         _, reason = _run(_feed(""), location_name="Medomsley")
         self.assertIn("Medomsley", reason)
 
-    def test_network_error_returns_none(self):
+    def test_network_error_returns_failure_sentinel(self):
+        # v1.5: a fetch failure returns None (unknown), NEVER "none" (all-clear) —
+        # a flaky poll mid-storm must not release the storm reserve.
         def _boom(req, timeout=None):
             raise OSError("no network")
         orig = storm_watch.urllib.request.urlopen
@@ -124,8 +127,41 @@ class TestStormWatchLegacyAndGuards(unittest.TestCase):
             level, reason = storm_watch.check_storm_level()
         finally:
             storm_watch.urllib.request.urlopen = orig
-        self.assertEqual(level, "none")
+        self.assertIsNone(level)
         self.assertIn("unavailable", reason)
+
+    def test_xml_parse_error_returns_failure_sentinel(self):
+        level, reason = _run(b"this is not xml <<<")
+        self.assertIsNone(level)
+        self.assertIn("parse error", reason.lower())
+
+    def test_title_only_entries_still_classify(self):
+        # v1.5: entries readable ONLY via the atom:title fallback used to be
+        # discarded by the drift guard despite carrying a valid warning.
+        entry = (f"<entry><title>Amber wind warning for North East England</title>"
+                 f"<cap:polygon>{_COVERS}</cap:polygon></entry>")
+        level, reason = _run(_feed(entry))
+        self.assertEqual(level, "amber")
+        self.assertIn("titles only", reason)
+
+    def test_colour_substring_false_positives_rejected(self):
+        # "predicted" contains "red", "notice" contains "ice" — word-boundary
+        # matching must reject both (no colour word, no hazard word).
+        # cap:event present so the entry counts as known-schema (a feed of only
+        # unreadable entries would rightly trip the drift guard instead).
+        entry = ("<entry><title>Service notice: coverage predicted to improve</title>"
+                 "<cap:event>Service notice: coverage predicted to improve</cap:event>"
+                 "</entry>")
+        level, _ = _run(_feed(entry))
+        self.assertEqual(level, "none")
+
+    def test_worst_colour_wins_not_first_found(self):
+        # A title mentioning an escalation must classify at the WORST colour.
+        entry = (f"<entry><title>Yellow warning upgraded to red wind warning</title>"
+                 f"<cap:event>Yellow warning upgraded to red wind warning</cap:event>"
+                 f"<cap:polygon>{_COVERS}</cap:polygon></entry>")
+        level, _ = _run(_feed(entry))
+        self.assertEqual(level, "red")
 
 
 if __name__ == "__main__":

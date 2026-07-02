@@ -55,9 +55,12 @@ REQUEST_TIMEOUT   = 15   # seconds
 
 # Cache TTLs
 RATES_CACHE_TTL       = 1800   # 30 min - rates change daily but check frequently for tomorrow
+RATES_NEG_CACHE_TTL   = 120    # 2 min - debounce failed rate/tariff fetches (keep last good)
 CONSUMPTION_CACHE_TTL = 86400  # 24 hours - consumption profile updated daily
 FINANCIALS_CACHE_TTL  = 1800   # 30 min - standing/unit rates change at most daily; balance slowly
 FINANCIALS_NEG_CACHE_TTL = 120 # 2 min - debounce failures so /api/status can't hammer Kraken
+FINANCIALS_FAIL_WARN_COUNT = 5    # consecutive failures before one WARNING at default level
+FINANCIALS_STALE_WARN_AGE  = 7200 # 2h - warn once when served financials are older than this
 
 # Gas volume (m3) -> kWh conversion.  Octopus bills gas in kWh but the
 # consumption API returns m3 for metric SMETS meters.  kWh = m3 * VCF * CV / 3.6.
@@ -182,6 +185,10 @@ class OctopusAPI:
         self._financials_cache    = None   # Kraken ledger rates + balance
         self._financials_cache_at = 0.0
         self._financials_neg_at   = 0.0    # last failure (negative-cache debounce)
+        self._financials_fail_count   = 0     # consecutive failures (reset on success)
+        self._financials_stale_warned = False # 2h-stale WARNING fired (reset on success)
+        self._rates_neg_at        = {}     # cache_key -> last failed fetch (debounce)
+        self._tariff_neg_at       = 0.0    # last failed tariff detection (debounce)
 
         # Rate-limit tracker.  Octopus permits roughly 100 requests/hour per
         # endpoint family.  We're nowhere near that under normal poll cadence
@@ -189,7 +196,7 @@ class OctopusAPI:
         # spike the count.  When the rolling hourly window passes
         # _RATE_LIMIT_WARN we log a WARNING; above _RATE_LIMIT_HARD we short
         # the request and let the caller fall back to cache.
-        self._request_log       = []     # list of monotonic timestamps
+        self._request_log       = []     # list of wall-clock timestamps (time.time)
         self._RATE_LIMIT_WINDOW = 3600   # seconds
         self._RATE_LIMIT_WARN   = 80     # log warning above this
         self._RATE_LIMIT_HARD   = 95     # refuse new requests above this
@@ -235,12 +242,26 @@ class OctopusAPI:
                 and now - self._tariff_cache_at < RATES_CACHE_TTL):
             return self._tariff_cache
 
+        # Failure debounce: after a recent failed detection serve the last good
+        # value (or the UNKNOWN fallback) without re-hitting the network.
+        if not force and now - self._tariff_neg_at < RATES_NEG_CACHE_TTL:
+            return self._tariff_cache or {
+                "tariff_key":   TARIFF_UNKNOWN,
+                "tariff_code":  "",
+                "product_code": "",
+                "display_name": "Unknown",
+            }
+
         tariff_info = self._detect_tariff_from_account()
         if not tariff_info:
             # REST account endpoint failed — try Kraken GraphQL as fallback
             tariff_info = self._detect_tariff_from_kraken()
         if not tariff_info:
-            tariff_info = {
+            # Detection failed — keep any previous good cache (serve stale) and
+            # stamp a short negative-cache window instead of pinning UNKNOWN
+            # for the full 30-min TTL (mirrors the v1.2 financials pattern).
+            self._tariff_neg_at = now
+            return self._tariff_cache or {
                 "tariff_key":   TARIFF_UNKNOWN,
                 "tariff_code":  "",
                 "product_code": "",
@@ -342,6 +363,12 @@ class OctopusAPI:
 
         result.sort(key=lambda x: x[0])
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
+        # Per-date agile_* entries are otherwise never evicted — prune anything
+        # older than 2 days so a long-running plugin doesn't accumulate them.
+        cutoff = str(target_date - timedelta(days=2))
+        for key in [k for k in self._rates_cache
+                    if k.startswith("agile_") and k[len("agile_"):] < cutoff]:
+            del self._rates_cache[key]
         return result
 
     # ================================================================
@@ -496,8 +523,33 @@ class OctopusAPI:
     def _financials_failed(self, now):
         """Stamp the negative-cache window and return the last good value (stale)
         or None if financials were never successfully fetched.  Prevents a Kraken
-        outage from making every /api/status poll fire a fresh GraphQL request."""
+        outage from making every /api/status poll fire a fresh GraphQL request.
+
+        Individual failures stay DEBUG-quiet; one WARNING fires after
+        FINANCIALS_FAIL_WARN_COUNT consecutive failures, and one more when the
+        served data first exceeds FINANCIALS_STALE_WARN_AGE — so a prolonged
+        Kraken outage is visible at default log level without heartbeat noise.
+        The cached value carries fetched_at so consumers can see its age."""
         self._financials_neg_at = now
+        self._financials_fail_count += 1
+        age = ((now - self._financials_cache_at)
+               if self._financials_cache is not None else None)
+        if self._financials_fail_count == FINANCIALS_FAIL_WARN_COUNT:
+            if age is not None:
+                self.logger.warning(
+                    f"[Octopus] Kraken financials failing "
+                    f"({self._financials_fail_count} consecutive) — serving "
+                    f"cached data {age / 3600.0:.1f}h old")
+            else:
+                self.logger.warning(
+                    f"[Octopus] Kraken financials failing "
+                    f"({self._financials_fail_count} consecutive) — no cached data")
+        elif (age is not None and age > FINANCIALS_STALE_WARN_AGE
+                and not self._financials_stale_warned):
+            self._financials_stale_warned = True
+            self.logger.warning(
+                f"[Octopus] Kraken financials stale — serving cached data "
+                f"{age / 3600.0:.1f}h old (fetches still failing)")
         return self._financials_cache
 
     def get_account_financials(self, force=False):
@@ -529,6 +581,8 @@ class OctopusAPI:
         token = self._get_kraken_token()
         if not token:
             return self._financials_failed(now)
+        if not self._record_request():      # Kraken counts against the same API
+            return self._financials_failed(now)
 
         query = json.dumps({
             "query": (
@@ -553,6 +607,11 @@ class OctopusAPI:
             )
             if not response.ok:
                 self.logger.debug(f"Kraken financials query failed: HTTP {response.status_code}")
+                if response.status_code in (401, 403):
+                    # Dead/expired JWT — purge it so the next attempt
+                    # re-authenticates instead of resending the same token
+                    # for the remainder of its ~55-min cache lifetime.
+                    self._kraken_token = None
                 return self._financials_failed(now)
             payload = response.json()
         except (requests.RequestException, ValueError) as e:
@@ -564,6 +623,10 @@ class OctopusAPI:
             errs = (payload or {}).get("errors")
             if errs:
                 self.logger.debug(f"Kraken financials GraphQL errors: {errs}")
+                # GraphQL errors + empty account is auth-shaped (e.g. an
+                # expired JWT, KT-CT-11xx) — purge the cached token so the
+                # next attempt re-runs obtainKrakenToken.
+                self._kraken_token = None
             return self._financials_failed(now)
 
         result = {"elec": None, "export": None, "gas": None, "balance_gbp": None}
@@ -574,6 +637,12 @@ class OctopusAPI:
 
         for agr in acct.get("electricityAgreements", []) or []:
             t    = agr.get("tariff") or {}
+            # Tariff types with no matching GraphQL fragment (e.g. DayNightTariff,
+            # prepay) resolve to only __typename — skip them rather than letting
+            # an all-None dict claim the elec/export slot ahead of a populated
+            # agreement (first-agreement-wins below).
+            if not any(k != "__typename" for k in t):
+                continue
             code = t.get("tariffCode", "") or ""
             mpan = ((agr.get("meterPoint") or {}).get("mpan")) or ""
             # Classify import vs export. Require POSITIVE export evidence (the export
@@ -615,8 +684,14 @@ class OctopusAPI:
                 "display_name": t.get("displayName"),
             }
 
+        # Stamp when this data was fetched so consumers can distinguish fresh
+        # from stale (the failure path serves this same dict unaltered).
+        result["fetched_at"] = now
+
         self._financials_cache    = result
         self._financials_cache_at = now
+        self._financials_fail_count   = 0
+        self._financials_stale_warned = False
         return result
 
     # ================================================================
@@ -630,6 +705,10 @@ class OctopusAPI:
         cached = self._rates_cache.get(cache_key)
         if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
             return cached["data"]
+        # Failure debounce: after a recent failed fetch serve the last good
+        # value without re-hitting the network on every call.
+        if not force and now - self._rates_neg_at.get(cache_key, 0.0) < RATES_NEG_CACHE_TTL:
+            return cached["data"] if cached else {"today_p": None, "tomorrow_p": None}
 
         product_code = self._find_product_code(TARIFF_TRACKER)
         if not product_code:
@@ -650,6 +729,14 @@ class OctopusAPI:
             "today_p":    today_rate,
             "tomorrow_p": tomorrow_rate,
         }
+        if today_rate is None:
+            # Fetch failed — keep the previous good cache entry (serve stale)
+            # and stamp a short negative-cache window so the next call after
+            # the debounce retries, instead of pinning the failure for the
+            # full 30-min positive TTL (mirrors the v1.2 financials pattern).
+            self._rates_neg_at[cache_key] = now
+            return cached["data"] if cached else result
+        self._rates_neg_at.pop(cache_key, None)
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
 
@@ -682,6 +769,12 @@ class OctopusAPI:
         cached = self._rates_cache.get(cache_key)
         if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
             return cached["data"]
+        # Failure debounce: after a recent failed fetch serve the last good
+        # value without re-hitting the network on every call.
+        if not force and now - self._rates_neg_at.get(cache_key, 0.0) < RATES_NEG_CACHE_TTL:
+            if cached:
+                return cached["data"]
+            return {"product_code": None, "today_slots": [], "tomorrow_slots": []}
 
         tariff_info  = self.get_current_tariff(force=force) or {}
         product_code = tariff_info.get("product_code")
@@ -696,6 +789,16 @@ class OctopusAPI:
             "today_slots":    self._fetch_rate_schedule(product_code, tariff_code, today_date),
             "tomorrow_slots": self._fetch_rate_schedule(product_code, tariff_code, tomorrow_date),
         }
+        if not result["today_slots"]:
+            # Today's slots always exist for an active tariff, so an empty list
+            # means the fetch failed — keep the previous good cache (serve
+            # stale) and stamp a short negative-cache window so the next call
+            # after the debounce retries, instead of pinning empty lists for
+            # the full 30-min positive TTL. (Tomorrow's slots being empty is
+            # normal before ~16:00 and does NOT indicate failure.)
+            self._rates_neg_at[cache_key] = now
+            return cached["data"] if cached else result
+        self._rates_neg_at.pop(cache_key, None)
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
 
@@ -717,7 +820,7 @@ class OctopusAPI:
             return {}
 
         tariff_code = self._build_tariff_code(product_code)
-        today       = datetime.now(timezone.utc).date()
+        today       = self._london_today()   # local day — UTC date is yesterday 23:00-00:00Z in BST
         slots       = self._fetch_rate_schedule(product_code, tariff_code, today)
 
         if not slots:
@@ -953,6 +1056,9 @@ class OctopusAPI:
         if not self.api_key:
             return None
 
+        if not self._record_request():      # Kraken counts against the same API
+            return None
+
         mutation = json.dumps({
             "query": "mutation ($k: String!) { obtainKrakenToken(input: { APIKey: $k }) { token } }",
             "variables": {"k": self.api_key},
@@ -974,7 +1080,16 @@ class OctopusAPI:
                 self.logger.debug(f"Kraken token malformed JSON: {e}")
                 self._kraken_token = None
                 return None
-            token = (payload or {}).get("data", {}).get("obtainKrakenToken", {}).get("token")
+            # Kraken answers an auth failure with HTTP 200 + data.obtainKrakenToken
+            # = null (live-verified: KT-CT-1139) — chained .get() defaults don't
+            # survive explicit nulls, so each level needs the or-{} idiom or this
+            # raises AttributeError and bypasses the negative cache.
+            token = (((payload or {}).get("data") or {})
+                     .get("obtainKrakenToken") or {}).get("token")
+            if not token and (payload or {}).get("errors"):
+                self.logger.warning(
+                    f"Kraken auth failed — check the Octopus API key: "
+                    f"{payload['errors']}")
             if token:
                 self._kraken_token    = token
                 self._kraken_token_at = now
@@ -1006,6 +1121,8 @@ class OctopusAPI:
         token = self._get_kraken_token()
         if not token:
             return None
+        if not self._record_request():      # Kraken counts against the same API
+            return None
 
         query = json.dumps({
             "query": (
@@ -1032,6 +1149,10 @@ class OctopusAPI:
             )
             if not response.ok:
                 self.logger.debug(f"Kraken tariff query failed: HTTP {response.status_code}")
+                if response.status_code in (401, 403):
+                    # Dead/expired JWT — purge it so the next attempt
+                    # re-authenticates rather than resending it for up to 55 min.
+                    self._kraken_token = None
                 return None
 
             try:
@@ -1045,6 +1166,10 @@ class OctopusAPI:
                 .get("account", {})
                 .get("electricityAgreements", [])
             )
+            if not agreements and (payload or {}).get("errors"):
+                # Errors + no agreements is auth-shaped — purge the cached JWT
+                # so the next attempt re-runs obtainKrakenToken.
+                self._kraken_token = None
             for agr in agreements:
                 tariff_node   = agr.get("tariff", {}) or {}
                 tariff_code   = tariff_node.get("tariffCode", "")
@@ -1157,14 +1282,22 @@ class OctopusAPI:
         For Agile: returns up to 48 half-hourly slots.
         For Go/Flux: returns 2-5 time-band slots.
         """
-        period_from = datetime(
-            target_date.year, target_date.month, target_date.day,
-            0, 0, 0, tzinfo=timezone.utc
-        ).isoformat().replace("+00:00", "Z")
-        period_to = datetime(
-            target_date.year, target_date.month, target_date.day,
-            23, 59, 59, tzinfo=timezone.utc
-        ).isoformat().replace("+00:00", "Z")
+        # Octopus rate slots align to the Europe/London day (23:00Z boundaries
+        # in BST) and the endpoint returns all slots OVERLAPPING the window —
+        # a UTC-midnight window in BST gains a spurious extra Tracker slot each
+        # afternoon and hour-skews Agile/Go day lists. Build the window from
+        # LOCAL midnight to next local midnight, expressed in UTC.
+        local_midnight = datetime(target_date.year, target_date.month,
+                                  target_date.day, 0, 0, 0)
+        try:
+            from zoneinfo import ZoneInfo
+            start_dt = local_midnight.replace(tzinfo=ZoneInfo("Europe/London"))
+        except ImportError:
+            import pytz
+            start_dt = pytz.timezone("Europe/London").localize(local_midnight)
+        end_dt      = start_dt + timedelta(days=1)
+        period_from = start_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        period_to   = end_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
         url = (
             f"{OCTOPUS_API_BASE}/products/{product_code}/electricity-tariffs/"

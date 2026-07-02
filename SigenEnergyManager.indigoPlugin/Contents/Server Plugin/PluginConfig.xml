@@ -46,7 +46,7 @@
         <Label>Site longitude (degrees E, negative for W, e.g. -0.1246 for London):</Label>
     </Field>
     <Field id="siteLocationName" type="textfield" defaultValue="">
-        <Label>Location name (used in storm-watch alerts, e.g. "Medomsley" — blank shows "your area"):</Label>
+        <Label>Location name (used in storm-watch alerts, e.g. "York" — blank shows "your area"):</Label>
     </Field>
     <Field id="siteArraysJson" type="textfield" defaultValue="">
         <Label>PV array specs (JSON list of {name, tilt, azimuth, kwp, shade}, blank = defaults):</Label>
@@ -132,8 +132,8 @@
     <Field id="inverterMaxKw" type="textfield" defaultValue="10.0">
         <Label>Inverter max charge power (kW):</Label>
     </Field>
-    <Field id="dawnSocTarget" type="textfield" defaultValue="10">
-        <Label>Summer resilience buffer (Apr-Sep, %, default 10) — minimum SOC kept overnight on flat-rate tariffs for power-cut protection; also VPP and storm floor:</Label>
+    <Field id="dawnSocTarget" type="textfield" defaultValue="15">
+        <Label>Summer resilience buffer (Apr-Sep, %, default 15, minimum 15) — minimum SOC kept overnight on flat-rate tariffs for power-cut protection; also VPP and storm floor:</Label>
     </Field>
     <Field id="winterBufferPct" type="textfield" defaultValue="20">
         <Label>Winter resilience buffer (Oct-Mar, %, default 20) — raised floor for longer nights and weaker solar; storm warnings can raise further:</Label>

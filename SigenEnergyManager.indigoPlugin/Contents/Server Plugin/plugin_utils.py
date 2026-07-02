@@ -80,6 +80,11 @@ class MillisecondTimestampFilter(logging.Filter):
 
     def filter(self, record):
         if self.enabled:
+            # The same filter object is attached to both the plugin logger and
+            # its handlers (see install_timestamp_filter), so a record can pass
+            # through it more than once — stamp each record exactly once.
+            if getattr(record, "_ts_stamped", False):
+                return True
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             try:
                 formatted = record.getMessage()
@@ -87,6 +92,7 @@ class MillisecondTimestampFilter(logging.Filter):
                 formatted = str(record.msg)
             record.msg  = f"[{ts}] {formatted}"
             record.args = None
+            record._ts_stamped = True
         return True
 
 
@@ -120,4 +126,20 @@ def install_timestamp_filter(plugin, enabled=True):
     """
     f = MillisecondTimestampFilter(enabled=enabled)
     plugin.logger.addFilter(f)
+    # Logger-level filters apply only to records emitted directly on that
+    # logger — records from module loggers (e.g. SigenEnergyManager.AxleAPI)
+    # propagate straight to the ancestors' HANDLERS without passing any
+    # logger-level filter. Attach the same filter to every handler reachable
+    # from the plugin logger (Indigo installs its event-log handler on the
+    # root logger) so module records get the same [HH:MM:SS.mmm] prefix.
+    # The filter stamps each record at most once (see MillisecondTimestampFilter),
+    # so direct plugin.logger records are not double-prefixed.
+    _lg   = plugin.logger
+    _seen = set()
+    while _lg is not None:
+        for _h in _lg.handlers:
+            if id(_h) not in _seen:
+                _h.addFilter(f)
+                _seen.add(id(_h))
+        _lg = _lg.parent if _lg.propagate else None
     return f

@@ -387,11 +387,11 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         )
         decision = self.bm.evaluate(snapshot)
 
-        # Dawn not viable and cannot wait -> import now
-        self.assertIn(decision.action, (ACTION_START_IMPORT, ACTION_SCHEDULE_IMPORT))
-        # If scheduled, must be tonight's cheap window
-        if decision.action == ACTION_SCHEDULE_IMPORT:
-            self.assertIsNotNone(decision.scheduled_time)
+        # Cannot wait (SOC at window start below the health floor) -> must
+        # import NOW. Pinned to START_IMPORT — the old either-of-two assertion
+        # would have let a regression that re-defers an unreachable-window
+        # import pass silently.
+        self.assertEqual(decision.action, ACTION_START_IMPORT)
 
     def test_import_during_cheap_window(self):
         """When in cheap window and import needed, import immediately."""
@@ -1171,34 +1171,11 @@ class TestTrackerMidnightLocal(unittest.TestCase):
             self.skipTest("pytz not available")
 
 
-class TestPowerCutLockoutParsing(unittest.TestCase):
-    """Tests for defensive parsing of pluginPrefs powerRestoredTime (v4.5)."""
-
-    def test_isoformat_with_tz_parses_cleanly(self):
-        """The normal case: a tz-aware ISO timestamp parses back to UTC."""
-        from datetime import datetime, timezone
-        original = datetime(2026, 4, 30, 6, 4, 42, tzinfo=timezone.utc)
-        s        = original.isoformat()
-        parsed   = datetime.fromisoformat(s)
-        self.assertEqual(parsed, original)
-        self.assertIsNotNone(parsed.tzinfo)
-
-    def test_naive_isoformat_can_be_recovered(self):
-        """A hand-edited naive timestamp must be recoverable as UTC."""
-        from datetime import datetime, timezone
-        s      = "2026-04-30T06:04:42"   # naive
-        parsed = datetime.fromisoformat(s)
-        self.assertIsNone(parsed.tzinfo)
-        # plugin.py promotes naive to UTC; ensure that doesn't crash subtraction
-        promoted = parsed.replace(tzinfo=timezone.utc)
-        delta_h  = (datetime.now(timezone.utc) - promoted).total_seconds() / 3600.0
-        self.assertIsInstance(delta_h, float)
-
-    def test_garbage_string_raises_valueerror(self):
-        """A corrupt timestamp raises ValueError (caught and cleared by plugin)."""
-        from datetime import datetime
-        with self.assertRaises(ValueError):
-            datetime.fromisoformat("not a timestamp")
+# NB: the old TestPowerCutLockoutParsing class was deleted here (01-Jul-2026) —
+# all three of its tests exercised only stdlib datetime.fromisoformat, never any
+# plugin code. The real behaviour (corrupt / tz-aware / naive powerRestoredTime)
+# is covered against the actual parsing path by TestResolveExportLockout in
+# test_plugin.py, including the naive-isoformat case moved there.
 
 
 class TestOctopusTouLocalBucketing(unittest.TestCase):
@@ -1290,6 +1267,127 @@ class TestModbusSleepFunction(unittest.TestCase):
         for s in calls:
             self.assertLessEqual(s, 1.0)
             self.assertGreaterEqual(s, 0.0)
+
+
+class TestResilienceBuffer(unittest.TestCase):
+    """_check_resilience_buffer — the ONLY Tracker grid-import path and the
+    carrier of the v5.40 storm reserve (a storm override raises dawn_target_pct
+    to 50%, and this is what actually imports up to it). Previously untested."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _run(self, **kwargs):
+        snapshot = _make_snapshot(**kwargs)
+        balance  = self.bm._calculate_24h_balance(snapshot)
+        return self.bm._check_resilience_buffer(snapshot, balance)
+
+    def test_tracker_night_below_storm_floor_imports_to_floor_plus_2(self):
+        # Storm override raised dawn target to 50%; SOC 30% at night -> import
+        # at full power to 52% (the +2% overshoot prevents stop/start cycling).
+        d = self._run(soc_pct=30.0, dawn_target_pct=50.0, now_hour=20)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+        self.assertAlmostEqual(d.target_soc_pct, 52.0)
+        self.assertEqual(d.power_watts, 10000)
+
+    def test_at_or_above_floor_no_import(self):
+        # >= boundary: exactly at the floor means no import (and none above it).
+        self.assertIsNone(self._run(soc_pct=50.0, dawn_target_pct=50.0,
+                                    now_hour=20))
+        self.assertIsNone(self._run(soc_pct=55.0, dawn_target_pct=50.0,
+                                    now_hour=20))
+
+    def test_daytime_skips_resilience_import(self):
+        # Daytime with sun: solar recharges the buffer — no grid import.
+        # is_daytime needs today's dawn in dawn_times AND P50 data for dusk.
+        today_str    = _today_str()
+        tomorrow_str = (datetime.now(timezone.utc).date()
+                        + timedelta(days=1)).strftime("%Y-%m-%d")
+        d = self._run(soc_pct=30.0, dawn_target_pct=50.0, now_hour=12,
+                      forecast_p50=_make_sunny_p50(), pv_watts=5000,
+                      dawn_times={today_str:    _now(hour=7),
+                                  tomorrow_str: _tomorrow_dawn(hour=7)})
+        self.assertIsNone(d)
+
+    def test_default_floor_imports_to_12_pct(self):
+        # Default dawn target 10%: SOC 8% -> import to 12% (10 + 2 overshoot).
+        d = self._run(soc_pct=8.0, dawn_target_pct=10.0, now_hour=20)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+        self.assertAlmostEqual(d.target_soc_pct, 12.0)
+
+    def test_non_flat_tariff_not_applicable(self):
+        # Go (cheap-window tariff) has its own import path — resilience buffer
+        # must return None so the TOU logic decides instead.
+        d = self._run(soc_pct=8.0, dawn_target_pct=10.0, now_hour=20,
+                      tariff_key=TARIFF_GO, cheap_start="00:30",
+                      cheap_end="04:30")
+        self.assertIsNone(d)
+
+
+class TestFloodContinuationGuards(unittest.TestCase):
+    """v5.42: an in-progress flood pre-drain must respect overrides that arrive
+    MID-drain — a storm warning that suppresses export or raises the mandated
+    reserve cannot be ignored just because the drain started on a calm night."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def test_export_disabled_mid_drain_aborts(self):
+        # Storm/lockout forced export_enabled False after the drain started:
+        # the safety gate wins — stop, do not keep exporting the reserve.
+        snapshot = _make_snapshot(
+            soc_pct=60.0, now_hour=1, export_active=True,
+            flood_prev_target_soc=40.0, export_enabled=False,
+        )
+        d = self.bm._check_overrides(snapshot)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("export disabled", d.reason.lower())
+
+    def test_raised_dawn_target_ends_drain_early(self):
+        # Storm raised dawn_target_pct to 50% mid-drain (drain target was 40%):
+        # SOC 48% is already below the effective 50% stop -> drain ends now.
+        snapshot = _make_snapshot(
+            soc_pct=48.0, now_hour=1, export_active=True,
+            flood_prev_target_soc=40.0, export_enabled=True,
+            dawn_target_pct=50.0,
+            corrected_tomorrow_kwh=60.0,   # refill gate would otherwise pass
+        )
+        d = self.bm._check_overrides(snapshot)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("50% reached", d.reason)
+
+    def test_flood_prev_zero_demand_does_not_fire(self):
+        # v5.43: explicit 0 in both consumption fields used to degenerate the
+        # forecast gate to always-pass (threshold 3 x 0 = 0) — a pre-drain could
+        # start before a completely sunless day. Zero demand now fails the gate.
+        snapshot = _make_snapshot(
+            soc_pct=70.0, now_hour=22, export_enabled=True,
+            weekday_kwh=0.0, weekend_kwh=0.0,
+            corrected_today_kwh=0.5, corrected_tomorrow_kwh=0.5,
+        )
+        preview = self.bm.compute_flood_preview(snapshot)
+        self.assertFalse(preview["forecast_gate_pass"])
+        self.assertFalse(preview["would_fire"])
+
+    def test_calm_night_drain_continues_unchanged(self):
+        # No overrides: drain above target with a sunny refill day continues,
+        # still targeting the original 40%. At 01:00 the refill day is TODAY
+        # (today's sun refills a pre-dawn drain) so corrected_today_kwh matters.
+        snapshot = _make_snapshot(
+            soc_pct=70.0, now_hour=1, export_active=True,
+            flood_prev_target_soc=40.0, export_enabled=True,
+            # Refill gate needs >= FLOOD_PREV_FORECAST_MULT (3x) the 22 kWh
+            # weekday need — 70 kWh clears it whichever day is the refill day.
+            corrected_today_kwh=70.0, corrected_tomorrow_kwh=70.0,
+        )
+        d = self.bm._check_overrides(snapshot)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_START_EXPORT)
+        self.assertAlmostEqual(d.target_soc_pct, 40.0)
 
 
 # Provide time module alias so the Modbus test above can grab a baseline timestamp

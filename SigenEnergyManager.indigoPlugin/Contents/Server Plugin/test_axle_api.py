@@ -16,9 +16,6 @@ import unittest
 from unittest.mock import MagicMock
 
 # ---- Mock requests (with real exception classes) before importing axle_api ----
-_req = MagicMock()
-
-
 class _ConnErr(Exception):
     pass
 
@@ -27,12 +24,22 @@ class _Timeout(Exception):
     pass
 
 
-_req.exceptions.ConnectionError = _ConnErr
-_req.exceptions.Timeout = _Timeout
-sys.modules["requests"] = _req
+# Install the stub only when the slot is empty — an unconditional assignment
+# made the combined suite ordering-dependent (whichever test file imported
+# first won the sys.modules slot for every later import of requests).
+if "requests" not in sys.modules:
+    _req = MagicMock()
+    _req.exceptions.ConnectionError = _ConnErr
+    _req.exceptions.Timeout = _Timeout
+    sys.modules["requests"] = _req
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import axle_api   # noqa: E402
+
+# Raise the SAME exception classes axle_api actually catches — whichever module
+# won the requests slot (the stub above, another file's stub, or real requests).
+_ConnErr = axle_api.requests.exceptions.ConnectionError
+_Timeout = axle_api.requests.exceptions.Timeout
 
 
 def _resp(status=200, content=b'{"x":1}', json_data=None, raise_json=False):

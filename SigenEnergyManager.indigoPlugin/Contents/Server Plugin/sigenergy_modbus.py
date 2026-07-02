@@ -3,9 +3,10 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Sonnet 4.6
-# Date:        30-04-2026
-# Version:     1.6
+# Author:      CliveS & Claude Fable 5
+# Date:        02-07-2026
+# Version:     1.7 (internal RLock, connect health probe + escalating back-off,
+#              outage early-abort, pvPowerWatts critical, verify-mismatch=False)
 #
 # Register map reviewed against Sigenergy Modbus Protocol V2.9 (2026-05-13).
 # (Was verified against V2.8 (2025-11-28); V2.9 deltas applied: 40031 mode 0x07
@@ -24,6 +25,7 @@
 #     triggers a reconnect on the next operation instead of zombie state.
 
 import logging
+import threading
 import time
 from datetime import datetime
 
@@ -67,7 +69,7 @@ INV_BATTERY_MAX_TEMP       = 30620    # S16, gain 10, degC
 INV_BATTERY_MIN_TEMP       = 30621    # S16, gain 10, degC
 
 # --- Plant holding registers (slave address 247, read/write) ---
-# Read with function 0x04, write single with 0x06, write multiple with 0x10
+# Read with function 0x03, write single with 0x06, write multiple with 0x10
 
 HOLD_REMOTE_EMS_ENABLE     = 40029    # U16 RW: 0=disabled, 1=enabled
 HOLD_REMOTE_EMS_MODE       = 40031    # U16 RW: Remote EMS control mode (Appendix 6)
@@ -79,10 +81,11 @@ HOLD_ESS_BACKUP_SOC        = 40046    # U16 RW, gain 10, % - backup reserve SOC
 HOLD_ESS_CHARGE_CUTOFF     = 40047    # U16 RW, gain 10, % - max charge SOC
 HOLD_ESS_DISCHARGE_CUTOFF  = 40048    # U16 RW, gain 10, % - min discharge SOC (reserve protection)
 
-# Sanity ceiling for power-limit writes (watts). Far above any residential inverter,
-# so a value above this is certainly a bug/typo — the setters clamp to it with a
-# warning rather than writing garbage to the inverter.
-MAX_POWER_LIMIT_W = 100_000
+# Sanity ceiling for power-limit writes (watts). 3x the largest residential
+# Sigenergy inverter (10kW), so a value above this is certainly a bug/typo —
+# the setters clamp to it with a warning rather than writing garbage to the
+# inverter (which applies its own internal clamp anyway).
+MAX_POWER_LIMIT_W = 30_000
 
 # --- EMS work modes (register 30003) ---
 
@@ -126,6 +129,23 @@ GRID_STATUSES = {
 MIN_REQUEST_INTERVAL = 1.0
 
 
+def _locked(fn):
+    """Serialise a primitive on the instance's RLock.
+
+    The sync pymodbus client, _connected and _throttle's clock are shared
+    state; plugin.py's _state_lock serialises the main callers but unlocked
+    paths (diagnostic menus, future callers) could interleave a connect()
+    with an in-flight transaction. RLock, so a write's verify read-back and
+    read_all's per-register reads nest without deadlock.
+    """
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__  = fn.__doc__
+    return wrapper
+
+
 class SigenergyModbus:
     """Modbus TCP client for Sigenergy inverter.
 
@@ -151,8 +171,14 @@ class SigenergyModbus:
         self.logger           = logger or logging.getLogger("SigenEnergyManager.Modbus")
         self.client           = None
         self._connected       = False
+        self._lock            = threading.RLock()   # serialises primitives (see _locked)
         self._last_connect_attempt = 0
-        self._reconnect_delay      = 30
+        # Reconnect delay escalates 30s -> 60s -> 120s (capped) while the
+        # inverter stays unreachable, resetting to 30s on a healthy connect —
+        # stops a hard outage re-running a burst every 30s indefinitely.
+        self._reconnect_delay_base = 30
+        self._reconnect_delay_max  = 120
+        self._reconnect_delay      = self._reconnect_delay_base
         self._last_request_time    = 0.0
         # sleep_func: callable taking seconds. When called from a plugin thread,
         # pass plugin.sleep so StopThread can interrupt the 1s throttle delay
@@ -168,13 +194,22 @@ class SigenergyModbus:
     # Connection Management
     # ================================================================
 
+    @_locked
     def connect(self):
-        """Connect to the Sigenergy inverter via Modbus TCP."""
+        """Connect to the Sigenergy inverter via Modbus TCP.
+
+        A successful TCP handshake alone is not proof of health — during an
+        inverter reboot/firmware update the device accepts TCP while the Modbus
+        application layer is down, and treating that as connected re-runs a
+        full failed read cycle every reconnect. So after connecting, one cheap
+        probe read (EMS work mode) must succeed before we report healthy.
+        The reconnect delay escalates while attempts keep failing.
+        """
         if not PYMODBUS_AVAILABLE:
             self.logger.error("pymodbus not installed - cannot connect to inverter")
             return False
 
-        now = time.time()
+        now = time.monotonic()   # monotonic — immune to NTP wall-clock steps
         if now - self._last_connect_attempt < self._reconnect_delay:
             return False
 
@@ -193,7 +228,18 @@ class SigenergyModbus:
 
             result = self.client.connect()
             if result:
+                # Tentatively connected — verify the application layer with a
+                # probe read before declaring healthy.
                 self._connected = True
+                if self._read_uint16(PLANT_EMS_WORK_MODE) is None:
+                    self.logger.warning(
+                        f"TCP connected to {self.ip}:{self.port} but probe read "
+                        f"failed — Modbus layer not ready (retry in "
+                        f"{self._next_reconnect_delay()}s)"
+                    )
+                    self._connected = False
+                    return False
+                self._reconnect_delay = self._reconnect_delay_base
                 self.logger.info(
                     f"Connected to Sigenergy at {self.ip}:{self.port} "
                     f"(plant={self.plant_address}, inverter={self.inverter_address})"
@@ -201,14 +247,24 @@ class SigenergyModbus:
                 return True
             else:
                 self._connected = False
-                self.logger.warning(f"Failed to connect to inverter at {self.ip}:{self.port}")
+                self.logger.warning(
+                    f"Failed to connect to inverter at {self.ip}:{self.port} "
+                    f"(retry in {self._next_reconnect_delay()}s)")
                 return False
 
         except Exception as e:
             self._connected = False
+            self._next_reconnect_delay()
             self.logger.error(f"Modbus connection error: {e}")
             return False
 
+    def _next_reconnect_delay(self):
+        """Escalate the reconnect delay (base -> 2x -> max, capped) and return it."""
+        self._reconnect_delay = min(self._reconnect_delay * 2,
+                                    self._reconnect_delay_max)
+        return self._reconnect_delay
+
+    @_locked
     def disconnect(self):
         """Disconnect from the inverter."""
         if self.client:
@@ -230,19 +286,29 @@ class SigenergyModbus:
         a plugin thread the sleep can be interrupted by StopThread during
         shutdown (Indigo hard-kills plugins that don't respond within ~10s).
         """
-        elapsed = time.time() - self._last_request_time
+        # time.monotonic() — a backwards NTP wall-clock step would make the
+        # elapsed value negative and stall for the full step size. The min()
+        # bound is belt-and-braces: never sleep longer than one interval.
+        elapsed = time.monotonic() - self._last_request_time
         if elapsed < MIN_REQUEST_INTERVAL:
-            self._sleep(MIN_REQUEST_INTERVAL - elapsed)
-        self._last_request_time = time.time()
+            self._sleep(min(MIN_REQUEST_INTERVAL - elapsed, MIN_REQUEST_INTERVAL))
+        self._last_request_time = time.monotonic()
 
     # ================================================================
     # Low-Level Read Primitives (function 0x03 - holding registers)
     # ================================================================
 
+    @_locked
     def _read_int16(self, register, slave=None):
         """Read a signed 16-bit register."""
         if slave is None:
             slave = self.plant_address
+        if not self._connected:
+            # A transport failure earlier in this cycle already marked the
+            # connection dead — abort instantly instead of burning a throttled
+            # read (and an ERROR line) per remaining register. read_all()'s
+            # error counting still sees the None and disconnects cleanly.
+            return None
         self._throttle()
         try:
             result = self.client.read_holding_registers(
@@ -260,13 +326,24 @@ class SigenergyModbus:
             self._connected = False
             return None
         except Exception as e:
+            # Raw socket errors (BrokenPipeError, OSError) are NOT always wrapped
+            # in ModbusException by pymodbus — treat any transport-level surprise
+            # as a dead connection so the cycle aborts instead of retrying 20x.
             self.logger.error(f"Unexpected read error reg {register} (slave {slave}): {e}")
+            self._connected = False
             return None
 
+    @_locked
     def _read_uint16(self, register, slave=None):
         """Read an unsigned 16-bit register."""
         if slave is None:
             slave = self.plant_address
+        if not self._connected:
+            # A transport failure earlier in this cycle already marked the
+            # connection dead — abort instantly instead of burning a throttled
+            # read (and an ERROR line) per remaining register. read_all()'s
+            # error counting still sees the None and disconnects cleanly.
+            return None
         self._throttle()
         try:
             result = self.client.read_holding_registers(
@@ -281,13 +358,24 @@ class SigenergyModbus:
             self._connected = False
             return None
         except Exception as e:
+            # Raw socket errors (BrokenPipeError, OSError) are NOT always wrapped
+            # in ModbusException by pymodbus — treat any transport-level surprise
+            # as a dead connection so the cycle aborts instead of retrying 20x.
             self.logger.error(f"Unexpected read error reg {register} (slave {slave}): {e}")
+            self._connected = False
             return None
 
+    @_locked
     def _read_int32(self, register, slave=None):
         """Read a signed 32-bit value from two consecutive registers."""
         if slave is None:
             slave = self.plant_address
+        if not self._connected:
+            # A transport failure earlier in this cycle already marked the
+            # connection dead — abort instantly instead of burning a throttled
+            # read (and an ERROR line) per remaining register. read_all()'s
+            # error counting still sees the None and disconnects cleanly.
+            return None
         self._throttle()
         try:
             result = self.client.read_holding_registers(
@@ -308,12 +396,20 @@ class SigenergyModbus:
             return None
         except Exception as e:
             self.logger.error(f"Unexpected read error regs {register}-{register+1} (slave {slave}): {e}")
+            self._connected = False
             return None
 
+    @_locked
     def _read_uint64(self, register, slave=None):
         """Read an unsigned 64-bit value from four consecutive registers (big-endian)."""
         if slave is None:
             slave = self.plant_address
+        if not self._connected:
+            # A transport failure earlier in this cycle already marked the
+            # connection dead — abort instantly instead of burning a throttled
+            # read (and an ERROR line) per remaining register. read_all()'s
+            # error counting still sees the None and disconnects cleanly.
+            return None
         self._throttle()
         try:
             result = self.client.read_holding_registers(
@@ -336,12 +432,20 @@ class SigenergyModbus:
             self.logger.error(
                 f"Unexpected read error regs {register}-{register+3} (slave {slave}): {e}"
             )
+            self._connected = False
             return None
 
+    @_locked
     def _read_uint32(self, register, slave=None):
         """Read an unsigned 32-bit value from two consecutive registers."""
         if slave is None:
             slave = self.plant_address
+        if not self._connected:
+            # A transport failure earlier in this cycle already marked the
+            # connection dead — abort instantly instead of burning a throttled
+            # read (and an ERROR line) per remaining register. read_all()'s
+            # error counting still sees the None and disconnects cleanly.
+            return None
         self._throttle()
         try:
             result = self.client.read_holding_registers(
@@ -359,6 +463,7 @@ class SigenergyModbus:
             return None
         except Exception as e:
             self.logger.error(f"Unexpected read error regs {register}-{register+1} (slave {slave}): {e}")
+            self._connected = False
             return None
 
     # ================================================================
@@ -490,13 +595,6 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
-        # --- Phase C: Calculated values ---
-
-        pv_w   = data.get("pvPowerWatts", 0)
-        grid_w = data.get("gridPowerWatts", 0)
-        batt_w = data.get("batteryPowerWatts", 0)
-        data["homePowerWatts"] = max(0, pv_w + grid_w - batt_w)
-
         # --- Phase D: Plant daily/lifetime energy registers ---
         # pvLifetimeKwh / gridImportLifetimeKwh / gridExportLifetimeKwh are LIFETIME
         # totals; plugin.py computes daily values as (current - start-of-day snapshot).
@@ -537,6 +635,9 @@ class SigenergyModbus:
             self.logger.error(
                 f"Too many Modbus errors ({total_errors}/{TOTAL_READS}) - marking disconnected")
             self._connected = False
+            # Stamp the attempt clock so the next poll honours the reconnect
+            # delay instead of instantly re-running a failed cycle.
+            self._last_connect_attempt = time.monotonic()
             return None
 
         # Critical-register guard. A partial read drops the failed key entirely;
@@ -549,7 +650,7 @@ class SigenergyModbus:
         # do NOT flip self._connected — the next poll retries normally.
         CRITICAL_KEYS = (
             "batterySoc", "gridPowerWatts", "batteryPowerWatts",
-            "plantRunningState", "gridStatus",
+            "pvPowerWatts", "plantRunningState", "gridStatus",
         )
         missing_critical = [k for k in CRITICAL_KEYS if k not in data]
         if missing_critical:
@@ -559,6 +660,12 @@ class SigenergyModbus:
                 f"last-known-good snapshot this cycle (not acting on partial data)."
             )
             return None
+
+        # --- Calculated values (after the critical guard, so never from
+        #     fabricated .get(..., 0) defaults) ---
+        data["homePowerWatts"] = max(
+            0, data["pvPowerWatts"] + data["gridPowerWatts"] - data["batteryPowerWatts"]
+        )
 
         data["modbusConnected"] = True
         data["lastUpdate"]      = datetime.now().strftime("%H:%M:%S")
@@ -575,6 +682,7 @@ class SigenergyModbus:
     # Low-Level Write Primitives
     # ================================================================
 
+    @_locked
     def _write_single_register(self, register, value, slave=None, verify=True):
         """Write a single 16-bit register (function 0x06).
 
@@ -621,12 +729,18 @@ class SigenergyModbus:
                 self.logger.debug(f"Write-back verify could not read reg {register}")
                 return True
             if int(readback) != int(value):
+                # A successful readback that disagrees is a hard fact — the
+                # inverter rejected or clamped the write. Callers treat True as
+                # "the register now holds this value", so returning True here
+                # made safety-critical rejections invisible (v5.43 change).
                 self.logger.warning(
                     f"Write-back mismatch: reg {register} wrote {value}, reads {readback} "
-                    f"— inverter may have rejected or clamped the value"
+                    f"— inverter rejected or clamped the value"
                 )
+                return False
         return True
 
+    @_locked
     def _write_uint32_registers(self, register, value, slave=None, verify=True):
         """Write a 32-bit unsigned value to two consecutive registers (function 0x10).
 
@@ -672,10 +786,13 @@ class SigenergyModbus:
                 self.logger.debug(f"Write-back verify could not read regs {register}")
                 return True
             if int(readback) != int(value):
+                # See _write_single_register — a confirmed mismatch returns False
+                # so callers know the safety write did not take (v5.43 change).
                 self.logger.warning(
                     f"Write-back mismatch: regs {register}-{register+1} wrote {value}, "
-                    f"reads {readback} — inverter may have rejected or clamped the value"
+                    f"reads {readback} — inverter rejected or clamped the value"
                 )
+                return False
         return True
 
     # ================================================================
@@ -769,10 +886,20 @@ class SigenergyModbus:
     # Convenience Methods
     # ================================================================
 
-    def force_charge(self, power_watts=10000):
+    def force_charge(self, power_watts=10000, cutoff_soc=None):
         """Force charge battery from grid at specified power.
 
         Enables Remote EMS, sets Charge Grid First mode, sets power limit.
+
+        cutoff_soc (optional): also write HOLD_ESS_CHARGE_CUTOFF (40047) as a
+        HARDWARE backstop so a plugin crash or Modbus outage mid-import cannot
+        leave the inverter grid-charging unbounded toward 100%. The plugin's
+        software SOC compare remains the primary stop; callers pass a couple of
+        percent of headroom above their target so the backstop only bites when
+        the software stop is unreachable. Best-effort: a failed cutoff write
+        logs a WARNING but does not fail the import (returning False here would
+        leave mode 0x03 latched with the plugin believing no import started —
+        strictly worse than the pre-backstop behaviour).
         """
         self.logger.info(f"Force charging from grid at {power_watts}W")
         if not self.enable_remote_ems():
@@ -781,6 +908,12 @@ class SigenergyModbus:
             return False
         if not self.set_charge_limit(power_watts):
             return False
+        if cutoff_soc is not None:
+            if not self.set_charge_cutoff(min(max(float(cutoff_soc), 0.0), 100.0)):
+                self.logger.warning(
+                    f"Charge-cutoff backstop write failed — import runs without a "
+                    f"hardware SOC ceiling (software stop at target still active)"
+                )
         self.logger.info(f"Force charge active: {power_watts}W from grid")
         return True
 
@@ -883,9 +1016,19 @@ class SigenergyModbus:
             return False
         if not self.set_remote_ems_mode(0x02):
             return False
-        # Reset both power limits — they persist across mode changes
-        self.set_discharge_limit(10000)
-        self.set_charge_limit(10000)
+        # Reset both power limits — they persist across mode changes. A failed
+        # reset means a stale force-charge/discharge cap may still throttle the
+        # battery in self-consumption, so report it (the manager's verify pass
+        # re-asserts the limits next cycle either way).
+        ok_discharge = self.set_discharge_limit(10000)
+        ok_charge    = self.set_charge_limit(10000)
+        if not (ok_discharge and ok_charge):
+            self.logger.error(
+                f"Self Consumption set but limit reset failed "
+                f"(discharge={'OK' if ok_discharge else 'FAILED'}, "
+                f"charge={'OK' if ok_charge else 'FAILED'}) — verify pass will retry"
+            )
+            return False
         self.logger.info("Remote EMS: Max Self Consumption active (charge/discharge limits cleared)")
         return True
 
