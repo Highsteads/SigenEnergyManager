@@ -245,7 +245,9 @@ class _FakeOcto:
             "export": {"unit_p": 12.0}, "balance_gbp": 392.39,
         } if fin == "default" else fin
         self._slots = slots
-        self._gas = {"m3": 0.716, "kwh": 8.03, "slots": slots} if gas == "default" else gas
+        # v5.46.0: a real get_gas_kwh_for_date carries `complete` (full-day coverage).
+        self._gas = ({"m3": 0.716, "kwh": 8.03, "slots": slots, "complete": True}
+                     if gas == "default" else gas)
         self.gas_mprn   = gas_mprn
         self.gas_serial = gas_serial
 
@@ -317,9 +319,29 @@ class TestSettleWholeHouseCosts(unittest.TestCase):
 
     def test_gas_unsettled_not_frozen(self):
         d1 = self._yesterday()
-        octo = _FakeOcto(gas={"m3": None, "kwh": None, "slots": 0})
+        octo = _FakeOcto(gas={"m3": None, "kwh": None, "slots": 0, "complete": False})
         r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
         self.assertFalse(r.get("cost_settled", False))
+
+    def test_gas_partial_day_not_frozen(self):
+        # THE 03-07-2026 BUG: gas had settled PARTIALLY (a single 00:00-00:30
+        # slot, 0.003 m3) — presence-gating froze 1 Jul at £0.00 gas forever.
+        # A kWh that is present but with complete=False must NOT settle.
+        d1 = self._yesterday()
+        octo = _FakeOcto(gas={"m3": 0.003, "kwh": 0.034, "slots": 1, "complete": False})
+        r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
+        self.assertFalse(r.get("cost_settled", False))
+
+    def test_gas_daily_read_meter_settles(self):
+        # A daily-read meter's ONE reading spans the whole day → complete=True
+        # even at slots=1; it must still settle (the reason presence-gating
+        # replaced slot-gating in the first place).
+        d1 = self._yesterday()
+        octo = _FakeOcto(gas={"m3": 0.716, "kwh": 8.03, "slots": 1, "complete": True})
+        r = self._run([{"date": d1, "rate_today_p": 23.478,
+                        "export_rate_p": 12.0, "grid_export_kwh": 10.0}], octo)[d1]
+        self.assertTrue(r["cost_settled"])
+        self.assertAlmostEqual(r["gas_unit_cost_gbp"], 0.53, delta=0.01)
 
     def test_no_ledger_skips(self):
         d1 = self._yesterday()
@@ -340,7 +362,7 @@ class TestSettleWholeHouseCosts(unittest.TestCase):
         # complete-day signal (48 slots). The day MUST still settle — gating gas on 46
         # slots would strand daily-read meters on an estimate forever (H2).
         d1 = self._yesterday()
-        octo = _FakeOcto(gas={"m3": 2.5, "kwh": 28.0, "slots": 1})  # import keeps 48 slots
+        octo = _FakeOcto(gas={"m3": 2.5, "kwh": 28.0, "slots": 1, "complete": True})  # import keeps 48 slots
         r = self._run([{"date": d1, "rate_today_p": 23.478, "grid_export_kwh": 10.0}], octo)[d1]
         self.assertTrue(r["cost_settled"])
         self.assertGreater(r["gas_unit_cost_gbp"], 0.0)
@@ -467,7 +489,7 @@ class TestWholeHouseEdges(unittest.TestCase):
         zero = {"elec": {"standing_p": 0.0, "unit_p": 0.0},
                 "gas": {"unit_p": 0.0, "standing_p": 0.0},
                 "export": {"unit_p": 12.0}, "balance_gbp": 0.0}
-        octo = _FakeOcto(fin=zero, gas={"m3": 0.0, "kwh": 0.0, "slots": 48})
+        octo = _FakeOcto(fin=zero, gas={"m3": 0.0, "kwh": 0.0, "slots": 48, "complete": True})
         r = self._settle([{"date": d1, "rate_today_p": 0.0,
                            "export_rate_p": 12.0, "grid_export_kwh": 0.0}], octo)[d1]
         self.assertEqual(r["whole_house_bill_gbp"], 0.0)

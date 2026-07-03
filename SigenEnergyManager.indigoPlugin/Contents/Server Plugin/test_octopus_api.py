@@ -171,6 +171,66 @@ class TestPerDayConsumption(unittest.TestCase):
         self.assertEqual(out["slots"], 1)
         self.assertIsNotNone(out["kwh"])
 
+    def test_gas_complete_flag_passthrough(self):
+        # v5.46.0: get_gas_kwh_for_date carries the full-day-coverage flag through.
+        self.api._sum_consumption_for_date = (
+            lambda url, d: {"value": 0.716, "slots": 48, "complete": True})
+        self.assertTrue(self.api.get_gas_kwh_for_date("2026-06-20")["complete"])
+        self.api._sum_consumption_for_date = (
+            lambda url, d: {"value": 0.003, "slots": 1, "complete": False})
+        self.assertFalse(self.api.get_gas_kwh_for_date("2026-06-20")["complete"])
+
+
+class TestConsumptionCoverage(unittest.TestCase):
+    """_sum_consumption_for_date `complete` flag (v5.46.0) — full-day coverage.
+
+    The 03-07-2026 gas bug: Octopus had returned only the day's FIRST half-hour
+    slot when the settle ran; presence-gating froze 1 Jul at 0.034 kWh (£0.00)
+    permanently. `complete` is True only when readings reach the end of the
+    local day — true for a whole half-hourly day AND for a daily-read meter's
+    single 24h reading, false for a partial day."""
+
+    def setUp(self):
+        self.api = _make_api()
+
+    def _run(self, intervals):
+        self.api._paginate = lambda url, params, authenticated: intervals
+        return self.api._sum_consumption_for_date("http://x/", "2026-07-01")
+
+    @staticmethod
+    def _slot(i):
+        # Half-hour slot i of the local (BST) day 2026-07-01, in UTC Z-form.
+        from datetime import datetime, timedelta, timezone
+        start = datetime(2026, 6, 30, 23, 0, tzinfo=timezone.utc) + timedelta(minutes=30 * i)
+        end = start + timedelta(minutes=30)
+        return {"consumption": 0.01,
+                "interval_start": start.isoformat().replace("+00:00", "Z"),
+                "interval_end": end.isoformat().replace("+00:00", "Z")}
+
+    def test_full_halfhourly_day_is_complete(self):
+        out = self._run([self._slot(i) for i in range(48)])
+        self.assertEqual(out["slots"], 48)
+        self.assertTrue(out["complete"])
+
+    def test_partial_day_is_incomplete(self):
+        # THE BUG SHAPE: only the first slot (00:00-00:30 local) has settled.
+        out = self._run([self._slot(0)])
+        self.assertEqual(out["slots"], 1)
+        self.assertFalse(out["complete"])
+
+    def test_daily_read_single_interval_is_complete(self):
+        # One reading spanning the whole local day (daily-read gas meter).
+        out = self._run([{"consumption": 0.716,
+                          "interval_start": "2026-06-30T23:00:00Z",
+                          "interval_end":   "2026-07-01T23:00:00Z"}])
+        self.assertEqual(out["slots"], 1)
+        self.assertTrue(out["complete"])
+
+    def test_no_data_is_incomplete(self):
+        out = self._run([])
+        self.assertIsNone(out["value"])
+        self.assertFalse(out["complete"])
+
 
 class TestFinancialsErrorPaths(unittest.TestCase):
     def setUp(self):

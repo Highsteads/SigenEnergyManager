@@ -439,10 +439,11 @@ class OctopusAPI:
         if intervals is None:
             return None
         if not intervals:
-            return {"value": None, "slots": 0}
+            return {"value": None, "slots": 0, "complete": False}
 
         total = 0.0
         slots = 0
+        latest_end = None
         for interval in intervals:
             try:
                 v = float(interval.get("consumption", 0))
@@ -452,7 +453,26 @@ class OctopusAPI:
                 slots += 1
             except (TypeError, ValueError):
                 continue
-        return {"value": round(total, 3), "slots": slots}
+            try:
+                e = datetime.fromisoformat(
+                    str(interval.get("interval_end", "")).replace("Z", "+00:00"))
+                if latest_end is None or e > latest_end:
+                    latest_end = e
+            except (TypeError, ValueError):
+                pass
+        # Full-day coverage: do the readings reach the end of the local day?
+        # A half-hourly meter's final slot ends AT day_end and a daily-read
+        # meter's single reading spans the whole day — both read complete. A
+        # PARTIALLY settled day (only the first slots in so far) ends mid-day;
+        # settling one freezes a near-zero figure permanently (the 03-07-2026
+        # gas bug: 1 Jul froze at 0.034 kWh off a single 00:00-00:30 slot), so
+        # per-day callers gate on this flag.
+        try:
+            complete = (latest_end is not None
+                        and latest_end >= day_end - timedelta(minutes=90))
+        except TypeError:   # naive/aware mismatch on the no-tz fallback path
+            complete = slots >= 40
+        return {"value": round(total, 3), "slots": slots, "complete": complete}
 
     def get_export_kwh_for_date(self, date_str, export_mpan, export_serial):
         """Sum all half-hourly export readings for one local (Europe/London) day.
@@ -506,7 +526,7 @@ class OctopusAPI:
             return None
         value = r["value"]
         if value is None:
-            return {"m3": None, "kwh": None, "slots": r["slots"]}
+            return {"m3": None, "kwh": None, "slots": r["slots"], "complete": False}
         if self.gas_unit == "kwh":
             # Meter already reports kWh — no conversion. m3 is back-derived for display.
             kwh = round(value, 3)
@@ -514,7 +534,8 @@ class OctopusAPI:
         else:
             m3  = value
             kwh = round(value * self.gas_kwh_per_m3, 3)
-        return {"m3": m3, "kwh": kwh, "slots": r["slots"]}
+        return {"m3": m3, "kwh": kwh, "slots": r["slots"],
+                "complete": r.get("complete", False)}
 
     # ================================================================
     # Public: Account financials (Kraken ledger — bill-exact)

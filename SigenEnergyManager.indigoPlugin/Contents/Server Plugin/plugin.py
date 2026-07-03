@@ -6,8 +6,25 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
-# Date:        02-07-2026
-# Version:     5.45.0
+# Date:        03-07-2026
+# Version:     5.46.0
+# 5.46.0 — Gas cost settle: full-day COVERAGE gate (fixes £0.00 gas on the
+#   whole-house card). Gas settles slower than electricity and can arrive
+#   PARTIALLY: on 03-07 the 1 Jul row froze (cost_settled) at 0.034 kWh / £0.00
+#   gas off a single 00:00-00:30 slot — and because the day/yesterday gas
+#   ESTIMATE reuses the most recent settled gas_kwh, the bad row poisoned the
+#   estimates too (Octopus app showed £0.74/£0.45; card showed £0.00). History:
+#   the same freeze happened 21-Jun and was fixed with a 46-slot gate on BOTH
+#   fuels; the later daily-read-meter accommodation (H2) relaxed gas back to
+#   presence-only, reintroducing it. Fix: _sum_consumption_for_date now returns
+#   `complete` — readings reach the end of the local day (90-min tolerance) —
+#   which is True for a whole half-hourly day AND for a daily meter's single
+#   24h reading, False for a partial day; the settle gates gas on it. The
+#   frozen 2026-07-01 row was un-settled to re-settle with complete data.
+#   +6 tests (301 pass; the 1 pre-existing failure is the time-of-day-dependent
+#   test_calm_night_drain_continues_unchanged flake, unrelated).
+# 5.42.0-5.45.0 — deep review #3 batch (02-07-2026): see the release notes /
+#   Plugins/CLAUDE.MD chained changelog; the code carries inline v5.4x notes.
 # 5.41.0 — Publish the Octopus cost/rate variables (REVIVE). The elec_*/gas_*/
 #   export_*/account_balance Indigo variables had no active writer since their
 #   original script was retired, so they had gone stale — elec_unit_rate_p frozen
@@ -1974,13 +1991,24 @@ class Plugin(indigo.PluginBase):
             if imp.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS:
                 continue
 
-            # Gas: gate on PRESENCE of a settled kWh, NOT a 46-slot half-hourly count.
+            # Gas: gate on FULL-DAY COVERAGE, not a 46-slot half-hourly count.
             # Many SMETS1 / daily-read gas meters report ONE reading per day (slots=1),
             # which can never reach 46 — gating on slots strands those users on an
-            # estimate forever. A user with no gas meter settles on electricity alone.
+            # estimate forever. But presence alone is NOT enough either: gas settles
+            # slower than electricity and can arrive PARTIALLY — on 03-07-2026 the
+            # 1 Jul row froze at 0.034 kWh (£0.00) off a single 00:00-00:30 slot.
+            # The `complete` flag (readings reach the end of the local day) is true
+            # for a whole half-hourly day AND for a daily meter's single 24h reading,
+            # but false for a partial day. A user with no gas meter settles on
+            # electricity alone.
             if has_gas_meter:
                 if not gas or gas.get("kwh") is None:
                     continue   # gas meter configured but not settled yet — wait
+                if not gas.get("complete", False):
+                    self.logger.debug(
+                        f"[CostSettle] gas for {date_str} only partially settled "
+                        f"({gas.get('slots', 0)} slot(s), coverage short of day end) — waiting")
+                    continue
                 try:
                     gas_kwh = float(gas["kwh"])
                 except (TypeError, ValueError):
