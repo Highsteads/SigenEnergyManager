@@ -1450,14 +1450,18 @@ class TestFloodContinuationGuards(unittest.TestCase):
 
     def test_calm_night_drain_continues_unchanged(self):
         # No overrides: drain above target with a sunny refill day continues,
-        # still targeting the original 40%. At 01:00 the refill day is TODAY
-        # (today's sun refills a pre-dawn drain) so corrected_today_kwh matters.
+        # still targeting the original 40%. NB the helper's default dawn_times
+        # holds only TOMORROW's dawn, so the refill day resolves to tomorrow —
+        # whose need follows the REAL calendar (snapshot.now anchors to the
+        # actual today): weekday need 22 (gate 3x = 66; 70 passes) but weekend
+        # need 30 (gate 90; 70 FAILS). That made this test fail every Friday
+        # and Saturday run. Pin weekend_kwh to the weekday value so the gate
+        # is 66 whichever real day the suite runs on.
         snapshot = _make_snapshot(
             soc_pct=70.0, now_hour=1, export_active=True,
             flood_prev_target_soc=40.0, export_enabled=True,
-            # Refill gate needs >= FLOOD_PREV_FORECAST_MULT (3x) the 22 kWh
-            # weekday need — 70 kWh clears it whichever day is the refill day.
             corrected_today_kwh=70.0, corrected_tomorrow_kwh=70.0,
+            weekend_kwh=22.0,   # calendar-proof: need is 22 on any run day
         )
         d = self.bm._check_overrides(snapshot)
         self.assertIsNotNone(d)
