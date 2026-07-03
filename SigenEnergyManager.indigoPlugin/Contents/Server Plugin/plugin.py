@@ -23,8 +23,42 @@
 #   frozen 2026-07-01 row was un-settled to re-settle with complete data.
 #   +6 tests (301 pass; the 1 pre-existing failure is the time-of-day-dependent
 #   test_calm_night_drain_continues_unchanged flake, unrelated).
-# 5.42.0-5.45.0 — deep review #3 batch (02-07-2026): see the release notes /
-#   Plugins/CLAUDE.MD chained changelog; the code carries inline v5.4x notes.
+# 5.45.0 — Locking-model restructure (the last deep-review-#3 deferral). _tick no
+#   longer holds _state_lock for its duration: network stages (modbus/forecast/
+#   octopus/VPP/storm/settle) run I/O UNLOCKED and lock only their merge; control
+#   stages (evaluate/verify/act, midnight, scheduled import) self-lock whole;
+#   get_dashboard_data takes a ms-scale locked snapshot then builds lock-free.
+#   NEW test_concurrency.py pins the contract. Bonus bug: the tick stamped
+#   last_modbus AFTER _poll_modbus returned, clobbering the v5.43.0 outage
+#   back-off (it never worked) — stamps before the call now. Live-verified:
+#   dashboard 2.6-10ms during polling (was up to ~20s mid-poll). 288→295 tests.
+# 5.44.0 — Decision tuning. _plan_agile_import gates the cheapest viable slot on
+#   round-trip break-even (rate/0.94 must undercut tomorrow's daytime reference;
+#   None = ungated) — returns SELF_CONSUMPTION passthrough when pre-charging
+#   loses money. surplus_kwh conservatism CONFIRMED by CliveS and pinned with an
+#   annotation + characterisation test. 283→288 tests.
+# 5.43.1 — Deep review #3 batch 3 (~75 lows/infos): Chart.js bundled locally;
+#   power-cut state persisted; atomic JSON writes; octopus JWT purge + failure
+#   negative-caching; GTI clamps; monotonic throttle; Sigenergy variable folder
+#   auto-created; test-quality fixes (tautologies replaced, value-0 decode);
+#   companion scripts hardened (optimiser v3.14, digest v1.1, axle v1.3).
+# 5.43.0 — Deep review #3 batch 2 (mediums): pause survives restart; staleness
+#   guard holds evaluation on frozen inverter data + poll back-off tiers; flood
+#   target + power-cut lockout crash-safe in accumulators.json; no phantom 0%
+#   SOC at restart; menu/prefs callbacks under _state_lock; connect() health
+#   probe + escalating reconnect; storm word-boundary matching; flood gate
+#   requires demand>0; Kraken null-token guard; London-day rate windows (BST
+#   skew); forecast staleness caps + day-aware persisted bias baseline; month
+#   cost vars fixed (1st-of-month zero + whole-house basis).
+# 5.42.0 — Deep review #3 batch 1 (highs; 122 confirmed findings across the
+#   review, 257→283 tests by batch 3): hardware charge-cutoff (reg 40047)
+#   backstop on every grid import (target+3%, verify-maintained, released on
+#   stop/disengage/startup — a crash mid-import can no longer grid-charge to
+#   100%; hardware-verified 02-07); flood pre-drain aborts when a storm
+#   suppresses export mid-drain + stops at max(target, dawn_target); modbus
+#   outage aborts the read cycle in ~1s with 2 log lines (was ~20 ERROR lines);
+#   storm-feed failure returns None not "none" (level HELD through flaky polls,
+#   ~24h decay with its own Pushover).
 # 5.41.0 — Publish the Octopus cost/rate variables (REVIVE). The elec_*/gas_*/
 #   export_*/account_balance Indigo variables had no active writer since their
 #   original script was retired, so they had gone stale — elec_unit_rate_p frozen
