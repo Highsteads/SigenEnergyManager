@@ -5,9 +5,21 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5
-# Date:        03-07-2026
-# Version:     5.46.0
+# Author:      CliveS & Claude Opus 4.8
+# Date:        05-07-2026
+# Version:     5.47.0
+# 5.47.0 — Octopus Go/iGo readiness (pre-September switch). (1) Go cheap-window
+#   corrected 00:30-05:30 -> 23:30-04:30 in TARIFF_WINDOWS (octopus_api.py +
+#   battery_manager.py) to match the live GO-FIX product (region F) — the stale
+#   window missed the cheap 23:30-00:30 hour and would have charged 04:30-05:30
+#   at the 31.36p day rate. (2) Power-cut reserve now guaranteed on TOU tariffs:
+#   _check_resilience_buffer fired only on Tracker/Flexible, so on Go/iGo a night
+#   before a well-covered (sunny) day left nothing holding the dawn_target floor
+#   and the battery drifted to the 1% health floor. It now tops the reserve up on
+#   Go/iGo/Flux/iFlux too, but ONLY inside the cheap window (night rate, never the
+#   day/peak rate) and ONLY when the import planner is not already covering
+#   tomorrow, so it never truncates the arbitrage fill. +3 resilience tests;
+#   fixed the calendar-flaky surplus-conservatism test (weekend need). 304 pass.
 # 5.46.0 — Gas cost settle: full-day COVERAGE gate (fixes £0.00 gas on the
 #   whole-house card). Gas settles slower than electricity and can arrive
 #   PARTIALLY: on 03-07 the 1 Jul row froze (cost_settled) at 0.034 kWh / £0.00

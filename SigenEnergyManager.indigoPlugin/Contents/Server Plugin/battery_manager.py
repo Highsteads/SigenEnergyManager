@@ -60,7 +60,7 @@ except ImportError:
     TARIFF_AGILE    = "agile"
     TARIFF_FLEXIBLE = "flexible"
     TARIFF_WINDOWS  = {
-        "go":    {"cheap_start": "00:30", "cheap_end": "05:30"},
+        "go":    {"cheap_start": "23:30", "cheap_end": "04:30"},   # 23:30-04:30 (5h) — live GO-FIX product (region F, verified 05-Jul-2026)
         "flux":  {"cheap_start": "02:00", "cheap_end": "05:00"},
         "igo":   {"cheap_start": "23:30", "cheap_end": "05:30"},   # 23:30-05:30 (6h)
         "iflux": {"cheap_start": "19:00", "cheap_end": "16:00"},   # 21h non-peak window
@@ -312,7 +312,8 @@ class BatteryManager:
             f"tomorrow need {balance.tomorrow_need_kwh:.1f} kWh"
         ))
 
-        # 2. Resilience buffer (flat-rate tariffs only)
+        # 2. Resilience buffer (flat-rate any-time; TOU only in the cheap window
+        #    when tomorrow is already covered — see _check_resilience_buffer)
         resilience = self._check_resilience_buffer(snapshot, balance)
         if resilience is not None:
             audit.append(("RESILIENCE", f"matched -> {resilience.reason}"))
@@ -447,24 +448,52 @@ class BatteryManager:
 
     def _check_resilience_buffer(self, snapshot: ManagerSnapshot,
                                  balance: SufficiencyBalance):
-        """Flat-rate-tariff overnight power-cut floor — return Decision or None.
+        """Overnight power-cut floor — return Decision or None.
 
-        On Tracker/Flexible there is no rate benefit to pre-charging the
-        battery for tomorrow (grid passthrough is just as cheap and avoids the
-        ~6% AC/DC/AC round-trip loss).  The ONE reason to import overnight on
-        a flat-rate tariff is power-cut resilience: keep at least
-        dawn_target_pct so the house can ride out an outage for several hours.
+        Keeps at least dawn_target_pct in the battery so the house can ride out
+        an outage for several hours. Import stops at dawn_target_pct + 2%
+        (overshoot prevents cycling).
 
-        Import stops at dawn_target_pct + 2% (overshoot prevents cycling).
-        Returns None when not applicable (non-flat tariff, daytime, or
-        battery already above the floor).
+        Flat-rate tariffs (Tracker/Flexible): there is no rate benefit to
+        pre-charging for tomorrow (grid passthrough is just as cheap and avoids
+        the ~6% round-trip loss), so this power-cut floor is the ONE reason to
+        import overnight — fire any time the battery is below it.
+
+        TOU tariffs (Go/iGo/Flux/iFlux): the import branch (priority 4) already
+        lifts the battery above this floor whenever tomorrow needs covering, so
+        this branch only fills the gap it leaves — a night before a well-covered
+        (e.g. sunny) day, where import_needed is False yet SOC has drifted below
+        the floor. Restore it ONLY inside the cheap window so the top-up is
+        bought at the night rate, never the peak/day rate. Without this, on
+        Go/iGo the reserve is never guaranteed (added 05-Jul-2026).
+
+        Returns None when not applicable (unknown tariff, daytime, battery above
+        the floor, or — on TOU — tomorrow already being covered or outside the
+        cheap window).
         """
-        if snapshot.tariff.tariff_key not in (TARIFF_TRACKER, TARIFF_FLEXIBLE):
+        tariff_key = snapshot.tariff.tariff_key
+        is_flat = tariff_key in (TARIFF_TRACKER, TARIFF_FLEXIBLE)
+        is_tou  = tariff_key in (TARIFF_GO, TARIFF_IGO, TARIFF_FLUX, TARIFF_IFLUX)
+        if not (is_flat or is_tou):
             return None
         if balance.is_daytime:
             return None
         if snapshot.current_soc_pct >= snapshot.dawn_target_pct:
             return None
+
+        if is_tou:
+            # The import planner already lifts SOC above the floor whenever
+            # tomorrow needs covering — only step in for the gap it misses.
+            if balance.import_needed:
+                return None
+            # Buy the reserve top-up at the night rate: only inside the cheap
+            # window, never the peak/day rate.
+            if not snapshot.tariff.cheap_start or not snapshot.tariff.cheap_end:
+                return None
+            now_hm = self._to_local(snapshot.now).strftime("%H:%M")
+            if not self._time_in_window(now_hm, snapshot.tariff.cheap_start,
+                                        snapshot.tariff.cheap_end):
+                return None
 
         buffer_pct    = snapshot.dawn_target_pct          # default 10%
         buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
@@ -472,13 +501,16 @@ class BatteryManager:
         deficit_kwh   = (buffer_pct - snapshot.current_soc_pct) / 100.0 * cap_kwh
         rate_str      = (f"{snapshot.tariff.today_rate_p:.2f}p/kWh"
                          if snapshot.tariff.today_rate_p else "")
+        context       = (f"flat rate {rate_str}" if is_flat
+                         else f"cheap window {snapshot.tariff.cheap_start}–"
+                              f"{snapshot.tariff.cheap_end}")
         return Decision(
             action          = ACTION_START_IMPORT,
             reason          = (
                 f"Resilience buffer: {snapshot.current_soc_pct:.1f}% below "
                 f"{buffer_pct:.0f}% minimum — importing {deficit_kwh:.1f} kWh "
                 f"to {buffer_target:.0f}% for power-cut protection "
-                f"(flat rate {rate_str}, solar recharges from dawn)"
+                f"({context}, solar recharges from dawn)"
             ),
             power_watts     = 10000,
             target_soc_pct  = buffer_target,

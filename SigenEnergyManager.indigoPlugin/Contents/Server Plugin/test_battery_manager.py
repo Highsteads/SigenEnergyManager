@@ -1317,12 +1317,43 @@ class TestResilienceBuffer(unittest.TestCase):
         self.assertEqual(d.action, ACTION_START_IMPORT)
         self.assertAlmostEqual(d.target_soc_pct, 12.0)
 
-    def test_non_flat_tariff_not_applicable(self):
-        # Go (cheap-window tariff) has its own import path — resilience buffer
-        # must return None so the TOU logic decides instead.
+    def test_tou_outside_cheap_window_no_resilience_import(self):
+        # Go, below floor but OUTSIDE the cheap window: never import the reserve
+        # at the day rate — wait for the cheap window. Resilience returns None.
         d = self._run(soc_pct=8.0, dawn_target_pct=10.0, now_hour=20,
-                      tariff_key=TARIFF_GO, cheap_start="00:30",
-                      cheap_end="04:30")
+                      tariff_key=TARIFF_GO, cheap_start="23:30",
+                      cheap_end="04:30", corrected_tomorrow_kwh=40.0)
+        self.assertIsNone(d)
+
+    def test_tou_in_cheap_window_below_floor_imports_at_night_rate(self):
+        # Go, tomorrow already covered (import planner won't fire) yet SOC below
+        # the power-cut floor, INSIDE the cheap window: top the reserve up at the
+        # night rate. This is the gap that otherwise drains to the health floor
+        # on a night before a sunny day (fixed 05-Jul-2026).
+        today_str    = _today_str()
+        tomorrow_str = (datetime.now(timezone.utc).date()
+                        + timedelta(days=1)).strftime("%Y-%m-%d")
+        d = self._run(soc_pct=8.0, dawn_target_pct=10.0, now_hour=2,
+                      tariff_key=TARIFF_GO, cheap_start="23:30",
+                      cheap_end="04:30", corrected_tomorrow_kwh=40.0,
+                      dawn_times={today_str:    _now(hour=7),
+                                  tomorrow_str: _tomorrow_dawn(hour=7)})
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+        self.assertAlmostEqual(d.target_soc_pct, 12.0)
+
+    def test_tou_import_needed_defers_to_planner(self):
+        # Go, SOC below floor AND tomorrow not covered (import_needed=True):
+        # defer to the TOU import planner (priority 4), which charges to the full
+        # tomorrow-cover target. Resilience returns None to avoid truncating it.
+        today_str    = _today_str()
+        tomorrow_str = (datetime.now(timezone.utc).date()
+                        + timedelta(days=1)).strftime("%Y-%m-%d")
+        d = self._run(soc_pct=8.0, dawn_target_pct=10.0, now_hour=2,
+                      tariff_key=TARIFF_GO, cheap_start="23:30",
+                      cheap_end="04:30", corrected_tomorrow_kwh=0.0,
+                      dawn_times={today_str:    _now(hour=7),
+                                  tomorrow_str: _tomorrow_dawn(hour=7)})
         self.assertIsNone(d)
 
 
@@ -1389,15 +1420,18 @@ class TestSurplusConservatism(unittest.TestCase):
 
     def test_surplus_is_conservative_no_tomorrow_solar(self):
         bm = BatteryManager()
-        # 20:00, SOC 50% (17.52 kWh), weekday need 22 kWh, and a BIG tomorrow
+        # 20:00, SOC 50% (17.52 kWh), daily need 22 kWh, and a BIG tomorrow
         # forecast that a 'precise' rolling-24h model would partially count.
+        # weekday_kwh == weekend_kwh here so the assertion is day-of-week agnostic
+        # (it used to fail every weekend when _now() landed on a Sat/Sun and the
+        # balance used the 30 kWh weekend need against a hard-coded 22).
         snapshot = _make_snapshot(soc_pct=50.0, now_hour=20,
-                                  corrected_tomorrow_kwh=60.0)
+                                  corrected_tomorrow_kwh=60.0,
+                                  weekday_kwh=22.0, weekend_kwh=22.0)
         balance = bm._calculate_24h_balance(snapshot)
         # battery(17.52) + remaining_solar(0, night) - need(22) = -4.48:
         # negative despite 60 kWh forecast tomorrow — deliberately so.
-        self.assertAlmostEqual(balance.surplus_kwh,
-                               17.52 - snapshot.weekday_kwh, places=1)
+        self.assertAlmostEqual(balance.surplus_kwh, 17.52 - 22.0, places=1)
         self.assertLess(balance.surplus_kwh, 0.0)
 
 
