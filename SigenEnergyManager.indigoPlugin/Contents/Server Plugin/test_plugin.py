@@ -1033,5 +1033,110 @@ class TestWriteEnergySummaryVariables(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestVppRestartPersistence(unittest.TestCase):
+    """v5.48.0 — an in-progress Axle VPP window must survive a plugin restart.
+
+    Covers the three pure helpers behind _rehydrate_vpp_state: the serialise /
+    deserialise round-trip (JSON-safe, DST-safe, tz-aware UTC) and the
+    resume/ended/idle decision that drives whether a restart re-enters the window
+    without the Axle API or cleans up a window that closed during downtime.
+    """
+
+    def _event(self, start, end):
+        return {
+            "start_time":            start,
+            "end_time":              end,
+            "import_export":         "export",
+            "duration_hrs":          (end - start).total_seconds() / 3600.0,
+            "forecast_dispatch_kwh": 5.5,
+            "estimated_revenue_p":   550.0,
+            "raw":                   {"anything": "dropped on serialise"},
+        }
+
+    # ---- serialise / deserialise round-trip ----
+    def test_roundtrip_preserves_utc_instant(self):
+        start = datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+        ser   = plugin._serialise_vpp_event(self._event(start, end))
+        # JSON-safe: datetimes are strings, and the raw blob is dropped.
+        self.assertIsInstance(ser["start_time"], str)
+        self.assertNotIn("raw", ser)
+        import json
+        json.dumps(ser)   # must not raise
+        back = plugin._deserialise_vpp_event(ser)
+        self.assertEqual(back["start_time"], start)
+        self.assertEqual(back["end_time"], end)
+        self.assertEqual(back["import_export"], "export")
+        self.assertAlmostEqual(back["duration_hrs"], 1.5, places=6)
+        self.assertEqual(back["forecast_dispatch_kwh"], 5.5)
+
+    def test_deserialise_normalises_offset_to_utc(self):
+        # A BST (+01:00) window must come back as the same UTC instant — the DST
+        # trap that shifted Predbat's notifications an hour can't occur here.
+        ser  = {"start_time": "2026-07-06T19:00:00+01:00",
+                "end_time":   "2026-07-06T20:00:00+01:00"}
+        back = plugin._deserialise_vpp_event(ser)
+        self.assertEqual(back["start_time"],
+                         datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc))
+        self.assertEqual(back["start_time"].tzinfo, timezone.utc)
+
+    def test_deserialise_rejects_corrupt_payload(self):
+        self.assertIsNone(plugin._deserialise_vpp_event(None))
+        self.assertIsNone(plugin._deserialise_vpp_event({}))
+        self.assertIsNone(plugin._deserialise_vpp_event({"start_time": "not-a-date",
+                                                         "end_time": "also-bad"}))
+
+    def test_serialise_none_event(self):
+        self.assertIsNone(plugin._serialise_vpp_event(None))
+
+    # ---- resume / ended / idle decision ----
+    def test_decision_resume_while_window_open(self):
+        start = datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+        now   = datetime(2026, 7, 6, 18, 45, tzinfo=timezone.utc)   # mid-window
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_ACTIVE, self._event(start, end), now),
+            "resume")
+
+    def test_decision_ended_past_tail(self):
+        start = datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+        now   = datetime(2026, 7, 6, 19, 40, tzinfo=timezone.utc)   # past end + 2min tail
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_ACTIVE, self._event(start, end), now),
+            "ended")
+
+    def test_decision_resume_within_tail(self):
+        start = datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+        now   = datetime(2026, 7, 6, 19, 31, tzinfo=timezone.utc)   # inside the +2min tail
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_ACTIVE, self._event(start, end), now),
+            "resume")
+
+    def test_decision_resume_across_midnight(self):
+        # A window that spans midnight must resume when the restart lands after
+        # 00:00 — the reason the persisted state is restored regardless of day.
+        start = datetime(2026, 7, 6, 23, 30, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 7, 0, 30, tzinfo=timezone.utc)
+        now   = datetime(2026, 7, 7, 0, 5, tzinfo=timezone.utc)
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_PRE_CHARGING, self._event(start, end), now),
+            "resume")
+
+    def test_decision_idle_when_state_idle(self):
+        start = datetime(2026, 7, 6, 18, 0, tzinfo=timezone.utc)
+        end   = datetime(2026, 7, 6, 19, 30, tzinfo=timezone.utc)
+        now   = datetime(2026, 7, 6, 18, 45, tzinfo=timezone.utc)
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_IDLE, self._event(start, end), now),
+            "idle")
+
+    def test_decision_idle_when_no_event(self):
+        now = datetime(2026, 7, 6, 18, 45, tzinfo=timezone.utc)
+        self.assertEqual(
+            plugin._vpp_resume_decision(plugin.VPP_ACTIVE, None, now), "idle")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

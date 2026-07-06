@@ -6,8 +6,21 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        05-07-2026
-# Version:     5.47.0
+# Date:        06-07-2026
+# Version:     5.48.0
+# 5.48.0 — VPP window survives a plugin restart. The Axle state machine was
+#   re-driven purely from the API each poll, so a restart mid-window relied on
+#   Axle still returning the active event; if its endpoint drops the event once
+#   live (Predbat issue #3051's failure mode) the rest of the window was silently
+#   missed. Now the active window (state + event + pre-charge/cutoff/export flags)
+#   is persisted into accumulators.json on every _vpp_transition (crash-safe,
+#   atomic — pluginPrefs only flush on a graceful shutdown), restored by
+#   _load_accumulators regardless of day (a window can span midnight), and
+#   _rehydrate_vpp_state() in startup() makes the time-based call: resume an open
+#   window WITHOUT the API, or reset the discharge-cutoff register + Self
+#   Consumption for a window that ended during downtime. New pure module helpers
+#   _serialise_vpp_event / _deserialise_vpp_event / _vpp_resume_decision with a
+#   contract test for the restart path. DST-safe throughout (UTC end-to-end).
 # 5.47.0 — Octopus Go/iGo readiness (pre-September switch). (1) Go cheap-window
 #   corrected 00:30-05:30 -> 23:30-04:30 in TARIFF_WINDOWS (octopus_api.py +
 #   battery_manager.py) to match the live GO-FIX product (region F) — the stale
@@ -1079,6 +1092,80 @@ VPP_DISCHARGE_EFFICIENCY  = 0.97
 BATTERY_CAPACITY_KWH      = 35.04
 
 
+def _serialise_vpp_event(event):
+    """Serialise an Axle VPP event dict to JSON-safe primitives.
+
+    datetimes -> ISO-8601 strings; the `raw` API blob is dropped (not needed to
+    resume a window). Returns None for a falsy event. Pure — unit-tested.
+    """
+    if not event:
+        return None
+
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    return {
+        "start_time":            _iso(event.get("start_time")),
+        "end_time":              _iso(event.get("end_time")),
+        "import_export":         event.get("import_export", "export"),
+        "duration_hrs":          event.get("duration_hrs"),
+        "forecast_dispatch_kwh": event.get("forecast_dispatch_kwh"),
+        "estimated_revenue_p":   event.get("estimated_revenue_p"),
+    }
+
+
+def _deserialise_vpp_event(d):
+    """Inverse of _serialise_vpp_event — ISO strings back to tz-aware UTC datetimes.
+
+    Returns None when start/end are missing or unparseable, so a corrupt payload
+    can never resurrect a dangling VPP state. Pure — unit-tested.
+    """
+    if not d:
+        return None
+    try:
+        start = datetime.fromisoformat(d["start_time"])
+        end   = datetime.fromisoformat(d["end_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    # The VPP state machine works in UTC end-to-end — normalise both ends.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    start = start.astimezone(timezone.utc)
+    end   = end.astimezone(timezone.utc)
+    return {
+        "start_time":            start,
+        "end_time":              end,
+        "import_export":         d.get("import_export", "export"),
+        "duration_hrs":          d.get("duration_hrs")
+                                 or (end - start).total_seconds() / 3600.0,
+        "forecast_dispatch_kwh": d.get("forecast_dispatch_kwh"),
+        "estimated_revenue_p":   d.get("estimated_revenue_p"),
+    }
+
+
+def _vpp_resume_decision(vpp_state, event, now, tail_minutes=2):
+    """Decide how to handle a persisted VPP window found on restart.
+
+    Returns:
+        "idle"   — nothing to resume (state IDLE or no usable event)
+        "ended"  — the window closed while the plugin was down; clean up hardware
+        "resume" — the window is still open; restore the state machine
+
+    Pure decision function (no side effects) so the restart contract is
+    unit-tested without Indigo or hardware.
+    """
+    if vpp_state == VPP_IDLE or not event:
+        return "idle"
+    end_time = event.get("end_time")
+    if end_time is None:
+        return "idle"
+    if now >= end_time + timedelta(minutes=tail_minutes):
+        return "ended"
+    return "resume"
+
+
 # ============================================================
 # Plugin log file (daily rotation, 14-day retention)
 # ============================================================
@@ -1387,6 +1474,11 @@ class Plugin(indigo.PluginBase):
                     )
             except (ValueError, TypeError):
                 pass
+
+        # Resume an in-progress Axle VPP window if the plugin restarted mid-event.
+        # The window was restored from accumulators.json by _load_accumulators;
+        # this makes the time-based resume/cleanup decision now modbus is up.
+        self._rehydrate_vpp_state()
 
         # Set initial state images for all devices that already exist
         # (deviceStartComm handles newly created devices; this handles existing ones on reload)
@@ -5595,6 +5687,65 @@ class Plugin(indigo.PluginBase):
                 "DNO-capped; Axle dispatch ignored).")
             self._drive_vpp_export()
 
+        # Persist the new state immediately (crash-safe, atomic) so a restart or
+        # crash mid-window resumes without relying on the Axle API still
+        # returning the active event. accumulators.json is the authoritative
+        # cross-restart store (pluginPrefs only flush on a graceful shutdown).
+        self._save_accumulators()
+
+    def _rehydrate_vpp_state(self):
+        """Resume an in-progress Axle VPP window after a plugin restart.
+
+        The VPP state machine is otherwise re-driven purely from the Axle API on
+        each poll, so a restart mid-window relies on Axle still returning the
+        active event. If its endpoint drops the event once the window is live,
+        the rest of the window would be silently missed — Predbat issue #3051's
+        failure mode. The window is persisted to accumulators.json on every
+        transition and restored into the store by _load_accumulators; here, with
+        modbus available, we make the time-based decision.
+
+        Best-effort — never blocks startup.
+        """
+        state = self.store.get("vpp_state", VPP_IDLE)
+        event = self.store.get("vpp_event")
+        now   = datetime.now(timezone.utc)
+        decision = _vpp_resume_decision(state, event, now)
+
+        if decision == "idle":
+            return
+
+        if decision == "ended":
+            # Window finished while the plugin was down. The discharge-cutoff
+            # register may still be raised in hardware (it survives a plugin
+            # restart) — reset it to the health floor and drop back to Self
+            # Consumption so the manager evaluates cleanly.
+            log(f"[VPP] Persisted window ended during downtime "
+                f"(ended {_local_time(event.get('end_time'))}) — cleaning up")
+            try:
+                if self.modbus:
+                    self.modbus.set_self_consumption()
+                self._restore_discharge_cutoff()
+            except Exception as exc:
+                log(f"[VPP] Restart cleanup failed: {exc}", level="WARNING")
+            self.store["vpp_event"]         = None
+            self.store["vpp_active"]        = False
+            self.store["export_active"]     = False
+            self.store["vpp_cutoff_raised"] = False
+            self._vpp_transition(VPP_IDLE)   # re-persists, clearing the window
+            return
+
+        # decision == "resume" — the window is still open. Restore the state
+        # machine only; NO hardware re-issue here. The discharge-cutoff register
+        # persisted across the restart, and for an ACTIVE window the manager's
+        # ACTION_VPP_EXPORT override re-drives the export on its next tick.
+        # Keeping vpp_cutoff_raised set stops _verify_ems_registers lowering the
+        # floor before then.
+        self.store["vpp_active"] = (state == VPP_ACTIVE)
+        log(f"[VPP] Resuming persisted '{state}' window after restart — "
+            f"{_local_time(event.get('start_time'))}-{_local_time(event.get('end_time'))} "
+            f"(Axle API not required; cutoff-raised="
+            f"{self.store.get('vpp_cutoff_raised', False)})")
+
     def _drive_vpp_export(self):
         """Self-drive the VPP export, re-evaluated each manager tick during VPP_ACTIVE.
 
@@ -7766,6 +7917,23 @@ class Plugin(indigo.PluginBase):
             "power_cut_started_at":      (self.store["power_cut_started_at"].isoformat()
                                           if self.store.get("power_cut_started_at") else ""),
             "power_cut_events":          list(self.store.get("power_cut_events", [])),
+            # Axle VPP window — restart-critical control state. A window can span
+            # midnight, so it is restored regardless of day. Written on every
+            # transition (see _vpp_transition) so a restart or crash mid-window
+            # resumes WITHOUT relying on Axle still returning the active event —
+            # the endpoint may drop it once live (Predbat issue #3051).
+            "vpp_state":                 self.store.get("vpp_state", VPP_IDLE),
+            "vpp_event":                 (_serialise_vpp_event(self.store.get("vpp_event"))
+                                          if self.store.get("vpp_state", VPP_IDLE) != VPP_IDLE
+                                          else None),
+            "vpp_pre_charge_soc":        self.store.get("vpp_pre_charge_soc", 0.0),
+            "vpp_export_start_kwh":      self.store.get("vpp_export_start_kwh", 0.0),
+            "vpp_charge_stopped":        self.store.get("vpp_charge_stopped", False),
+            "vpp_cutoff_raised":         self.store.get("vpp_cutoff_raised", False),
+            "vpp_is_daytime":            self.store.get("vpp_is_daytime", False),
+            "vpp_export_active":         (self.store.get("export_active", False)
+                                          if self.store.get("vpp_state", VPP_IDLE) != VPP_IDLE
+                                          else False),
         }
         try:
             # Atomic — rewritten every 5 minutes; a crash/power blip mid-write
@@ -7815,6 +7983,26 @@ class Plugin(indigo.PluginBase):
                     pass
             if data.get("power_cut_events"):
                 self.store["power_cut_events"] = list(data["power_cut_events"])[-100:]
+            # Axle VPP window, restored regardless of day (a window can span
+            # midnight). Only the raw fields are restored here — the time-based
+            # resume/cleanup decision is deferred to _rehydrate_vpp_state() in
+            # startup(), where modbus is available for any hardware cleanup.
+            _vpp_state = data.get("vpp_state", VPP_IDLE)
+            if _vpp_state and _vpp_state != VPP_IDLE:
+                _vpp_event = _deserialise_vpp_event(data.get("vpp_event"))
+                if _vpp_event is not None:
+                    self.store["vpp_state"]            = _vpp_state
+                    self.store["vpp_event"]            = _vpp_event
+                    self.store["vpp_active"]           = (_vpp_state == VPP_ACTIVE)
+                    self.store["vpp_pre_charge_soc"]   = data.get("vpp_pre_charge_soc", 0.0)
+                    self.store["vpp_export_start_kwh"] = data.get("vpp_export_start_kwh", 0.0)
+                    self.store["vpp_charge_stopped"]   = bool(data.get("vpp_charge_stopped", False))
+                    self.store["vpp_cutoff_raised"]    = bool(data.get("vpp_cutoff_raised", False))
+                    self.store["vpp_is_daytime"]       = bool(data.get("vpp_is_daytime", False))
+                    if data.get("vpp_export_active"):
+                        self.store["export_active"] = True
+                    self.logger.debug(
+                        f"VPP {_vpp_state} window restored from accumulators (crash-safe copy)")
             _prt = data.get("power_restored_time")
             if _prt and not self.pluginPrefs.get("powerRestoredTime", ""):
                 # _resolve_export_lockout reads the PREF — reseed it so the
