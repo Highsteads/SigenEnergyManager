@@ -727,7 +727,8 @@ header h1{
     <div class="fc-meta">
       <span class="fc-meta-item" data-help-title="Today's forecast" data-help="Bias-corrected solar production estimate for the whole of today (sunrise to sunset), in kWh. Comes from Open-Meteo using your roof's tilt and azimuth for each PV string, with a self-learned correction factor applied based on past forecast-vs-actual accuracy.">Today: <strong id="fc-today">&#8212;</strong> kWh</span>
       <span class="fc-meta-item" data-help-title="Tomorrow's forecast" data-help="Bias-corrected solar production estimate for tomorrow, in kWh. The battery manager uses this to decide whether tonight's flood-prevention export is worthwhile and how much grid charging (if any) to schedule overnight.">Tomorrow: <strong id="fc-tmrw">&#8212;</strong> kWh</span>
-      <span class="fc-meta-item" data-help-title="Remaining today" data-help="Sum of forecasted production from the current hour through dusk, in kWh. Updates every refresh — drops as the day progresses and grows briefly if a sunny patch is forecast for the next hour.">Remaining: <strong id="fc-rem">&#8212;</strong> kWh</span>
+      <span class="fc-meta-item" data-help-title="Remaining today" data-help="Bias-corrected forecast production from now through dusk, in kWh — on the same scale as the Today figure, with the current hour counted only for the time still to run. Updates every refresh.">Remaining: <strong id="fc-rem">&#8212;</strong> kWh</span>
+      <span class="fc-meta-item" data-help-title="Expected total" data-help="Generated so far today plus the forecast still to come. Compare it against Today's forecast — a higher number means the day is running ahead of prediction.">Expected total: <strong id="fc-exp">&#8212;</strong> kWh</span>
       <span class="fc-meta-item" data-help-title="Bias correction factor" data-help="Self-learned multiplier the plugin applies to the raw Open-Meteo numbers based on past accuracy.  1.00 = forecast was dead-on. >1.00 = forecast tends to under-predict (boost it up). <1.00 = over-predict (knock it down). Adjusts automatically each midnight.">Bias factor: <strong id="fc-bias">&#8212;</strong></span>
     </div>
     <svg id="fc-svg" viewBox="0 0 756 80" xmlns="http://www.w3.org/2000/svg">
@@ -1287,6 +1288,11 @@ function update(d) {
     document.getElementById('fc-today').textContent = d.solar.today_kwh;
     document.getElementById('fc-tmrw').textContent  = d.solar.tomorrow_kwh;
     document.getElementById('fc-rem').textContent   = d.solar.remaining_kwh;
+    // Expected end of day = generated so far + still to come. Both bias-corrected,
+    // so it is directly comparable to the Today figure beside it.
+    const _act = d.solar.actual_today_kwh, _rem = d.solar.remaining_kwh;
+    document.getElementById('fc-exp').textContent =
+      (_act != null && _rem != null) ? (_act + _rem).toFixed(1) : '—';
     document.getElementById('fc-bias').textContent  = d.solar.bias_factor;
   }
   if (d.hourly_forecast) renderForecast(d.hourly_forecast);

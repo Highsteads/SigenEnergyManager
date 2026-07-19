@@ -333,6 +333,9 @@
             <State id="remainingTodayKwh">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Remaining today changed</TriggerLabel>
+                <!-- Bias-corrected (same scale as correctedTodayKwh) with the
+                     current hour pro-rated to its unelapsed fraction, so
+                     pvDailyKwh + this = expected end-of-day total. -->
                 <ControlPageLabel>Remaining Today (kWh)</ControlPageLabel>
             </State>
             <State id="currentHourWatts">

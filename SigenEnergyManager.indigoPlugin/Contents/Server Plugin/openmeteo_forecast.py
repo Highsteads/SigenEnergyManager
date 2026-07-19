@@ -8,7 +8,18 @@
 #              needs only a simple constructor swap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        04-06-2026
-# Version:     1.6 (zoneinfo tz fallback, per-array cache day-shift guard, instance arrays)
+# Version:     1.7 (remainingTodayKwh bias-corrected + current hour pro-rated)
+# 1.7 — remainingTodayKwh was summed straight off the RAW hourly p50 buckets while
+#       the headline forecast it sits beside (correctedTodayKwh) is bias-corrected,
+#       so the two figures were on different scales — 19-Jul-2026 the Energy page
+#       read 38.3 kWh today, forecast 53, remaining 25.3 (raw sum 57.7 x 0.915 =
+#       52.8). It also counted the WHOLE current hour as still to come, overstating
+#       the figure by up to a full peak hour (~7 kWh at midday). Both fixed in one
+#       new helper, `_remaining_today_kwh`, now the single owner of the calculation
+#       for both the fetch path and the enrichment path. currentHourWatts /
+#       nextHourWatts stay RAW — they're instantaneous-shape diagnostics, not day
+#       totals, and the optimiser reads the corrected shape from the hourly file.
+# 1.6 — zoneinfo tz fallback, per-array cache day-shift guard, instance arrays.
 # 1.5 — HTTP 5xx (502/503/504) from Open-Meteo now logged at WARNING (transient
 #       server-side gateway blip; falls back to cached/partial forecast) instead
 #       of a red ERROR. 4xx still ERROR. Fixes recurring "HTTP 502" ERROR spam.
@@ -563,13 +574,17 @@ class OpenMeteoForecast:
                         dt_aware = dt_naive
                     dawn_times[date_str] = dt_aware
 
-        # Remaining today: future hours only (naive comparison against now)
+        # Remaining today: bias-corrected, with the current hour pro-rated.
+        # _enrich_forecast recomputes this against the current clock on every
+        # serve path, but both call sites go through the one helper — keeping a
+        # second inline implementation here is exactly how the two drifted onto
+        # different scales before v1.7.
         now_hour_naive = now_local.replace(minute=0, second=0,
                                            microsecond=0, tzinfo=None)
-        remaining_today_kwh = sum(
-            wh / 1000.0
-            for key, wh in hourly_today.items()
-            if datetime.strptime(key, "%Y-%m-%d %H:%M:%S") >= now_hour_naive
+        remaining_today_kwh = self._remaining_today_kwh(
+            hourly_today,
+            self._apply_band_correction(today_total),
+            now=now_local,
         )
 
         # Current and next hour watts
@@ -770,6 +785,9 @@ class OpenMeteoForecast:
         For each day, `_apply_band_correction(raw_kwh)` linearly interpolates
         a factor from `self._correction_bands` and multiplies the raw total.
 
+        v1.7 (19-Jul-2026): `remainingTodayKwh` takes the same per-day factor and
+        pro-rates the current hour — see `_remaining_today_kwh`.
+
         `biasFactor` keeps its v1.2 meaning — the overall kWh-weighted scalar
         across all records — so dashboard displays don't shift unexpectedly.
         Per-day effective factors are exposed as `biasFactorToday` and
@@ -795,21 +813,23 @@ class OpenMeteoForecast:
         # remainingTodayKwh / currentHourWatts / nextHourWatts are baked in at
         # fetch time, but every cache-served and stale-fallback return passes
         # through here — recompute them against the current clock from the
-        # hourly buckets so every serve path is time-correct.
+        # hourly buckets so every serve path is time-correct. Note remaining
+        # takes factor_today: it sits next to correctedTodayKwh on the dashboard
+        # and must be on the same scale (v1.7).
         hourly_today = combined.get("_hourly_p50_today") or {}
         if hourly_today:
             now_hour = self._now_local().replace(minute=0, second=0,
                                                  microsecond=0, tzinfo=None)
-            remaining_kwh = 0.0
-            for key, wh in hourly_today.items():
-                try:
-                    if datetime.strptime(key, "%Y-%m-%d %H:%M:%S") >= now_hour:
-                        remaining_kwh += wh / 1000.0
-                except (ValueError, TypeError):
-                    continue
             cur_key = now_hour.strftime("%Y-%m-%d %H:%M:%S")
             nxt_key = (now_hour + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-            enriched["remainingTodayKwh"] = round(remaining_kwh, 1)
+            enriched["remainingTodayKwh"] = self._remaining_today_kwh(
+                hourly_today, factor_today
+            )
+            # currentHourWatts / nextHourWatts stay RAW — they describe the
+            # model's instantaneous shape (and are labelled as W averages), not
+            # day totals, so they are not comparable to correctedTodayKwh and
+            # don't take the band factor. The optimiser gets the corrected shape
+            # from _write_optimiser_file instead.
             enriched["currentHourWatts"]  = hourly_today.get(cur_key, 0)
             enriched["nextHourWatts"]     = hourly_today.get(nxt_key, 0)
         return enriched
@@ -1261,3 +1281,53 @@ class OpenMeteoForecast:
         if PYTZ_AVAILABLE and LONDON_TZ:
             return datetime.now(tz=LONDON_TZ)
         return datetime.now()
+
+    # ================================================================
+    # Remaining-Today Helper
+    # ================================================================
+
+    def _remaining_today_kwh(self, hourly_today, factor=1.0, now=None):
+        """kWh forecast from *now* to end of day — bias-corrected and pro-rated.
+
+        Two things this owns, both of which were wrong when the calculation was
+        inlined at two separate call sites (fixed in v1.7):
+
+        1. `factor` is the day's band-correction multiplier, so the result lands
+           on the SAME scale as correctedTodayKwh. The raw buckets alone put
+           "Remaining" and "forecast" on different scales in the same sentence.
+        2. The current hour contributes only its UNELAPSED fraction. Counting the
+           whole bucket treated energy already generated as still to come — up to
+           a full peak hour (~7 kWh at midday on this array).
+
+        Args:
+            hourly_today: {"YYYY-MM-DD HH:MM:SS": wh_int} for today, local time.
+            factor:       band-correction multiplier for today's raw daily total.
+            now:          override for the current local time (tests). Naive or
+                          aware — tz is stripped to match the naive bucket keys.
+
+        Returns:
+            float kWh, rounded to 1 dp. 0.0 for empty/absent buckets.
+        """
+        if not hourly_today:
+            return 0.0
+
+        now_local = (now or self._now_local()).replace(tzinfo=None)
+        now_hour  = now_local.replace(minute=0, second=0, microsecond=0)
+        cur_key   = now_hour.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Fraction of the current hour still ahead of us (1.0 on the hour).
+        elapsed_frac   = (now_local - now_hour).total_seconds() / 3600.0
+        remaining_frac = min(1.0, max(0.0, 1.0 - elapsed_frac))
+
+        total_kwh = 0.0
+        for key, wh in hourly_today.items():
+            try:
+                slot = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue                      # malformed key — skip, don't abort
+            if slot > now_hour:
+                total_kwh += wh / 1000.0
+            elif key == cur_key:
+                total_kwh += (wh / 1000.0) * remaining_frac
+
+        return round(total_kwh * factor, 1)

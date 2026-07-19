@@ -6,8 +6,27 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        06-07-2026
-# Version:     5.48.0
+# Date:        19-07-2026
+# Version:     5.49.0
+# 5.49.0 — Solar card figures reconciled. The Energy page read "38.3 kWh today,
+#   forecast 53, Remaining 25.3" — figures that cannot be added up. Two causes,
+#   both in how remainingTodayKwh was derived (openmeteo_forecast.py 1.6 → 1.7):
+#   (a) it was summed off the RAW hourly p50 buckets while the forecast beside it
+#   is bias-corrected, so the two sat on different scales (raw 57.7 × 0.915 =
+#   52.8); (b) it counted the WHOLE current hour as still to come, overstating it
+#   by up to a full peak hour (~7 kWh at midday). Both now owned by one helper,
+#   openmeteo_forecast._remaining_today_kwh, which the fetch path and the
+#   enrichment path share. This also corrects the "expected total" line in Show
+#   Today's Energy Summary and Show Manager Status, which add pvDailyKwh to it.
+#   The hourly forecast published to the dashboards is scaled by the same day
+#   factor, so the bars and their kWh tooltips now sum to the headline forecast
+#   (the optimiser JSON already did this). New "Expected total" figure on both
+#   dashboards' solar cards = generated so far + still to come, so the projected
+#   end-of-day number is stated rather than left to the reader to work out.
+#   NOT touched: forecast_p50 passed to the decision engine stays raw (it is
+#   compared against SOLAR_DUSK_THRESHOLD_WH, and scaling would shift dusk
+#   detection), and the persisted _hourly_p50_* cache buckets stay raw because
+#   the bands are recomputed nightly. 9 new tests (27 → 36).
 # 5.48.0 — VPP window survives a plugin restart. The Axle state machine was
 #   re-driven purely from the API each poll, so a restart mid-window relied on
 #   Axle still returning the active event; if its endpoint drops the event once
@@ -1812,7 +1831,17 @@ class Plugin(indigo.PluginBase):
             soc    = float(inv.get("batterySoc",      0.0))
 
             # Hourly forecast: {hour_label: kWh}
+            # Scaled by today's band factor so the bars (and their per-hour kWh
+            # tooltips) sum to the corrected headline forecast rather than the raw
+            # model total — same shape-preserving scaling _write_optimiser_file
+            # applies to the optimiser JSON. The cached _hourly_p50_* buckets stay
+            # raw: bands are recomputed nightly, so the cache must hold the
+            # model's own numbers.
             raw_hourly = fcast.get("_hourly_p50_today", {})
+            try:
+                hour_factor = float(fcast.get("biasFactorToday", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                hour_factor = 1.0
             hourly = {}
             for key in sorted(raw_hourly.keys()):
                 wh = raw_hourly[key]
@@ -1820,7 +1849,7 @@ class Plugin(indigo.PluginBase):
                     hour = int(str(key).split(" ")[1].split(":")[0])
                 except (IndexError, ValueError):
                     continue
-                hourly[f"{hour:02d}:00"] = round(wh / 1000.0, 2)
+                hourly[f"{hour:02d}:00"] = round(wh / 1000.0 * hour_factor, 2)
 
             # Self-sufficiency
             home_kwh   = store.get("home_daily_kwh", 0.0)

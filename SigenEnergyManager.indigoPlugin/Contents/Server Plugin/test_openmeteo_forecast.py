@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 # Filename:    test_openmeteo_forecast.py
 # Description: Unit tests for OpenMeteoForecast bias-correction maths
-# Author:      CliveS & Claude Opus 4.7
-# Date:        22-05-2026
-# Version:     1.1
+# Author:      CliveS & Claude Opus 4.8
+# Date:        19-07-2026
+# Version:     1.2
+# 1.2 — added TestRemainingToday for v1.7 of the module under test (bias-corrected,
+#       current-hour-pro-rated remainingTodayKwh). Every case passes an explicit
+#       `now=` so the suite never depends on the wall clock.
 # 1.1 — added TestComputeCorrectionBands, TestApplyBandCorrection, and rewrote
 #       TestBiasFactorNotApplied as TestBiasFactorApplied for v1.3 of the
 #       module under test.
@@ -13,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -315,6 +319,117 @@ class TestBiasFactorApplied(unittest.TestCase):
         })
         self.assertEqual(enriched["correctedTodayKwh"],    30.0)
         self.assertEqual(enriched["correctedTomorrowKwh"], 50.0)
+
+
+class TestRemainingToday(unittest.TestCase):
+    """v1.7 (19-Jul-2026): _remaining_today_kwh — bias-corrected + pro-rated.
+
+    Regression cover for the Energy-page bug where the card read "38.3 kWh today,
+    forecast 53, Remaining 25.3" — Remaining was summed off the RAW buckets while
+    the forecast beside it was bias-corrected, and the whole current hour counted
+    as still to come.
+
+    Every case passes an explicit `now=` so nothing here depends on the wall clock.
+    """
+
+    # A simple day: 1 kWh in each of 06:00-11:00, nothing outside. Raw total 6 kWh.
+    HOURLY = {f"2026-07-19 {h:02d}:00:00": (1000 if 6 <= h <= 11 else 0)
+              for h in range(24)}
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_current_hour_is_pro_rated(self):
+        """Half way through 09:00 → that bucket contributes half; 10 + 11 in full."""
+        self.assertEqual(
+            self.f._remaining_today_kwh(self.HOURLY, 1.0,
+                                        now=datetime(2026, 7, 19, 9, 30)),
+            2.5,
+        )
+
+    def test_on_the_hour_counts_the_whole_bucket(self):
+        """Nothing of 09:00 elapsed yet → 09 + 10 + 11 in full."""
+        self.assertEqual(
+            self.f._remaining_today_kwh(self.HOURLY, 1.0,
+                                        now=datetime(2026, 7, 19, 9, 0)),
+            3.0,
+        )
+
+    def test_band_factor_is_applied(self):
+        """Result lands on the corrected scale, not the raw one.
+
+        Factor chosen to avoid a .x5 result — the helper rounds to 1 dp to match
+        the published field's precision, so a half-way value would test rounding
+        rather than the scaling this case is about.
+        """
+        self.assertEqual(
+            self.f._remaining_today_kwh(self.HOURLY, 0.6,
+                                        now=datetime(2026, 7, 19, 9, 30)),
+            1.5,   # 2.5 raw × 0.6
+        )
+
+    def test_before_dawn_equals_whole_corrected_day(self):
+        """The invariant that proves the scale matches correctedTodayKwh:
+        remaining before any generation == raw daily total × the day's factor."""
+        self.assertEqual(
+            self.f._remaining_today_kwh(self.HOURLY, 0.915,
+                                        now=datetime(2026, 7, 19, 3, 0)),
+            round(6.0 * 0.915, 1),
+        )
+
+    def test_after_dusk_is_zero(self):
+        self.assertEqual(
+            self.f._remaining_today_kwh(self.HOURLY, 1.0,
+                                        now=datetime(2026, 7, 19, 21, 15)),
+            0.0,
+        )
+
+    def test_empty_and_missing_buckets_return_zero(self):
+        self.assertEqual(self.f._remaining_today_kwh({}, 1.0,
+                                                     now=datetime(2026, 7, 19, 9, 0)), 0.0)
+        self.assertEqual(self.f._remaining_today_kwh(None, 1.0,
+                                                     now=datetime(2026, 7, 19, 9, 0)), 0.0)
+
+    def test_malformed_key_is_skipped_not_fatal(self):
+        """One bad key must not cost us the rest of the day's forecast."""
+        buckets = dict(self.HOURLY)
+        buckets["not-a-timestamp"] = 5000
+        self.assertEqual(
+            self.f._remaining_today_kwh(buckets, 1.0,
+                                        now=datetime(2026, 7, 19, 9, 0)),
+            3.0,
+        )
+
+    def test_aware_now_is_accepted(self):
+        """_now_local returns a tz-aware datetime under pytz — bucket keys are
+        naive, so the helper must strip tz rather than raise on the comparison."""
+        try:
+            import pytz
+        except ImportError:
+            self.skipTest("pytz not installed")
+        aware = pytz.timezone("Europe/London").localize(datetime(2026, 7, 19, 9, 30))
+        self.assertEqual(self.f._remaining_today_kwh(self.HOURLY, 1.0, now=aware), 2.5)
+
+    def test_enrich_forecast_publishes_corrected_remaining(self):
+        """End-to-end through _enrich_forecast: the published field is corrected."""
+        self.f._correction_bands = [(17.5, 1.0), (30.0, 1.0), (40.0, 1.0),
+                                    (50.0, 1.0), (65.0, 0.5)]
+        enriched = self.f._enrich_forecast({
+            "todayKwh":           65.0,     # lands squarely in the 0.5 band
+            "tomorrowKwh":        20.0,
+            "_hourly_p50_today":  self.HOURLY,
+        })
+        self.assertEqual(enriched["biasFactorToday"], 0.5)
+        # Remaining must carry the same 0.5 the headline total carries.
+        self.assertEqual(
+            enriched["remainingTodayKwh"],
+            self.f._remaining_today_kwh(self.HOURLY, 0.5),
+        )
 
 
 class TestPartialFetch(unittest.TestCase):
