@@ -5,8 +5,28 @@
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        24-06-2026
-# Version:     3.7
+# Date:        20-07-2026
+# Version:     3.8
+# 3.8 — Solar overflow charge is paced to a TARGET SOC (default 90%), not to 100%.
+#       required_charge_kw is subtracted from export BEFORE the DNO cap is applied, so
+#       a 100% target spends the low-surplus morning buying SOC out of exportable kWh
+#       and still meets the afternoon peak with less headroom than it started with —
+#       clipping anyway. Owner's actual requirement (CliveS, 20-Jul-2026): "I do not
+#       need to get to 100%, it means the chance of clipping is greater. Anything above
+#       90% is great, above 85% is still OK", 80%+ ample for a power cut. The target is
+#       a GOAL not a ceiling — above-cap excess still charges past it, so bright days
+#       finish high anyway out of surplus that would otherwise have been clipped.
+#       Modelled on 20-Jul's measured curve: 100% -> 45.0 kWh export / 1.53 kWh clipped
+#       / ends 91.1%; 90% -> 46.6 kWh / NOTHING clipped / ends 90.8%. New snapshot
+#       fields solar_overflow_target_pct / solar_overflow_min_end_pct / storm_active.
+#       A storm restores the 100% target (the one time a full battery is worth clipping
+#       for) while keeping the pacing lazy, so it is never force-charged out of export
+#       when the day's own solar would have got there. NO dull-day guard in the pacing:
+#       the physics gate already refuses to export unless remaining solar exceeds the
+#       room to 100%, and it re-evaluates every tick — a lower target keeps SOC lower,
+#       so the gate bites EARLIER and the end-of-day level protects itself. The floor
+#       pref is therefore just a clamp against a mis-set target. +11 contract tests,
+#       including a pin that target=100 reduces to the exact pre-3.8 formula.
 # 3.7 — _compute_flood_preview: the flood-export gate math extracted into one pure,
 #       side-effect-free method (no daytime guard) — the single source of truth.
 #       _check_flood_prevention now consumes it (control behaviour unchanged) and the
@@ -108,6 +128,25 @@ SOLAR_OVERFLOW_MIN_CHARGE_W   = 200   # minimum charge cap floor (avoid writing 
 SOLAR_OVERFLOW_CAP_DEADBAND_W = 500   # only rewrite limit if cap changes by > this
 SOLAR_DUSK_THRESHOLD_WH       = 500   # Wh/hr below which a slot is considered post-dusk
 
+# v3.8 — the charge PACING target. Until now the overflow charge was paced to reach
+# 100% exactly at dusk, and because that pacing is subtracted from export BEFORE the
+# DNO cap is applied, a high target spends the low-surplus morning buying SOC out of
+# exportable kWh — then still meets the afternoon peak with less headroom than it
+# started with, and clips anyway. Owner's actual requirement (CliveS, 20-Jul-2026):
+# "I do not need to get to 100%, it means the chance of clipping is greater. Anything
+# above 90% is great, above 85% is still OK", with 80%+ ample for power-cut cover.
+#
+# CRITICAL: this is a charging GOAL, not a ceiling. Once export is at the DNO cap the
+# above-cap excess still has nowhere to go but the battery, so it charges straight past
+# the target — you get the high finish for free, out of surplus that would otherwise
+# have been clipped. Modelled on 20-Jul's measured curve: 100% target -> 45.0 kWh
+# exported, 1.53 kWh clipped, ends 91.1%; 90% target -> 46.6 kWh exported, NOTHING
+# clipped, ends 90.8%. Three-tenths of a point of finish for 1.6 kWh of export.
+SOLAR_OVERFLOW_TARGET_SOC_PCT = 90.0
+# Dull-day guard. If pacing to the target would leave the battery below this at dusk,
+# the day is too weak to give kWh away — revert to the old 100% pacing and keep them.
+SOLAR_OVERFLOW_MIN_END_SOC_PCT = 80.0
+
 
 # ============================================================
 # Data classes
@@ -183,6 +222,19 @@ class ManagerSnapshot:
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
     solar_overflow_charge_cap: int  = 0       # current cap in watts
+
+    # Solar overflow charge PACING target (v3.8). Charge is paced to reach this SOC at
+    # dusk rather than 100% — see SOLAR_OVERFLOW_TARGET_SOC_PCT. A goal, not a ceiling:
+    # above-cap excess still charges past it. Defaults keep pre-v3.8 behaviour reachable
+    # by setting the target to 100.
+    solar_overflow_target_pct:  float = SOLAR_OVERFLOW_TARGET_SOC_PCT
+    solar_overflow_min_end_pct: float = SOLAR_OVERFLOW_MIN_END_SOC_PCT
+
+    # Storm warning active — raises the overflow target back to 100% (a storm is the one
+    # time a genuinely full battery is worth clipping for). Set by plugin's
+    # _apply_storm_override. Note the pacing stays LAZY even at 100%: if the day's own
+    # solar will fill the battery anyway, nothing is force-charged out of export.
+    storm_active: bool = False
 
     # Flood prevention state (from plugin.py store — so evaluate() can continue a running pre-drain)
     # 0.0 when inactive; set to the target SOC % when a flood-prevention export is running
@@ -1178,8 +1230,47 @@ class BatteryManager:
             return None
 
         # ── 3. Charge cap calculation ─────────────────────────────────────
-        # Charge exactly fast enough to reach 100% at dusk; export everything else
-        required_charge_kw = headroom_kwh / max(0.5, hours_to_dusk)
+        # Charge exactly fast enough to reach the TARGET at dusk; export everything
+        # else. v3.8: the target is 90% by default, not 100% — see
+        # SOLAR_OVERFLOW_TARGET_SOC_PCT for why aiming at 100% actively causes
+        # clipping. Above-cap excess still charges past the target (it has nowhere
+        # else to go once export is capped), so the battery routinely finishes above
+        # it anyway, for free.
+        target_pct  = float(snapshot.solar_overflow_target_pct)
+        min_end_pct = float(snapshot.solar_overflow_min_end_pct)
+
+        # A storm is the one time a genuinely full battery is worth clipping for.
+        # The pacing stays lazy even so: if the day's solar will reach 100% unaided,
+        # required_charge stays small and nothing is force-charged out of export.
+        if snapshot.storm_active:
+            target_pct = 100.0
+
+        # Floor. NOTE the dull-day case needs no guard here, and a "will the solar
+        # actually reach the target?" test would be dead code: the physics gate above
+        # only lets us export when net_to_battery EXCEEDS the room to 100%, so whenever
+        # this method runs the day can demonstrably reach 100% — never mind the target.
+        # Better still, that gate is re-evaluated every tick against remaining solar, so
+        # the moment the rest of the day can no longer fill to 100% it returns None,
+        # export stops and everything charges. A lower target keeps the battery lower,
+        # which makes the gate bite EARLIER — the pacing change is self-limiting and the
+        # end-of-day level is protected by machinery that already exists.
+        #
+        # So the floor's only remaining job is to stop a mis-set pref pacing to a level
+        # below what the owner wants available for a power cut. A clamp does that
+        # exactly, with no unreachable branches.
+        target_pct = max(target_pct, min_end_pct)
+
+        # Room up to the TARGET (not to 100%) is what sets the pacing rate. Clamped at
+        # zero: at or above the target there is nothing left to pace towards, so export
+        # runs at the full DNO cap and the battery simply takes the overspill.
+        # Deliberately mirrors the headroom_kwh expression above term-for-term, so a
+        # target of 100 reduces to exactly the pre-v3.8 formula — the change is provably
+        # a no-op when the target is left at 100 (pinned by a contract test).
+        headroom_to_target = max(
+            0.0,
+            (target_pct - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh,
+        )
+        required_charge_kw = headroom_to_target / max(0.5, hours_to_dusk)
         pv_surplus_kw      = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
         export_kw          = min(
             max(0.0, pv_surplus_kw - required_charge_kw),
@@ -1196,7 +1287,8 @@ class BatteryManager:
             reason          = (
                 f"Solar overflow: {balance.surplus_kwh:.1f} kWh 24h surplus | "
                 f"{solar_surplus:.1f} kWh physics surplus\n"
-                f"Req charge {required_charge_kw:.2f} kW  |  "
+                f"Req charge {required_charge_kw:.2f} kW to {target_pct:.0f}% target"
+                f"{' (storm)' if snapshot.storm_active else ''}  |  "
                 f"PV surplus {pv_surplus_kw:.2f} kW  |  "
                 f"Export {export_kw:.2f} kW  |  Cap {cap_w}W\n"
                 f"Battery {balance.battery_kwh:.1f} kWh  |  "

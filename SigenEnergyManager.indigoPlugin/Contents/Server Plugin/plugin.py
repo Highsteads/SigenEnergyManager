@@ -7,7 +7,41 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        20-07-2026
-# Version:     5.50.0
+# Version:     5.51.0
+# 5.51.0 — Daytime charge is paced to a 90% target, not 100% (battery_manager 3.7→3.8).
+#   The same root cause as 5.50.0, one layer down: the plugin kept treating 100% as the
+#   goal when the owner's requirement is 85-90%. Solar overflow paced the charge to hit
+#   100% exactly at dusk, and because `required_charge_kw` is subtracted from export
+#   BEFORE the DNO cap is applied, that high target spent the low-surplus MORNING buying
+#   SOC out of kWh that would have fitted under the cap — then still met the afternoon
+#   peak with less headroom than it started with, and clipped anyway. CliveS, 20-Jul:
+#   "I do not need to get to 100%, it means the chance of clipping is greater. Anything
+#   above 90% is great, above 85% is still OK", with 80%+ ample for a power cut.
+#   The target is a GOAL, not a ceiling. Once export is at the cap the above-cap excess
+#   still has nowhere to go but the battery, so it charges straight past the target —
+#   the high finish comes free, out of surplus that would otherwise have been binned.
+#   Modelled on 20-Jul's measured curve (dull ~5.1 kW morning, breaking clear to 8.59 kW
+#   at 14:00): 100% target -> 45.0 kWh exported, 1.53 kWh CLIPPED, ends 91.1%. 90%
+#   target -> 46.6 kWh exported, NOTHING clipped, ends 90.8%. Three-tenths of a point of
+#   finish for 1.6 kWh of export and the elimination of the waste.
+#   New prefs `solarOverflowTargetSoc` (90) + `solarOverflowMinEndSoc` (80), guarded;
+#   new snapshot fields solar_overflow_target_pct / solar_overflow_min_end_pct /
+#   storm_active. `_apply_storm_override` sets storm_active, which restores the 100%
+#   target — a storm is the one time a genuinely full battery is worth clipping for —
+#   while KEEPING the lazy pacing, so it is never force-charged out of export when the
+#   day's own solar would have reached 100% unaided (CliveS's explicit constraint).
+#   NO dull-day guard in the pacing, and this is the interesting bit: the contract tests
+#   proved one would be dead code. The physics gate above it only exports when remaining
+#   solar EXCEEDS the room to 100%, so whenever overflow runs the day can demonstrably
+#   reach 100% — and the gate re-evaluates every tick, so the moment the rest of the day
+#   can no longer fill the battery it returns None, export stops and everything charges.
+#   A lower target keeps SOC lower, which makes that gate bite EARLIER: the pacing change
+#   is self-limiting and the end-of-day level is protected by machinery already present.
+#   The floor pref is therefore just a clamp against a mis-set target. Caveat recorded
+#   honestly: because the gate cuts export earlier in the afternoon, the real-world gain
+#   will be somewhat below the 1.6 kWh the model shows (the model has no gate).
+#   +11 contract tests (344 → 355), including a pin that target=100 reduces to the exact
+#   pre-3.8 formula, so the change is provably a no-op at the old setting.
 # 5.50.0 — Post-power-cut export lockout is now FORECAST-aware as well as SOC-aware.
 #   Prompted by a live incident this morning: the grid dropped for 109 SECONDS at
 #   05:25:54 (restored 05:27:43) and the standard 4-hour lockout armed at SOC 75.6%.
@@ -971,6 +1005,7 @@ from battery_manager  import (
     ACTION_VPP_EXPORT,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
+    SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
 )
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
@@ -4095,6 +4130,12 @@ class Plugin(indigo.PluginBase):
             vpp_tomorrow_kwh            = vpp_tomorrow_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
+            solar_overflow_target_pct   = _as_float(prefs.get("solarOverflowTargetSoc"),
+                                                    SOLAR_OVERFLOW_TARGET_SOC_PCT),
+            solar_overflow_min_end_pct  = _as_float(prefs.get("solarOverflowMinEndSoc"),
+                                                    SOLAR_OVERFLOW_MIN_END_SOC_PCT),
+            # storm_active is set by _apply_storm_override AFTER the snapshot is built
+            # (it already mutates dawn_target_pct/export_enabled there) — see step 4.
             flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
         )
 
@@ -4142,9 +4183,17 @@ class Plugin(indigo.PluginBase):
         else:
             self.store["storm_override_logged_level"] = None
             self.store["storm_export_suppressed"]     = False
+            snapshot.storm_active                     = False
             return
 
         snapshot.dawn_target_pct = max(snapshot.dawn_target_pct, override_soc)
+        # v5.51.0: restore the 100% solar-overflow charge target for the duration. A
+        # storm is the one time a genuinely full battery is worth clipping for. The
+        # pacing stays lazy even then — if the day's own solar reaches 100% unaided,
+        # required_charge stays small and nothing is force-charged out of export, which
+        # is CliveS's explicit constraint: don't ram the battery full ahead of a storm
+        # when the sun was going to do it anyway.
+        snapshot.storm_active = True
 
         # Release point can never sit below the active reserve target — below the
         # target we genuinely want max charge (overflow off) to fill fast for a cut.

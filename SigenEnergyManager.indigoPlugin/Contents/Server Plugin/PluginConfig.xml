@@ -249,6 +249,18 @@
     <Field id="powerCutLockoutMinSocPctInfo" type="label">
         <Label>Export also resumes during the lockout when the day's remaining solar comfortably refills the battery to the floor above on its own — on a bright summer morning, holding export off banks nothing the sun wasn't going to deliver anyway, and only risks driving the battery to 100% and clipping everything above your export cap. This setting is the safety line: however good the forecast looks, that early release never applies below this percentage, because a nearly-empty battery is not a resilience reserve. On a winter night, with no solar to come, the SOC floor above governs on its own. Default 50.</Label>
     </Field>
+    <Field id="solarOverflowTargetSoc" type="textfield" defaultValue="90">
+        <Label>Daytime charge target (%):</Label>
+    </Field>
+    <Field id="solarOverflowTargetSocInfo" type="label">
+        <Label>On a sunny day the battery charge is paced to reach this level by dusk, and everything spare is exported. This is a target, not a limit — once export is running at your DNO cap, surplus solar has nowhere else to go and keeps charging the battery past it, so most bright days still finish near full. Aiming at 100% is counter-productive: the pacing is taken out of export before the cap is applied, so a high target spends the morning giving away exportable units to buy charge, and still meets the afternoon peak with less room to absorb it. Default 90.</Label>
+    </Field>
+    <Field id="solarOverflowMinEndSoc" type="textfield" defaultValue="80">
+        <Label>Daytime charge target floor (%):</Label>
+    </Field>
+    <Field id="solarOverflowMinEndSocInfo" type="label">
+        <Label>Safety net for dull days. If pacing to the target above would still leave the battery below this level at dusk, the day is too weak to be giving units away — the target reverts to 100% and every spare unit is kept in the battery instead of exported. Set this to the level you want available for a power cut. Default 80.</Label>
+    </Field>
     <Field id="stormExportReleasePct" type="textfield" defaultValue="85">
         <Label>Storm export release SOC (%):</Label>
     </Field>

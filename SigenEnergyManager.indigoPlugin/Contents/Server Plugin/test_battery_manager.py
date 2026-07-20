@@ -24,6 +24,9 @@ from battery_manager import (
     TARIFF_TRACKER,
     TARIFF_GO,
     FLOOD_PREV_TARGET_PCT,
+    SufficiencyBalance,
+    SOLAR_OVERFLOW_TARGET_SOC_PCT,
+    SOLAR_OVERFLOW_MIN_END_SOC_PCT,
 )
 
 
@@ -1501,6 +1504,142 @@ class TestFloodContinuationGuards(unittest.TestCase):
         self.assertIsNotNone(d)
         self.assertEqual(d.action, ACTION_START_EXPORT)
         self.assertAlmostEqual(d.target_soc_pct, 40.0)
+
+
+class TestSolarOverflowChargeTarget(unittest.TestCase):
+    """v3.8: the overflow charge is paced to a TARGET SOC (default 90%), not to 100%.
+
+    Aiming at 100% actively causes clipping: required_charge is subtracted from export
+    BEFORE the DNO cap is applied, so a high target spends the low-surplus morning
+    buying SOC out of exportable kWh, then still meets the afternoon peak with less
+    headroom than it started with. Modelled on 20-Jul-2026's measured curve, a 90%
+    target exported 1.6 kWh more, clipped nothing (vs 1.53 kWh) and still finished at
+    90.8% vs 91.1%.
+
+    The target is a GOAL, not a ceiling — above-cap excess still charges past it.
+    """
+
+    CAP = 35.04
+
+    def _snap(self, soc_pct=77.0, pv_w=8500, home_w=750, target=None,
+              min_end=None, storm=False, max_export_kw=4.0):
+        return ManagerSnapshot(
+            current_soc_pct           = soc_pct,
+            capacity_kwh              = self.CAP,
+            export_enabled            = True,
+            max_export_kw             = max_export_kw,
+            pv_watts                  = pv_w,
+            house_load_watts          = home_w,
+            solar_overflow_target_pct = (SOLAR_OVERFLOW_TARGET_SOC_PCT
+                                         if target is None else target),
+            solar_overflow_min_end_pct= (SOLAR_OVERFLOW_MIN_END_SOC_PCT
+                                         if min_end is None else min_end),
+            storm_active              = storm,
+        )
+
+    def _bal(self, soc_pct=77.0, remaining_solar=26.0, home_to_dusk=6.6,
+             hours_to_dusk=7.0, surplus=36.0):
+        return SufficiencyBalance(
+            battery_kwh                = soc_pct / 100.0 * self.CAP,
+            remaining_solar_kwh        = remaining_solar,
+            remaining_home_to_dusk_kwh = home_to_dusk,
+            is_daytime                 = True,
+            hours_to_dusk              = hours_to_dusk,
+            surplus_kwh                = surplus,
+        )
+
+    def _decide(self, **kw):
+        snap_kw = {k: v for k, v in kw.items()
+                   if k in ("soc_pct", "pv_w", "home_w", "target", "min_end",
+                            "storm", "max_export_kw")}
+        bal_kw  = {k: v for k, v in kw.items()
+                   if k in ("remaining_solar", "home_to_dusk", "hours_to_dusk", "surplus")}
+        soc = kw.get("soc_pct", 77.0)
+        return BatteryManager()._check_solar_overflow(
+            self._snap(**snap_kw), self._bal(soc_pct=soc, **bal_kw)
+        )
+
+    # ── The headline behaviour ─────────────────────────────────────────────
+    def test_lower_target_exports_more_in_the_morning(self):
+        """The whole point, and it bites exactly where the money was being lost: on a
+        MORNING surplus that already fits under the DNO cap. At 4.05 kW surplus the
+        100% target skims 1.15 kW off for charge, the 90% target only 0.65 kW — so
+        half a kW that used to be stored is exported instead, and the battery arrives
+        at the afternoon peak with more room. (At full midday surplus both hit the cap
+        and look identical, which is why the morning is the case that matters.)"""
+        at_90  = self._decide(target=90.0,  pv_w=4700, home_w=650)
+        at_100 = self._decide(target=100.0, pv_w=4700, home_w=650)
+        self.assertIsNotNone(at_90)
+        self.assertIsNotNone(at_100)
+        self.assertGreater(at_90.export_kw, at_100.export_kw)
+        self.assertLess(at_90.power_watts, at_100.power_watts)   # smaller charge cap
+
+    def test_midday_both_targets_pin_to_the_export_cap(self):
+        """Characterisation: once surplus exceeds cap + required, the target makes no
+        difference to export — the excess simply charges the battery either way."""
+        at_90  = self._decide(target=90.0)
+        at_100 = self._decide(target=100.0)
+        self.assertAlmostEqual(at_90.export_kw, 4.0, places=6)
+        self.assertAlmostEqual(at_100.export_kw, 4.0, places=6)
+
+    def test_target_of_100_is_identical_to_pre_v38(self):
+        """Regression pin: the formula reduces EXACTLY to the old one at target=100.
+        headroom = (100 - soc)/100 * cap, required = headroom / hours_to_dusk."""
+        d = self._decide(target=100.0, soc_pct=77.0, hours_to_dusk=7.0,
+                         pv_w=4700, home_w=650)
+        expected_req = (100.0 - 77.0) / 100.0 * self.CAP / 7.0
+        surplus_kw   = (4700 - 650) / 1000.0
+        self.assertAlmostEqual(d.export_kw, min(surplus_kw - expected_req, 4.0), places=6)
+
+    def test_at_or_above_target_paces_at_zero_and_exports_full_cap(self):
+        """Above the target there is nothing to pace towards — export runs at the cap
+        and the battery simply takes the overspill (the 'goal not ceiling' property)."""
+        d = self._decide(soc_pct=93.0, target=90.0)
+        self.assertAlmostEqual(d.export_kw, 4.0, places=6)
+
+    def test_excess_above_export_cap_still_charges_past_the_target(self):
+        """8.5 kW PV - 0.75 kW home = 7.75 kW surplus, only 4 kW can leave. The rest
+        MUST go to the battery even though we are already over the 90% target."""
+        d = self._decide(soc_pct=93.0, target=90.0)
+        self.assertAlmostEqual(d.power_watts, 8500 - 750 - 4000, delta=1)
+
+    # ── Floor clamp ────────────────────────────────────────────────────────
+    def test_target_below_the_floor_is_clamped_up(self):
+        """A mis-set pref must never pace below the level wanted for a power cut."""
+        d = self._decide(target=60.0, min_end=80.0)
+        self.assertIn("to 80% target", d.reason)
+
+    def test_target_above_the_floor_is_left_alone(self):
+        d = self._decide(target=90.0, min_end=80.0)
+        self.assertIn("to 90% target", d.reason)
+
+    def test_physics_gate_already_protects_a_dull_day(self):
+        """Documents WHY no dull-day guard is needed in the pacing. When the remaining
+        solar can no longer fill the battery to 100%, the physics gate declines to
+        export at all and everything charges — so a low target can never strand the
+        battery. A lower target keeps SOC lower, which makes this bite EARLIER."""
+        d = self._decide(soc_pct=55.0, target=90.0,
+                         remaining_solar=9.0, home_to_dusk=5.0)
+        self.assertIsNone(d)
+
+    # ── Storm ──────────────────────────────────────────────────────────────
+    def test_storm_restores_the_100_pct_target(self):
+        d = self._decide(target=90.0, storm=True)
+        self.assertIn("to 100% target", d.reason)
+        self.assertIn("(storm)", d.reason)
+
+    def test_storm_pacing_stays_lazy_not_a_force_charge(self):
+        """CliveS's constraint: a storm raises the target but must not ram the battery
+        full out of export when the day's own solar would get there anyway. Charge is
+        still only the paced rate, never the whole surplus."""
+        d = self._decide(target=90.0, storm=True, soc_pct=77.0)
+        surplus_w = 8500 - 750
+        self.assertLess(d.power_watts, surplus_w)
+        self.assertGreater(d.export_kw, 0.0)
+
+    def test_defaults(self):
+        self.assertEqual(SOLAR_OVERFLOW_TARGET_SOC_PCT, 90.0)
+        self.assertEqual(SOLAR_OVERFLOW_MIN_END_SOC_PCT, 80.0)
 
 
 # Provide time module alias so the Modbus test above can grab a baseline timestamp
