@@ -6,8 +6,49 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        19-07-2026
-# Version:     5.49.0
+# Date:        20-07-2026
+# Version:     5.50.0
+# 5.50.0 — Post-power-cut export lockout is now FORECAST-aware as well as SOC-aware.
+#   Prompted by a live incident this morning: the grid dropped for 109 SECONDS at
+#   05:25:54 (restored 05:27:43) and the standard 4-hour lockout armed at SOC 75.6%.
+#   The flat 85% floor (v5.34/5.35) then held export off until 07:36:07 while the
+#   battery climbed to the floor — 2h 08m of no export, ~3.3 kWh banked instead of
+#   sold. Every one of those kWh was exportable at the time: PV surplus ran
+#   1.1-4.25 kW, comfortably inside the 4 kW DNO cap. The bill came due in the
+#   afternoon. By 13:28 the battery was at 91.6% with only ~2.9 kWh of headroom
+#   against 6.8 kW of PV, so once the washing machine finished the pack would fill
+#   and every watt above house+4 kW would be CLIPPED — thrown away, because the DNO
+#   cap leaves nowhere for it to go. Without the lockout we'd have been at ~82% with
+#   ~6.2 kWh of headroom and clipped nothing. The lockout had converted exportable
+#   morning kWh into afternoon curtailment. Underlining it: the overnight optimiser
+#   had already computed the day's actual power-cut resilience minimum as 10% (3.5
+#   kWh), while the lockout insisted on banking to 85%.
+#   FIX: a SECOND, strictly-additional release condition (`_solar_refill_releases_
+#   lockout`, pure + unit-tested). Export also resumes mid-lockout once the day's
+#   remaining solar, net of house load to dusk, covers the gap up to the SOC floor
+#   with a 1.25x margin — because on a bright summer morning holding export off
+#   banks nothing the sun wasn't going to deliver anyway. Guarded by a new
+#   `powerCutLockoutMinSocPct` floor (default 50): however good the forecast, the
+#   early release never applies to a nearly-empty battery, which is not a resilience
+#   reserve. Deliberately expressed in kWh, not SOC percent — an SOC-space form
+#   (projected >= floor x margin) is unsatisfiable at the defaults since 85 x 1.25 =
+#   106 > 100. Replayed against this morning's logged figures it releases at the
+#   first daytime tick (~06:00) instead of 07:36; a winter night, a dull December
+#   day, an unknown SOC and a below-minimum battery all still hold.
+#   Plumbing: `_power_cut_window_active()` extracted from `_resolve_export_lockout`
+#   so `_evaluate_manager_impl` can build a provisional snapshot + SufficiencyBalance
+#   ONLY inside a lockout window (both calls are pure and side-effect free; outside a
+#   window — nearly always — normal ticks pay nothing). `_resolve_export_lockout`
+#   takes an optional `balance`; omitting it reproduces pre-5.50 behaviour exactly,
+#   and a failure building the balance falls back to the flat floor. The one-shot
+#   "export re-enabled during lockout" INFO now names WHICH rule released it, and is
+#   no longer able to crash formatting an unknown SOC (reachable when export is
+#   disabled mid-window). Dashboard `power_cut` block gains `lockout_min_soc` +
+#   `solar_release_active` so the Lockout chip can explain itself.
+#   NOT applied to the storm override, despite the two mirroring each other since
+#   v5.39: a storm forecast means the solar may not arrive, so releasing export on
+#   the strength of a forecast is exactly wrong there. Commented in both places so
+#   nobody "restores symmetry" later. +22 tests (344 total, all green).
 # 5.49.0 — Solar card figures reconciled. The Energy page read "38.3 kWh today,
 #   forecast 53, Remaining 25.3" — figures that cannot be added up. Two causes,
 #   both in how remainingTodayKwh was derived (openmeteo_forecast.py 1.6 → 1.7):
@@ -1084,6 +1125,26 @@ POWER_CUT_LOCKOUT_HOURS = 4.0
 # precaution holds.
 POWER_CUT_LOCKOUT_SOC_FLOOR = 85.0
 
+# v5.50.0 — second, STRICTLY-ADDITIONAL release condition for the lockout (see
+# _solar_refill_releases_lockout). A flat SOC floor cannot tell a January night
+# from a July morning: on 20-Jul-2026 a 109-SECOND grid blip at 05:25 armed the
+# lockout at SOC 75.6%, and export stayed off until 07:36 while the battery
+# climbed to the 85% floor. Those ~3.3 kWh were all exportable under the 4 kW DNO
+# cap at the time, and banking them instead cost us the afternoon headroom that
+# would otherwise have absorbed the above-cap peak — so the lockout converted
+# exportable morning kWh into afternoon curtailment. The overnight optimiser had
+# already computed the day's actual power-cut resilience minimum as 10%.
+#
+# Never release on the strength of a forecast below this SOC, however good the day
+# looks — a nearly-empty battery is not a resilience reserve, and the whole point
+# of the lockout is that the grid has just proved itself unreliable.
+POWER_CUT_LOCKOUT_MIN_SOC_PCT = 50.0
+# Today's remaining surplus must exceed the gap-to-floor by this factor before we
+# trust it. remaining_solar_kwh is already bias-corrected (battery_manager applies
+# snapshot.bias_factor), so this is belt-and-braces on a calibrated figure rather
+# than a hedge against raw forecast optimism.
+POWER_CUT_LOCKOUT_REFILL_MARGIN = 1.25
+
 
 def _export_locked_out(within_window, soc_pct, soc_floor):
     """Pure decision: should export be suppressed by the post-power-cut lockout?
@@ -1098,6 +1159,43 @@ def _export_locked_out(within_window, soc_pct, soc_floor):
     if soc_pct is None:
         return True
     return soc_pct < soc_floor
+
+
+def _solar_refill_releases_lockout(is_daytime, soc_pct, min_soc_pct, battery_kwh,
+                                   floor_kwh, remaining_solar_kwh, home_to_dusk_kwh,
+                                   margin=POWER_CUT_LOCKOUT_REFILL_MARGIN):
+    """Pure decision: does today's own solar make the lockout reserve self-refilling?
+
+    Returns True when the day's remaining generation (net of house load to dusk)
+    comfortably covers the gap between where the battery is now and the lockout
+    SOC floor. In that case holding export off banks NOTHING the sun wasn't going
+    to deliver anyway — it just risks driving the battery to 100% and clipping
+    every watt above the DNO export cap. This is a release-EARLY condition only:
+    the caller ORs it with the flat SOC floor, so it can never hold export off for
+    longer than the floor alone would.
+
+    Deliberately expressed in kWh rather than as an SOC percentage: an SOC-space
+    formulation like `projected_dusk_pct >= floor_pct * margin` is unsatisfiable
+    whenever `floor_pct * margin > 100` (85 * 1.25 = 106), because the projection
+    is capped at the battery's physical capacity.
+
+    Fail-safe in the same direction as _export_locked_out — night, unknown SOC, or
+    a battery below min_soc_pct all return False, which HOLDS the lockout.
+
+    NOT used by the storm override, which solves the same clipping problem via
+    STORM_EXPORT_RELEASE_PCT. That is deliberate: a storm forecast means the solar
+    may not arrive at all, so releasing export because a forecast looks good is
+    exactly the wrong call there. Do not "restore symmetry" between the two.
+    """
+    if not is_daytime or soc_pct is None:
+        return False
+    if soc_pct < min_soc_pct:
+        return False
+    needed = max(0.0, floor_kwh - battery_kwh)
+    if needed <= 0.0:
+        return True          # already at/above the floor — nothing left to bank
+    surplus = max(0.0, remaining_solar_kwh - home_to_dusk_kwh)
+    return surplus >= needed * margin
 
 
 # VPP state machine values
@@ -2028,6 +2126,11 @@ class Plugin(indigo.PluginBase):
                     "lockout_active": store.get("power_cut_lockout_active", False),
                     "export_suppressed": store.get("power_cut_export_suppressed", False),
                     "lockout_soc_floor": self._power_cut_lockout_soc_floor(),
+                    "lockout_min_soc": self._power_cut_lockout_min_soc(),
+                    # True when export is running mid-lockout because today's solar
+                    # refills the reserve on its own — lets the Lockout chip explain
+                    # itself rather than looking like a bug.
+                    "solar_release_active": store.get("power_cut_solar_release", False),
                 },
                 "forecast_accuracy": (
                     self.forecast.get_accuracy_summary(window_days=7)
@@ -3626,8 +3729,26 @@ class Plugin(indigo.PluginBase):
 
         soc_pct = self.latest_inverter_data.get("batterySoc", 0.0)
 
-        # 1. Power cut lockout (SOC-aware — see _resolve_export_lockout)
-        export_enabled = self._resolve_export_lockout(soc_pct)
+        # 1. Power cut lockout (SOC- and forecast-aware — see _resolve_export_lockout).
+        #    The solar-refill release needs the energy balance, which normally isn't
+        #    built until step 3, so inside a lockout window we build a provisional
+        #    snapshot first purely to obtain it. Both calls are pure (no side
+        #    effects, no disk I/O) and safe to repeat, and a lockout window is a
+        #    rare state — outside one, normal ticks pay nothing for this.
+        lockout_balance = None
+        if self._power_cut_window_active():
+            try:
+                provisional = self._build_manager_snapshot(
+                    soc_pct, bool(self.pluginPrefs.get("exportEnabled", False)), 0.0,
+                )
+                lockout_balance = self.manager._calculate_24h_balance(provisional)
+            except Exception as exc:
+                # Never let the release calculation break the lockout itself —
+                # balance=None simply falls back to the flat SOC floor.
+                log(f"[PowerCut] Could not build balance for the solar-refill "
+                    f"release ({exc!r}) — falling back to the SOC floor",
+                    level="WARNING")
+        export_enabled = self._resolve_export_lockout(soc_pct, lockout_balance)
 
         # 2. VPP reserve
         vpp_reserved_kwh = self._compute_vpp_reserved_kwh()
@@ -3703,6 +3824,13 @@ class Plugin(indigo.PluginBase):
         return _as_float(self.pluginPrefs.get("powerCutLockoutSocFloor"),
                          POWER_CUT_LOCKOUT_SOC_FLOOR)
 
+    def _power_cut_lockout_min_soc(self):
+        """SOC floor (%) below which the solar-refill release never applies.
+        Reads the powerCutLockoutMinSocPct pref, guarded, defaulting to the
+        POWER_CUT_LOCKOUT_MIN_SOC_PCT constant."""
+        return _as_float(self.pluginPrefs.get("powerCutLockoutMinSocPct"),
+                         POWER_CUT_LOCKOUT_MIN_SOC_PCT)
+
     def _storm_export_release_pct(self):
         """SOC (%) at/above which the storm override stops suppressing export.
         Reads the stormExportReleasePct pref, guarded, defaulting to the
@@ -3711,7 +3839,41 @@ class Plugin(indigo.PluginBase):
         return _as_float(self.pluginPrefs.get("stormExportReleasePct"),
                          STORM_EXPORT_RELEASE_PCT)
 
-    def _resolve_export_lockout(self, soc_pct=None):
+    def _power_cut_window_active(self):
+        """True while inside the POWER_CUT_LOCKOUT_HOURS window after a restore.
+
+        The window is purely time-based (decoupled from the export pref) so the
+        cleared-event fires on real expiry, not immediately when export happens to
+        be disabled.
+
+        Defensive parsing: a hand-edited or corrupt pluginPrefs value (naive ISO,
+        garbage string, or wrong type) must NEVER fail-open and let export resume
+        during the lockout window. On parse failure we clear the bad value (so it
+        doesn't block forever) and resume normal operation.
+
+        Extracted from _resolve_export_lockout in v5.50.0 so _evaluate_manager_impl
+        can cheaply ask "are we in a lockout?" before deciding whether the extra
+        energy-balance calculation for the solar-refill release is worth doing.
+        """
+        prt_str = self.pluginPrefs.get("powerRestoredTime", "")
+        if not prt_str:
+            return False
+        try:
+            power_restored = datetime.fromisoformat(prt_str)
+            if power_restored.tzinfo is None:
+                power_restored = power_restored.replace(tzinfo=timezone.utc)
+            hours_since = (datetime.now(timezone.utc) - power_restored).total_seconds() / 3600.0
+            return hours_since < POWER_CUT_LOCKOUT_HOURS
+        except (ValueError, TypeError, AttributeError) as exc:
+            log(
+                f"[PowerCut] Bad powerRestoredTime in prefs ({exc!r}) — "
+                f"clearing and resuming normal operation",
+                level="WARNING",
+            )
+            self.pluginPrefs["powerRestoredTime"] = ""
+            return False
+
+    def _resolve_export_lockout(self, soc_pct=None, balance=None):
         """Apply the post-power-cut export lockout (returns export_enabled bool).
 
         For POWER_CUT_LOCKOUT_HOURS after the grid is restored, export is held
@@ -3723,35 +3885,17 @@ class Plugin(indigo.PluginBase):
         when SOC merely crosses the floor); `power_cut_export_suppressed` tracks
         whether export is actually held off right now.
 
-        Defensive parsing: a hand-edited or corrupt pluginPrefs value (naive ISO,
-        garbage string, or wrong type) must NEVER fail-open and let export
-        resume during the lockout window. On parse failure we clear the bad
-        value (so it doesn't block forever) and resume normal operation.
+        v5.50.0 adds a SECOND, strictly-additional release condition: pass the
+        current SufficiencyBalance as `balance` and export also resumes once
+        today's own remaining solar comfortably refills the battery to the floor
+        by itself (see _solar_refill_releases_lockout). Omitting `balance` — as
+        every pre-5.50 caller did — reproduces the old behaviour exactly.
 
-        Side effects: updates the two store flags and fires the
+        Side effects: updates the store flags and fires the
         `powerCutLockoutCleared` trigger event when the window expires.
         """
-        export_pref    = bool(self.pluginPrefs.get("exportEnabled", False))
-        prt_str        = self.pluginPrefs.get("powerRestoredTime", "")
-        within_window  = False
-
-        # The lockout WINDOW is purely time-based (decoupled from the export pref) so
-        # the cleared-event fires on real expiry, not immediately when export happens
-        # to be disabled. Suppression below still only applies when export is enabled.
-        if prt_str:
-            try:
-                power_restored = datetime.fromisoformat(prt_str)
-                if power_restored.tzinfo is None:
-                    power_restored = power_restored.replace(tzinfo=timezone.utc)
-                hours_since = (datetime.now(timezone.utc) - power_restored).total_seconds() / 3600.0
-                within_window = hours_since < POWER_CUT_LOCKOUT_HOURS
-            except (ValueError, TypeError, AttributeError) as exc:
-                log(
-                    f"[PowerCut] Bad powerRestoredTime in prefs ({exc!r}) — "
-                    f"clearing and resuming normal operation",
-                    level="WARNING",
-                )
-                self.pluginPrefs["powerRestoredTime"] = ""
+        export_pref   = bool(self.pluginPrefs.get("exportEnabled", False))
+        within_window = self._power_cut_window_active()
 
         # SOC floor: within the window, suppress export only while SOC is low AND
         # export is actually enabled (nothing to suppress otherwise).
@@ -3762,17 +3906,49 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             soc_val = None
         soc_floor  = self._power_cut_lockout_soc_floor()
-        suppressed = export_pref and _export_locked_out(within_window, soc_val, soc_floor)
-        export_enabled = export_pref and not suppressed
+        locked_out = _export_locked_out(within_window, soc_val, soc_floor)
 
-        # One-shot INFO when the SOC floor first lets export resume mid-window,
-        # so the log explains why export is running during a lockout.
+        # Solar-refill release. Only consulted while the SOC floor would otherwise
+        # hold export off, and only when the caller supplied a balance — so it can
+        # release EARLIER than the floor but never hold longer.
+        solar_release = False
+        if locked_out and balance is not None:
+            cap_kwh = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), 35.04)
+            solar_release = _solar_refill_releases_lockout(
+                is_daytime          = bool(getattr(balance, "is_daytime", False)),
+                soc_pct             = soc_val,
+                min_soc_pct         = self._power_cut_lockout_min_soc(),
+                battery_kwh         = float(getattr(balance, "battery_kwh", 0.0)),
+                floor_kwh           = soc_floor / 100.0 * cap_kwh,
+                remaining_solar_kwh = float(getattr(balance, "remaining_solar_kwh", 0.0)),
+                home_to_dusk_kwh    = float(getattr(balance, "remaining_home_to_dusk_kwh", 0.0)),
+            )
+
+        suppressed     = export_pref and locked_out and not solar_release
+        export_enabled = export_pref and not suppressed
+        self.store["power_cut_solar_release"] = bool(within_window and solar_release)
+
+        # One-shot INFO when export first resumes mid-window, naming WHICH rule
+        # released it — this line is what explains the behaviour in the event log
+        # months later. soc_val is formatted defensively: export_pref=False makes
+        # suppressed False regardless of SOC, so this can be reached with an
+        # unknown SOC.
         prev_suppressed = bool(self.store.get("power_cut_export_suppressed", False))
         if within_window and prev_suppressed and not suppressed:
-            log(
-                f"[PowerCut] SOC {soc_val:.0f}% ≥ {soc_floor:.0f}% "
-                f"floor — export re-enabled during lockout to protect solar",
-            )
+            soc_str = f"{soc_val:.0f}%" if soc_val is not None else "unknown"
+            if solar_release:
+                surplus = (float(getattr(balance, "remaining_solar_kwh", 0.0))
+                           - float(getattr(balance, "remaining_home_to_dusk_kwh", 0.0)))
+                log(
+                    f"[PowerCut] SOC {soc_str} — today's solar refills the "
+                    f"{soc_floor:.0f}% reserve on its own ({surplus:.1f} kWh surplus "
+                    f"to dusk), so export re-enabled during lockout to protect solar",
+                )
+            else:
+                log(
+                    f"[PowerCut] SOC {soc_str} ≥ {soc_floor:.0f}% "
+                    f"floor — export re-enabled during lockout to protect solar",
+                )
         self.store["power_cut_export_suppressed"] = suppressed
 
         # Detect lockout-window-cleared transition for the Indigo trigger event.

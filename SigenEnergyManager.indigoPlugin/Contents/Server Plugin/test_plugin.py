@@ -556,6 +556,127 @@ class TestLockoutSocFloorPref(unittest.TestCase):
                          plugin.POWER_CUT_LOCKOUT_SOC_FLOOR)
 
 
+class TestLockoutMinSocPref(unittest.TestCase):
+    """v5.50.0: the solar-refill release floor is configurable, guarded."""
+
+    class _Stub:
+        def __init__(self, prefs):
+            self.pluginPrefs = prefs
+
+    def _min(self, prefs):
+        return plugin.Plugin._power_cut_lockout_min_soc(self._Stub(prefs))
+
+    def test_blank_uses_default(self):
+        self.assertEqual(self._min({}), plugin.POWER_CUT_LOCKOUT_MIN_SOC_PCT)
+
+    def test_pref_overrides(self):
+        self.assertEqual(self._min({"powerCutLockoutMinSocPct": "40"}), 40.0)
+
+    def test_garbage_falls_back(self):
+        self.assertEqual(self._min({"powerCutLockoutMinSocPct": ""}),
+                         plugin.POWER_CUT_LOCKOUT_MIN_SOC_PCT)
+
+
+class TestSolarRefillReleasesLockout(unittest.TestCase):
+    """v5.50.0: the second, strictly-additional lockout release — today's own solar
+    refills the reserve, so holding export off banks nothing and only risks clipping.
+
+    Anchored on the 20-Jul-2026 incident: a 109-second grid blip at 05:25 armed the
+    lockout at SOC 75.6%, and the flat 85% floor held export off until 07:36. Those
+    ~3.3 kWh were exportable under the 4 kW DNO cap at the time, and banking them
+    instead cost the afternoon headroom that would have absorbed the above-cap peak.
+    """
+
+    # 85% of the 35.04 kWh pack — the default floor expressed in kWh.
+    FLOOR_KWH = 0.85 * 35.04
+
+    def _release(self, **kw):
+        args = dict(is_daytime=True, soc_pct=80.0, min_soc_pct=50.0,
+                    battery_kwh=28.0, floor_kwh=self.FLOOR_KWH,
+                    remaining_solar_kwh=40.0, home_to_dusk_kwh=10.0)
+        args.update(kw)
+        return plugin._solar_refill_releases_lockout(**args)
+
+    # ── The incident itself ────────────────────────────────────────────────
+    def test_incident_0736_already_at_floor(self):
+        # Logged live: Battery 29.8 kWh | Solar remaining 53.0 | Home to dusk 12.7.
+        self.assertTrue(self._release(soc_pct=85.0, battery_kwh=29.8,
+                                      remaining_solar_kwh=53.0,
+                                      home_to_dusk_kwh=12.7))
+
+    def test_incident_backed_up_to_first_light_releases(self):
+        # The point of the change: at SOC 75.6% (26.5 kWh) the same day's forecast
+        # already covers the 3.3 kWh gap many times over, so export should resume
+        # at the first daytime tick rather than at 07:36.
+        self.assertTrue(self._release(soc_pct=75.6, battery_kwh=26.5,
+                                      remaining_solar_kwh=53.0,
+                                      home_to_dusk_kwh=12.7))
+
+    # ── Fail-safe directions (all must HOLD the lockout) ───────────────────
+    def test_night_holds(self):
+        # No solar to come -> the flat SOC floor must govern on its own.
+        self.assertFalse(self._release(is_daytime=False, remaining_solar_kwh=0.0,
+                                       home_to_dusk_kwh=0.0))
+
+    def test_unknown_soc_holds(self):
+        self.assertFalse(self._release(soc_pct=None))
+
+    def test_below_min_soc_holds_despite_perfect_forecast(self):
+        # A nearly-empty battery is not a resilience reserve, however bright it is.
+        self.assertFalse(self._release(soc_pct=49.9, battery_kwh=17.5,
+                                       remaining_solar_kwh=60.0,
+                                       home_to_dusk_kwh=10.0))
+
+    def test_dull_winter_day_holds(self):
+        # 4 kWh of solar left against 6 kWh of house load -> no surplus at all.
+        self.assertFalse(self._release(soc_pct=60.0, battery_kwh=21.0,
+                                       remaining_solar_kwh=4.0,
+                                       home_to_dusk_kwh=6.0))
+
+    def test_house_load_exceeding_solar_clamps_to_zero(self):
+        # Negative surplus must not sneak through as a large negative number.
+        self.assertFalse(self._release(soc_pct=60.0, battery_kwh=21.0,
+                                       remaining_solar_kwh=2.0,
+                                       home_to_dusk_kwh=30.0))
+
+    # ── Boundaries ─────────────────────────────────────────────────────────
+    def test_min_soc_boundary_is_inclusive(self):
+        self.assertTrue(self._release(soc_pct=50.0, battery_kwh=17.5,
+                                      remaining_solar_kwh=60.0,
+                                      home_to_dusk_kwh=10.0))
+
+    def test_margin_boundary_exact_release(self):
+        # needed = 4.0 kWh, margin 1.25 -> requires exactly 5.0 kWh of surplus.
+        battery = self.FLOOR_KWH - 4.0
+        self.assertTrue(self._release(battery_kwh=battery,
+                                      remaining_solar_kwh=15.0,
+                                      home_to_dusk_kwh=10.0))
+
+    def test_margin_boundary_just_short_holds(self):
+        battery = self.FLOOR_KWH - 4.0
+        self.assertFalse(self._release(battery_kwh=battery,
+                                       remaining_solar_kwh=14.99,
+                                       home_to_dusk_kwh=10.0))
+
+    def test_at_floor_short_circuits_true(self):
+        # Nothing left to bank -> release regardless of the forecast.
+        self.assertTrue(self._release(battery_kwh=self.FLOOR_KWH,
+                                      remaining_solar_kwh=0.0,
+                                      home_to_dusk_kwh=0.0))
+
+    def test_kwh_formulation_is_satisfiable_at_default_floor(self):
+        # Regression guard on the design note: an SOC-space formulation
+        # (projected_dusk_pct >= floor_pct * margin) is unsatisfiable at the
+        # defaults, because 85 * 1.25 = 106 > 100. The kWh form must not be.
+        self.assertTrue(self._release(soc_pct=51.0, battery_kwh=17.9,
+                                      remaining_solar_kwh=45.0,
+                                      home_to_dusk_kwh=8.0))
+
+    def test_defaults(self):
+        self.assertEqual(plugin.POWER_CUT_LOCKOUT_MIN_SOC_PCT, 50.0)
+        self.assertEqual(plugin.POWER_CUT_LOCKOUT_REFILL_MARGIN, 1.25)
+
+
 class TestResolveExportLockout(unittest.TestCase):
     """_resolve_export_lockout — the post-power-cut export lockout WRAPPER (the pure
     core _export_locked_out is tested separately). Window is time-based; suppression
@@ -633,6 +754,53 @@ class TestResolveExportLockout(unittest.TestCase):
         # 85 is NOT below the 85 floor -> export allowed (boundary).
         p = self._mk(restored_minutes_ago=60)
         self.assertTrue(p._resolve_export_lockout(85.0))
+
+    # ── v5.50.0 solar-refill release, through the wrapper ──────────────────
+    @staticmethod
+    def _balance(is_daytime=True, battery_kwh=26.5,
+                 remaining_solar_kwh=53.0, remaining_home_to_dusk_kwh=12.7):
+        return types.SimpleNamespace(
+            is_daytime=is_daytime, battery_kwh=battery_kwh,
+            remaining_solar_kwh=remaining_solar_kwh,
+            remaining_home_to_dusk_kwh=remaining_home_to_dusk_kwh,
+        )
+
+    def test_balance_none_reproduces_pre_5_50_behaviour(self):
+        # Every pre-5.50 caller omitted `balance` — that path must be unchanged.
+        p = self._mk(restored_minutes_ago=60)
+        self.assertFalse(p._resolve_export_lockout(75.6))
+        self.assertTrue(p.store["power_cut_export_suppressed"])
+
+    def test_solar_refill_releases_below_the_soc_floor(self):
+        # The 20-Jul-2026 incident: SOC 75.6% is below the 85% floor, but the day's
+        # own solar refills the reserve, so export resumes instead of banking kWh
+        # that the sun was going to deliver anyway.
+        p = self._mk(restored_minutes_ago=60, prev_suppressed=True)
+        self.assertTrue(p._resolve_export_lockout(75.6, self._balance()))
+        self.assertFalse(p.store["power_cut_export_suppressed"])
+        self.assertTrue(p.store["power_cut_solar_release"])
+
+    def test_solar_refill_does_not_release_at_night(self):
+        p = self._mk(restored_minutes_ago=60)
+        bal = self._balance(is_daytime=False, remaining_solar_kwh=0.0,
+                            remaining_home_to_dusk_kwh=0.0)
+        self.assertFalse(p._resolve_export_lockout(75.6, bal))
+        self.assertTrue(p.store["power_cut_export_suppressed"])
+        self.assertFalse(p.store["power_cut_solar_release"])
+
+    def test_solar_release_flag_clears_outside_the_window(self):
+        # Window expired -> not a "release", just normal operation.
+        p = self._mk(restored_minutes_ago=300)
+        self.assertTrue(p._resolve_export_lockout(75.6, self._balance()))
+        self.assertFalse(p.store["power_cut_solar_release"])
+
+    def test_release_log_survives_unknown_soc(self):
+        # export_enabled=False makes suppressed False regardless of SOC, so the
+        # one-shot log can be reached with soc_val=None. It must not raise.
+        p = self._mk(export_enabled=False, restored_minutes_ago=60,
+                     prev_suppressed=True)
+        self.assertFalse(p._resolve_export_lockout(None))
+        self.assertFalse(p.store["power_cut_export_suppressed"])
 
 
 class TestDisengageToSafeBaseline(unittest.TestCase):

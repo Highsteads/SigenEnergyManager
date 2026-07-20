@@ -243,6 +243,12 @@
     <Field id="powerCutLockoutSocFloorInfo" type="label">
         <Label>After the grid is restored, export is held off for a few hours as a precaution — but only while the battery is below this percentage. At or above it, export resumes so flood-prevention can shed surplus and a near-full battery doesn't reach 100% and clip solar. Default 85.</Label>
     </Field>
+    <Field id="powerCutLockoutMinSocPct" type="textfield" defaultValue="50">
+        <Label>Lockout solar-refill minimum SOC (%):</Label>
+    </Field>
+    <Field id="powerCutLockoutMinSocPctInfo" type="label">
+        <Label>Export also resumes during the lockout when the day's remaining solar comfortably refills the battery to the floor above on its own — on a bright summer morning, holding export off banks nothing the sun wasn't going to deliver anyway, and only risks driving the battery to 100% and clipping everything above your export cap. This setting is the safety line: however good the forecast looks, that early release never applies below this percentage, because a nearly-empty battery is not a resilience reserve. On a winter night, with no solar to come, the SOC floor above governs on its own. Default 50.</Label>
+    </Field>
     <Field id="stormExportReleasePct" type="textfield" defaultValue="85">
         <Label>Storm export release SOC (%):</Label>
     </Field>
