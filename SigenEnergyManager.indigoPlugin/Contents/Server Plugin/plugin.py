@@ -6,8 +6,23 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        20-07-2026
-# Version:     5.51.1
+# Date:        21-07-2026
+# Version:     5.51.2
+#
+# v5.51.2 (21-07-2026): shared plugin_utils.py refreshed to v1.3 — the
+# estate-wide propagation of the four Appliance Monitor deep-review fixes.
+# * install_timestamp_filter() is idempotent — a second call used to stack a
+#   second filter, so every log line came out with two timestamps.
+# * `import indigo` is soft, so the module imports outside the Indigo host and
+#   can be exercised by offline tests.
+# * A malformed log call keeps its arguments in the log instead of dropping
+#   them, so a %-placeholder mismatch is visible.
+# * New shared as_bool() — a pref re-serialised as the string "false" is
+#   truthy, which is exactly the wrong answer.
+# This bundle keeps its LOCAL variant: install_timestamp_filter also walks up
+# to every reachable handler so module-logger records get stamped. That walk
+# is now idempotent too.
+#
 # 5.51.0 — Daytime charge is paced to a 90% target, not 100% (battery_manager 3.7→3.8).
 #   The same root cause as 5.50.0, one layer down: the plugin kept treating 100% as the
 #   goal when the owner's requirement is 85-90%. Solar overflow paced the charge to hit
