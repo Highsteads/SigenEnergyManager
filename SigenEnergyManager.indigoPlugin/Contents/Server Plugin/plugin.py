@@ -7,7 +7,7 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        20-07-2026
-# Version:     5.51.0
+# Version:     5.51.1
 # 5.51.0 — Daytime charge is paced to a 90% target, not 100% (battery_manager 3.7→3.8).
 #   The same root cause as 5.50.0, one layer down: the plugin kept treating 100% as the
 #   goal when the owner's requirement is 85-90%. Solar overflow paced the charge to hit
@@ -589,6 +589,12 @@
 #     written analysis (mode/registers/limits Axle used, can we copy it?).
 #     The prompt is preserved in this commit's notes; create with
 #     mcp__scheduled-tasks__create_scheduled_task when next interactive.
+#
+# v5.51.1 (21-07-2026): LOG-LEVEL FIX. indigo.server.log(level=...) wants a Python
+# logging INT — a STRING is silently ignored and the line logs as plain Info.
+# The log() helper passed its level name straight through, so every WARNING and
+# ERROR raised through it had been appearing as an ordinary Info line. Added
+# _lvl() to map the name to a real level. Estate-wide sweep (38 files).
 #
 # Changes:     v5.18.1 (14-05-2026) — quiet the VPP event log.
 #   • Per-minute VPP/Axle snapshots moved OUT of the Indigo Event Log
@@ -1360,10 +1366,34 @@ def _ensure_plugin_log(data_dir):
         pass
 
 
+import logging
+
+
+_LOG_LEVELS = {
+    "DEBUG":   logging.DEBUG,
+    "INFO":    logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR":   logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _lvl(level):
+    """Map a level NAME to a Python logging int.
+
+    indigo.server.log(level=...) wants an int. A STRING is silently ignored
+    and the line logs as plain Info, which hid every WARNING and ERROR raised
+    through log() until this was corrected (21-07-2026).
+    """
+    if isinstance(level, int):
+        return level
+    return _LOG_LEVELS.get(str(level).upper(), logging.INFO)
+
+
 def log(message, level="INFO"):
     """Custom log function — writes to Indigo event log and daily plugin log file."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    indigo.server.log(f"[{ts}] {message}", level=level)
+    indigo.server.log(f"[{ts}] {message}", level=_lvl(level))
     if _plugin_log_fh is not None:
         try:
             _plugin_log_fh.write(f"{ts} [{level:<7}] {message}\n")
