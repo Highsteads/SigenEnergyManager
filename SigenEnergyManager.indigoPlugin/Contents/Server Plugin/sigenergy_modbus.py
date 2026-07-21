@@ -9,10 +9,16 @@
 #              outage early-abort, pvPowerWatts critical, verify-mismatch=False)
 #
 # Register map reviewed against Sigenergy Modbus Protocol V2.9 (2026-05-13).
+# V2.9 is STILL the current protocol as of 21-07-2026 — re-checked that day after
+# the mySigen app 4.0 launch (Intersolar, 17-19 Jun 2026). App 4.0 is a cloud-side
+# release (SigenAgent trading, AI search) and did NOT bump the Modbus spec.
 # (Was verified against V2.8 (2025-11-28); V2.9 deltas applied: 40031 mode 0x07
 #  is "Reserved" (not "AI Mode"), 0x08="V2G" added; 40032/40034 are GLOBAL caps
 #  "regardless of EMS mode". Not yet used: 40001 PCS active-power dispatch
 #  (S32 kW; needs 40029=1 + 40031=0; no command watchdog; verify sign on hardware).)
+# DELIBERATELY NOT IMPLEMENTED from V2.9: the ESS pre-heating block (50000-50183)
+# and the PID/PSS device ranges. See the pre-heating note below the holding
+# registers for why — the block is absent on our firmware.
 # Adapted from SigenergySolar v3.1 sigenergy_modbus.py
 # Changes from SigenergySolar version:
 #   - Added set_export_limit(watts) wrapper for register 40038-39
@@ -80,6 +86,39 @@ HOLD_GRID_MAX_IMPORT_LIMIT = 40040    # U32 RW (2 regs), gain 1000, kW.
 HOLD_ESS_BACKUP_SOC        = 40046    # U16 RW, gain 10, % - backup reserve SOC
 HOLD_ESS_CHARGE_CUTOFF     = 40047    # U16 RW, gain 10, % - max charge SOC
 HOLD_ESS_DISCHARGE_CUTOFF  = 40048    # U16 RW, gain 10, % - min discharge SOC (reserve protection)
+
+# --- ESS pre-heating (V2.9, plant holding registers) - NOT IMPLEMENTED ---
+#
+# V2.9 added a battery pre-heating block. Warming a cold pack lifts its charge
+# acceptance, so on paper it is worth having: a derated winter morning costs us
+# solar we cannot get back. The map (two independent community transcriptions
+# agree exactly, and they self-check — the 30 TOU slots run 50003..50182, ending
+# immediately before the reserved-SoC register):
+#
+#   50000            U16 RW  Pre-heating enable        0=disable, 1=enable
+#   50001            U16 RW  Pre-heating mode          0=automatic, 1=manual
+#   50002            U16 RW  Pre-heating advance       0/1, only when mode=manual
+#   50003+(n-1)*6    U32 RW  TOU slot n start, epoch seconds  (n = 1..30)
+#   50005+(n-1)*6    U32 RW  TOU slot n end,   epoch seconds
+#   50007+(n-1)*6    S32 RW  TOU slot n target power, gain 1000, kW (<0 discharge)
+#   50183            U16 RW  Pre-heating reserved SoC, gain 100, %
+#
+# We do NOT read any of these, because OUR INVERTER DOES NOT HAVE THEM. Probed
+# live on 21-07-2026 against 192.168.100.49 (plant address 247, firmware
+# V100R001C22SPC113): every one of the addresses above returns Modbus exception
+# 2, ILLEGAL DATA ADDRESS. So does every other probe across the whole 50k range
+# (49999 / 50100 / 50200 / 50500) — the range is simply not implemented in this
+# firmware, rather than pre-heating alone being switched off. Control reads in
+# the same session (30003, 30014) answered normally, so this is not a comms
+# fault. sigenergy2mqtt reaches the same conclusion at runtime: it probes 50000
+# and skips the whole pre-heating device when the read fails.
+#
+# Implementing them today would add reads that fail on every single poll cycle,
+# each one burning a second of the throttle and logging an error, in exchange for
+# no data. Revisit after an inverter firmware update: re-probe 50000, and if it
+# answers, wire up 50000/50001/50002/50183 (skip the 30 TOU slots — 90 registers
+# is far too many for a 1s-throttled cycle, and they only pay off for scheduled
+# arbitrage, which we do not do on the Tracker tariff).
 
 # Sanity ceiling for power-limit writes (watts). 3x the largest residential
 # Sigenergy inverter (10kW), so a value above this is certainly a bug/typo —
