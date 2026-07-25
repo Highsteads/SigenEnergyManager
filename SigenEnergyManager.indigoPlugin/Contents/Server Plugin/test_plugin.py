@@ -1306,5 +1306,184 @@ class TestVppRestartPersistence(unittest.TestCase):
             plugin._vpp_resume_decision(plugin.VPP_ACTIVE, None, now), "idle")
 
 
+class TestRowStandingCharge(unittest.TestCase):
+    """_row_standing_p — the per-day standing charge with its ledger fallback.
+
+    87 of the first 121 live history rows carry no elec_standing_p_day, so the
+    fallback is the common path, not the edge case.
+    """
+
+    def test_prefers_the_value_frozen_on_the_day(self):
+        self.assertEqual(
+            plugin.Plugin._row_standing_p({"elec_standing_p_day": 50.0}, 61.5), 50.0)
+
+    def test_falls_back_to_the_current_ledger(self):
+        self.assertEqual(plugin.Plugin._row_standing_p({}, 61.5), 61.5)
+        self.assertEqual(
+            plugin.Plugin._row_standing_p({"elec_standing_p_day": None}, 61.5), 61.5)
+
+    def test_zero_when_nothing_is_known(self):
+        # Never invent a charge — understating beats making one up.
+        self.assertEqual(plugin.Plugin._row_standing_p({}, None), 0.0)
+
+    def test_non_numeric_falls_through(self):
+        self.assertEqual(
+            plugin.Plugin._row_standing_p({"elec_standing_p_day": "n/a"}, 61.5), 61.5)
+        self.assertEqual(plugin.Plugin._row_standing_p({}, "n/a"), 0.0)
+
+    def test_a_genuine_zero_standing_charge_is_honoured(self):
+        self.assertEqual(
+            plugin.Plugin._row_standing_p({"elec_standing_p_day": 0.0}, 61.5), 0.0)
+
+
+class TestPeriodTotalsIdentity(unittest.TestCase):
+    """The Period totals row must read as an identity the eye can check:
+
+        solar benefit  =  grid-only  -  elec bill  +  export earned
+
+    It did not before: "Elec bill" carried the standing charge on settled days
+    only, and "Grid-only" never carried it at all, so the row was out by one
+    standing charge per unsettled day (~£0.62).
+    """
+
+    RATE_P, STAND_P, EXPORT_P = 20.0, 61.5, 12.0
+
+    def _periods(self, rows):
+        import json, tempfile, shutil, os as _os
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(_os.path.join(tmp, "daily_history.json"), "w", encoding="utf-8") as f:
+                json.dump(rows, f)
+            p = _mk_plugin(tmp, _FakeOcto())
+            return p._period_economics_summary(
+                export_rate_p=self.EXPORT_P, fallback_import_rate_p=self.RATE_P)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _row(self, days_back, settled):
+        from datetime import timedelta
+        d = (_london_today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        r = {"date": d, "month": d[:7], "home_kwh": 20.0, "grid_import_kwh": 5.0,
+             "grid_export_kwh": 10.0, "rate_today_p": self.RATE_P,
+             "export_rate_p": self.EXPORT_P, "elec_standing_p_day": self.STAND_P}
+        if settled:
+            r.update({"cost_settled": True,
+                      "elec_unit_cost_gbp": 5.0 * self.RATE_P / 100.0,
+                      "elec_standing_gbp":  self.STAND_P / 100.0})
+        return r
+
+    def _assert_identity(self, w):
+        self.assertAlmostEqual(
+            w["benefit_total_gbp"],
+            round(w["no_solar_total_gbp"]
+                  - w["elec_whole_house_total_gbp"]
+                  + w["export_total_gbp"], 2),
+            delta=0.02)
+
+    def test_identity_holds_for_settled_days(self):
+        self._assert_identity(self._periods([self._row(n, True) for n in (1, 2, 3)])["week"])
+
+    def test_identity_holds_for_unsettled_days(self):
+        # THE BUG: Octopus settles ~a day in arrears, so a 7-day window nearly
+        # always holds an unsettled day. Those contributed unit cost only.
+        self._assert_identity(self._periods([self._row(n, False) for n in (1, 2, 3)])["week"])
+
+    def test_identity_holds_for_a_mixed_window(self):
+        rows = [self._row(1, False), self._row(2, True), self._row(3, True)]
+        self._assert_identity(self._periods(rows)["week"])
+
+    def test_unsettled_day_carries_its_standing_charge(self):
+        w = self._periods([self._row(1, False)])["week"]
+        # unit 5 kWh x 20p = £1.00, plus 61.5p standing = £1.615
+        self.assertAlmostEqual(w["elec_whole_house_total_gbp"], 1.615, delta=0.01)
+
+    def test_grid_only_carries_the_standing_charge(self):
+        w = self._periods([self._row(1, False)])["week"]
+        # 20 kWh x 20p = £4.00, plus the same 61.5p standing charge
+        self.assertAlmostEqual(w["no_solar_total_gbp"], 4.62, delta=0.01)
+
+    def test_benefit_is_unchanged_by_the_standing_charge(self):
+        # Standing cancels in (no_sol + st) - (imp + st) + exp, so the headline
+        # saving must not move. 20x20p - 5x20p + 10x12p = £4.20.
+        w = self._periods([self._row(1, False)])["week"]
+        self.assertAlmostEqual(w["benefit_total_gbp"], 4.20, delta=0.01)
+
+    def test_calendar_months_report_the_elec_bill_too(self):
+        import json, tempfile, shutil, os as _os
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(_os.path.join(tmp, "daily_history.json"), "w", encoding="utf-8") as f:
+                json.dump([self._row(1, False)], f)
+            cal = _mk_plugin(tmp, _FakeOcto())._calendar_months_summary(
+                export_rate_p=self.EXPORT_P, fallback_import_rate_p=self.RATE_P)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        live = [m for m in cal["months"] if m["days"]]
+        self.assertTrue(live, "expected one month with data")
+        self._assert_identity(live[0])
+
+
+class TestWholeHouseCardRateMissing(unittest.TestCase):
+    """_wh_build_card must not paint a green "Covered" badge over a bill it
+    could not work out. With no unit rate it used to bill the standing charge
+    alone, which export nearly always beat."""
+
+    def _card(self, unit_p, import_kwh=8.0, export_kwh=10.0):
+        return plugin.Plugin._wh_build_card(
+            import_kwh, export_kwh, unit_p, 12.0, 61.5,
+            gas_kwh=0.0, gas_unit_p=0.0, gas_standing_p=0.0,
+            provisional=True, gas_estimated=False)
+
+    def test_missing_rate_blanks_the_verdict(self):
+        c = self._card(None)
+        self.assertTrue(c["rate_missing"])
+        self.assertIsNone(c["bill_gbp"])
+        self.assertIsNone(c["net_gbp"])
+        self.assertIsNone(c["covered"])
+        self.assertIsNone(c["electric_gbp"])
+
+    def test_known_rate_still_answers(self):
+        c = self._card(20.0)
+        self.assertFalse(c["rate_missing"])
+        self.assertAlmostEqual(c["bill_gbp"], 8.0 * 0.20 + 0.615, delta=0.01)
+        self.assertFalse(c["covered"])          # £1.20 export vs £2.22 bill
+
+    def test_no_import_needs_no_rate(self):
+        # Nothing drawn from the grid, so a missing rate costs nothing and the
+        # card can still be trusted.
+        c = self._card(None, import_kwh=0.0)
+        self.assertFalse(c["rate_missing"])
+        self.assertIsNotNone(c["bill_gbp"])
+
+    def test_zero_export_rate_is_a_real_rate(self):
+        # `if export_rate_p else 12.0` silently swapped a genuine 0p for 12p.
+        c = plugin.Plugin._wh_build_card(
+            0.0, 10.0, 20.0, 0.0, 61.5, 0.0, 0.0, 0.0,
+            provisional=True, gas_estimated=False)
+        self.assertEqual(c["export_gbp"], 0.0)
+
+    def test_gas_estimated_needs_a_gas_meter(self):
+        tmp_rec = {"grid_import_kwh": 5.0, "grid_export_kwh": 10.0,
+                   "rate_today_p": 20.0, "export_rate_p": 12.0,
+                   "elec_standing_p_day": 61.5}
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        with_gas = p._wh_provisional_from_row(tmp_rec, 61.5, 6.0, 29.0, 8.0, 20.0,
+                                              has_gas=True)
+        without  = p._wh_provisional_from_row(tmp_rec, 61.5, 6.0, 29.0, 8.0, 20.0,
+                                              has_gas=False)
+        self.assertTrue(with_gas["gas_estimated"])
+        self.assertFalse(without["gas_estimated"])
+
+
+class TestBatteryCapacityPublished(unittest.TestCase):
+    """energy.html hardcoded 35.04 kWh, which is wrong for every other install."""
+
+    def test_capacity_constant_is_sane(self):
+        self.assertGreater(plugin.BATTERY_CAPACITY_KWH, 0)
+
+    def test_default_export_rate_constant_exists(self):
+        self.assertEqual(plugin.DEFAULT_EXPORT_RATE_P, 12.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

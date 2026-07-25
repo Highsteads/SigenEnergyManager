@@ -5,9 +5,39 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Opus 4.8
-# Date:        21-07-2026
-# Version:     5.51.2
+# Author:      CliveS & Claude Opus 5
+# Date:        25-07-2026
+# Version:     5.52.0
+#
+# v5.52.0 (25-07-2026): dashboard economics audit — four faults found by checking
+# the figures against the live ledger rather than reading the code.
+# * "Grid-only" now carries the standing charge. A grid-only home pays the same
+#   daily charge, so the counterfactual sat ~£0.62/day (~£225/yr) under the truth
+#   while the elec bill printed beside it included the charge. The solar BENEFIT
+#   is unchanged — standing cancels in (no_sol + st) - (imp + st) + exp.
+# * "Elec bill" now carries the standing charge on UNSETTLED days too. It was
+#   unit-only for those, and Octopus settles ~a day in arrears, so a 7-day window
+#   nearly always held one. Live proof: the week reported £3.82 against a true
+#   £4.44 — one day's standing charge missing, under a header promising
+#   "unit + standing".
+#   Together these two make the Period totals row a real identity:
+#       solar benefit = grid-only - elec bill + export earned
+# * /api/daily accepts up to 800 days (was 365). The dashboards' week-on-week card
+#   compares against the same week last year by probing offsets 364-370, and a 365
+#   cap returned at most one of the seven — the year column could never unlock,
+#   however long the history grew.
+# * A missing electricity unit rate no longer paints a green "Covered" badge.
+#   _wh_build_card billed the standing charge alone, which export nearly always
+#   beat; bill/net/covered now come back None so the page can render "—".
+# * Calendar months report elec_whole_house_total_gbp too, so that table reads as
+#   the same identity as Period totals.
+# * The 12p export fallback was written out in nine places — now one constant,
+#   DEFAULT_EXPORT_RATE_P, and the `if export_rate_p else 12.0` test that silently
+#   swapped a genuine 0p rate for 12p is now an `is None` test.
+# * gas_estimated now honours has_gas on the yesterday / day-before cards, so an
+#   electricity-only user stops seeing "(est)" on a £0.00 gas line.
+# * /api/status publishes battery.capacity_kwh so dashboards stop hardcoding this
+#   system's 35.04 kWh pack.
 #
 # v5.51.2 (21-07-2026): shared plugin_utils.py refreshed to v1.3 — the
 # estate-wide propagation of the four Appliance Monitor deep-review fixes.
@@ -1264,6 +1294,11 @@ VPP_ACTIVE       = "active"
 VPP_DISCHARGE_EFFICIENCY  = 0.97
 BATTERY_CAPACITY_KWH      = 35.04
 
+# Fallback export rate, pence per kWh, used only when no live or per-day rate is
+# known (Octopus Outgoing flat 12p, live here since 26-Mar-2026). It was written
+# out as a bare 12.0 in nine places, so a tariff change meant finding all nine.
+DEFAULT_EXPORT_RATE_P = 12.0
+
 
 def _serialise_vpp_event(event):
     """Serialise an Axle VPP event dict to JSON-safe primitives.
@@ -1779,9 +1814,9 @@ class Plugin(indigo.PluginBase):
         try:
             export_rate_p = float(self.latest_rates_data.get("export_rate_p", 0.0))
             if export_rate_p <= 0:
-                export_rate_p = 12.0
+                export_rate_p = DEFAULT_EXPORT_RATE_P
         except (TypeError, ValueError):
-            export_rate_p = 12.0
+            export_rate_p = DEFAULT_EXPORT_RATE_P
 
         # v5.15: publish the auto-calibrated consumption profile so the
         # optimiser script uses the SAME real-inverter-derived numbers the
@@ -2046,7 +2081,7 @@ class Plugin(indigo.PluginBase):
             profile        = store.get("consumption_profile", []) or []
             tomorrow_need  = sum(profile) if len(profile) == 48 else 22.0
             tomorrow_surplus = max(0.0, tomorrow_solar - tomorrow_need)
-            export_rate_p  = 12.0
+            export_rate_p  = DEFAULT_EXPORT_RATE_P
             try:
                 rates_export = float(rates.get("export_rate_p", 0.0))
                 if rates_export > 0:
@@ -2146,6 +2181,11 @@ class Plugin(indigo.PluginBase):
                 "battery": {
                     "soc_pct":  round(soc, 1),
                     "power_w":  bat_w,
+                    # Published so dashboards can turn SOC into kWh without
+                    # hardcoding this system's pack size — energy.html carried
+                    # its own 35.04 literal, which is wrong for anyone else
+                    # running the plugin.
+                    "capacity_kwh": BATTERY_CAPACITY_KWH,
                 },
                 "solar": {
                     "power_w":        pv_w,
@@ -2380,7 +2420,7 @@ class Plugin(indigo.PluginBase):
             try:
                 export_rate_p = float(rec.get("export_rate_p"))
             except (TypeError, ValueError):
-                export_rate_p = fin_export_p if fin_export_p is not None else 12.0
+                export_rate_p = fin_export_p if fin_export_p is not None else DEFAULT_EXPORT_RATE_P
 
             try:
                 import_kwh = float(imp["kwh"])
@@ -2473,30 +2513,44 @@ class Plugin(indigo.PluginBase):
     def _wh_build_card(import_kwh, export_kwh, elec_unit_p, export_rate_p,
                        elec_standing_p, gas_kwh, gas_unit_p, gas_standing_p,
                        provisional, gas_estimated):
-        """Assemble a whole-house card dict from kWh + rates (None-safe)."""
+        """Assemble a whole-house card dict from kWh + rates (None-safe).
+
+        When the electricity unit rate is unknown but import is non-zero the
+        bill cannot be known either, so bill/net/covered come back None and the
+        page renders "—". Returning 0.00 for the unit cost — as this did — left
+        the standing charge as the whole bill, which nearly always beat the
+        export revenue and painted a green "Covered" badge over a bill nobody
+        had actually worked out.
+        """
+        rate_missing = (elec_unit_p is None and (import_kwh or 0.0) > 0.0)
         eu = (import_kwh * elec_unit_p / 100.0) if (import_kwh is not None and elec_unit_p is not None) else 0.0
         es = (elec_standing_p / 100.0) if elec_standing_p is not None else 0.0
         gu = (gas_kwh * gas_unit_p / 100.0) if (gas_kwh is not None and gas_unit_p is not None) else 0.0
         gs = (gas_standing_p / 100.0) if gas_standing_p is not None else 0.0
         bill = eu + es + gu + gs
-        exp  = (export_kwh or 0.0) * (export_rate_p if export_rate_p else 12.0) / 100.0
+        # `is None` not truthiness — a genuine 0p export rate is a real rate,
+        # and the old test silently swapped it for 12p.
+        er   = export_rate_p if export_rate_p is not None else DEFAULT_EXPORT_RATE_P
+        exp  = (export_kwh or 0.0) * er / 100.0
         return {
-            "electric_unit_gbp":     round(eu, 2),
+            "electric_unit_gbp":     None if rate_missing else round(eu, 2),
             "electric_standing_gbp": round(es, 2),
-            "electric_gbp":          round(eu + es, 2),
+            "electric_gbp":          None if rate_missing else round(eu + es, 2),
             "gas_unit_gbp":          round(gu, 2),
             "gas_standing_gbp":      round(gs, 2),
             "gas_gbp":               round(gu + gs, 2),
-            "bill_gbp":              round(bill, 2),
+            "bill_gbp":              None if rate_missing else round(bill, 2),
             "export_gbp":            round(exp, 2),
-            "net_gbp":               round(exp - bill, 2),
-            "covered":               bool(exp >= bill),
+            "net_gbp":               None if rate_missing else round(exp - bill, 2),
+            "covered":               None if rate_missing else bool(exp >= bill),
+            "rate_missing":          rate_missing,
             "provisional":           provisional,
             "gas_estimated":         gas_estimated,
         }
 
     def _wh_provisional_from_row(self, rec, elec_standing_p, gas_unit_p,
-                                 gas_standing_p, gas_est_kwh, fin_elec_unit_p):
+                                 gas_standing_p, gas_est_kwh, fin_elec_unit_p,
+                                 has_gas=True):
         """Provisional card for a not-yet-settled recent day, from the row's
         Sigen-measured import/export (complete at midnight) plus an estimated gas
         figure.  Electric and export are accurate; only gas is an estimate until
@@ -2509,14 +2563,14 @@ class Plugin(indigo.PluginBase):
         imp_kwh       = _f(rec.get("grid_import_kwh"), 0.0)
         exp_kwh       = _f(rec.get("grid_export_kwh"), 0.0)
         elec_unit_p   = _f(rec.get("rate_today_p"), fin_elec_unit_p)
-        export_rate_p = _f(rec.get("export_rate_p"), 12.0)
+        export_rate_p = _f(rec.get("export_rate_p"), DEFAULT_EXPORT_RATE_P)
         es_p          = _f(rec.get("elec_standing_p_day"), elec_standing_p)
         gu_p          = _f(rec.get("gas_unit_p_day"), gas_unit_p)
         gs_p          = _f(rec.get("gas_standing_p_day"), gas_standing_p)
         return self._wh_build_card(imp_kwh, exp_kwh, elec_unit_p, export_rate_p,
                                    es_p, gas_est_kwh, gu_p, gs_p,
                                    provisional=True,
-                                   gas_estimated=(gas_est_kwh is not None))
+                                   gas_estimated=(gas_est_kwh is not None and has_gas))
 
     def _whole_house_summary(self, import_rate_p, export_rate_p):
         """Whole-house cost block for /api/status.
@@ -2592,6 +2646,11 @@ class Plugin(indigo.PluginBase):
                 except (TypeError, ValueError):
                     continue
 
+        # Resolved before _day_card so the yesterday / day-before cards apply the
+        # same gas test the today card does — without it an electricity-only user
+        # got an "(est)" tag on a £0.00 gas line.
+        has_gas = bool(self.octopus and self.octopus.gas_mprn and self.octopus.gas_serial)
+
         def _day_card(date_str):
             """Settled row if frozen, else a provisional card from the row's
             Sigen-measured import/export (complete at midnight) + estimated gas —
@@ -2604,7 +2663,7 @@ class Plugin(indigo.PluginBase):
                 return None
             return self._wh_provisional_from_row(
                 rec, elec_standing_p, gas_unit_p, gas_standing_p,
-                gas_est_kwh, fin_elec_unit_p)
+                gas_est_kwh, fin_elec_unit_p, has_gas=has_gas)
 
         # ---- Yesterday + day before ----
         y_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -2662,6 +2721,44 @@ class Plugin(indigo.PluginBase):
         ]
         return out
 
+    def _current_elec_standing_p(self):
+        """Today's electricity standing charge in pence/day, or None.
+
+        Used as the fallback for history rows written before per-day rate
+        capture (elec_standing_p_day), which is 87 of the first 121 rows here.
+        Mirrors the _day_rate fallback in _settle_whole_house_costs.
+        """
+        try:
+            fin = self.octopus.get_account_financials() if self.octopus else None
+        except Exception:
+            return None
+        if not fin or not fin.get("elec"):
+            return None
+        try:
+            v = fin["elec"].get("standing_p")
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _row_standing_p(rec, fallback_p):
+        """Electricity standing charge in pence for one history row.
+
+        Prefers the value frozen on the day; falls back to the current ledger;
+        returns 0.0 when neither is known so a missing rate can only ever
+        understate, never invent a charge.
+        """
+        v = rec.get("elec_standing_p_day")
+        try:
+            if v is not None:
+                return float(v)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return float(fallback_p) if fallback_p is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _period_economics_summary(self, export_rate_p, fallback_import_rate_p):
         """Roll up weekly / monthly / yearly economics from daily_history.json.
 
@@ -2690,6 +2787,8 @@ class Plugin(indigo.PluginBase):
         except Exception:
             today = datetime.now().date()
 
+        fallback_standing_p = self._current_elec_standing_p()
+
         def aggregate(subset):
             if not subset:
                 return {
@@ -2698,6 +2797,7 @@ class Plugin(indigo.PluginBase):
                     "no_solar_total_gbp": None, "net_total_gbp":      None,
                     "benefit_total_gbp":  None,
                     "elec_whole_house_total_gbp": None,
+                    "elec_whole_house_avg_gbp":   None,
                     "import_avg_gbp":     None, "export_avg_gbp":     None,
                     "no_solar_avg_gbp":   None, "net_avg_gbp":        None,
                     "benefit_avg_gbp":    None,
@@ -2726,25 +2826,39 @@ class Plugin(indigo.PluginBase):
                     er = 0
                 if er <= 0:
                     er = export_rate_p
-                imp_p   = imp_k * ir
-                exp_p   = exp_k * er
-                no_sol  = home  * ir
-                net     = exp_p - imp_p
-                benefit = no_sol - imp_p + exp_p
+                # The day's standing charge, needed twice below: a grid-only
+                # home pays exactly the same one, and the whole-house electric
+                # column claims to include it.
+                st_p = self._row_standing_p(r, fallback_standing_p)
+
+                imp_p       = imp_k * ir
+                exp_p       = exp_k * er
+                no_sol_unit = home  * ir
+                net         = exp_p - imp_p
+                # Standing cancels out of the benefit — (no_sol + st) - (imp + st)
+                # + exp — so it is computed from the unit-only figures and does
+                # NOT change when the standing charge is reported below.
+                benefit     = no_sol_unit - imp_p + exp_p
                 total_imp_p      += imp_p
                 total_exp_p      += exp_p
-                total_no_solar_p += no_sol
+                # Grid-only counterfactual carries the standing charge: the same
+                # meter, the same daily charge, just no solar behind it. Without
+                # it the column sat ~£0.62/day under the truth while the elec
+                # bill beside it included the charge.
+                total_no_solar_p += no_sol_unit + st_p
                 total_net_p      += net
                 total_benefit_p  += benefit
-                # Whole-house electric on the same basis as the today card
-                # (unit + standing): settled rows carry frozen bill-exact
-                # figures; unsettled rows fall back to the rate-based unit
-                # cost (standing not yet known for that day).
+                # Whole-house electric, ALWAYS unit + standing so the column
+                # matches its header and the row reads as an identity:
+                #   solar benefit = grid-only - elec bill + export earned
+                # Settled rows carry frozen bill-exact figures; unsettled rows
+                # (Octopus settles ~a day in arrears, so a 7-day window nearly
+                # always holds one) previously contributed unit only.
                 if r.get("elec_unit_cost_gbp") is not None:
                     total_elec_wh_gbp += (float(r.get("elec_unit_cost_gbp") or 0)
                                           + float(r.get("elec_standing_gbp") or 0))
                 else:
-                    total_elec_wh_gbp += imp_p / 100.0
+                    total_elec_wh_gbp += (imp_p + st_p) / 100.0
                 counted += 1
             if counted == 0:
                 return aggregate([])   # all rate-less, treat as empty
@@ -2758,6 +2872,7 @@ class Plugin(indigo.PluginBase):
                 "net_total_gbp":       _g(total_net_p),
                 "benefit_total_gbp":   _g(total_benefit_p),
                 "elec_whole_house_total_gbp": round(total_elec_wh_gbp, 2),
+                "elec_whole_house_avg_gbp":   round(total_elec_wh_gbp / counted, 2),
                 "import_avg_gbp":      _ga(total_imp_p),
                 "export_avg_gbp":      _ga(total_exp_p),
                 "no_solar_avg_gbp":    _ga(total_no_solar_p),
@@ -2811,6 +2926,8 @@ class Plugin(indigo.PluginBase):
             if m_key in by_month:
                 by_month[m_key].append(r)
 
+        fallback_standing_p = self._current_elec_standing_p()
+
         # Reuse the aggregate maths from the period summary
         def aggregate(subset):
             if not subset:
@@ -2819,12 +2936,15 @@ class Plugin(indigo.PluginBase):
                     "import_total_gbp":   None, "export_total_gbp":   None,
                     "no_solar_total_gbp": None, "net_total_gbp":      None,
                     "benefit_total_gbp":  None,
+                    "elec_whole_house_total_gbp": None,
+                    "elec_whole_house_avg_gbp":   None,
                     "import_avg_gbp":     None, "export_avg_gbp":     None,
                     "no_solar_avg_gbp":   None, "net_avg_gbp":        None,
                     "benefit_avg_gbp":    None,
                 }
             total_imp_p = total_exp_p = 0.0
             total_no_solar_p = total_net_p = total_benefit_p = 0.0
+            total_elec_wh_gbp = 0.0   # whole-house electric (unit + standing)
             counted = 0
             for r in subset:
                 home  = float(r.get("home_kwh",        0) or 0)
@@ -2848,16 +2968,26 @@ class Plugin(indigo.PluginBase):
                     er = 0
                 if er <= 0:
                     er = export_rate_p
-                imp_p   = imp_k * ir
-                exp_p   = exp_k * er
-                no_sol  = home  * ir
-                net     = exp_p - imp_p
-                benefit = no_sol - imp_p + exp_p
+                # Same basis as _period_economics_summary — see the comments
+                # there for why standing sits in grid-only and in the elec bill
+                # but never in the benefit.
+                st_p = self._row_standing_p(r, fallback_standing_p)
+
+                imp_p       = imp_k * ir
+                exp_p       = exp_k * er
+                no_sol_unit = home  * ir
+                net         = exp_p - imp_p
+                benefit     = no_sol_unit - imp_p + exp_p
                 total_imp_p      += imp_p
                 total_exp_p      += exp_p
-                total_no_solar_p += no_sol
+                total_no_solar_p += no_sol_unit + st_p
                 total_net_p      += net
                 total_benefit_p  += benefit
+                if r.get("elec_unit_cost_gbp") is not None:
+                    total_elec_wh_gbp += (float(r.get("elec_unit_cost_gbp") or 0)
+                                          + float(r.get("elec_standing_gbp") or 0))
+                else:
+                    total_elec_wh_gbp += (imp_p + st_p) / 100.0
                 counted += 1
             if counted == 0:
                 return aggregate([])
@@ -2870,6 +3000,8 @@ class Plugin(indigo.PluginBase):
                 "no_solar_total_gbp":  _g(total_no_solar_p),
                 "net_total_gbp":       _g(total_net_p),
                 "benefit_total_gbp":   _g(total_benefit_p),
+                "elec_whole_house_total_gbp": round(total_elec_wh_gbp, 2),
+                "elec_whole_house_avg_gbp":   round(total_elec_wh_gbp / counted, 2),
                 "import_avg_gbp":      _ga(total_imp_p),
                 "export_avg_gbp":      _ga(total_exp_p),
                 "no_solar_avg_gbp":    _ga(total_no_solar_p),
@@ -2961,7 +3093,7 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             yi = datetime.now().year
         # Resolve export rate same as in get_dashboard_data
-        export_rate_p = 12.0
+        export_rate_p = DEFAULT_EXPORT_RATE_P
         try:
             rates_export = float((self.latest_rates_data or {}).get("export_rate_p", 0.0))
             if rates_export > 0:
@@ -4155,7 +4287,7 @@ class Plugin(indigo.PluginBase):
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
-            export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), 12.0),
+            export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), DEFAULT_EXPORT_RATE_P),
             weekday_kwh        = weekday_pref,
             weekend_kwh        = weekend_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
@@ -6256,9 +6388,9 @@ class Plugin(indigo.PluginBase):
                 (self.latest_rates_data or {}).get("export_rate_p", 0.0)
             )
             if export_rate_p <= 0:
-                export_rate_p = 12.0
+                export_rate_p = DEFAULT_EXPORT_RATE_P
         except (TypeError, ValueError):
-            export_rate_p = 12.0
+            export_rate_p = DEFAULT_EXPORT_RATE_P
 
         # Capture the standing charges + gas unit rate in force on this day, so
         # the whole-house settle values each frozen day at its OWN rates rather
@@ -6971,7 +7103,7 @@ class Plugin(indigo.PluginBase):
         """
         rates   = self.latest_rates_data or {}
         tracker = rates.get("tracker", {})
-        export_rate_p = 12.0
+        export_rate_p = DEFAULT_EXPORT_RATE_P
         try:
             rates_export = float(rates.get("export_rate_p", 0.0))
             if rates_export > 0:

@@ -2000,7 +2000,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             self._send_api(lambda: self._plugin_ref.get_dashboard_years())
 
         elif path == "/api/daily":
-            days = self._int_param("days", 30, 1, 365)
+            # Upper bound is deliberately >365. The dashboards' week-on-week card
+            # compares against the same week LAST year, probing day offsets 364-370
+            # back from the newest record — a 365 cap returns at most one of those
+            # seven days, so the year column could never unlock however long the
+            # history grew. 800 leaves room for a two-year comparison later.
+            days = self._int_param("days", 30, 1, 800)
             self._send_api(lambda: self._plugin_ref.get_dashboard_daily(days=days))
 
         elif path == "/api/export-sync":
