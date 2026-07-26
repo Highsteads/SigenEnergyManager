@@ -7,7 +7,34 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        26-07-2026
-# Version:     5.52.1
+# Version:     5.53.0
+#
+# v5.53.0 (26-07-2026): the power-cut alerts now carry the whole picture. These are
+# the two messages read on a phone during an outage, and they said almost nothing:
+# time, off-grid mode, and how long the cut lasted. Everything needed to judge the
+# situation — how full the battery is, what the house is pulling, how long that
+# lasts, and on a restore what export is doing and both ways the lockout ends —
+# lived in a log nobody opens at the time. Both channels now carry the same full
+# body. Three pure helpers so the arithmetic is testable without a power cut:
+# _backup_runtime_hours (usable energy is everything ABOVE the discharge cutoff,
+# since the inverter stops there and overstating backup is worst in exactly this
+# message), _format_runtime (minutes / one decimal / whole hours / days, capped at
+# "10+ days"), and _lockout_message. Every figure is optional: a paragraph whose
+# readings are missing is dropped rather than printed as a zero, so a partial
+# Modbus read costs one line and never the alert. The lockout end time is derived
+# from the SAME pluginPrefs["powerRestoredTime"] the window itself uses, so the
+# time quoted cannot drift from when export actually resumes.
+#
+# Also fixes a LATENT BREAKAGE IN THE STORM ALERTS, found by ruff while in here
+# (F821, pre-existing on HEAD). The v5.45.0 locking restructure split
+# _apply_storm_result out of _check_storm_watch and left `loc_name` behind in the
+# caller, so the two bodies that quote it — the YELLOW escalation and every
+# ALL-CLEAR — raised NameError instead of sending. Amber and red never quote it,
+# which is why nothing looked broken. The sting is in the tail: storm_alerted_level
+# is written only AFTER a successful send, so a failed all-clear left it stuck at
+# the old level and every later storm at or below it was judged "already alerted"
+# and stayed silent. Armed but never fired — no storm here since 02-Jul-2026.
+# +28 tests total, 374 -> 402; the 3 storm tests raise NameError on the old code.
 #
 # v5.52.1 (26-07-2026): the grid-restore message named only ONE of the two export
 # release rules. It promised "unless SOC >= 85%", wording written before v5.50.0
@@ -1291,6 +1318,78 @@ def _solar_refill_releases_lockout(is_daytime, soc_pct, min_soc_pct, battery_kwh
         return True          # already at/above the floor — nothing left to bank
     surplus = max(0.0, remaining_solar_kwh - home_to_dusk_kwh)
     return surplus >= needed * margin
+
+
+def _backup_runtime_hours(soc_pct, floor_pct, capacity_kwh, home_w):
+    """Pure: hours the battery could carry the house at the load it is drawing now.
+
+    Usable energy is everything above the inverter's discharge cutoff — below that
+    it stops, so counting it would overstate the backup. Returns None when the
+    answer is unknowable rather than guessing: no SOC reading, no house load, a
+    zero or negative load (the meter dropping out mid-outage), or a nonsense
+    capacity. A caller that gets None should say nothing about runtime.
+
+    This is a snapshot at the CURRENT load, not a forecast — the house will draw
+    differently over the next few hours, and on a bright day the panels keep the
+    battery topped up. It is the same simple figure the dashboard shows, which
+    matters: two places quoting the same number should compute it the same way.
+    """
+    if soc_pct is None or home_w is None:
+        return None
+    try:
+        soc      = float(soc_pct)
+        floor    = float(floor_pct)
+        capacity = float(capacity_kwh)
+        load_w   = float(home_w)
+    except (TypeError, ValueError):
+        return None
+    if capacity <= 0.0 or load_w <= 0.0:
+        return None
+    usable_kwh = max(0.0, soc - floor) / 100.0 * capacity
+    return usable_kwh / (load_w / 1000.0)
+
+
+def _format_runtime(hours):
+    """Pure: turn a backup-runtime figure into something readable on a phone.
+
+    Minutes under the hour, one decimal up to half a day, whole hours to two
+    days, then days. Capped at "10+ days" because past that the number is
+    meaningless — the load will have changed many times over.
+    """
+    if hours is None:
+        return None
+    try:
+        h = float(hours)
+    except (TypeError, ValueError):
+        return None
+    if h <= 0.0:
+        return None
+    if h >= 240.0:
+        return "10+ days"
+    if h < 1.0:
+        return f"{h * 60:.0f} minutes"
+    if h < 12.0:
+        return f"{h:.1f} hours"
+    if h < 48.0:
+        return f"{h:.0f} hours"
+    return f"{h / 24:.1f} days"
+
+
+def _lockout_message(export_enabled, lockout_end_local, soc_floor_pct):
+    """Pure: one plain sentence on what the export lockout is doing after a restore.
+
+    Must name BOTH ways the lockout ends, or an early resume on the solar rule
+    reads as a fault — which is exactly what happened on 26-Jul-2026, when export
+    restarted at 74% after a message promising 85%. Returns None when there is
+    nothing to say, so the caller can leave the paragraph out entirely.
+    """
+    if not export_enabled:
+        return "Export is switched off in the plugin settings, so nothing is being held back."
+    if not lockout_end_local:
+        return None
+    return (f"Export is held off until {lockout_end_local} as a precaution. It restarts "
+            f"early if the battery reaches {soc_floor_pct:.0f}%, or if today's solar can "
+            f"refill that reserve on its own.")
 
 
 # VPP state machine values
@@ -4566,6 +4665,70 @@ class Plugin(indigo.PluginBase):
         Returns '' when neither is set (email is then skipped)."""
         return (POWERCUT_EMAIL or self.pluginPrefs.get("powerCutEmailRecipient", "") or "").strip()
 
+    def _power_cut_lockout_end_local(self):
+        """Local clock time the export lockout expires, or "" if none is armed.
+
+        Read from the SAME pluginPrefs["powerRestoredTime"] the lockout window
+        itself uses, so the time quoted in the alert cannot drift from the time
+        export actually resumes. The caller arms the lockout (and writes that
+        pref) before sending the restore alert, so it is already there.
+        """
+        prt_str = self.pluginPrefs.get("powerRestoredTime", "")
+        if not prt_str:
+            return ""
+        try:
+            restored = datetime.fromisoformat(prt_str)
+            if restored.tzinfo is None:
+                restored = restored.replace(tzinfo=timezone.utc)
+            return _local_time(restored + timedelta(hours=POWER_CUT_LOCKOUT_HOURS))
+        except (ValueError, TypeError, AttributeError):
+            return ""
+
+    def _power_cut_status_lines(self, kind):
+        """Build the detail paragraphs for a power-cut alert. Returns a list.
+
+        Each paragraph is independent and is simply omitted when the readings
+        behind it are missing, so a dropped Modbus register costs one line rather
+        than the whole message.
+        """
+        lines = []
+        data  = getattr(self, "latest_inverter_data", None) or {}
+
+        soc      = _as_float(data.get("batterySoc"), None)
+        home_w   = _as_float(data.get("homePowerWatts"), None)
+        capacity = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), BATTERY_CAPACITY_KWH)
+        floor    = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+
+        # Battery + load + how long that lasts.
+        if soc is not None:
+            stored = soc / 100.0 * capacity
+            bits   = [f"Battery {soc:.0f}% ({stored:.1f} kWh stored)"]
+            if home_w is not None:
+                bits.append(f"the house is drawing {home_w:.0f} W")
+            runtime = _format_runtime(
+                _backup_runtime_hours(soc, floor, capacity, home_w))
+            if runtime:
+                # Say plainly that this is at the load right now — the figure
+                # moves the moment anything switches on, and on a sunny day the
+                # panels stretch it a long way further.
+                if kind == "lost":
+                    bits.append(f"enough to carry it for about {runtime} at that load")
+                else:
+                    bits.append(f"about {runtime} of backup at that load "
+                                f"if the power goes again")
+            lines.append(", ".join(bits) + ".")
+
+        # What export is doing now the grid is back.
+        if kind != "lost":
+            lockout = _lockout_message(
+                export_enabled    = bool(self.pluginPrefs.get("exportEnabled", False)),
+                lockout_end_local = self._power_cut_lockout_end_local(),
+                soc_floor_pct     = self._power_cut_lockout_soc_floor(),
+            )
+            if lockout:
+                lines.append(lockout)
+        return lines
+
     def _send_power_cut_notification(self, kind, detail=""):
         """Alert on a grid-status transition via Pushover + email.
 
@@ -4574,6 +4737,16 @@ class Plugin(indigo.PluginBase):
         detail   — the off-grid mode string on loss (e.g. "Off-grid (auto)"), or
                    the pre-formatted duration suffix on restoration (e.g.
                    " (duration 83s)") as built by the caller.
+
+        Both channels carry the SAME full body: battery level, what the house is
+        drawing, how long the battery would carry it, and — on a restore — what
+        the export lockout is doing and both ways out of it. These are the two
+        messages read on a phone during an outage, so everything needed to judge
+        the situation goes in them rather than in a log nobody opens at the time.
+
+        Every figure is optional. A line whose numbers are missing is left out
+        rather than printed as a dash or a zero, so a partial Modbus read can
+        never dress a guess up as a reading.
 
         Pushover is sent at normal priority so it honours the configured quiet
         hours. Both sends are best-effort: a failure (most likely when the outage
@@ -4585,12 +4758,22 @@ class Plugin(indigo.PluginBase):
 
         local_now = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
         if kind == "lost":
-            title   = "Power cut — grid lost"
-            message = (f"Mains power lost at {local_now}. The house is now running "
-                       f"on the Sigenergy battery ({detail}).")
+            title = "Power cut — grid lost"
+            head  = (f"Mains power lost at {local_now}. The house is now running "
+                     f"on the Sigenergy battery ({detail}).")
         else:
-            title   = "Power restored"
-            message = f"Mains power restored at {local_now}{detail}."
+            title = "Power restored"
+            head  = f"Mains power restored at {local_now}{detail}."
+
+        paragraphs = [head]
+        try:
+            paragraphs.extend(self._power_cut_status_lines(kind))
+        except Exception as exc:
+            # The headline is the part that matters. Never let a missing reading
+            # or a bad pref stop the alert going out.
+            log(f"[PowerCut] Could not build notification detail: {exc!r}",
+                level="WARNING")
+        message = "\n\n".join(paragraphs)
 
         # Pushover — normal priority, so quiet hours are respected.
         try:
@@ -4635,6 +4818,15 @@ class Plugin(indigo.PluginBase):
 
     def _apply_storm_result(self, new_level, reason):
         """Merge a MeteoAlarm poll result. Caller holds the lock."""
+        # Read here, not from the caller. The v5.45.0 locking restructure split
+        # this method out of _check_storm_watch and left loc_name behind in it,
+        # so the yellow-escalation and all-clear alerts — the two bodies that
+        # quote it — raised NameError instead of sending. Worse than the missing
+        # alert: storm_alerted_level is only written AFTER a successful send, so
+        # a failed all-clear left it stuck at the old level and every later
+        # storm at or below that level was then judged "already alerted" and
+        # stayed silent. Latent since 02-Jul-2026 — no storm has hit since.
+        loc_name      = self.pluginPrefs.get("siteLocationName") or "your area"
         prev_level    = self.store.get("storm_level", "none")
         alerted_level = self.store.get("storm_alerted_level", "none")
 

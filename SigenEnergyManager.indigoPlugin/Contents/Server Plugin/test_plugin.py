@@ -1485,5 +1485,248 @@ class TestBatteryCapacityPublished(unittest.TestCase):
         self.assertEqual(plugin.DEFAULT_EXPORT_RATE_P, 12.0)
 
 
+class TestBackupRuntimeHours(unittest.TestCase):
+    """v5.53.0: how long the battery would carry the house, for the power-cut alerts.
+
+    Usable energy is everything ABOVE the discharge cutoff, because the inverter
+    stops there — counting the last percent would overstate the backup in the one
+    message where being optimistic is worst.
+    """
+
+    def test_typical_case(self):
+        # 74% of 35.04 kWh above a 1% floor = 25.6 kWh, against a 647 W house.
+        hours = plugin._backup_runtime_hours(74.0, 1.0, 35.04, 647.0)
+        self.assertAlmostEqual(hours, 25.579 / 0.647, places=1)
+
+    def test_floor_is_subtracted(self):
+        with_floor = plugin._backup_runtime_hours(50.0, 10.0, 10.0, 1000.0)
+        no_floor   = plugin._backup_runtime_hours(50.0, 0.0, 10.0, 1000.0)
+        self.assertEqual(with_floor, 4.0)     # (50-10)% of 10 kWh at 1 kW
+        self.assertEqual(no_floor, 5.0)
+        self.assertLess(with_floor, no_floor)
+
+    def test_at_or_below_floor_is_zero_not_negative(self):
+        self.assertEqual(plugin._backup_runtime_hours(1.0, 1.0, 35.04, 500.0), 0.0)
+        self.assertEqual(plugin._backup_runtime_hours(0.5, 1.0, 35.04, 500.0), 0.0)
+
+    def test_unknown_inputs_return_none(self):
+        # None rather than a number — the caller omits the line instead of guessing.
+        self.assertIsNone(plugin._backup_runtime_hours(None, 1.0, 35.04, 647.0))
+        self.assertIsNone(plugin._backup_runtime_hours(74.0, 1.0, 35.04, None))
+        self.assertIsNone(plugin._backup_runtime_hours("abc", 1.0, 35.04, 647.0))
+
+    def test_zero_or_negative_load_returns_none(self):
+        # A meter dropping out mid-outage must not divide by zero or read as forever.
+        self.assertIsNone(plugin._backup_runtime_hours(74.0, 1.0, 35.04, 0.0))
+        self.assertIsNone(plugin._backup_runtime_hours(74.0, 1.0, 35.04, -50.0))
+
+    def test_zero_capacity_returns_none(self):
+        self.assertIsNone(plugin._backup_runtime_hours(74.0, 1.0, 0.0, 647.0))
+
+
+class TestFormatRuntime(unittest.TestCase):
+    """v5.53.0: the runtime figure has to read well on a phone at 3am."""
+
+    def test_minutes_under_the_hour(self):
+        self.assertEqual(plugin._format_runtime(0.5), "30 minutes")
+
+    def test_one_decimal_to_half_a_day(self):
+        self.assertEqual(plugin._format_runtime(3.25), "3.2 hours")
+
+    def test_whole_hours_to_two_days(self):
+        self.assertEqual(plugin._format_runtime(21.4), "21 hours")
+
+    def test_days_beyond_two(self):
+        self.assertEqual(plugin._format_runtime(60.0), "2.5 days")
+
+    def test_capped_at_ten_days(self):
+        self.assertEqual(plugin._format_runtime(500.0), "10+ days")
+
+    def test_none_and_zero_return_none(self):
+        self.assertIsNone(plugin._format_runtime(None))
+        self.assertIsNone(plugin._format_runtime(0.0))
+        self.assertIsNone(plugin._format_runtime("abc"))
+
+
+class TestLockoutMessage(unittest.TestCase):
+    """v5.53.0: the restore alert must name BOTH ways the export lockout ends.
+
+    26-Jul-2026: an 83-second cut was followed by export correctly resuming at 74%
+    on the solar-refill rule, from a plugin whose message had promised 85%. The
+    behaviour was right and the sentence was wrong, which is indistinguishable
+    from a fault when you are reading it on a phone.
+    """
+
+    def test_names_both_release_rules(self):
+        msg = plugin._lockout_message(True, "12:41", 85.0)
+        self.assertIn("12:41", msg)
+        self.assertIn("85%", msg)
+        self.assertIn("solar", msg.lower())
+
+    def test_floor_is_not_hardcoded(self):
+        msg = plugin._lockout_message(True, "12:41", 70.0)
+        self.assertIn("70%", msg)
+        self.assertNotIn("85%", msg)
+
+    def test_export_disabled_says_so(self):
+        msg = plugin._lockout_message(False, "12:41", 85.0)
+        self.assertIn("switched off", msg)
+        self.assertNotIn("12:41", msg)      # no lockout time when nothing is held
+
+    def test_no_end_time_omits_the_paragraph(self):
+        self.assertIsNone(plugin._lockout_message(True, "", 85.0))
+
+
+class TestPowerCutStatusLines(unittest.TestCase):
+    """v5.53.0: assembly of the alert body. A missing reading costs one line,
+    never the message."""
+
+    class _Stub:
+        def __init__(self, prefs, data):
+            self.pluginPrefs = prefs
+            self.latest_inverter_data = data
+
+        def _power_cut_lockout_soc_floor(self):
+            return plugin.Plugin._power_cut_lockout_soc_floor(self)
+
+        def _power_cut_lockout_end_local(self):
+            return plugin.Plugin._power_cut_lockout_end_local(self)
+
+    def _lines(self, kind, prefs=None, data=None):
+        prefs = dict(prefs or {})
+        prefs.setdefault("batteryCapacityKwh", "35.04")
+        prefs.setdefault("batteryHealthCutoff", "1")
+        stub = self._Stub(prefs, data if data is not None else {})
+        return plugin.Plugin._power_cut_status_lines(stub, kind)
+
+    def test_lost_reports_battery_load_and_runtime(self):
+        lines = self._lines("lost", data={"batterySoc": 74.0, "homePowerWatts": 647.0})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("74%", lines[0])
+        self.assertIn("647 W", lines[0])
+        self.assertIn("carry it for about", lines[0])
+
+    def test_restore_adds_the_lockout_paragraph(self):
+        restored = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        lines = self._lines(
+            "restored",
+            prefs={"exportEnabled": True, "powerRestoredTime": restored},
+            data={"batterySoc": 74.0, "homePowerWatts": 647.0},
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertIn("backup", lines[0])
+        self.assertIn("Export is held off until", lines[1])
+
+    def test_missing_soc_drops_only_the_battery_line(self):
+        restored = (datetime.now(timezone.utc)).isoformat()
+        lines = self._lines(
+            "restored",
+            prefs={"exportEnabled": True, "powerRestoredTime": restored},
+            data={},                       # partial Modbus read — no SOC at all
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Export is held off", lines[0])
+
+    def test_missing_load_still_reports_the_battery(self):
+        lines = self._lines("lost", data={"batterySoc": 74.0})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("74%", lines[0])
+        self.assertNotIn("drawing", lines[0])
+        self.assertNotIn("about", lines[0])   # no runtime without a load figure
+
+    def test_lost_never_mentions_the_lockout(self):
+        # The lockout only exists after a restore. Quoting a stale powerRestoredTime
+        # during a live outage would be nonsense.
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        lines = self._lines(
+            "lost",
+            prefs={"exportEnabled": True, "powerRestoredTime": stale},
+            data={"batterySoc": 74.0, "homePowerWatts": 647.0},
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("Export", lines[0])
+
+    def test_corrupt_restored_time_omits_the_lockout_paragraph(self):
+        lines = self._lines(
+            "restored",
+            prefs={"exportEnabled": True, "powerRestoredTime": "not-a-date"},
+            data={"batterySoc": 74.0, "homePowerWatts": 647.0},
+        )
+        self.assertEqual(len(lines), 1)          # battery line only, no bad time quoted
+
+    def test_lockout_end_is_four_hours_after_the_restore(self):
+        restored = datetime(2026, 7, 26, 7, 40, 52, tzinfo=timezone.utc)
+        stub = self._Stub({"powerRestoredTime": restored.isoformat()}, {})
+        # 07:40 UTC + 4h = 11:40 UTC = 12:40 BST.
+        self.assertIn(plugin.Plugin._power_cut_lockout_end_local(stub),
+                      ("12:40", "11:40"))       # tolerate a pytz-less test host
+
+
+class TestApplyStormResultLocName(unittest.TestCase):
+    """v5.53.0 regression: _apply_storm_result referenced loc_name, which the
+    v5.45.0 locking restructure left behind in _check_storm_watch.
+
+    The two bodies that quote it — yellow escalation and the all-clear — raised
+    NameError instead of sending. The sting is in the tail: storm_alerted_level
+    is only written AFTER a successful send, so a failed all-clear left it stuck
+    at the old level and every later storm at or below it was judged "already
+    alerted" and stayed silent. Amber and red never quote the name, so those kept
+    working, which is why nothing looked broken.
+
+    These tests raise NameError against the pre-fix code.
+    """
+
+    class _Stub:
+        def __init__(self, store, prefs=None):
+            self.store       = store
+            self.pluginPrefs = prefs if prefs is not None else {}
+            self.sent        = []
+
+        def _send_pushover(self, title, body, priority="0"):
+            self.sent.append((title, body, priority))
+
+        def _save_accumulators(self):
+            pass
+
+    def _apply(self, stub, level, reason="test reason"):
+        plugin.Plugin._apply_storm_result(stub, level, reason)
+
+    def test_yellow_escalation_sends(self):
+        stub = self._Stub({"storm_level": "none", "storm_alerted_level": "none"},
+                          {"siteLocationName": "Medomsley"})
+        self._apply(stub, "yellow")
+        self.assertEqual(len(stub.sent), 1)
+        self.assertIn("Yellow", stub.sent[0][0])
+        self.assertIn("Medomsley", stub.sent[0][1])
+        self.assertEqual(stub.store["storm_alerted_level"], "yellow")
+
+    def test_all_clear_sends_and_resets_the_latch(self):
+        stub = self._Stub({"storm_level": "amber", "storm_alerted_level": "amber"},
+                          {"siteLocationName": "Medomsley"})
+        self._apply(stub, "none")
+        self.assertEqual(len(stub.sent), 1)
+        self.assertIn("Cleared", stub.sent[0][0])
+        # The latch MUST reset, or the next storm is judged already-alerted.
+        self.assertEqual(stub.store["storm_alerted_level"], "none")
+
+    def test_unset_location_falls_back(self):
+        stub = self._Stub({"storm_level": "none", "storm_alerted_level": "none"}, {})
+        self._apply(stub, "yellow")
+        self.assertIn("your area", stub.sent[0][1])
+
+    def test_amber_and_red_still_send(self):
+        for level, word in (("amber", "Amber"), ("red", "RED")):
+            stub = self._Stub({"storm_level": "none", "storm_alerted_level": "none"})
+            self._apply(stub, level)
+            self.assertEqual(len(stub.sent), 1, level)
+            self.assertIn(word, stub.sent[0][0])
+            self.assertEqual(stub.sent[0][2], "1")      # high priority
+
+    def test_no_alert_when_level_unchanged(self):
+        stub = self._Stub({"storm_level": "amber", "storm_alerted_level": "amber"})
+        self._apply(stub, "amber")
+        self.assertEqual(stub.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
