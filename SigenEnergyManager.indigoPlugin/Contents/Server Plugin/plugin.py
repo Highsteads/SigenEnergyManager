@@ -7,7 +7,30 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        26-07-2026
-# Version:     5.53.0
+# Version:     5.54.0
+#
+# v5.54.0 (26-07-2026): the restore alert now WORKS OUT whether today's solar will
+# refill the reserve, instead of leaving the reader to guess which of the two
+# release rules applies to them. CliveS asked whether this was possible or too
+# difficult — it is neither: the plugin already answers exactly that question
+# every 60 seconds, so the alert now asks it once more at send time and states
+# the outcome, with both figures (spare vs needed) so the sums can be checked.
+# New _solar_refill_outlook() builds the provisional snapshot + 24h balance the
+# SAME way _evaluate_manager_impl does inside a lockout window, so the message
+# and the decision cannot disagree. Four outcomes, each phrased honestly: solar
+# covers it (export restarts within the minute), does not cover it YET (names
+# the forecast as a way out), night (does NOT dangle a forecast that cannot
+# arrive), and unknown — where it falls back to naming both rules and claiming
+# nothing. The needed figure quotes the MARGIN-INFLATED bar (× 1.25), because
+# that is the bar actually used; quoting the raw gap would make a "not yet"
+# verdict look wrong to anyone checking it.
+#
+# The same outlook is now logged at restore time. On 26-Jul-2026 export sat
+# suppressed for 20 minutes after the restore — manager evaluating every 60 s on
+# live data, no errors — and nothing in the log recorded what was being judged,
+# so afterwards the only honest answer was "we cannot tell". That gap is still
+# UNEXPLAINED and worth a proper look; this line makes the next one answerable.
+# +18 tests, 402 -> 415.
 #
 # v5.53.0 (26-07-2026): the power-cut alerts now carry the whole picture. These are
 # the two messages read on a phone during an outage, and they said almost nothing:
@@ -1375,21 +1398,48 @@ def _format_runtime(hours):
     return f"{h / 24:.1f} days"
 
 
-def _lockout_message(export_enabled, lockout_end_local, soc_floor_pct):
+def _lockout_message(export_enabled, lockout_end_local, soc_floor_pct, outlook=None):
     """Pure: one plain sentence on what the export lockout is doing after a restore.
 
     Must name BOTH ways the lockout ends, or an early resume on the solar rule
     reads as a fault — which is exactly what happened on 26-Jul-2026, when export
     restarted at 74% after a message promising 85%. Returns None when there is
     nothing to say, so the caller can leave the paragraph out entirely.
+
+    `outlook` is the answer to "will today's solar refill the reserve?" worked out
+    at send time — a dict of {releases, surplus_kwh, needed_kwh, is_daytime} — or
+    None when it could not be worked out. Given one, the message SAYS which way it
+    has gone and shows the two figures, rather than leaving the reader to wonder
+    which of the two rules will apply to them. It is still a forecast, so it is
+    phrased as what the plugin thinks now and re-checks every minute — never as a
+    promise. Without an outlook it falls back to naming both rules and no more.
     """
     if not export_enabled:
         return "Export is switched off in the plugin settings, so nothing is being held back."
     if not lockout_end_local:
         return None
-    return (f"Export is held off until {lockout_end_local} as a precaution. It restarts "
-            f"early if the battery reaches {soc_floor_pct:.0f}%, or if today's solar can "
-            f"refill that reserve on its own.")
+
+    head = f"Export is held off until {lockout_end_local} as a precaution."
+    if not outlook:
+        return (f"{head} It restarts early if the battery reaches {soc_floor_pct:.0f}%, "
+                f"or if today's solar can refill that reserve on its own.")
+
+    surplus = outlook.get("surplus_kwh")
+    needed  = outlook.get("needed_kwh")
+    figures = ""
+    if surplus is not None and needed is not None:
+        figures = f" ({surplus:.1f} kWh spare against the {needed:.1f} kWh needed)"
+
+    if outlook.get("releases"):
+        return (f"{head} But today's solar covers that reserve on its own{figures}, so "
+                f"export should restart within the minute. It re-checks every minute.")
+    if not outlook.get("is_daytime"):
+        return (f"{head} There is no solar left today to refill the reserve any sooner, "
+                f"so it stands until the battery reaches {soc_floor_pct:.0f}% or the "
+                f"window ends.")
+    return (f"{head} Today's solar does not cover that reserve yet{figures}, so it stands "
+            f"until the battery reaches {soc_floor_pct:.0f}%, the forecast improves, or "
+            f"the window ends. It re-checks every minute.")
 
 
 # VPP state machine values
@@ -3868,6 +3918,19 @@ class Plugin(indigo.PluginBase):
                     f"if today's solar can refill that reserve on its own)",
                     level="WARNING",
                 )
+                # Record what the solar rule thinks RIGHT NOW, with its figures.
+                # On 26-Jul-2026 export sat suppressed for 20 minutes after the
+                # restore and nothing in the log said what was being judged, so
+                # the only honest answer afterwards was "we cannot tell". One
+                # line here makes the next one answerable.
+                outlook = self._solar_refill_outlook(
+                    _as_float(data.get("batterySoc"), None))
+                if outlook:
+                    log(f"[PowerCut] Solar-refill outlook at restore: "
+                        f"{'RELEASES' if outlook['releases'] else 'holds'} — "
+                        f"{outlook['surplus_kwh']:.1f} kWh spare vs "
+                        f"{outlook['needed_kwh']:.1f} kWh needed, "
+                        f"daytime={outlook['is_daytime']}")
                 self._trigger_event("powerCutLockoutStarted")
             else:
                 log("[PowerCut] Grid restored after outage (export disabled — "
@@ -4684,6 +4747,60 @@ class Plugin(indigo.PluginBase):
         except (ValueError, TypeError, AttributeError):
             return ""
 
+    def _solar_refill_outlook(self, soc_pct):
+        """Will today's solar refill the lockout reserve on its own? Answer it NOW.
+
+        Returns {releases, surplus_kwh, needed_kwh, is_daytime} or None when the
+        question cannot be answered (no SOC, no forecast yet, anything raising).
+        None is a real answer here — the caller then falls back to naming both
+        rules without claiming to know which will apply.
+
+        Built the SAME way _evaluate_manager_impl builds it inside a lockout
+        window — provisional snapshot, then the manager's own 24h balance — so
+        the alert and the decision cannot disagree. Both calls are pure and hold
+        no lock of their own; _state_lock is an RLock, so re-entering is safe.
+
+        The two figures are worth returning even when the answer is no: they are
+        what makes "not yet" checkable rather than a bare refusal, and they are
+        the numbers that were missing from the log on 26-Jul-2026 when export sat
+        suppressed for 20 minutes with no way to see what the plugin was judging.
+        """
+        if soc_pct is None:
+            return None
+        try:
+            provisional = self._build_manager_snapshot(
+                soc_pct, bool(self.pluginPrefs.get("exportEnabled", False)), 0.0,
+            )
+            balance = self.manager._calculate_24h_balance(provisional)
+        except Exception as exc:
+            log(f"[PowerCut] Could not work out the solar-refill outlook ({exc!r})",
+                level="WARNING")
+            return None
+
+        cap_kwh     = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), BATTERY_CAPACITY_KWH)
+        floor_kwh   = self._power_cut_lockout_soc_floor() / 100.0 * cap_kwh
+        battery_kwh = float(getattr(balance, "battery_kwh", 0.0))
+        is_daytime  = bool(getattr(balance, "is_daytime", False))
+        surplus     = max(0.0, float(getattr(balance, "remaining_solar_kwh", 0.0))
+                          - float(getattr(balance, "remaining_home_to_dusk_kwh", 0.0)))
+        # Quote the margin-inflated figure, because that is the bar actually used.
+        needed      = max(0.0, floor_kwh - battery_kwh) * POWER_CUT_LOCKOUT_REFILL_MARGIN
+
+        return {
+            "releases": _solar_refill_releases_lockout(
+                is_daytime          = is_daytime,
+                soc_pct             = soc_pct,
+                min_soc_pct         = self._power_cut_lockout_min_soc(),
+                battery_kwh         = battery_kwh,
+                floor_kwh           = floor_kwh,
+                remaining_solar_kwh = float(getattr(balance, "remaining_solar_kwh", 0.0)),
+                home_to_dusk_kwh    = float(getattr(balance, "remaining_home_to_dusk_kwh", 0.0)),
+            ),
+            "surplus_kwh": surplus,
+            "needed_kwh":  needed,
+            "is_daytime":  is_daytime,
+        }
+
     def _power_cut_status_lines(self, kind):
         """Build the detail paragraphs for a power-cut alert. Returns a list.
 
@@ -4718,12 +4835,15 @@ class Plugin(indigo.PluginBase):
                                 f"if the power goes again")
             lines.append(", ".join(bits) + ".")
 
-        # What export is doing now the grid is back.
+        # What export is doing now the grid is back, and which way the solar rule
+        # is currently pointing. Worked out here rather than left as a conditional
+        # — the reader wants to know whether it applies to them today.
         if kind != "lost":
             lockout = _lockout_message(
                 export_enabled    = bool(self.pluginPrefs.get("exportEnabled", False)),
                 lockout_end_local = self._power_cut_lockout_end_local(),
                 soc_floor_pct     = self._power_cut_lockout_soc_floor(),
+                outlook           = self._solar_refill_outlook(soc),
             )
             if lockout:
                 lines.append(lockout)

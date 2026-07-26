@@ -1576,15 +1576,55 @@ class TestLockoutMessage(unittest.TestCase):
     def test_no_end_time_omits_the_paragraph(self):
         self.assertIsNone(plugin._lockout_message(True, "", 85.0))
 
+    # --- v5.54.0: say WHICH way the solar rule has gone, with the figures ---
+
+    def test_outlook_yes_says_export_restarts(self):
+        msg = plugin._lockout_message(True, "12:40", 85.0, {
+            "releases": True, "surplus_kwh": 10.6, "needed_kwh": 4.6, "is_daytime": True})
+        self.assertIn("covers that reserve on its own", msg)
+        self.assertIn("10.6 kWh spare", msg)
+        self.assertIn("4.6 kWh needed", msg)
+        self.assertIn("restart within the minute", msg)
+
+    def test_outlook_no_in_daylight_says_not_yet_with_figures(self):
+        msg = plugin._lockout_message(True, "12:40", 85.0, {
+            "releases": False, "surplus_kwh": 3.1, "needed_kwh": 5.9, "is_daytime": True})
+        self.assertIn("does not cover that reserve yet", msg)
+        self.assertIn("3.1 kWh spare", msg)
+        self.assertIn("5.9 kWh needed", msg)
+        self.assertIn("forecast improves", msg)
+
+    def test_outlook_no_at_night_does_not_dangle_a_forecast(self):
+        # At night there is no forecast to improve — saying so would be false hope.
+        msg = plugin._lockout_message(True, "01:40", 85.0, {
+            "releases": False, "surplus_kwh": 0.0, "needed_kwh": 6.0, "is_daytime": False})
+        self.assertIn("no solar left today", msg)
+        self.assertNotIn("forecast improves", msg)
+        self.assertIn("85%", msg)
+
+    def test_outlook_none_falls_back_to_naming_both_rules(self):
+        # Unknown must not be dressed up as either answer.
+        msg = plugin._lockout_message(True, "12:40", 85.0, None)
+        self.assertIn("or if today's solar can refill", msg)
+        self.assertNotIn("does not cover", msg)
+        self.assertNotIn("covers that reserve on its own", msg)
+
+    def test_missing_figures_still_gives_the_verdict(self):
+        msg = plugin._lockout_message(True, "12:40", 85.0,
+                                      {"releases": True, "is_daytime": True})
+        self.assertIn("covers that reserve on its own", msg)
+        self.assertNotIn("kWh spare", msg)      # no invented numbers
+
 
 class TestPowerCutStatusLines(unittest.TestCase):
     """v5.53.0: assembly of the alert body. A missing reading costs one line,
     never the message."""
 
     class _Stub:
-        def __init__(self, prefs, data):
+        def __init__(self, prefs, data, outlook=None):
             self.pluginPrefs = prefs
             self.latest_inverter_data = data
+            self._outlook = outlook
 
         def _power_cut_lockout_soc_floor(self):
             return plugin.Plugin._power_cut_lockout_soc_floor(self)
@@ -1592,11 +1632,16 @@ class TestPowerCutStatusLines(unittest.TestCase):
         def _power_cut_lockout_end_local(self):
             return plugin.Plugin._power_cut_lockout_end_local(self)
 
-    def _lines(self, kind, prefs=None, data=None):
+        def _solar_refill_outlook(self, soc_pct):
+            # Stubbed: the outlook needs the whole manager + forecast stack.
+            # Its own arithmetic is covered by TestSolarRefillOutlook.
+            return self._outlook
+
+    def _lines(self, kind, prefs=None, data=None, outlook=None):
         prefs = dict(prefs or {})
         prefs.setdefault("batteryCapacityKwh", "35.04")
         prefs.setdefault("batteryHealthCutoff", "1")
-        stub = self._Stub(prefs, data if data is not None else {})
+        stub = self._Stub(prefs, data if data is not None else {}, outlook)
         return plugin.Plugin._power_cut_status_lines(stub, kind)
 
     def test_lost_reports_battery_load_and_runtime(self):
@@ -1660,6 +1705,99 @@ class TestPowerCutStatusLines(unittest.TestCase):
         # 07:40 UTC + 4h = 11:40 UTC = 12:40 BST.
         self.assertIn(plugin.Plugin._power_cut_lockout_end_local(stub),
                       ("12:40", "11:40"))       # tolerate a pytz-less test host
+
+
+class TestSolarRefillOutlook(unittest.TestCase):
+    """v5.54.0: the alert works out whether today's solar will refill the reserve,
+    instead of leaving the reader to guess which of the two rules applies to them.
+
+    Uses the manager's OWN balance so the message and the decision cannot disagree,
+    and returns None — not a guess — whenever it cannot be worked out.
+    """
+
+    class _Balance:
+        def __init__(self, is_daytime=True, battery_kwh=26.1,
+                     remaining_solar_kwh=21.3, remaining_home_to_dusk_kwh=10.7):
+            self.is_daytime                 = is_daytime
+            self.battery_kwh                = battery_kwh
+            self.remaining_solar_kwh        = remaining_solar_kwh
+            self.remaining_home_to_dusk_kwh = remaining_home_to_dusk_kwh
+
+    class _Manager:
+        def __init__(self, balance):
+            self._balance = balance
+
+        def _calculate_24h_balance(self, snapshot):
+            if self._balance is None:
+                raise RuntimeError("no forecast yet")
+            return self._balance
+
+    class _Stub:
+        def __init__(self, balance, prefs=None):
+            self.pluginPrefs = prefs if prefs is not None else {}
+            self.manager     = TestSolarRefillOutlook._Manager(balance)
+
+        def _build_manager_snapshot(self, soc, export_enabled, vpp):
+            return object()
+
+        def _power_cut_lockout_soc_floor(self):
+            return plugin.Plugin._power_cut_lockout_soc_floor(self)
+
+        def _power_cut_lockout_min_soc(self):
+            return plugin.Plugin._power_cut_lockout_min_soc(self)
+
+    def _outlook(self, soc, balance, prefs=None):
+        prefs = dict(prefs or {})
+        prefs.setdefault("batteryCapacityKwh", "35.04")
+        return plugin.Plugin._solar_refill_outlook(self._Stub(balance, prefs), soc)
+
+    def test_this_mornings_figures_release(self):
+        # 26-Jul-2026 09:00: 21.3 kWh solar left vs 10.7 to dusk = 10.6 spare;
+        # 85% of 35.04 = 29.78 kWh floor, battery 26.1 → 3.68 short, × 1.25 = 4.6.
+        out = self._outlook(74.5, self._Balance())
+        self.assertTrue(out["releases"])
+        self.assertAlmostEqual(out["surplus_kwh"], 10.6, places=1)
+        self.assertAlmostEqual(out["needed_kwh"], 4.6, places=1)
+
+    def test_needed_quotes_the_margin_inflated_bar(self):
+        # The gate is needed × 1.25, so quoting the raw gap would understate it
+        # and make a "not yet" verdict look wrong to anyone checking the sums.
+        out = self._outlook(74.5, self._Balance())
+        raw = 29.784 - 26.1
+        self.assertGreater(out["needed_kwh"], raw)
+        self.assertAlmostEqual(out["needed_kwh"],
+                               raw * plugin.POWER_CUT_LOCKOUT_REFILL_MARGIN, places=2)
+
+    def test_dull_day_holds(self):
+        out = self._outlook(74.5, self._Balance(remaining_solar_kwh=12.0,
+                                                remaining_home_to_dusk_kwh=10.0))
+        self.assertFalse(out["releases"])
+        self.assertAlmostEqual(out["surplus_kwh"], 2.0, places=1)
+
+    def test_night_holds_and_reports_night(self):
+        out = self._outlook(74.5, self._Balance(is_daytime=False,
+                                                remaining_solar_kwh=0.0,
+                                                remaining_home_to_dusk_kwh=0.0))
+        self.assertFalse(out["releases"])
+        self.assertFalse(out["is_daytime"])
+
+    def test_surplus_never_negative(self):
+        out = self._outlook(74.5, self._Balance(remaining_solar_kwh=1.0,
+                                                remaining_home_to_dusk_kwh=9.0))
+        self.assertEqual(out["surplus_kwh"], 0.0)
+
+    def test_unknown_soc_returns_none(self):
+        self.assertIsNone(self._outlook(None, self._Balance()))
+
+    def test_balance_failure_returns_none(self):
+        # None, not a guess — the caller then names both rules and claims nothing.
+        self.assertIsNone(self._outlook(74.5, None))
+
+    def test_below_min_soc_holds_however_good_the_forecast(self):
+        out = self._outlook(20.0, self._Balance(battery_kwh=7.0,
+                                                remaining_solar_kwh=60.0,
+                                                remaining_home_to_dusk_kwh=5.0))
+        self.assertFalse(out["releases"])
 
 
 class TestApplyStormResultLocName(unittest.TestCase):
