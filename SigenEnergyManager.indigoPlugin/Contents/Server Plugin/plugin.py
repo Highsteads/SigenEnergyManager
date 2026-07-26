@@ -6,8 +6,17 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
-# Date:        25-07-2026
-# Version:     5.52.0
+# Date:        26-07-2026
+# Version:     5.52.1
+#
+# v5.52.1 (26-07-2026): the grid-restore message named only ONE of the two export
+# release rules. It promised "unless SOC >= 85%", wording written before v5.50.0
+# added the forecast-aware solar-refill release — so when this morning's 83-second
+# cut (grid lost 08:39:29, restored 08:40:52) was followed by export resuming at
+# 74% SOC at 09:00:30, the plugin had told the owner one thing and done another.
+# The release path itself was already honest (it names WHICH rule fired), but the
+# line read FIRST, at the moment of the outage, was not. Now names both. The
+# Pushover/email body says nothing about export at all, so it needed no change.
 #
 # v5.52.0 (25-07-2026): dashboard economics audit — four faults found by checking
 # the figures against the live ledger rather than reading the code.
@@ -3749,11 +3758,15 @@ class Plugin(indigo.PluginBase):
                 self.store["power_cut_lockout_active"] = True
                 self.pluginPrefs["powerRestoredTime"]  = now_utc.isoformat()
                 self._save_accumulators()   # crash-safe copy — prefs alone only persist on graceful shutdown
+                # Name BOTH release rules. Since v5.50.0 the lockout also lifts
+                # when the day's own solar can refill the reserve unaided, so a
+                # message quoting only the SOC floor makes an early resume look
+                # like a fault (live: 26-Jul-2026, export resumed at 74%).
                 log(
                     f"[PowerCut] Grid restored after outage — export locked for "
-                    f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution "
-                    f"(unless SOC ≥ {self._power_cut_lockout_soc_floor():.0f}%, when export "
-                    f"resumes to protect solar)",
+                    f"{POWER_CUT_LOCKOUT_HOURS:.0f} hours as precaution (export resumes "
+                    f"early if SOC reaches {self._power_cut_lockout_soc_floor():.0f}%, or "
+                    f"if today's solar can refill that reserve on its own)",
                     level="WARNING",
                 )
                 self._trigger_event("powerCutLockoutStarted")
