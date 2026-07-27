@@ -6623,7 +6623,7 @@ class Plugin(indigo.PluginBase):
         if self.forecast:
             self.forecast.record_accuracy(self.store["pv_daily_kwh"], date_str=yesterday)
 
-        # Write daily history ring buffer
+        # Write daily history — every record kept, no cap since v5.7
         self._write_daily_history(yesterday)
 
         # Forecast accuracy: log the rolling 7-day summary so trends are

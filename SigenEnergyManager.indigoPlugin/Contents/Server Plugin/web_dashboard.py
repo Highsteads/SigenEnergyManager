@@ -1598,7 +1598,7 @@ function tweenNumber(el, target, opts) {
 }
 
 /* ============================================================
-   Charts (v5.2) — Chart.js via CDN
+   Charts (v5.2) — Chart.js, bundled with the plugin since v5.43.1
    ============================================================ */
 
 let socChart = null, energyChart = null, dailyChart = null;
