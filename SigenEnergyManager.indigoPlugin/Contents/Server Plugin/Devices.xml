@@ -457,6 +457,20 @@
             </Field>
         </ConfigUI>
         <States>
+            <!-- Feed health (v5.55.0). The Axle poll returns "no event" for a
+                 healthy quiet day AND for a hard failure, so without these two
+                 a dead API is indistinguishable from a calm week — which is
+                 exactly how a revoked token went unnoticed for six weeks. -->
+            <State id="apiStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Axle API status changed</TriggerLabel>
+                <ControlPageLabel>Axle API Status</ControlPageLabel>
+            </State>
+            <State id="apiLastOk">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Axle API last-good time changed</TriggerLabel>
+                <ControlPageLabel>Axle API Last Good Poll</ControlPageLabel>
+            </State>
             <State id="vppStatus">
                 <ValueType>String</ValueType>
                 <TriggerLabel>VPP status changed</TriggerLabel>

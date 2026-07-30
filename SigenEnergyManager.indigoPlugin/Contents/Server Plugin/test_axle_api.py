@@ -133,5 +133,117 @@ class TestAxleGetNextEvent(unittest.TestCase):
         self.assertIsNone(self.api.get_next_event())
 
 
+class TestAxleFailureIsVisible(unittest.TestCase):
+    """v1.3 — a failing poll must be distinguishable from a quiet day.
+
+    get_next_event() returns None for BOTH, so the caller cannot tell them apart
+    from the return value alone. It could not, and on 30-Jul-2026 that cost six
+    weeks: Axle stopped accepting this install's token some time after 15-Jun,
+    every poll 401'd, and because AxleAPI logged through a logger with no handler
+    attached there was not one line about it anywhere. The VPP device read
+    "Standby" throughout, which is exactly what a quiet week looks like.
+    """
+
+    def setUp(self):
+        self.api = axle_api.AxleAPI("token123")
+
+    def _set(self, resp):
+        axle_api.requests.get = MagicMock(return_value=resp)
+
+    # --- healthy polls leave no error, event or not -----------------------
+
+    def test_event_found_clears_error(self):
+        self._set(_resp(json_data=dict(_VALID)))
+        self.api.get_next_event()
+        self.assertIsNone(self.api.last_error)
+
+    def test_no_event_is_not_an_error(self):
+        # THE distinction this whole class exists for: a quiet day is healthy.
+        for label, resp in (
+            ("null body",  _resp(json_data=None)),
+            ("204",        _resp(status=204, content=b"")),
+            ("empty body", _resp(content=b"")),
+        ):
+            with self.subTest(label):
+                self.api.last_error = "stale"
+                self._set(resp)
+                self.assertIsNone(self.api.get_next_event())
+                self.assertIsNone(self.api.last_error)
+
+    # --- every failure mode records something ----------------------------
+
+    def test_401_records_auth_failure(self):
+        self._set(_resp(status=401, content=b'{"detail":"Could not validate credentials"}'))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+        self.assertIn("401", self.api.last_error)
+
+    def test_http_error_records_status(self):
+        self._set(_resp(status=503, content=b"down"))
+        self.api.get_next_event()
+        self.assertIn("503", self.api.last_error or "")
+
+    def test_malformed_json_records_error(self):
+        self._set(_resp(raise_json=True))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+    def test_missing_timestamps_records_error(self):
+        self._set(_resp(json_data={"import_export": "export"}))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+    def test_implausible_window_records_error(self):
+        self._set(_resp(json_data={
+            "start_time": "2026-03-20T18:00:00+00:00",
+            "end_time":   "2026-03-20T17:00:00+00:00",
+        }))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+    def test_connection_error_records_error(self):
+        axle_api.requests.get = MagicMock(side_effect=_ConnErr("no net"))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+    def test_timeout_records_error(self):
+        axle_api.requests.get = MagicMock(side_effect=_Timeout("slow"))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+    def test_no_token_records_error(self):
+        api = axle_api.AxleAPI("")
+        api.get_next_event()
+        self.assertIsNotNone(api.last_error)
+
+    # --- recovery ---------------------------------------------------------
+
+    def test_error_clears_on_next_good_poll(self):
+        # A latched error would report a dead feed for ever after one blip.
+        self._set(_resp(status=401, content=b"nope"))
+        self.api.get_next_event()
+        self.assertIsNotNone(self.api.last_error)
+
+        self._set(_resp(json_data=dict(_VALID)))
+        self.assertIsNotNone(self.api.get_next_event())
+        self.assertIsNone(self.api.last_error)
+
+    # --- logger injection -------------------------------------------------
+
+    def test_injected_logger_receives_the_error(self):
+        # The whole point: the plugin's logger, which has handlers, sees it.
+        spy = MagicMock()
+        api = axle_api.AxleAPI("token123", logger=spy)
+        axle_api.requests.get = MagicMock(return_value=_resp(status=401, content=b"nope"))
+        api.get_next_event()
+        self.assertTrue(spy.error.called, "401 must reach the injected logger")
+
+    def test_default_logger_still_works(self):
+        api = axle_api.AxleAPI("token123")
+        self.assertIsNotNone(api.logger)
+        axle_api.requests.get = MagicMock(return_value=_resp(json_data=dict(_VALID)))
+        self.assertIsNotNone(api.get_next_event())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

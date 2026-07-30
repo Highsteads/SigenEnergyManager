@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 # Filename:    axle_api.py
 # Description: Axle VPP REST API client - polls for export event schedule
-# Author:      CliveS & Claude Opus 4.8
-# Date:        26-06-2026
-# Version:     1.2
+# Author:      CliveS & Claude Fable 5
+# Date:        30-07-2026
+# Version:     1.3
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
 # Changes: Updated logger name to SigenEnergyManager; _parse_dt guards non-string input
+#          v1.3 — accepts an injected logger and records last_error, so a failing
+#          poll is visible instead of silent (see the class docstring).
 
 import logging
 import requests
@@ -44,14 +46,25 @@ class AxleAPI:
     - After event: plugin detects EMS mode reversion and restores cutoff
     """
 
-    def __init__(self, api_token):
+    def __init__(self, api_token, logger=None):
         """Initialise the Axle API client.
 
         Args:
             api_token: Bearer token from Axle signup (stored in IndigoSecrets.py).
+            logger:    The plugin's own logger. Pass it — the private
+                       "SigenEnergyManager.AxleAPI" fallback below has NO handler
+                       attached anywhere in this plugin, so anything logged through
+                       it is discarded. That is not theoretical: Axle revoked this
+                       install's token some time after 15-Jun-2026 and every 401
+                       vanished, leaving the plugin blind to VPP events for six
+                       weeks with not one line in any log (found 30-Jul-2026).
         """
-        self.api_token = api_token
-        self.logger    = logging.getLogger("SigenEnergyManager.AxleAPI")
+        self.api_token  = api_token
+        self.logger     = logger or logging.getLogger("SigenEnergyManager.AxleAPI")
+        # Description of the most recent HARD failure, else None. get_next_event()
+        # returns None both for "no event scheduled" and for a failed call, so
+        # without this a revoked token is indistinguishable from a quiet day.
+        self.last_error = None
 
     def get_next_event(self):
         """Fetch the next VPP event from the Axle API.
@@ -65,7 +78,12 @@ class AxleAPI:
                 raw           (original API dict)
             or None if no event is scheduled or API call fails.
         """
+        # Cleared on entry; each failure branch below sets it. A poll that reaches
+        # the end with this still None succeeded, whether or not an event exists.
+        self.last_error = None
+
         if not self.api_token:
+            self.last_error = "No API token configured"
             self.logger.warning("Axle API token not configured - cannot poll for events")
             return None
 
@@ -82,6 +100,7 @@ class AxleAPI:
             )
 
             if response.status_code == 401:
+                self.last_error = "Authentication failed (401) - token rejected by Axle"
                 self.logger.error(
                     "Axle API authentication failed - check AXLE_API_KEY in IndigoSecrets.py"
                 )
@@ -90,6 +109,7 @@ class AxleAPI:
             if response.status_code not in (200, 204):
                 # Error branch must precede the empty-body check — a 5xx with
                 # an empty body is an outage, not a routine "no event scheduled".
+                self.last_error = f"HTTP {response.status_code}"
                 self.logger.error(
                     f"Axle API HTTP error: {response.status_code} - {response.text[:200]}"
                 )
@@ -102,6 +122,7 @@ class AxleAPI:
             try:
                 data = response.json()
             except ValueError as e:
+                self.last_error = "Malformed JSON response"
                 self.logger.error(f"Axle API malformed JSON response: {e}")
                 return None
 
@@ -113,6 +134,7 @@ class AxleAPI:
             end_time   = self._parse_dt(data.get("end_time"))
 
             if start_time is None or end_time is None:
+                self.last_error = "Event returned with unparseable timestamps"
                 self.logger.error(
                     f"Axle API: missing or unparseable timestamps in response: {data}"
                 )
@@ -124,6 +146,7 @@ class AxleAPI:
             # otherwise propagate a negative or zero duration into pre-charge
             # SOC sizing and dashboard earnings arithmetic.
             if duration_hrs <= 0 or duration_hrs > 24:
+                self.last_error = f"Event rejected - implausible window ({duration_hrs:.1f}h)"
                 self.logger.warning(
                     f"Axle API: implausible event window {start_time} -> {end_time} "
                     f"({duration_hrs:.1f}h) — ignoring event"
@@ -174,12 +197,15 @@ class AxleAPI:
             }
 
         except requests.exceptions.ConnectionError:
+            self.last_error = "Connection error (no internet?)"
             self.logger.warning("Axle API: connection error (no internet?)")
             return None
         except requests.exceptions.Timeout:
+            self.last_error = f"Timed out after {REQUEST_TIMEOUT}s"
             self.logger.warning(f"Axle API: request timed out after {REQUEST_TIMEOUT}s")
             return None
         except Exception as e:
+            self.last_error = f"Unexpected error: {e}"
             self.logger.error(f"Axle API: unexpected error: {e}")
             return None
 

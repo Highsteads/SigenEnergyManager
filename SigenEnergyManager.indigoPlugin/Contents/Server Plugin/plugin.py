@@ -5,9 +5,48 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Opus 5
-# Date:        26-07-2026
-# Version:     5.54.0
+# Author:      CliveS & Claude Fable 5
+# Date:        30-07-2026
+# Version:     5.55.0
+#
+# v5.55.0 (30-07-2026): A FAILING AXLE POLL IS NOW VISIBLE. Axle announced a grid
+# event for this evening; the plugin knew nothing about it, and had known nothing
+# for six weeks. The token was revoked server-side some time after the 15-Jun
+# event (a JWT, but NOT expired — exp is 2053; the endpoint answers
+# 401 "Could not validate credentials"), so every poll since had failed.
+#
+# NOT ONE LINE was logged about it. Two faults compounded:
+#   1. AxleAPI was the only API client in this plugin constructed WITHOUT a
+#      logger, so it fell back to logging.getLogger("SigenEnergyManager.AxleAPI")
+#      — a logger with no handler attached anywhere here. Every 401 was
+#      discarded. Compare OctopusAPI and SigenergyModbus, both of which are
+#      handed self.logger.
+#   2. get_next_event() returns None for "no event scheduled" AND for a hard
+#      failure, so even a caller watching the return value could not tell a dead
+#      feed from a quiet week. The VPP device read a calm "Standby" throughout.
+#
+# The silence is the bug worth fixing — a rejected token is Axle's business, but
+# six weeks of not knowing is ours. AxleAPI now takes a logger and records
+# last_error; _record_vpp_api_status() logs a failure once and then hourly (a
+# sustained outage costs one line an hour, not one per 10-min poll) and logs the
+# recovery; and the Axle VPP Monitor device carries apiStatus + apiLastOk so the
+# state is visible without reading a log at all. +13 tests (all verified failing
+# against 5.54.0), suite 415 -> 428.
+#
+# RESOLVED SAME DAY: CliveS fetched a replacement token from his Axle account and
+# put it in IndigoSecrets.py at 14:41; the restart onto this version picked it up
+# and the poll went healthy immediately — apiStatus "OK", and tonight's 19:00-20:00
+# event was announced within seconds, which is the new machinery proving itself on
+# the first try.
+#
+# GOTCHA THAT NEARLY CAUSED A MISDIAGNOSIS, worth remembering: a plugin host caches
+# IndigoSecrets in sys.modules at ITS OWN startup, so the token a host holds is the
+# one that was on disk when that host last started, NOT what is on disk now. Testing
+# the same key from ClaudeBridge's context (running since 23-Jul) kept returning 401
+# AFTER the replacement was in place, because that host still held the old value —
+# a sys.path.insert cannot help, the cached module wins. Read the file directly with
+# importlib when you need to know what is REALLY on disk, and remember a credential
+# change needs a restart of every host that reads it, not just the file edited.
 #
 # v5.54.0 (26-07-2026): the restore alert now WORKS OUT whether today's solar will
 # refill the reserve, instead of leaving the reader to guess which of the two
@@ -5745,9 +5784,42 @@ class Plugin(indigo.PluginBase):
 
         return VPP_POLL_NORMAL_INTERVAL
 
+    def _record_vpp_api_status(self, error):
+        """Record the outcome of the latest Axle poll and surface a lasting failure.
+
+        get_next_event() returns None for BOTH "no event scheduled" and a hard
+        failure, so an unhealthy feed looks exactly like a quiet week. Axle
+        revoked this install's token some time after 15-Jun-2026 and the plugin
+        polled a dead endpoint for six weeks in complete silence — the VPP page
+        simply read "Standby" throughout. This is what makes that state visible.
+
+        Logs on the first occurrence of a given failure and hourly thereafter, so
+        a sustained outage costs one line an hour rather than one every 10 min.
+        """
+        prev = self.store.get("vpp_api_error")
+        self.store["vpp_api_error"] = error
+
+        if error:
+            self.store["vpp_api_fails"] = self.store.get("vpp_api_fails", 0) + 1
+            now = time.time()
+            if error != prev or now - self.store.get("vpp_api_logged", 0.0) >= 3600.0:
+                self.store["vpp_api_logged"] = now
+                log(f"[VPP] Axle poll failing - {error} "
+                    f"(consecutive failures: {self.store['vpp_api_fails']})", "ERROR")
+        else:
+            if prev:
+                log(f"[VPP] Axle poll recovered after {self.store.get('vpp_api_fails', 0)} "
+                    f"failure(s) - API reachable again")
+            self.store["vpp_api_fails"]  = 0
+            self.store["vpp_api_logged"] = 0.0
+            self.store["vpp_api_last_ok"] = time.time()
+
     def _poll_vpp(self):
         """Poll Axle API and advance VPP state machine."""
-        if not self.axle or not self.pluginPrefs.get("axleEnabled", False):
+        if not self.pluginPrefs.get("axleEnabled", False):
+            return
+        if not self.axle:
+            self._record_vpp_api_status("No API token configured")
             return
         # While the manager is paused the VPP state machine must not advance — pause
         # already stood down any active window and disengaged the inverter, so a
@@ -5758,6 +5830,7 @@ class Plugin(indigo.PluginBase):
             return
 
         event = self.axle.get_next_event()   # NETWORK — unlocked (v5.45.0)
+        self._record_vpp_api_status(self.axle.last_error)
         with self._state_lock:
             self._apply_vpp_event(event)
 
@@ -7633,7 +7706,15 @@ class Plugin(indigo.PluginBase):
         vpp_rate      = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)  # GBP/kWh, configurable (default £1)
         earnings_est  = round(max_export_kw * duration_hrs * vpp_rate, 2)
 
+        # Feed health. Without this the device reads a calm "Standby" whether the
+        # API is healthy and quiet or rejecting every call (see _record_vpp_api_status).
+        api_error = self.store.get("vpp_api_error")
+        last_ok   = self.store.get("vpp_api_last_ok")
+        last_ok_s = datetime.fromtimestamp(last_ok).strftime("%H:%M %d/%m") if last_ok else "never"
+
         states = [
+            {"key": "apiStatus",         "value": api_error or "OK"},
+            {"key": "apiLastOk",         "value": last_ok_s},
             {"key": "vppStatus",         "value": "Active" if self.store["vpp_active"] else "Standby"},
             {"key": "vppState",          "value": self.store["vpp_state"]},
             {"key": "eventStartTime",    "value": start_str},
@@ -8538,8 +8619,9 @@ class Plugin(indigo.PluginBase):
             gas_unit=(self.pluginPrefs.get("gasMeterUnit") or "m3"),
         )
 
-        # Axle VPP
-        self.axle = AxleAPI(api_token=axle_key) if axle_key else None
+        # Axle VPP. Pass our own logger — AxleAPI's private fallback logger has no
+        # handler, so its errors go nowhere (a revoked token hid for six weeks).
+        self.axle = AxleAPI(api_token=axle_key, logger=self.logger) if axle_key else None
 
         # Inverter IP: IndigoSecrets.py wins over PluginConfig.  If neither is set,
         # log an ERROR and skip Modbus init only — the rest of the plugin can
