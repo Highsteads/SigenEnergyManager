@@ -1866,5 +1866,61 @@ class TestApplyStormResultLocName(unittest.TestCase):
         self.assertEqual(stub.sent, [])
 
 
+class TestVppEventStr(unittest.TestCase):
+    """v5.55.1 — the dashboard's VPP window used to be a hardcoded "".
+
+    `/api/status` published `"event_str": ""` as a literal from the day the
+    block was written, so every consumer that appends it rendered "VPP event
+    announced:" and then stopped. The one fact worth showing — WHEN — was the
+    one that was missing, and it went unseen because nothing had ever taken
+    that branch: the feed was dead (see 5.55.0) so no event had reached it.
+
+    The empty string still has to mean "say nothing", because the callers all
+    guard on falsiness — so the tests below pin BOTH directions: a real window
+    renders, and a missing or malformed one renders nothing rather than a
+    half-sentence or an exception.
+    """
+
+    def _p(self, event):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"vpp_event": event}
+        return p
+
+    def _utc(self, y, m, d, hh, mm):
+        return datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
+
+    def test_todays_window_is_short(self):
+        # 18:00Z = 19:00 BST — and the local conversion is the point: printing
+        # the stored UTC raw would read an hour early all summer.
+        today = datetime.now().date()
+        ev = {"start_time": datetime(today.year, today.month, today.day, 18, 0, tzinfo=timezone.utc),
+              "end_time":   datetime(today.year, today.month, today.day, 19, 0, tzinfo=timezone.utc)}
+        s = self._p(ev)._vpp_event_str()
+        self.assertRegex(s, r"^\d{2}:\d{2}-\d{2}:\d{2}$")
+        self.assertNotIn("/", s)          # today's window carries no date
+
+    def test_other_day_window_carries_the_date(self):
+        ev = {"start_time": self._utc(2026, 3, 20, 18, 0),
+              "end_time":   self._utc(2026, 3, 20, 19, 30)}
+        s = self._p(ev)._vpp_event_str()
+        self.assertIn("20/03", s)
+        self.assertIn("-", s)
+
+    def test_no_event_says_nothing(self):
+        self.assertEqual(self._p(None)._vpp_event_str(), "")
+        self.assertEqual(self._p({})._vpp_event_str(), "")
+
+    def test_half_an_event_says_nothing(self):
+        # A start with no end must not render "19:00-" .
+        ev = {"start_time": self._utc(2026, 3, 20, 18, 0), "end_time": None}
+        self.assertEqual(self._p(ev)._vpp_event_str(), "")
+
+    def test_malformed_event_does_not_raise(self):
+        # This runs inside the /api/status build — an exception here would blank
+        # the whole payload and take every dashboard card with it.
+        ev = {"start_time": "not-a-datetime", "end_time": "nor-this"}
+        self.assertEqual(self._p(ev)._vpp_event_str(), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

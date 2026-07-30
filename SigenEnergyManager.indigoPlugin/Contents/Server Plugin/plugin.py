@@ -7,7 +7,18 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     5.55.0
+# Version:     5.55.1
+#
+# v5.55.1 (30-07-2026): THE DASHBOARD'S VPP WINDOW WAS A HARDCODED EMPTY STRING.
+# `/api/status` published `"event_str": ""` as a literal, from the day the block
+# was written, so every consumer that appends it rendered "VPP event announced:"
+# and then stopped — the one fact worth showing, WHEN, was the fact missing.
+# Live-spotted on the phone within an hour of the feed coming back, which is the
+# first time anything had ever taken that branch. New `_vpp_event_str()` formats
+# the stored window through `_local_time` (so it matches the device states and
+# the log rather than reading an hour early through BST), prefixes the date only
+# when the window is not today, and returns "" on a missing or malformed event
+# because every caller already treats "" as "say nothing". +5 tests, 428 -> 433.
 #
 # v5.55.0 (30-07-2026): A FAILING AXLE POLL IS NOW VISIBLE. Axle announced a grid
 # event for this evening; the plugin knew nothing about it, and had known nothing
@@ -2430,7 +2441,11 @@ class Plugin(indigo.PluginBase):
                 "vpp": {
                     "state":     store.get("vpp_state",  "idle"),
                     "active":    store.get("vpp_active", False),
-                    "event_str": "",
+                    # Was hardcoded "" from the day this block was written, so
+                    # every consumer that appends it produced a dangling
+                    # "VPP event announced:" with the one useful fact — WHEN —
+                    # missing. Live-spotted 30-07-2026 on the phone.
+                    "event_str": self._vpp_event_str(),
                 },
                 "storm": {
                     "level": storm_level_now,
@@ -7685,6 +7700,33 @@ class Plugin(indigo.PluginBase):
             {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
         dev.updateStatesOnServer(states)
+
+    def _vpp_event_str(self):
+        """The announced window as "19:00-20:00", or "" when there is none.
+
+        Consumers append this to a sentence ("VPP event announced: …"), so an
+        empty string must read as "nothing to add" rather than "unknown" — the
+        callers already guard on falsiness. A window on another day is prefixed
+        with its date; today's stays short, because that is the common case and
+        the whole point is a glanceable line on a phone.
+
+        Times go through _local_time so they match the device states and the
+        log, all of which are Europe/London — the stored event is UTC-aware and
+        printing that raw would read an hour early through BST.
+        """
+        event = self.store.get("vpp_event") or {}
+        start = event.get("start_time")
+        end   = event.get("end_time")
+        if not start or not end:
+            return ""
+        try:
+            window = f"{_local_time(start)}-{_local_time(end)}"
+            return window if _local_time(start, "%Y-%m-%d") == _local_today_str() \
+                else f"{_local_time(start, '%d/%m')} {window}"
+        except Exception:
+            # A malformed stored event must not take the whole status payload
+            # down — every caller treats "" as "say nothing".
+            return ""
 
     def _update_vpp_device(self):
         """Push VPP state to axleVppMonitor device."""
