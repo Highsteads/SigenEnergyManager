@@ -7,7 +7,46 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     5.55.2
+# Version:     5.55.3
+#
+# v5.55.3 (30-07-2026): A SILENT UTC FALLBACK IN THE DECISION ENGINE (battery_manager
+# 3.8 -> 3.9). Chasing why four battery_manager tests failed on the usual runner
+# turned up something better than a test-environment quirk: two production sites
+# converted to Europe/London with pytz ONLY and, when pytz was missing, fell back
+# to returning the UTC value unchanged. Not an error — an answer quietly one hour
+# out for the eight months of BST. `_to_local()` returned `dt` unconverted, so
+# every caller compared a UTC clock against local wall-clock windows; and the
+# overnight-drain midnight boundary was built at UTC midnight, i.e. 01:00 BST.
+# The failing tests were not noise, they were the two sites being caught.
+#
+# ROOT CAUSE WAS DUPLICATION: five hand-rolled copies of the same conversion,
+# three with a stdlib-zoneinfo tier and two without. That is also why these two
+# were missed when octopus_api got exactly this fix in v5.22.1 (27-May-2026).
+# Now ONE implementation — `_london_tz` / `_london_localise` / `_to_london` — used
+# by all five, with stdlib zoneinfo PREFERRED over pytz: it ships with Python
+# 3.9+, so it cannot vanish when a Packages rebuild fails (this install has had
+# that happen more than once), and it has no `.localize()` trap. Attaching a pytz
+# zone via a bare `replace(tzinfo=...)` yields LMT, -00:01 for London — the exact
+# detail a copied block gets wrong, now impossible to get wrong twice.
+#
+# LIVE INSTALLS WERE NEVER AFFECTED: pytz>=2024.1 is pinned in requirements.txt
+# and bundled in Contents/Packages (2026.1.post1 present), so the working path
+# was always taken. This removes a latent wrong-answer path, not a live fault.
+#
+# The test suite was lying too, in three ways, all fixed: two tests did their own
+# `import pytz` and ERRORED before asserting anything; two more SKIPPED silently
+# (a skipped test is a test that is not testing); and a `_today_str()` helper
+# returned the UTC date where the module returns the London one, which would have
+# disagreed for one hour every night in BST. Suite now 434 tests, 0 skipped,
+# 0 failures, WITH and WITHOUT pytz — previously 4 failed and 2 skipped.
+#
+# NOT DONE, deliberately, and flagged rather than half-finished: openmeteo_forecast.py
+# carries the SAME pattern (module-level LONDON_TZ + a `PYTZ_AVAILABLE` gate that
+# leaves a datetime NAIVE when absent). It cannot be converted piecemeal — its
+# dawn parse calls `LONDON_TZ.localize(dt, is_dst=False)` to resolve the autumn
+# fold, and zoneinfo expresses that as `fold=1`, not a kwarg. Changing the module
+# constant without that mapping would break the once-a-year path. Worth doing as
+# its own change with tests pinning the fold equivalence.
 #
 # v5.55.2 (30-07-2026): "NO EVENT" WAS BEING REPORTED AS A FAULT. Axle signals
 # "nothing scheduled" in TWO shapes: a null body, and — from the moment an event

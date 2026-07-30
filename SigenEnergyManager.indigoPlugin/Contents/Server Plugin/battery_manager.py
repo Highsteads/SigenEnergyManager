@@ -4,9 +4,28 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 4.8
-# Date:        20-07-2026
-# Version:     3.8
+# Author:      CliveS & Claude Fable 5
+# Date:        30-07-2026
+# Version:     3.9
+# 3.9 — Europe/London conversion consolidated into ONE implementation
+#       (_london_tz / _london_localise / _to_london) used by all five sites that
+#       needed it, and stdlib zoneinfo is now PREFERRED over pytz.
+#       WHY: the conversion was five hand-rolled copies. Three had a zoneinfo
+#       fallback and two did not, so without pytz those two silently returned
+#       UTC — the day-of-week profile lookup read the wrong half-hour slot and
+#       the cheap-window scheduler was an hour out, for the whole of BST, with
+#       nothing logged. Not a crash; a quietly wrong answer.
+#       Live installs were never affected (pytz>=2024.1 is pinned and bundled),
+#       but Packages has been wiped and rebuilt more than once on this system,
+#       and zoneinfo is stdlib from 3.9 so it cannot go missing the same way.
+#       _london_localise exists because pytz and zoneinfo need DIFFERENT calls
+#       to attach a zone to a naive local time — tz.localize(naive) vs
+#       naive.replace(tzinfo=tz). Using zoneinfo's form on a pytz zone yields
+#       LMT (-00:01 for London), which is precisely the detail a copied block
+#       gets wrong. One function, so it can only be got wrong once.
+#       Behaviour is unchanged wherever pytz is present. Tests now pass with AND
+#       without pytz (434, 0 skipped, both ways) — previously 4 failed and 2
+#       silently skipped on any runner lacking it.
 # 3.8 — Solar overflow charge is paced to a TARGET SOC (default 90%), not to 100%.
 #       required_charge_kw is subtracted from export BEFORE the DNO cap is applied, so
 #       a 100% target spends the low-surplus morning buying SOC out of exportable kWh
@@ -61,6 +80,81 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Europe/London time — ONE implementation, used by every site in this module
+# ══════════════════════════════════════════════════════════════════════════════
+# This module makes several decisions against LOCAL wall-clock time: the day-of-
+# week profile lookup, dusk, the tariff cheap-window boundaries and the local
+# midnight the overnight drain is measured to. Getting the zone wrong is not a
+# crash — it is an answer that is quietly one hour out for eight months a year.
+#
+# It used to be five hand-rolled copies of the conversion. Three had a
+# stdlib-zoneinfo fallback and two did not, so those two silently returned UTC
+# whenever pytz was missing and the affected tests failed with 16.0 != 18.0 and
+# '22:45' != '23:45' — both exactly the BST offset. Duplication is why the two
+# were missed when octopus_api was given the same fix in v5.22.1 (27-May-2026).
+#
+# ZONEINFO IS PREFERRED over pytz, deliberately:
+#   * it is stdlib from Python 3.9, so it cannot go missing when a Packages
+#     rebuild fails — and this install has had Packages wiped and rebuilt more
+#     than once (ClaudeBridge's __init__ loss, the paho 1.6.1 -> 2.1.0 purge);
+#   * it has no .localize() requirement. Attaching a pytz zone with a bare
+#     `replace(tzinfo=...)` yields LMT — for London that is -00:01, a silently
+#     wrong answer by 60 seconds. zoneinfo has no such trap.
+# pytz is kept as a second source only for completeness.
+
+def _london_tz():
+    """Return an Europe/London tzinfo, or None if no tz database is reachable.
+
+    None means "cannot convert" and callers must degrade explicitly — it must
+    never be confused with "the answer is UTC". On any supported Python this
+    returns a real zone, so the None path is effectively unreachable; it exists
+    so a broken interpreter fails visibly at the call site rather than here.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/London")
+    except Exception:
+        try:
+            import pytz
+            return pytz.timezone("Europe/London")
+        except Exception:
+            return None
+
+
+def _london_localise(naive_dt):
+    """Attach Europe/London to a NAIVE datetime that is already local wall-clock.
+
+    THE reason this is a shared function: pytz and zoneinfo need different calls
+    for this and only this operation. pytz requires `tz.localize(naive)` (which
+    also resolves the DST gap/fold); zoneinfo requires `naive.replace(tzinfo=tz)`.
+    Using zoneinfo's form on a pytz zone gives LMT, and that is exactly the kind
+    of detail a copied block gets wrong.
+
+    Returns None when no zone is available, so a caller cannot mistake an
+    unconverted value for a converted one.
+    """
+    tz = _london_tz()
+    if tz is None:
+        return None
+    localise = getattr(tz, "localize", None)     # pytz only
+    return localise(naive_dt) if localise else naive_dt.replace(tzinfo=tz)
+
+
+def _to_london(dt):
+    """Convert an AWARE datetime to Europe/London.
+
+    A naive datetime is returned unchanged — callers that hold naive values
+    treat them as already-local, and silently stamping a zone on one would
+    invent information. Returns dt unchanged if no zone is available.
+    """
+    if dt is None or dt.tzinfo is None:
+        return dt
+    tz = _london_tz()
+    return dt.astimezone(tz) if tz is not None else dt
+
 
 # Import tariff key constants
 try:
@@ -592,17 +686,9 @@ class BatteryManager:
         now             = snapshot.now
 
         # ── Local time for day-of-week ──────────────────────────────────────
-        # (ImportError, Exception) was redundant — Exception already covers it and
-        # masked real tz errors. Try pytz, then stdlib zoneinfo (correct in GMT too).
-        try:
-            import pytz
-            local_now = now.astimezone(pytz.timezone("Europe/London"))
-        except Exception:
-            try:
-                from zoneinfo import ZoneInfo
-                local_now = now.astimezone(ZoneInfo("Europe/London"))
-            except Exception:
-                local_now = now
+        # Shared _to_london (see the top of this module): zoneinfo first, pytz
+        # second, and dt returned unchanged only if neither is reachable.
+        local_now = _to_london(now)
 
         today_str = local_now.date().strftime("%Y-%m-%d")
 
@@ -654,21 +740,15 @@ class BatteryManager:
         # dusk_dt = end of the last meaningful solar hour (start + 1h), tz-aware
         dusk_dt = None
         if dusk_hour_naive is not None:
-            # Mirror the local_now pattern above: pytz, then stdlib zoneinfo,
-            # and only then the UTC stamp — the naive dusk time is Europe/London,
-            # so stamping it UTC directly runs an hour late in BST (extending
-            # is_daytime and hours_to_dusk by an hour).
-            try:
-                import pytz
-                _tz_l   = pytz.timezone("Europe/London")
-                dusk_dt = _tz_l.localize(dusk_hour_naive + timedelta(hours=1))
-            except Exception:
-                try:
-                    from zoneinfo import ZoneInfo
-                    dusk_dt = (dusk_hour_naive + timedelta(hours=1)).replace(
-                        tzinfo=ZoneInfo("Europe/London"))
-                except Exception:
-                    dusk_dt = (dusk_hour_naive + timedelta(hours=1)).replace(tzinfo=timezone.utc)
+            # The naive dusk time is Europe/London wall-clock, so stamping it UTC
+            # directly runs an hour late in BST (extending is_daytime and
+            # hours_to_dusk by an hour). _london_localise picks the right call
+            # for whichever tz library is present; the UTC stamp is the last
+            # resort only when no tz database exists at all.
+            _dusk_naive = dusk_hour_naive + timedelta(hours=1)
+            dusk_dt = _london_localise(_dusk_naive)
+            if dusk_dt is None:
+                dusk_dt = _dusk_naive.replace(tzinfo=timezone.utc)
 
         is_daytime = (
             today_dawn_dt is not None
@@ -995,19 +1075,19 @@ class BatteryManager:
             # `now` is UTC, so a naive .replace(tzinfo=now.tzinfo) places the
             # boundary at UTC midnight — which is 01:00 BST in summer. The
             # cheap-rate Tracker boundary is local-time midnight.
-            try:
-                import pytz
-                _tz_l        = pytz.timezone("Europe/London")
-                local_now    = now.astimezone(_tz_l)
-                midnight_naive = datetime.combine(
-                    local_now.date() + timedelta(days=1), datetime.min.time()
-                )
-                midnight_dt  = _tz_l.localize(midnight_naive).astimezone(now.tzinfo or timezone.utc)
-            except ImportError:
-                # Fallback: UTC midnight if pytz unavailable
-                midnight_dt = datetime.combine(
-                    now.date() + timedelta(days=1), datetime.min.time()
-                ).replace(tzinfo=now.tzinfo or timezone.utc)
+            # WAS pytz-only with a silent UTC fallback (fixed v5.55.3). Without
+            # pytz it built midnight in UTC — 01:00 BST — and the overnight drain
+            # was measured to the wrong instant, with nothing logged.
+            local_now      = _to_london(now)
+            midnight_naive = datetime.combine(
+                local_now.date() + timedelta(days=1), datetime.min.time()
+            )
+            midnight_dt = _london_localise(midnight_naive)
+            midnight_dt = (
+                midnight_dt.astimezone(now.tzinfo or timezone.utc)
+                if midnight_dt is not None
+                else midnight_naive.replace(tzinfo=now.tzinfo or timezone.utc)
+            )
 
             drain_to_midnight   = self._estimate_consumption_until(
                 now, midnight_dt, snapshot.consumption_profile
@@ -1355,15 +1435,13 @@ class BatteryManager:
 
     @staticmethod
     def _to_local(dt: datetime) -> datetime:
-        """Convert dt to UK local time; handle naive datetimes as already local."""
-        try:
-            import pytz
-            london = pytz.timezone("Europe/London")
-            if dt.tzinfo is None:
-                return dt
-            return dt.astimezone(london)
-        except Exception:
-            return dt
+        """Convert dt to UK local time; handle naive datetimes as already local.
+
+        WAS pytz-only (fixed v5.55.3): without pytz the `except Exception`
+        returned dt UNCONVERTED, so every caller silently compared a UTC clock
+        against local wall-clock windows — an hour out for the whole of BST.
+        """
+        return _to_london(dt)
 
     def _check_flood_prevention(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
@@ -1654,22 +1732,25 @@ class BatteryManager:
             h, m = int(h), int(m)
         except (ValueError, AttributeError):
             return None
-        try:
-            import pytz
-            london          = pytz.timezone("Europe/London")
-            local_now       = now.astimezone(london) if now.tzinfo else london.localize(now)
+        # WAS pytz-only with a silent "UTC == local" fallback (fixed v5.55.3),
+        # which scheduled the cheap-window import an hour out for all of BST.
+        local_now = _to_london(now) if now.tzinfo else _london_localise(now)
+        if local_now is not None:
             local_naive_now = local_now.replace(tzinfo=None)
             cand_naive      = local_naive_now.replace(
                 hour=h, minute=m, second=0, microsecond=0
             )
             if cand_naive <= local_naive_now:
                 cand_naive += timedelta(days=1)
-            candidate = london.localize(cand_naive)        # localize handles DST gap/fold
-            return candidate.astimezone(now.tzinfo) if now.tzinfo else cand_naive
-        except Exception:
-            # Fallback (pytz unavailable): original naive behaviour, UTC == local.
-            candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += timedelta(days=1)
-            return candidate
+            # _london_localise resolves the DST gap/fold on whichever library
+            # is present — the one operation the two APIs disagree about.
+            candidate = _london_localise(cand_naive)
+            if candidate is not None:
+                return candidate.astimezone(now.tzinfo) if now.tzinfo else cand_naive
+
+        # No tz database at all: fall back to the original naive behaviour.
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
 

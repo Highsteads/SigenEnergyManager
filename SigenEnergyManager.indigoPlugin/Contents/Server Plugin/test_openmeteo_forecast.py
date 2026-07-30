@@ -408,11 +408,11 @@ class TestRemainingToday(unittest.TestCase):
     def test_aware_now_is_accepted(self):
         """_now_local returns a tz-aware datetime under pytz — bucket keys are
         naive, so the helper must strip tz rather than raise on the comparison."""
-        try:
-            import pytz
-        except ImportError:
-            self.skipTest("pytz not installed")
-        aware = pytz.timezone("Europe/London").localize(datetime(2026, 7, 19, 9, 30))
+        # Was skipped when pytz was absent, so this assertion never ran on the
+        # usual runner. The test is about accepting an AWARE datetime — any real
+        # zone proves that, and zoneinfo is stdlib.
+        from zoneinfo import ZoneInfo
+        aware = datetime(2026, 7, 19, 9, 30, tzinfo=ZoneInfo("Europe/London"))
         self.assertEqual(self.f._remaining_today_kwh(self.HOURLY, 1.0, now=aware), 2.5)
 
     def test_enrich_forecast_publishes_corrected_remaining(self):

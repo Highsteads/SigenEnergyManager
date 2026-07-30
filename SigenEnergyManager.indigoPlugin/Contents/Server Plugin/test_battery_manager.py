@@ -52,12 +52,13 @@ def _tomorrow_dawn(hour=7):
 
 def _today_str():
     """Return today's date string (local BST/GMT) matching battery_manager's today_str."""
-    try:
-        import pytz
-        _tz_l = pytz.timezone("Europe/London")
-        return datetime.now(timezone.utc).astimezone(_tz_l).date().strftime("%Y-%m-%d")
-    except ImportError:
-        return datetime.now(timezone.utc).date().strftime("%Y-%m-%d")
+    # Must resolve the SAME zone battery_manager does, or this helper and the
+    # module disagree about which day it is either side of local midnight during
+    # BST — a test that passes all day and fails for one hour a night. stdlib
+    # zoneinfo, so there is no pytz-missing branch to drift.
+    from zoneinfo import ZoneInfo
+    return datetime.now(timezone.utc).astimezone(
+        ZoneInfo("Europe/London")).date().strftime("%Y-%m-%d")
 
 def _make_sunny_p50(dusk_hour=19, peak_wh=10000):
     """Minimal P50 for a sunny day: peak_wh per hour from 07:00 to dusk_hour (local).
@@ -372,8 +373,10 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         # so the test is correct in both BST and GMT — the old UTC `.hour == 0`
         # check silently encoded the BST-offset bug (00:30 local is 23:30 UTC in
         # summer, not 00:00 UTC).
-        import pytz
-        local_sched = decision.scheduled_time.astimezone(pytz.timezone("Europe/London"))
+        # zoneinfo, not pytz: stdlib, so this test asserts the contract on any
+        # supported Python instead of erroring out where pytz is absent.
+        from zoneinfo import ZoneInfo
+        local_sched = decision.scheduled_time.astimezone(ZoneInfo("Europe/London"))
         self.assertEqual((local_sched.hour, local_sched.minute), (0, 30))
 
     def test_go_import_now_if_margin_too_low_for_cheap_window(self):
@@ -420,8 +423,8 @@ class TestTouWindowLocalTime(unittest.TestCase):
     """
 
     def test_next_window_start_returns_local_0030_in_bst(self):
-        import pytz
-        london = pytz.timezone("Europe/London")
+        from zoneinfo import ZoneInfo
+        london = ZoneInfo("Europe/London")
         now    = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)   # summer → BST
         result = BatteryManager._next_window_start(now, "00:30")
         # 00:30 LOCAL on 16 Jun == 23:30 UTC on 15 Jun (BST = UTC+1)
@@ -1165,13 +1168,13 @@ class TestTrackerMidnightLocal(unittest.TestCase):
 
         self.assertEqual(decision.action, ACTION_SCHEDULE_IMPORT)
         # Resolve the scheduled time in Europe/London — must always be 00:05 local.
-        try:
-            import pytz
-            london = decision.scheduled_time.astimezone(pytz.timezone("Europe/London"))
-            self.assertEqual(london.hour, 0)
-            self.assertEqual(london.minute, 5)
-        except ImportError:
-            self.skipTest("pytz not available")
+        # Was skipped entirely when pytz was absent — i.e. this assertion had
+        # never actually run on the usual test runner. zoneinfo is stdlib, so it
+        # runs everywhere and there is nothing left to skip.
+        from zoneinfo import ZoneInfo
+        london = decision.scheduled_time.astimezone(ZoneInfo("Europe/London"))
+        self.assertEqual(london.hour, 0)
+        self.assertEqual(london.minute, 5)
 
 
 # NB: the old TestPowerCutLockoutParsing class was deleted here (01-Jul-2026) —
