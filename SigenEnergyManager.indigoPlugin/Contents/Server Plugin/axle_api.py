@@ -4,12 +4,15 @@
 # Description: Axle VPP REST API client - polls for export event schedule
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     1.3
+# Version:     1.4
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
 # Changes: Updated logger name to SigenEnergyManager; _parse_dt guards non-string input
 #          v1.3 — accepts an injected logger and records last_error, so a failing
 #          poll is visible instead of silent (see the class docstring).
+#          v1.4 — an all-null event object is "no event scheduled", not a fault.
+#          Axle returns that shape once an event ends; it is truthy, so it used
+#          to reach the malformed branch and report a failure every 10 minutes.
 
 import logging
 import requests
@@ -128,6 +131,23 @@ class AxleAPI:
 
             if not data:
                 self.logger.info("Axle poll: no event scheduled (null response)")
+                return None
+
+            # Axle says "no event scheduled" in TWO shapes. A null body (above),
+            # and — from the moment an event ends — a full object with every
+            # field null:
+            #   {"start_time": null, "end_time": null, "import_export": null,
+            #    "opted_out": false, "updated_at": "..."}
+            # That object is truthy, so it fell through to the malformed-response
+            # branch below and reported a hard failure every 10 minutes for the
+            # rest of the night. Observed from 20:00:47 on 30-07-2026, one minute
+            # after the first event in six weeks ended.
+            #
+            # BOTH timestamps absent = no event. Only ONE = genuinely malformed,
+            # and still an error — that distinction is the point of doing this
+            # here rather than widening the guard below.
+            if data.get("start_time") is None and data.get("end_time") is None:
+                self.logger.info("Axle poll: no event scheduled (all-null event object)")
                 return None
 
             start_time = self._parse_dt(data.get("start_time"))

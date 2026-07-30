@@ -159,16 +159,37 @@ class TestAxleFailureIsVisible(unittest.TestCase):
 
     def test_no_event_is_not_an_error(self):
         # THE distinction this whole class exists for: a quiet day is healthy.
+        # The all-null OBJECT is the shape Axle returns once an event ends — it
+        # is truthy, so it used to reach the malformed branch and report a hard
+        # failure every 10 minutes all night (observed 30-07-2026, one minute
+        # after the first event in six weeks finished).
         for label, resp in (
-            ("null body",  _resp(json_data=None)),
-            ("204",        _resp(status=204, content=b"")),
-            ("empty body", _resp(content=b"")),
+            ("null body",       _resp(json_data=None)),
+            ("204",             _resp(status=204, content=b"")),
+            ("empty body",      _resp(content=b"")),
+            ("all-null object", _resp(json_data={"start_time": None, "end_time": None,
+                                                 "import_export": None, "opted_out": False,
+                                                 "updated_at": "2026-07-30T19:00:47+00:00"})),
         ):
             with self.subTest(label):
                 self.api.last_error = "stale"
                 self._set(resp)
                 self.assertIsNone(self.api.get_next_event())
                 self.assertIsNone(self.api.last_error)
+
+    def test_half_null_event_is_still_an_error(self):
+        # Only ONE timestamp missing is malformed, not "no event" — the guard
+        # must not swallow it. This is the half of the discrimination that a
+        # broader "any null → no event" fix would have silently lost.
+        for label, data in (
+            ("start only", {"start_time": "2026-03-20T18:00:00+00:00", "end_time": None}),
+            ("end only",   {"start_time": None, "end_time": "2026-03-20T19:00:00+00:00"}),
+        ):
+            with self.subTest(label):
+                self.api.last_error = None
+                self._set(_resp(json_data=data))
+                self.assertIsNone(self.api.get_next_event())
+                self.assertIsNotNone(self.api.last_error)
 
     # --- every failure mode records something ----------------------------
 
@@ -188,8 +209,17 @@ class TestAxleFailureIsVisible(unittest.TestCase):
         self.api.get_next_event()
         self.assertIsNotNone(self.api.last_error)
 
-    def test_missing_timestamps_records_error(self):
-        self._set(_resp(json_data={"import_export": "export"}))
+    def test_unparseable_timestamps_record_error(self):
+        # Timestamps PRESENT but not dates — genuinely malformed, still an error.
+        #
+        # This case replaces an earlier version of this test that used
+        # {"import_export": "export"} — i.e. both timestamps ABSENT — and
+        # asserted an error. That assertion encoded the very bug fixed in
+        # v5.55.2: both-absent is Axle's way of saying "no event scheduled",
+        # not a fault. The test failed when the fix landed, which is the test
+        # doing its job; the honest repair is to move it to a payload that IS
+        # malformed rather than to relax the assertion.
+        self._set(_resp(json_data={"start_time": "not-a-date", "end_time": "nor-this"}))
         self.api.get_next_event()
         self.assertIsNotNone(self.api.last_error)
 

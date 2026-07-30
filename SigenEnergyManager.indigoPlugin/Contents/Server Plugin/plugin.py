@@ -7,7 +7,31 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     5.55.1
+# Version:     5.55.2
+#
+# v5.55.2 (30-07-2026): "NO EVENT" WAS BEING REPORTED AS A FAULT. Axle signals
+# "nothing scheduled" in TWO shapes: a null body, and — from the moment an event
+# ends — a full object with every field null:
+#   {"start_time": null, "end_time": null, "import_export": null,
+#    "opted_out": false, "updated_at": "..."}
+# That object is TRUTHY, so it sailed past the empty-body check and landed in
+# the malformed-timestamps branch, logging an ERROR every 10 minutes from
+# 20:00:47 — one minute after tonight's event, the first in six weeks, ended.
+# By 21:03 it had raised 8 consecutive "failures", pushed a Pushover alert
+# through Log_Error_Watch, and left the monitor device reading a fault.
+#
+# The plugin's BEHAVIOUR was right all along (it read the reply as "no event");
+# only the reporting was wrong. This misclassification is older than yesterday
+# and was harmless while invisible — v5.55.0 made failures visible, which is
+# exactly how it surfaced. The visibility is doing its job; the classification
+# needed to learn Axle's second dialect.
+#
+# BOTH timestamps null = no event. Only ONE null, or present-but-unparseable =
+# genuinely malformed, and STILL an error — that discrimination is the point,
+# and a broader "any null → no event" guard would have quietly lost it.
+# +2 tests, 433 -> 434. One EXISTING test had to be moved rather than relaxed:
+# it asserted an error for a both-absent payload, which encoded the very bug
+# being fixed, so it now uses a present-but-unparseable pair instead.
 #
 # v5.55.1 (30-07-2026): THE DASHBOARD'S VPP WINDOW WAS A HARDCODED EMPTY STRING.
 # `/api/status` published `"event_str": ""` as a literal, from the day the block
