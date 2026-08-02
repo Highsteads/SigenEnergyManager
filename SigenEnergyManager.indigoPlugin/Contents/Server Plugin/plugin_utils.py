@@ -4,8 +4,16 @@
 # Description: Shared utilities for all Indigo plugins (CliveS / Highsteads)
 #              Bundled in Contents/Server Plugin/ and imported via os.getcwd()
 # Author:      CliveS & Claude Opus 4.8
-# Date:        21-07-2026
-# Version:     1.3
+# Date:        02-08-2026
+# Version:     1.4
+#
+# v1.4 (02-08-2026): as_bool() returns the DEFAULT for a string it does not
+# recognise, rather than False. Returning False silently flipped every
+# default=True caller off whenever a pref held junk — the opposite of what the
+# helper exists to prevent. Shipped in the code on 31-07-2026 during the
+# Dashboards deep review but the header was never bumped, so the file claimed
+# to be 1.3 while behaving as 1.4; this corrects the record and propagates the
+# same file to every bundle.
 #
 # v1.3 (21-07-2026): Four fixes found by the Appliance Monitor deep review,
 # propagated to every CliveS plugin bundle on the same day.
@@ -20,11 +28,6 @@
 # Also folded in the Device Activity Monitor docstring corrections: the banner
 # is called from MENU callbacks, never from __init__/startup, and the import
 # pattern is the bundle-local os.getcwd() form.
-#
-# LOCAL VARIANT — SigenEnergyManager only. install_timestamp_filter() also walks
-# up to every reachable HANDLER and attaches the same filter there, so records
-# from module loggers (SigenEnergyManager.AxleAPI and friends) get stamped too.
-# Keep this difference when refreshing the file from the shared master.
 #
 # v1.2 (23-05-2026): Added install_timestamp_filter() — a logging.Filter that
 # prepends [HH:MM:SS.mmm] to every self.logger record. Toggle at runtime via
@@ -152,7 +155,14 @@ def as_bool(value, default=False):
         return default
     if isinstance(value, (int, float)):
         return bool(value)
-    return str(value).strip().lower() in ("true", "1", "yes", "on")
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    # An UNRECOGNISED string is unknown, not False — returning False here
+    # silently flipped default=True callers off whenever a pref held junk.
+    return default
 
 
 def install_timestamp_filter(plugin, enabled=True):
@@ -191,31 +201,14 @@ def install_timestamp_filter(plugin, enabled=True):
         return None
     # Idempotent: a second call used to add a second filter, and every line
     # then came out with two timestamps.
-    f = None
+    # NB: attached at LOGGER level, so records from child loggers
+    # (logger.getChild()) bypass it — fine for CliveS plugins, which log on
+    # self.logger directly. SigenEnergyManager needs module-logger records
+    # stamped too and carries a handler-walking variant of this function.
     for existing in getattr(logger, "filters", []):
         if isinstance(existing, MillisecondTimestampFilter):
             existing.enabled = enabled
-            f = existing
-            break
-    if f is None:
-        f = MillisecondTimestampFilter(enabled=enabled)
-        logger.addFilter(f)
-    # Logger-level filters apply only to records emitted directly on that
-    # logger — records from module loggers (e.g. SigenEnergyManager.AxleAPI)
-    # propagate straight to the ancestors' HANDLERS without passing any
-    # logger-level filter. Attach the same filter to every handler reachable
-    # from the plugin logger (Indigo installs its event-log handler on the
-    # root logger) so module records get the same [HH:MM:SS.mmm] prefix.
-    # The filter stamps each record at most once (see MillisecondTimestampFilter),
-    # so direct plugin.logger records are not double-prefixed.
-    _lg   = logger
-    _seen = set()
-    while _lg is not None:
-        for _h in _lg.handlers:
-            if id(_h) in _seen:
-                continue
-            _seen.add(id(_h))
-            if not any(isinstance(x, MillisecondTimestampFilter) for x in _h.filters):
-                _h.addFilter(f)
-        _lg = _lg.parent if _lg.propagate else None
+            return existing
+    f = MillisecondTimestampFilter(enabled=enabled)
+    logger.addFilter(f)
     return f
