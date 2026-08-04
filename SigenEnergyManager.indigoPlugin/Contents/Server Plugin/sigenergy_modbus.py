@@ -950,8 +950,8 @@ class SigenergyModbus:
         if cutoff_soc is not None:
             if not self.set_charge_cutoff(min(max(float(cutoff_soc), 0.0), 100.0)):
                 self.logger.warning(
-                    f"Charge-cutoff backstop write failed — import runs without a "
-                    f"hardware SOC ceiling (software stop at target still active)"
+                    "Charge-cutoff backstop write failed — import runs without a "
+                    "hardware SOC ceiling (software stop at target still active)"
                 )
         self.logger.info(f"Force charge active: {power_watts}W from grid")
         return True

@@ -5,9 +5,16 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5
-# Date:        30-07-2026
-# Version:     5.55.3
+# Author:      CliveS & Claude Opus 5
+# Date:        04-08-2026
+# Version:     5.55.4
+#
+# v5.55.4 (04-08-2026): CI has been failing since 02-08 on two ruff F541s — an
+# f-string with no placeholders, in the charge-cutoff backstop warning at
+# sigenergy_modbus.py:953. Dropped the two stray f prefixes. No behaviour change:
+# the string had nothing to interpolate, which is why ruff objected. This repo's
+# CI is a syntax check plus ruff and has NO test suite at all, so a lint error is
+# the whole gate — worth noting for the most complex plugin in the estate.
 #
 # v5.55.3 (30-07-2026): A SILENT UTC FALLBACK IN THE DECISION ENGINE (battery_manager
 # 3.8 -> 3.9). Chasing why four battery_manager tests failed on the usual runner
