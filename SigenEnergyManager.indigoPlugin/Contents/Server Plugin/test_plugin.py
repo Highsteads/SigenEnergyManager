@@ -199,6 +199,147 @@ class TestDriveVppExport(unittest.TestCase):
         self.assertEqual(len(self._charge_cap_writes(p)), 0)
 
 
+class TestVppDriverField(unittest.TestCase):
+    """_vpp_driver — judged from the LIVE mode register, not from our own intent
+    flag. The old field mirrored store["export_active"], so it reported what we
+    meant to do rather than what the inverter was doing."""
+
+    def _p(self, **store):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = store
+        return p
+
+    def test_idle_when_not_exporting(self):
+        self.assertEqual(self._p(export_active=False)._vpp_driver(0x06), "idle")
+
+    def test_self_when_register_matches_what_we_wrote(self):
+        p = self._p(export_active=True, vpp_export_mode=0x06)
+        self.assertEqual(p._vpp_driver(0x06), "self")
+
+    def test_external_when_register_holds_a_mode_we_did_not_write(self):
+        """The whole point of the field: something else moved 40031."""
+        p = self._p(export_active=True, vpp_export_mode=0x06)
+        self.assertEqual(p._vpp_driver(0x02), "external")
+
+    def test_unverified_when_the_modbus_read_failed(self):
+        """A failed read must NOT read as agreement — absent is not a match."""
+        p = self._p(export_active=True, vpp_export_mode=0x06)
+        self.assertEqual(p._vpp_driver(None), "self (unverified)")
+
+    def test_unverified_before_any_mode_has_been_written(self):
+        p = self._p(export_active=True)
+        self.assertEqual(p._vpp_driver(0x06), "self (unverified)")
+
+
+class TestVppBankCapVerify(unittest.TestCase):
+    """_verify_ems_registers maintains the bank sub-mode's charge cap during an
+    active window. In bank (0x02) the cap IS the export mechanism — drift up to
+    inverter max sends the surplus to the battery instead of the grid, and the
+    mode register still reads a perfectly correct 0x02, so nothing else notices."""
+
+    def _p(self, submode, expected_cap, actual_cap, mode=0x02):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.modbus      = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "batteryHealthCutoff": "1.0"}
+        p.store = {
+            "vpp_state":              plugin.VPP_ACTIVE,
+            "export_active":          True,
+            "vpp_export_mode":        mode,
+            "vpp_export_submode":     submode,
+            "vpp_bank_charge_cap_w":  expected_cap,
+        }
+        p.modbus.connected                          = True
+        p.modbus.read_ems_mode.return_value         = mode
+        p.modbus.read_charge_limit.return_value     = actual_cap
+        p.modbus.read_discharge_limit.return_value  = 10000
+        p.modbus.read_discharge_cutoff.return_value = 1.0     # matches the health floor
+        p.modbus.read_charge_cutoff.return_value    = 100.0   # no import backstop raised
+        return p
+
+    def test_drifted_cap_is_reasserted(self):
+        p = self._p("bank", expected_cap=1200, actual_cap=10000)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_called_once()
+        self.assertEqual(p.modbus.set_charge_limit.call_args.args[0], 1200)
+
+    def test_cap_within_deadband_is_left_alone(self):
+        p = self._p("bank", expected_cap=1200, actual_cap=1350)   # 150 < 300
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_not_called()
+
+    def test_discharge_submode_limits_untouched(self):
+        """0x05/0x06 limits are static for the window — the 10-Apr-2026 rule."""
+        p = self._p("discharge", expected_cap=-1, actual_cap=0, mode=0x06)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_not_called()
+        p.modbus.set_discharge_limit.assert_not_called()
+
+    def test_unread_cap_is_not_treated_as_agreement(self):
+        p = self._p("bank", expected_cap=1200, actual_cap=None)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_not_called()
+
+
+class TestVppPvStatus(unittest.TestCase):
+    """The summariser's PV verdict. `min_pv_w > 100` alone made every DARK window
+    report "PV collapsed" — an alarm about the sun having set. Live case
+    05-Aug-2026: a 21:00-22:00 BST window, 45 snapshots at 0 W, a clean 4.23 kWh
+    export, and a Pushover saying PV had collapsed."""
+
+    @staticmethod
+    def _verdict(daytime, min_pv_w):
+        """Mirror of the summariser's decision, exercised directly."""
+        if not daytime:
+            return "n/a (dark window)", True
+        if min_pv_w > 100:
+            return "ran", True
+        return "curtailed", False
+
+    def test_dark_window_is_not_an_alarm(self):
+        status, ok = self._verdict(daytime=False, min_pv_w=0)
+        self.assertEqual(status, "n/a (dark window)")
+        self.assertTrue(ok)
+
+    def test_daytime_pv_running_is_fine(self):
+        self.assertEqual(self._verdict(True, 1450), ("ran", True))
+
+    def test_daytime_pv_pinned_at_zero_is_the_real_fault(self):
+        """The 15-Jun-2026 mode-0x06 curtailment this check exists to catch."""
+        self.assertEqual(self._verdict(True, 0), ("curtailed", False))
+
+
+class TestLondonTimeHelpers(unittest.TestCase):
+    """plugin.py's local-time helpers, after the v5.55.3 sweep finally reached it.
+
+    Every one of these used to be a hand-rolled `import pytz` with an
+    `except: carry on in UTC` fallback — an answer an hour wrong for the eight
+    months of BST, with nothing logged."""
+
+    def test_london_now_is_aware(self):
+        self.assertIsNotNone(plugin._london_now().tzinfo)
+
+    def test_bst_conversion_is_applied(self):
+        """August: London is UTC+1. A silent-UTC fallback returns 12:00."""
+        dt = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(plugin._local_time(dt), "13:00")
+
+    def test_gmt_conversion_is_applied(self):
+        """January: London is UTC. Guards against a fixed +1 'fix'."""
+        dt = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(plugin._local_time(dt), "12:00")
+
+    def test_naive_localise_is_not_lmt(self):
+        """Attaching a pytz zone with a bare replace() yields LMT, -00:01 for
+        London. The shared helper picks the right call for the library in use."""
+        aware = plugin._london_localise(datetime(2026, 8, 5, 12, 0))
+        self.assertEqual(aware.utcoffset(), timedelta(hours=1))
+
+    def test_today_str_matches_the_london_date(self):
+        self.assertEqual(plugin._local_today_str(),
+                         plugin._london_now().strftime("%Y-%m-%d"))
+
+
 class TestWholeHouseCard(unittest.TestCase):
     """Plugin._wh_card_from_row — turns a cost-settled daily_history row into the
     dashboard card dict (v5.31.0). Pure/static, so no Indigo instance needed."""
@@ -272,12 +413,15 @@ def _mk_plugin(tmp, octo, store=None):
 
 
 def _london_today():
-    from datetime import datetime
-    try:
-        import pytz
-        return datetime.now(pytz.timezone("Europe/London")).date()
-    except ImportError:
-        return datetime.now().date()
+    """Today in Europe/London, via the module under test.
+
+    Was a private pytz copy with a `except ImportError: return the UTC date`
+    fallback — a test helper that quietly disagreed with the module for one hour
+    every night in BST, and on a pytz-less runner disagreed all summer. Use the
+    module's own helper so the test cannot pass against a basis production never
+    uses.
+    """
+    return plugin._london_today()
 
 
 class TestSettleWholeHouseCosts(unittest.TestCase):
@@ -1702,9 +1846,11 @@ class TestPowerCutStatusLines(unittest.TestCase):
     def test_lockout_end_is_four_hours_after_the_restore(self):
         restored = datetime(2026, 7, 26, 7, 40, 52, tzinfo=timezone.utc)
         stub = self._Stub({"powerRestoredTime": restored.isoformat()}, {})
-        # 07:40 UTC + 4h = 11:40 UTC = 12:40 BST.
-        self.assertIn(plugin.Plugin._power_cut_lockout_end_local(stub),
-                      ("12:40", "11:40"))       # tolerate a pytz-less test host
+        # 07:40 UTC + 4h = 11:40 UTC = 12:40 BST. Asserted exactly: the module
+        # resolves Europe/London through stdlib zoneinfo, so there is no longer a
+        # pytz-less host to tolerate — and "12:40 or 11:40" would have passed on
+        # the silent-UTC bug this release removes.
+        self.assertEqual(plugin.Plugin._power_cut_lockout_end_local(stub), "12:40")
 
 
 class TestSolarRefillOutlook(unittest.TestCase):

@@ -545,10 +545,20 @@
                 <TriggerLabel>Last VPP PV survival changed</TriggerLabel>
                 <ControlPageLabel>Last VPP PV Survived</ControlPageLabel>
             </State>
+            <State id="lastVppPvStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last VPP PV status changed</TriggerLabel>
+                <ControlPageLabel>Last VPP PV Status (ran / curtailed / n/a)</ControlPageLabel>
+            </State>
             <State id="lastVppEmsModes">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last VPP EMS modes changed</TriggerLabel>
                 <ControlPageLabel>Last VPP EMS Modes Observed</ControlPageLabel>
+            </State>
+            <State id="lastVppDriver">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last VPP driver changed</TriggerLabel>
+                <ControlPageLabel>Last VPP Driver (self / external)</ControlPageLabel>
             </State>
             <State id="lastVppLogPath">
                 <ValueType>String</ValueType>

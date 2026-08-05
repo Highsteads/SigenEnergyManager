@@ -7,7 +7,67 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        05-08-2026
-# Version:     5.55.5
+# Version:     5.56.0
+#
+# v5.56.0 (05-08-2026): THE POST-EVENT REPORT WAS ANSWERING A QUESTION WE STOPPED
+# ASKING IN JUNE. The VPP summary Pushover still asked what AXLE had done — "Did
+# Axle keep PV running through battery export?", "What EMS mode did Axle use?" —
+# wording left over from the observe-and-hand-over model that v5.28.0 replaced
+# with self-drive. Every window since has been driven by us over Modbus with
+# Axle's dispatch ignored, so those questions had a false premise baked in.
+#
+# Alongside it, `pv_survived` was a bare `min_pv_w > 100` with no daylight test,
+# so EVERY DARK WINDOW reported "PV collapsed" — an alarm about the sun having
+# set. Both fired together on the 05-Aug-2026 21:00-22:00 BST event: 45 snapshots
+# at 0 W PV, a textbook 4.23 kWh export holding grid at -4000 W (+/-50 W) all
+# hour, and a notification saying PV had collapsed and asking what Axle had done.
+# The report was the only thing wrong with that event.
+#
+# Now: the PV verdict is gated on the daylight flag latched at VPP_ACTIVE entry
+# and reads ran / curtailed / n/a (dark window), with the boolean state kept as
+# the "nothing went wrong" flag a trigger wants. The prompt states plainly that
+# the export was self-driven and asks about OUR mode choice. New device states
+# lastVppPvStatus and lastVppDriver carry what a boolean cannot.
+#
+# `driver` in the JSONL was `"self" if export_active else "axle"` — it mirrored
+# our own intent flag, so it could only ever read "self" once we started driving.
+# It never looked at the hardware, and so could not answer the one question it
+# existed to answer. It now compares the LIVE mode register against the mode we
+# wrote: a mode we did not write, while we hold Remote EMS, means something
+# external moved it. Reported per snapshot and summarised, with a WARNING if it
+# is ever seen.
+#
+# _verify_ems_registers gains ONE register during an active window: the bank
+# sub-mode's charge cap. In bank (0x02) that cap IS the export mechanism — it is
+# what stops the inverter soaking the PV surplus into the battery instead of
+# selling it. Drift there would leave the mode register reading a perfectly
+# correct 0x02 while the export fell to nothing, and _drive_vpp_export only
+# rewrites the cap when the surplus moves by >300 W, so it could stand for the
+# rest of the window. This does not reopen the 10-Apr-2026 grid-import incident:
+# that was the solar-overflow cap being written over a VPP window; here the
+# expected value is the VPP driver's own cap and the check runs only while bank
+# is live. Every other limit still stays untouched for the whole window.
+#
+# AND THE v5.55.3 TIME-ZONE SWEEP NEVER REACHED THIS FILE. That release unified
+# battery_manager on _london_tz / _london_localise / _to_london, with stdlib
+# zoneinfo preferred, precisely because five hand-rolled copies had left two
+# sites silently an hour out. plugin.py still had FIFTEEN of them — including
+# _local_today_str(), the midnight-rollover basis, which is the exact bug class
+# that release was written about, and _event_is_daytime(), where an hour's error
+# flips a dusk-edge window to daytime and runs the mode that curtails PV. All
+# fifteen now call the one shared implementation. A missing tz database logs an
+# ERROR once and says what it affects, instead of quietly answering in UTC.
+#
+# The tests were lying in the same two ways as last time: a private _london_today
+# helper with its own pytz fallback (so it could disagree with the module for an
+# hour every night in BST), and a `("12:40", "11:40")` assertion tolerating a
+# pytz-less host — which would have passed against the very bug being removed.
+# Both replaced with exact assertions. Suite 434 -> 465, 0 skipped, green with
+# AND without pytz.
+#
+# Still deliberately NOT done, unchanged from v5.55.3: openmeteo_forecast.py
+# carries the same pattern and needs the localize(is_dst=False) -> fold=1 mapping
+# pinned by tests before it can move. Its own change.
 #
 # v5.55.5 (05-08-2026): SOLAR OVERFLOW WAS FLAPPING (battery_manager 3.9 -> 3.10).
 # Its physics gate — does today's remaining solar exceed the room left in the
@@ -1262,6 +1322,10 @@ from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, GAS_KWH_PER_M3
 from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
+    # The ONE Europe/London implementation (v5.55.3). Imported rather than
+    # re-declared: five hand-rolled copies is what put two sites an hour out
+    # in the first place, and a sixth here would be the same mistake again.
+    _london_tz, _london_localise, _to_london,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT,
@@ -1762,19 +1826,62 @@ def log(message, level="INFO"):
             pass
 
 
+# Latch so a missing tz database is reported ONCE, not on every 60-second
+# evaluate. A plain module global is unreliable inside plugin callbacks, so the
+# house idiom is a mutable container.
+_TZ_WARN_STATE = {"warned": False}
+
+
+def _warn_no_tzdb():
+    """Report — loudly, once — that Europe/London could not be resolved.
+
+    Every local-time answer in this module is a decision input: tariff windows,
+    the midnight rollover, dawn/dusk, the VPP daytime/dark mode choice. The old
+    code met a missing tz database with `except: carry on in UTC`, which is an
+    answer an hour wrong for the eight months of BST with nothing logged. Degrade
+    visibly instead. In practice unreachable — zoneinfo is stdlib from 3.9, so
+    this survives a Contents/Packages wipe that would take pytz with it.
+    """
+    if _TZ_WARN_STATE["warned"]:
+        return
+    _TZ_WARN_STATE["warned"] = True
+    log("No Europe/London time zone available (neither zoneinfo nor pytz) — "
+        "local times are falling back to UTC and will be an hour out during "
+        "BST. Tariff windows, midnight rollover and VPP daytime/dark detection "
+        "are all affected.", level="ERROR")
+
+
+def _london_now():
+    """Current time as an AWARE Europe/London datetime.
+
+    The single entry point for "what is the local time now" in this module.
+    """
+    tz = _london_tz()
+    if tz is None:
+        _warn_no_tzdb()
+        return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc).astimezone(tz)
+
+
+def _london_today():
+    """Today's date in Europe/London."""
+    return _london_now().date()
+
+
 def _local_time(dt, fmt="%H:%M"):
     """Format a UTC-aware datetime in Europe/London local time (BST/GMT).
 
     All datetimes from the Axle API and VPP state machine are UTC-aware.
     Displaying them without conversion shows UTC, which is 1 hour behind
     BST during British Summer Time (late March — late October).
+
+    A naive datetime is formatted as-is: callers holding naive values treat them
+    as already-local, and stamping a zone on one would invent information.
     """
-    try:
-        import pytz
-        local = pytz.timezone("Europe/London")
-        return dt.astimezone(local).strftime(fmt)
-    except Exception:
-        return dt.strftime(fmt)   # fallback: still UTC but won't crash
+    if _london_tz() is None:
+        _warn_no_tzdb()
+        return dt.strftime(fmt)
+    return _to_london(dt).strftime(fmt)
 
 
 def _local_today_str():
@@ -1786,12 +1893,7 @@ def _local_today_str():
     day for the first hour after local midnight in BST, which would make the loader
     reject (and silently drop) a fresh day's accumulators on a restart in that window.
     """
-    try:
-        import pytz
-        return datetime.now(timezone.utc).astimezone(
-            pytz.timezone("Europe/London")).strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
+    return _london_today().strftime("%Y-%m-%d")
 
 
 class Plugin(indigo.PluginBase):
@@ -2670,12 +2772,7 @@ class Plugin(indigo.PluginBase):
             return
 
         by_date = {r.get("date"): r for r in records if r.get("date")}
-        try:
-            import pytz
-            today = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("Europe/London")).date()
-        except ImportError:
-            today = datetime.now().date()
+        today   = _london_today()
 
         settled_n = 0
         for offset in range(1, self.COST_SETTLE_WINDOW_DAYS + 1):
@@ -2941,12 +3038,7 @@ class Plugin(indigo.PluginBase):
         by_date  = {r.get("date"): r for r in records if r.get("date")}
         settled  = [r for r in records if r.get("cost_settled")]
 
-        try:
-            import pytz
-            now_local = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("Europe/London"))
-        except ImportError:
-            now_local = datetime.now()
+        now_local  = _london_now()
         today      = now_local.date()
         month_pref = today.strftime("%Y-%m")
 
@@ -3098,12 +3190,7 @@ class Plugin(indigo.PluginBase):
                 records = json.load(f)
         except (OSError, ValueError):
             records = []
-        try:
-            import pytz
-            today = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("Europe/London")).date()
-        except Exception:
-            today = datetime.now().date()
+        today = _london_today()
 
         fallback_standing_p = self._current_elec_standing_p()
 
@@ -3227,12 +3314,7 @@ class Plugin(indigo.PluginBase):
                 records = json.load(f)
         except (OSError, ValueError):
             records = []
-        try:
-            import pytz
-            now_local = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("Europe/London"))
-        except Exception:
-            now_local = datetime.now()
+        now_local = _london_now()
         if year is None:
             year = now_local.year
 
@@ -3360,12 +3442,7 @@ class Plugin(indigo.PluginBase):
         # Look up YESTERDAY by date, not records[-1] — after a missed-midnight restart
         # (Mac asleep over midnight) the last row may be the day before, mislabelling
         # the "yesterday" card. Fall back to the most recent row if the date is absent.
-        try:
-            import pytz
-            today_local = datetime.now(timezone.utc).astimezone(
-                pytz.timezone("Europe/London")).date()
-        except Exception:
-            today_local = datetime.now().date()
+        today_local = _london_today()
         y_str   = (today_local - timedelta(days=1)).strftime("%Y-%m-%d")
         by_date = {r.get("date"): r for r in records if r.get("date")}
         yest = by_date.get(y_str) or records[-1]
@@ -3617,12 +3694,7 @@ class Plugin(indigo.PluginBase):
             pass
 
         # Use Europe/London for "today" (matches _check_midnight)
-        try:
-            import pytz
-            tz_l  = pytz.timezone("Europe/London")
-            today = datetime.now(timezone.utc).astimezone(tz_l)
-        except ImportError:
-            today = datetime.now()
+        today      = _london_now()
         today_date = today.date()
 
         diffs_for_avg = []
@@ -4542,16 +4614,9 @@ class Plugin(indigo.PluginBase):
 
         max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
 
-        try:
-            import pytz
-            london = pytz.timezone("Europe/London")
-            now_local   = datetime.now(timezone.utc).astimezone(london)
-            start_local = start.astimezone(london) if start.tzinfo else start
-            end_local   = end.astimezone(london)   if end.tzinfo   else end
-        except Exception:
-            now_local   = datetime.now(timezone.utc)
-            start_local = start
-            end_local   = end
+        now_local   = _london_now()
+        start_local = _to_london(start)   # naive values are returned unchanged
+        end_local   = _to_london(end)
 
         # Future-only: clip to "from now"
         effective_start = max(start_local, now_local)
@@ -4654,11 +4719,7 @@ class Plugin(indigo.PluginBase):
 
     def _apply_seasonal_override(self, snapshot):
         """Raise resilience floor in winter months (Oct–Mar) — longer nights."""
-        try:
-            import pytz as _pytz_s
-            local_month = datetime.now(_pytz_s.timezone("Europe/London")).month
-        except Exception:
-            local_month = datetime.now().month
+        local_month = _london_now().month
 
         applied = None
         if local_month in (10, 11, 12, 1, 2, 3):
@@ -4835,11 +4896,7 @@ class Plugin(indigo.PluginBase):
             eh, em = [int(x) for x in end_str.split(":")]
         except (ValueError, AttributeError):
             return False
-        try:
-            import pytz
-            now = datetime.now(pytz.timezone("Europe/London"))
-        except Exception:
-            now = datetime.now()
+        now       = _london_now()
         now_min   = now.hour * 60 + now.minute
         start_min = sh * 60 + sm
         end_min   = eh * 60 + em
@@ -5545,9 +5602,11 @@ class Plugin(indigo.PluginBase):
             # During the self-driven window the export mode is written once at
             # VPP_ACTIVE entry and the manager's ACTION_VPP_EXPORT guard does not
             # re-write it. Maintain the chosen mode (0x05 daytime / 0x06 dark)
-            # here so a transient drift self-heals. MODE REGISTER ONLY — never
-            # touch the charge/discharge limits mid-window (a stray limit write
-            # once caused a brief 2 kW grid import, 10-Apr-2026).
+            # here so a transient drift self-heals. Mode register, PLUS the bank
+            # sub-mode's own charge cap (see below) — and nothing else. A stray
+            # write of any OTHER limit once caused a brief 2 kW grid import
+            # (10-Apr-2026), which is why the general limit block below still
+            # skips the whole window.
             expected_mode = self.store.get("vpp_export_mode", 0x06)
             actual_mode   = self.modbus.read_ems_mode()
             if actual_mode is not None and actual_mode != expected_mode:
@@ -5557,6 +5616,33 @@ class Plugin(indigo.PluginBase):
                     level="WARNING",
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
+
+            # ONE exception to "mode register only": the bank sub-mode's charge
+            # cap. In bank (0x02) the cap IS the export mechanism — it is what
+            # stops the inverter soaking the PV surplus into the battery instead
+            # of sending it to the grid. If it drifted up to inverter max the
+            # export would fall to ~0 and NOTHING above would notice, because the
+            # mode register would still read a correct 0x02. _drive_vpp_export
+            # only rewrites the cap when the surplus moves by >300 W, so a drift
+            # could stand for the rest of the window — a silently unpaid event.
+            #
+            # This does not reopen the 10-Apr-2026 incident: that was the
+            # solar-overflow cap being written back over a VPP window. Here the
+            # expected value is the VPP driver's own cap, and the check only runs
+            # while bank is the live sub-mode. The 0x05/0x06 limits stay untouched
+            # (they are static for the window, and the snapshots record them).
+            if self.store.get("vpp_export_submode") == "bank":
+                expected_cap_w = self.store.get("vpp_bank_charge_cap_w", -1)
+                if expected_cap_w is not None and expected_cap_w >= 0:
+                    actual_cap_w = self.modbus.read_charge_limit()
+                    if actual_cap_w is not None and abs(actual_cap_w - expected_cap_w) > 300:
+                        log(
+                            f"[Verify] VPP bank charge-cap drift: inverter={actual_cap_w}W "
+                            f"expected={expected_cap_w}W — re-asserting (export would "
+                            f"otherwise be banked instead of sold)",
+                            level="WARNING",
+                        )
+                        self.modbus.set_charge_limit(expected_cap_w, quiet=True)
 
         # --- Discharge limit and charge limit ---
         # Skip during VPP_PRE_CHARGING and VPP_ACTIVE: the self-driven export owns
@@ -5630,10 +5716,17 @@ class Plugin(indigo.PluginBase):
             return
 
         now_utc = datetime.now(timezone.utc)
-        # Normalise scheduled time to UTC if naive
+        # Normalise scheduled time to UTC if naive. A naive value here is local
+        # wall-clock, so it needs localising (pytz) or stamping (zoneinfo) — the
+        # one operation the two libraries spell differently, hence the shared
+        # helper. It returns None only if no tz database exists at all; skip the
+        # tick loudly rather than start an import at the wrong hour.
         if scheduled.tzinfo is None:
-            import pytz
-            scheduled = pytz.timezone("Europe/London").localize(scheduled).astimezone(timezone.utc)
+            localised = _london_localise(scheduled)
+            if localised is None:
+                _warn_no_tzdb()
+                return
+            scheduled = localised.astimezone(timezone.utc)
 
         if now_utc >= scheduled:
             log("[Manager] Scheduled import window reached - starting import")
@@ -6145,6 +6238,31 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             log(f"[VPP] Could not write event header: {exc}", level="WARNING")
 
+    def _vpp_driver(self, ems_mode):
+        """Who is actually driving the inverter, judged from the live register.
+
+        The old field was `"self" if store["export_active"] else "axle"` — it
+        mirrored our own intent flag, so it could only ever read "self" once we
+        started driving and "axle" before. It never looked at the hardware, and
+        therefore could not answer the one question it existed to answer.
+
+        Compare the LIVE mode register against the mode we last wrote instead.
+        While we hold Remote EMS nothing else should be able to move it, so a
+        mode we did not write means something external did — the signal that
+        Axle's cloud dispatch has reached the inverter (or that a stray write
+        has). Returns:
+          "self"             — register matches the mode we wrote
+          "external"         — register holds a mode we did not write
+          "self (unverified)" — Modbus read failed, or no mode written yet
+          "idle"             — not driving an export right now
+        """
+        if not self.store.get("export_active"):
+            return "idle"
+        expected = self.store.get("vpp_export_mode")
+        if ems_mode is None or expected is None:
+            return "self (unverified)"
+        return "self" if ems_mode == expected else "external"
+
     def _log_vpp_snapshot(self, event):
         """Append one per-minute snapshot of inverter state to the per-event
         JSONL file. Captures everything we'd need to reconstruct what Axle
@@ -6186,7 +6304,7 @@ class Plugin(indigo.PluginBase):
                 "ems_work_mode":      inv.get("emsWorkMode"),
                 "ems_mode_register":  ems_mode,
                 "ems_mode_name":      ems_mode_names.get(ems_mode) if ems_mode is not None else None,
-                "driver":             "self" if self.store.get("export_active") else "axle",
+                "driver":             self._vpp_driver(ems_mode),
                 "charge_limit_w":     chg_lim,
                 "discharge_limit_w":  dis_lim,
                 "grid_status":        inv.get("gridStatus"),
@@ -6261,11 +6379,42 @@ class Plugin(indigo.PluginBase):
         # grid exporting = negative watts; "peak export" is most negative magnitude
         peak_grid_export_w = int(-min(grid_watts))               if grid_watts else 0
 
-        # PV "survived" = at no point did PV collapse to ~0 W during the
-        # window (Axle's clever trick is to keep PV running while battery
-        # exports — our naive mode 0x06 path curtailed PV to 0).  Threshold
-        # of 100W tolerates the very last snapshot at event-end.
-        pv_survived        = bool(pv_watts) and min_pv_w > 100
+        # Was the driver ever something other than us? Any snapshot reading
+        # "external" means the live mode register held a mode we did not write.
+        drivers_seen  = {s.get("driver") for s in snapshots if s.get("driver")}
+        external_seen = "external" in drivers_seen
+        driver_str    = ", ".join(sorted(drivers_seen)) if drivers_seen else "(unknown)"
+
+        # Did our export mode curtail PV?  Mode 0x06 makes the battery do all the
+        # discharge and, with the grid held at the DNO cap, the MPPT shuts down —
+        # the 15-Jun-2026 fault that mode 0x05 (daytime) exists to avoid.
+        #
+        # THIS QUESTION ONLY EXISTS IN DAYLIGHT.  The old test was a bare
+        # `min_pv_w > 100`, so every dark window reported "PV collapsed" — an
+        # alarm about the sun having set.  Live case 05-Aug-2026, a 21:00-22:00
+        # BST window: 45 snapshots at 0 W PV, a clean 4.23 kWh export, and a
+        # Pushover claiming PV had collapsed.  Gate on the daylight flag latched
+        # at VPP_ACTIVE entry, falling back to a fresh solar-window check if the
+        # store has been cleared (a restart between event end and summary).
+        daytime = self.store.get("vpp_is_daytime")
+        if daytime is None:
+            try:
+                daytime = self._event_is_daytime(event.get("start_time"))
+            except Exception:
+                daytime = False
+        daytime = bool(daytime)
+
+        if not daytime:
+            pv_status = "n/a (dark window)"
+        elif pv_watts and min_pv_w > 100:   # 100 W tolerates the event-end sample
+            pv_status = "ran"
+        else:
+            pv_status = "curtailed"
+
+        # The boolean is the "nothing went wrong with PV" flag a trigger wants,
+        # so a dark window is True — there was no PV to lose.  pv_status carries
+        # the detail that a boolean cannot.
+        pv_survived = pv_status != "curtailed"
 
         # rough PV produced over the window: avg watts * hours
         try:
@@ -6302,7 +6451,9 @@ class Plugin(indigo.PluginBase):
                     {"key": "lastVppMaxBatteryDischargeW", "value": max_bat_dis_w},
                     {"key": "lastVppPeakGridExportW",      "value": peak_grid_export_w},
                     {"key": "lastVppPvSurvived",           "value": pv_survived},
+                    {"key": "lastVppPvStatus",             "value": pv_status},
                     {"key": "lastVppEmsModes",             "value": ems_modes_str},
+                    {"key": "lastVppDriver",               "value": driver_str},
                     {"key": "lastVppLogPath",              "value": path or ""},
                 ])
         except Exception as exc:
@@ -6310,24 +6461,36 @@ class Plugin(indigo.PluginBase):
                 level="WARNING")
 
         # ----- Pushover: headline numbers + pre-formed Claude prompt -----
-        pv_status = "PV stayed alive" if pv_survived else "PV collapsed"
-        title = f"Axle VPP done — {export_kwh:.2f} kWh exported"
+        # The prompt used to ask what AXLE did — wording left over from the
+        # observe-and-hand-over model that v5.28.0 replaced with self-drive in
+        # June. We drive every window ourselves now and ignore Axle's dispatch,
+        # so those questions had a false premise baked in and sent the reader
+        # looking for behaviour that was never going to be in the file.
+        window_str = "daytime" if daytime else "dark"
+        title = f"VPP window done — {export_kwh:.2f} kWh exported"
         body_lines = [
             f"Export:   {export_kwh:.2f} kWh",
             f"PV:       {pv_kwh:.2f} kWh ({pv_status}; min {min_pv_w} W)",
             f"Battery:  peak discharge {max_bat_dis_w} W",
             f"Grid:     peak export {peak_grid_export_w} W",
             f"EMS:      {ems_modes_str}",
+            f"Window:   {window_str}   Driver: {driver_str}",
+        ]
+        if external_seen:
+            body_lines.append("WARNING:  external control detected mid-window")
+        body_lines += [
             "",
             "── Ask Claude ──",
             "Read the latest VPP JSONL file at",
             f"  {path}",
-            "and tell me:",
-            "  1. Did Axle keep PV running through battery export, and how?",
-            "  2. What EMS mode + register values did Axle use?",
-            "  3. Can SigenEnergyManager replicate this via Modbus, or",
-            "     do we still need to release Remote EMS for Axle?",
-            "  4. Recommended changes to _vpp_transition / _verify_ems_registers.",
+            "This was a SELF-DRIVEN export (we hold Remote EMS over Modbus and",
+            "ignore Axle's dispatch; Axle settles on the meter). Tell me:",
+            f"  1. Did we hold the export target for the full window ({window_str})?",
+            "  2. What EMS mode + register values did we use, and were they",
+            "     the right ones for the conditions?",
+            "  3. Did anything external move the mode register mid-window?",
+            "  4. Any recommended changes to _drive_vpp_export /",
+            "     _verify_ems_registers.",
         ]
         body = "\n".join(body_lines)
         try:
@@ -6341,7 +6504,12 @@ class Plugin(indigo.PluginBase):
         log(f"[VPP] Summary: {export_kwh:.2f} kWh exported, "
             f"PV {pv_kwh:.2f} kWh ({pv_status}), "
             f"peak grid export {peak_grid_export_w} W, "
+            f"{window_str} window, driver {driver_str}, "
             f"EMS modes: {ems_modes_str}. Log: {path}")
+        if external_seen:
+            log("[VPP] External control was detected during the window — the mode "
+                "register held a value the plugin did not write. Check the JSONL "
+                "snapshots for when it changed.", level="WARNING")
 
     def _start_vpp_precharge(self, event):
         """Assess SOC 30 min before VPP event; raise discharge cutoff; no grid import.
@@ -6450,13 +6618,13 @@ class Plugin(indigo.PluginBase):
         fcast      = self.latest_forecast_data or {}
         dawn_times = fcast.get("_dawn_times", {})
 
-        # Convert event start to local (London) time for date lookup
-        try:
-            import pytz as _pytz
-            _london     = _pytz.timezone("Europe/London")
-            event_local = event_start.astimezone(_london)
-        except Exception:
-            event_local = event_start
+        # Convert event start to local (London) time for date lookup. An hour's
+        # error here flips a dusk-edge window to "daytime" and runs mode 0x05
+        # when it should run 0x06 (or the reverse — the 15-Jun-2026 PV
+        # curtailment), so this must not degrade silently.
+        if _london_tz() is None:
+            _warn_no_tzdb()
+        event_local = _to_london(event_start)
 
         event_date_str = event_local.strftime("%Y-%m-%d")
 
@@ -6474,12 +6642,10 @@ class Plugin(indigo.PluginBase):
                 if slot_str.startswith(event_date_str) and hourly[slot_str] > 0:
                     try:
                         dt_naive = datetime.strptime(slot_str, "%Y-%m-%d %H:%M:%S")
-                        try:
-                            import pytz as _pytz
-                            _london = _pytz.timezone("Europe/London")
-                            dusk = _london.localize(dt_naive)
-                        except Exception:
-                            dusk = dt_naive
+                        # Forecast slots are local wall-clock, so localise (not
+                        # stamp) — see _london_localise on why that distinction
+                        # cannot be hand-rolled per site.
+                        dusk = _london_localise(dt_naive) or dt_naive
                     except Exception:
                         pass
                     break
