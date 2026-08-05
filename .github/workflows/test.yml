@@ -24,3 +24,25 @@ jobs:
         run: |
           pip install ruff
           ruff check .
+
+      # The suite is run TWICE, deliberately, and the bare run comes FIRST.
+      #
+      # Nothing in the tests needs a third-party package, and that is a property worth
+      # defending rather than a happy accident. v5.55.3 fixed a silent UTC fallback in
+      # the decision engine that only appeared when pytz was missing — an answer quietly
+      # an hour out for the eight months of BST — and the two tests that would have
+      # caught it had been SKIPPING on "pytz not available" for weeks. A run with the
+      # dependencies installed cannot see that class of bug at all. Bare first, then, so
+      # the fallback paths stay exercised.
+      #
+      # run_tests.py rather than `python -m unittest discover` because plain unittest
+      # exits 0 on a SKIP, which is how the two above stayed invisible.
+      - name: Tests — no third-party packages (guards the pytz-absent fallbacks)
+        run: python scripts/run_tests.py
+
+      - name: Install the bundled dependencies
+        run: pip install -r "SigenEnergyManager.indigoPlugin/Contents/Server Plugin/requirements.txt"
+
+      # And again as the plugin actually ships, with pymodbus and pytz present.
+      - name: Tests — with the bundled dependencies (the real install shape)
+        run: python scripts/run_tests.py
