@@ -5,9 +5,68 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Opus 5
-# Date:        05-08-2026
-# Version:     5.56.0
+# Author:      CliveS & Claude Fable 5
+# Date:        06-08-2026
+# Version:     5.57.0
+#
+# v5.57.0 (06-08-2026): ADVERSARIAL REVIEW OF THE VPP DRIVE PATH — the
+# money-bearing code, first fresh-eyes pass since the 5.30 series. Five
+# confirmed findings, all fixed; one suspected finding REFUTED (the daytime
+# latch does survive a restart — v5.48.0's persistence covers it).
+#
+# 1. NO DIRECTION GUARD (latent since v5.28.0, recorded then as "noted only"
+#    and never closed). Axle's API carries import_export and the client
+#    returns it; _apply_vpp_event never read it. An announced IMPORT event
+#    would have been announced, pre-charged and then SELF-DRIVEN AS A FULL
+#    4 kW EXPORT — pushing energy out through the very window the grid wants
+#    it in, draining the battery for a dispatch that settles against us. A
+#    non-export event is now treated exactly like "no event" (the None branch
+#    already stands down pre-window state cleanly), with ONE warning per
+#    event, latched on its start time — the poll repeats every 10 minutes,
+#    potentially for hours of lead time.
+#
+# 2. DAYTIME-DISCHARGE CHARGE CAP NOT MAINTAINED. daytime_export pins
+#    charge=0 because in 0x05 an open charge limit lets high PV charge the
+#    battery INSTEAD of exporting — the v5.29.0 missed-dispatch failure. The
+#    verify loop skipped every limit during the window, so a failed or
+#    externally reverted write resurrected that failure with the mode
+#    register reading a perfectly correct 0x05. Exact sibling of the bank
+#    charge-cap gap closed in v5.56.0; the verify branch now maintains it,
+#    daytime discharge only (dark windows never pinned charge — PV is zero
+#    and the register is irrelevant).
+#
+# 3. DISCHARGE LIMIT NOT MAINTAINED EITHER, despite the verify docstring
+#    promising "export_active: discharge limit = inverter max" SINCE v5.16
+#    while the ACTIVE branch skipped the whole window. A stale low cap
+#    throttles the paid export with nothing to heal it. Now maintained in
+#    the discharge sub-mode (the register the drive itself wrote). Neither
+#    new write can cause a grid import, so the 10-Apr-2026 rule stands; the
+#    old test asserting "limits untouched in discharge" was pinning the GAP
+#    as if it were the contract, and has been flipped with its rationale.
+#
+# 4. vpp_export_mode NOT PERSISTED. Verify runs BEFORE the act step, so the
+#    first tick after a mid-window restart read the store default (0x06) and
+#    "corrected" a daytime window's 0x02/0x05 register to it — one spurious
+#    mode write per restart, each costing a real mode-switch settle (~26 s of
+#    degraded export, measured 15-Jun-2026). Now saved in accumulators.json
+#    and restored; a pre-5.57 file simply leaves the default.
+#
+# 5. A WINDOW SPANNING MIDNIGHT SETTLED NEGATIVE (latent since v5.28.0 —
+#    Axle has only ever sent within-day windows). The export figure is
+#    (grid_export_daily_kwh - anchor) and the midnight rollover zeroes the
+#    counter, so the log, the JSONL, the device states and the Pushover would
+#    all have carried "-N kWh exported". The rollover now re-bases the anchor
+#    (pure _vpp_export_anchor_after_midnight, unit-tested) so the delta is
+#    continuous across midnight.
+#
+# Plus: the late-detection path now writes the JSONL event header it always
+# skipped, so a late-published event's snapshot file carries its announcement
+# record like every other.
+#
+# Suite 485 -> 500, with the TEN finding-pinned cases verified FAILING against
+# the pre-fix code and the five deliberately-neutral ones passing on both
+# sides (they assert behaviour that was already right — a test that fails on
+# both sides proves nothing).
 #
 # v5.56.0 (05-08-2026): THE POST-EVENT REPORT WAS ANSWERING A QUESTION WE STOPPED
 # ASKING IN JUNE. The VPP summary Pushover still asked what AXLE had done — "Did
@@ -1770,6 +1829,23 @@ def _vpp_resume_decision(vpp_state, event, now, tail_minutes=2):
     if now >= end_time + timedelta(minutes=tail_minutes):
         return "ended"
     return "resume"
+
+
+def _vpp_export_anchor_after_midnight(old_start_kwh, pre_reset_total_kwh):
+    """New vpp_export_start_kwh when the daily export counter resets mid-window.
+
+    The window's export figure is (grid_export_daily_kwh - start anchor). The
+    midnight rollover zeroes the counter, so a window spanning midnight would
+    settle NEGATIVE — logged, written to the JSONL, pushed to the device states
+    and the Pushover as e.g. "-3.90 kWh exported" (v5.57.0; latent since v5.28.0,
+    never hit because Axle has only ever sent within-day windows).
+
+    Re-basing the anchor to (old_start - pre_reset_total) keeps the delta exact:
+    the export banked before midnight is (pre_reset_total - old_start), and the
+    new day's counter T then yields T - (old_start - pre_reset_total)
+    = (pre_reset_total - old_start) + T. Pure so the arithmetic is unit-tested.
+    """
+    return old_start_kwh - pre_reset_total_kwh
 
 
 # ============================================================
@@ -5668,6 +5744,46 @@ class Plugin(indigo.PluginBase):
                         )
                         self.modbus.set_charge_limit(expected_cap_w, quiet=True)
 
+            # And the DISCHARGE sub-mode's own registers (v5.57.0). Same argument
+            # as the bank cap, in the other sub-mode:
+            #   - daytime_export pins charge=0, because in 0x05 an OPEN charge
+            #     limit lets high PV charge the battery INSTEAD of exporting —
+            #     the v5.29.0 missed-dispatch failure. A failed or externally
+            #     reverted write resurrects it with the mode register reading a
+            #     perfectly correct 0x05, so nothing above notices. Dark windows
+            #     never pin charge (PV is zero, the register is irrelevant), so
+            #     only the daytime latch asserts it.
+            #   - both discharge modes wrote discharge=inv_max, and the
+            #     docstring above has promised "export_active: discharge limit
+            #     = inverter max" since v5.16 while this branch skipped the
+            #     whole window. A stale lower cap (a failed night_export write,
+            #     or anything external) throttles the paid export for the
+            #     remaining window with nothing to heal it.
+            # Neither write can cause a grid import — a charge cap of 0 blocks
+            # charging, and the discharge limit is the register the drive
+            # itself wrote — so the 10-Apr-2026 rule is not reopened.
+            elif self.store.get("vpp_export_submode") == "discharge":
+                actual_dis_w = self.modbus.read_discharge_limit()
+                if actual_dis_w is not None and abs(actual_dis_w - inv_max_w) > 200:
+                    log(
+                        f"[Verify] VPP discharge-limit drift: inverter={actual_dis_w}W "
+                        f"expected={inv_max_w}W — re-asserting (a low cap throttles "
+                        f"the paid export)",
+                        level="WARNING",
+                    )
+                    self.modbus.set_discharge_limit(inv_max_w)
+                if self.store.get("vpp_is_daytime"):
+                    actual_chg_w = self.modbus.read_charge_limit()
+                    if actual_chg_w is not None and actual_chg_w > 300:
+                        log(
+                            f"[Verify] VPP daytime-discharge charge cap drift: "
+                            f"inverter={actual_chg_w}W expected=0W — re-asserting "
+                            f"(open charge limit in 0x05 banks PV instead of "
+                            f"exporting it — the v5.29.0 failure)",
+                            level="WARNING",
+                        )
+                        self.modbus.set_charge_limit(0, quiet=True)
+
         # --- Discharge limit and charge limit ---
         # Skip during VPP_PRE_CHARGING and VPP_ACTIVE: the self-driven export owns
         # these registers through the window (night_export sets the discharge limit
@@ -6080,6 +6196,33 @@ class Plugin(indigo.PluginBase):
         now           = datetime.now(timezone.utc)
         current_state = self.store["vpp_state"]
 
+        # Direction guard (v5.57.0 — closes the item v5.28.0 recorded as "noted
+        # only"). Everything below self-drives an EXPORT: announce, pre-charge,
+        # raise the cutoff, then night_export/daytime_export for the window.
+        # Axle's API carries an import_export field and has only ever sent
+        # "export", but nothing here checked it — an IMPORT event would have
+        # been driven as a full export, pushing 4 kW OUT through the very window
+        # the grid wants energy IN, draining the battery for a dispatch that
+        # settles against us. Treat a non-export event exactly like "no event":
+        # the None branch already stands down any pre-window state cleanly, and
+        # an ACTIVE window keeps driving to its own stored end (our stored
+        # window is always an export one — a non-export event can never reach
+        # ACTIVE). Warn ONCE per event (latched on its start time — the poll
+        # repeats every 10 minutes, potentially for hours of lead time).
+        if event is not None:
+            direction = str(event.get("import_export") or "export").strip().lower()
+            if direction != "export":
+                start_key = str(event.get("start_time"))
+                if self.store.get("vpp_direction_warned") != start_key:
+                    self.store["vpp_direction_warned"] = start_key
+                    log(f"[VPP] Axle announced a '{direction}' event "
+                        f"({_local_time(event['start_time'])}-"
+                        f"{_local_time(event['end_time'])}) — this plugin only "
+                        f"self-drives EXPORT windows, so it will NOT be driven. "
+                        f"If Axle have started sending import events, that needs "
+                        f"building, not assuming.", level="WARNING")
+                event = None
+
         if event is None:
             # Axle API returns None when no event is scheduled or the event has ended
 
@@ -6146,6 +6289,11 @@ class Plugin(indigo.PluginBase):
             )
             self.store["vpp_event"] = event
             self.store["vpp_export_start_kwh"] = self.store["grid_export_daily_kwh"]
+            # The announced path writes the JSONL header at announcement; this path
+            # never announced, so write it here — otherwise the event's snapshot
+            # file opens with no announcement record and the post-event analysis
+            # loses the dispatch metadata (v5.57.0).
+            self._write_vpp_event_header(event)
             # Pre-charge was skipped, so set the discharge cutoff here too — otherwise
             # vpp_cutoff_raised stays False and _verify_ems_registers would reset the
             # cutoff to the health floor mid-window, letting a late-detected NIGHT event
@@ -7061,6 +7209,18 @@ class Plugin(indigo.PluginBase):
         # Write final daily totals to Indigo variables before reset
         self._write_energy_summary_variables()
         self.store["last_energy_var"] = time.time()
+
+        # A VPP window spanning midnight must keep its export delta intact
+        # across the counter reset below, or the settlement figure goes
+        # negative (see _vpp_export_anchor_after_midnight). Must run BEFORE
+        # the reset — it needs the pre-reset total.
+        if self.store.get("vpp_state", VPP_IDLE) == VPP_ACTIVE:
+            _pre_total = self.store.get("grid_export_daily_kwh", 0.0)
+            _old_start = self.store.get("vpp_export_start_kwh", 0.0)
+            self.store["vpp_export_start_kwh"] = _vpp_export_anchor_after_midnight(
+                _old_start, _pre_total)
+            log(f"[VPP] Window spans midnight — export anchor re-based "
+                f"({max(0.0, _pre_total - _old_start):.2f} kWh banked before the rollover)")
 
         # Reset accumulators
         self.store["pv_daily_kwh"]              = 0.0
@@ -9113,6 +9273,14 @@ class Plugin(indigo.PluginBase):
             "vpp_charge_stopped":        self.store.get("vpp_charge_stopped", False),
             "vpp_cutoff_raised":         self.store.get("vpp_cutoff_raised", False),
             "vpp_is_daytime":            self.store.get("vpp_is_daytime", False),
+            # The live export mode (0x02 bank / 0x05 / 0x06). Without it, the
+            # first verify after a mid-window restart expects the 0x06 default
+            # and "corrects" a daytime window's register to it — verify runs
+            # BEFORE the act step whose _drive_vpp_export would re-decide, so
+            # the spurious write lands first and costs a real mode-switch
+            # settle (~26 s of degraded export, measured 15-Jun-2026). 0 =
+            # not driving.
+            "vpp_export_mode":           self.store.get("vpp_export_mode", 0),
             "vpp_export_active":         (self.store.get("export_active", False)
                                           if self.store.get("vpp_state", VPP_IDLE) != VPP_IDLE
                                           else False),
@@ -9181,6 +9349,16 @@ class Plugin(indigo.PluginBase):
                     self.store["vpp_charge_stopped"]   = bool(data.get("vpp_charge_stopped", False))
                     self.store["vpp_cutoff_raised"]    = bool(data.get("vpp_cutoff_raised", False))
                     self.store["vpp_is_daytime"]       = bool(data.get("vpp_is_daytime", False))
+                    # Restore the live export mode so the first verify holds the
+                    # window's REAL mode rather than the 0x06 default (see the
+                    # save-side comment). Absent (pre-5.57 file, or not
+                    # driving) leaves the default in place.
+                    try:
+                        _mode = int(data.get("vpp_export_mode", 0))
+                    except (TypeError, ValueError):
+                        _mode = 0
+                    if _mode:
+                        self.store["vpp_export_mode"] = _mode
                     if data.get("vpp_export_active"):
                         self.store["export_active"] = True
                     self.logger.debug(

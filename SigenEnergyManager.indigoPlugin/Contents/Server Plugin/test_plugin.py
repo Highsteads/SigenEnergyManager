@@ -237,7 +237,8 @@ class TestVppBankCapVerify(unittest.TestCase):
     inverter max sends the surplus to the battery instead of the grid, and the
     mode register still reads a perfectly correct 0x02, so nothing else notices."""
 
-    def _p(self, submode, expected_cap, actual_cap, mode=0x02):
+    def _p(self, submode, expected_cap, actual_cap, mode=0x02, daytime=False,
+           actual_dis=10000):
         p = plugin.Plugin.__new__(plugin.Plugin)
         p.logger      = MagicMock()
         p.modbus      = MagicMock()
@@ -248,11 +249,12 @@ class TestVppBankCapVerify(unittest.TestCase):
             "vpp_export_mode":        mode,
             "vpp_export_submode":     submode,
             "vpp_bank_charge_cap_w":  expected_cap,
+            "vpp_is_daytime":         daytime,
         }
         p.modbus.connected                          = True
         p.modbus.read_ems_mode.return_value         = mode
         p.modbus.read_charge_limit.return_value     = actual_cap
-        p.modbus.read_discharge_limit.return_value  = 10000
+        p.modbus.read_discharge_limit.return_value  = actual_dis
         p.modbus.read_discharge_cutoff.return_value = 1.0     # matches the health floor
         p.modbus.read_charge_cutoff.return_value    = 100.0   # no import backstop raised
         return p
@@ -268,9 +270,50 @@ class TestVppBankCapVerify(unittest.TestCase):
         p._verify_ems_registers()
         p.modbus.set_charge_limit.assert_not_called()
 
-    def test_discharge_submode_limits_untouched(self):
-        """0x05/0x06 limits are static for the window — the 10-Apr-2026 rule."""
-        p = self._p("discharge", expected_cap=-1, actual_cap=0, mode=0x06)
+    def test_discharge_submode_healthy_registers_untouched(self):
+        """Healthy discharge-mode registers get NO writes. This test used to be
+        named ..._limits_untouched and asserted the verify loop NEVER touched
+        the discharge sub-mode's limits — i.e. it pinned the v5.57.0 GAP as if
+        it were the contract. The 10-Apr-2026 rule was about a FOREIGN cap (the
+        solar-overflow one) being written over a window; re-asserting the
+        registers the drive itself wrote is the opposite of that."""
+        p = self._p("discharge", expected_cap=-1, actual_cap=0, mode=0x06,
+                    daytime=False, actual_dis=10000)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_not_called()
+        p.modbus.set_discharge_limit.assert_not_called()
+
+    def test_discharge_drifted_discharge_limit_reasserted(self):
+        """A stale low discharge cap throttles the paid export for the rest of
+        the window; the verify docstring has promised inv-max during export
+        since v5.16 while the ACTIVE branch skipped it."""
+        p = self._p("discharge", expected_cap=-1, actual_cap=0, mode=0x06,
+                    actual_dis=4000)
+        p._verify_ems_registers()
+        p.modbus.set_discharge_limit.assert_called_once()
+        self.assertEqual(p.modbus.set_discharge_limit.call_args.args[0], 10000)
+
+    def test_daytime_discharge_open_charge_cap_reasserted(self):
+        """The v5.29.0 failure: in 0x05 an OPEN charge limit banks high PV into
+        the battery instead of exporting it — mode register reads correct, so
+        only this check can see it."""
+        p = self._p("discharge", expected_cap=-1, actual_cap=10000, mode=0x05,
+                    daytime=True)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_called_once()
+        self.assertEqual(p.modbus.set_charge_limit.call_args.args[0], 0)
+
+    def test_dark_discharge_never_pins_the_charge_cap(self):
+        """Dark windows never wrote charge=0 (PV is zero, the register is
+        irrelevant), so verify must not invent that expectation."""
+        p = self._p("discharge", expected_cap=-1, actual_cap=10000, mode=0x06,
+                    daytime=False)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_not_called()
+
+    def test_discharge_unread_limits_not_treated_as_agreement(self):
+        p = self._p("discharge", expected_cap=-1, actual_cap=None, mode=0x05,
+                    daytime=True, actual_dis=None)
         p._verify_ems_registers()
         p.modbus.set_charge_limit.assert_not_called()
         p.modbus.set_discharge_limit.assert_not_called()
@@ -279,6 +322,198 @@ class TestVppBankCapVerify(unittest.TestCase):
         p = self._p("bank", expected_cap=1200, actual_cap=None)
         p._verify_ems_registers()
         p.modbus.set_charge_limit.assert_not_called()
+
+
+class TestVppDirectionGuard(unittest.TestCase):
+    """_apply_vpp_event refuses to drive a non-export event (v5.57.0).
+
+    Everything downstream of the announce self-drives an EXPORT — pre-charge,
+    raised cutoff, night/daytime_export for the window. Axle's API carries
+    import_export and has only ever sent "export", but nothing checked it: an
+    IMPORT event would have been announced, pre-charged and then driven as a
+    full 4 kW export THROUGH the very window the grid wants energy in. Flagged
+    "noted only" at v5.28.0 and open ever since."""
+
+    def _p(self, state=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.modbus = MagicMock()
+        p.store  = {"vpp_state": state or plugin.VPP_IDLE}
+        p.latest_inverter_data   = {}
+        p._vpp_transition        = MagicMock()
+        p._trigger_event         = MagicMock()
+        p._write_vpp_event_header = MagicMock()
+        p._update_vpp_device     = MagicMock()
+        p._start_vpp_precharge   = MagicMock()
+        p._end_vpp_export        = MagicMock()
+        p._log_vpp_snapshot      = MagicMock()
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._event_is_daytime      = MagicMock(return_value=False)
+        p._restore_discharge_cutoff = MagicMock()
+        return p
+
+    @staticmethod
+    def _event(direction, hours_ahead=2.0):
+        start = datetime.now(timezone.utc) + timedelta(hours=hours_ahead)
+        return {
+            "start_time":    start,
+            "end_time":      start + timedelta(hours=1),
+            "import_export": direction,
+            "duration_hrs":  1.0,
+        }
+
+    def test_export_event_announces(self):
+        p = self._p()
+        p._apply_vpp_event(self._event("export"))
+        p._vpp_transition.assert_called_once_with(plugin.VPP_ANNOUNCED)
+        self.assertIn("vpp_event", p.store)
+
+    def test_import_event_is_never_announced(self):
+        """The finding itself: pre-fix this announced and would have driven."""
+        p = self._p()
+        p._apply_vpp_event(self._event("import"))
+        p._vpp_transition.assert_not_called()
+        self.assertNotIn("vpp_event", p.store)
+
+    def test_import_warning_is_latched_per_event(self):
+        p  = self._p()
+        ev = self._event("import")
+        p._apply_vpp_event(ev)
+        latch = p.store.get("vpp_direction_warned")
+        self.assertEqual(latch, str(ev["start_time"]))
+        p._apply_vpp_event(ev)          # second poll: still refused, latch stable
+        p._vpp_transition.assert_not_called()
+        self.assertEqual(p.store.get("vpp_direction_warned"), latch)
+
+    def test_missing_direction_defaults_to_export(self):
+        """Axle omitting the field must not strand real events — the client has
+        always defaulted it to export, and so does the guard."""
+        p  = self._p()
+        ev = self._event("export")
+        del ev["import_export"]
+        p._apply_vpp_event(ev)
+        p._vpp_transition.assert_called_once_with(plugin.VPP_ANNOUNCED)
+
+    def test_import_event_mid_announced_stands_down(self):
+        """An announced export window that Axle then republishes as import is a
+        cancellation — the None branch's teardown must run."""
+        p = self._p(state=plugin.VPP_ANNOUNCED)
+        p.store["export_active"] = False
+        p._apply_vpp_event(self._event("import", hours_ahead=0.4))
+        p._restore_discharge_cutoff.assert_called_once()
+        p._vpp_transition.assert_called_once_with(plugin.VPP_IDLE)
+
+
+class TestVppExportModePersistence(unittest.TestCase):
+    """vpp_export_mode survives a restart (v5.57.0).
+
+    Verify runs BEFORE the act step, so the first tick after a mid-window
+    restart used the store default 0x06 and "corrected" a daytime window's
+    0x02/0x05 register to it — one spurious mode write per restart, each
+    costing a real mode-switch settle (~26 s, measured 15-Jun-2026)."""
+
+    def _saved_payload(self, store):
+        import json as _json
+        import tempfile
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {}
+        p.store       = store
+        p._state_lock = threading.RLock()
+        p._save_home_profile = MagicMock()
+        path = os.path.join(tempfile.mkdtemp(), "accumulators.json")
+        p._save_accumulators_locked(path)
+        with open(path, encoding="utf-8") as fh:
+            return _json.load(fh)
+
+    @staticmethod
+    def _base_store(**extra):
+        store = {
+            "pv_daily_kwh": 1.0, "grid_import_daily_kwh": 0.0,
+            "grid_export_daily_kwh": 2.0, "home_daily_kwh": 3.0,
+            "peak_soc": 90.0, "min_soc": 40.0, "today_date": "2026-08-05",
+            "pv_lifetime_start_kwh": 100.0, "import_lifetime_start_kwh": 10.0,
+            "export_lifetime_start_kwh": 20.0,
+        }
+        store.update(extra)
+        return store
+
+    def test_export_mode_is_saved(self):
+        payload = self._saved_payload(self._base_store(
+            vpp_state=plugin.VPP_ACTIVE,
+            vpp_event={"start_time": datetime(2026, 8, 5, 11, 0, tzinfo=timezone.utc),
+                       "end_time":   datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)},
+            vpp_export_mode=0x05,
+        ))
+        self.assertEqual(payload.get("vpp_export_mode"), 0x05)
+
+    def test_export_mode_is_restored(self):
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        start = datetime(2026, 8, 5, 11, 0, tzinfo=timezone.utc)
+        data = {
+            "vpp_state": plugin.VPP_ACTIVE,
+            "vpp_event": plugin._serialise_vpp_event(
+                {"start_time": start, "end_time": start + timedelta(hours=1)}),
+            "vpp_export_mode": 0x05,
+        }
+        with open(os.path.join(tmp, "accumulators.json"), "w", encoding="utf-8") as fh:
+            _json.dump(data, fh)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger        = MagicMock()
+        p.pluginPrefs   = {}
+        p.store         = {}
+        p._get_data_dir = lambda: tmp
+        p._load_accumulators()
+        self.assertEqual(p.store.get("vpp_export_mode"), 0x05)
+        self.assertEqual(p.store.get("vpp_state"), plugin.VPP_ACTIVE)
+
+    def test_pre_557_file_leaves_the_default(self):
+        """An accumulators file from before the key existed must not plant 0."""
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        start = datetime(2026, 8, 5, 11, 0, tzinfo=timezone.utc)
+        data = {
+            "vpp_state": plugin.VPP_ACTIVE,
+            "vpp_event": plugin._serialise_vpp_event(
+                {"start_time": start, "end_time": start + timedelta(hours=1)}),
+        }
+        with open(os.path.join(tmp, "accumulators.json"), "w", encoding="utf-8") as fh:
+            _json.dump(data, fh)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger        = MagicMock()
+        p.pluginPrefs   = {}
+        p.store         = {}
+        p._get_data_dir = lambda: tmp
+        p._load_accumulators()
+        self.assertNotIn("vpp_export_mode", p.store)
+
+
+class TestVppMidnightAnchor(unittest.TestCase):
+    """_vpp_export_anchor_after_midnight — a window spanning midnight keeps its
+    export delta across the daily counter reset. Latent since v5.28.0: the
+    counter zeroes at midnight, so (total - start) went NEGATIVE and the
+    settlement figure was logged, JSONL'd, state-written and Pushover'd as
+    e.g. "-3.90 kWh exported"."""
+
+    def test_rebase_arithmetic(self):
+        # Window started with the day's counter at 3.0; by midnight it read 7.5.
+        self.assertAlmostEqual(
+            plugin._vpp_export_anchor_after_midnight(3.0, 7.5), -4.5)
+
+    def test_delta_is_continuous_across_the_rollover(self):
+        old_start, pre_total = 3.0, 7.5     # 4.5 kWh banked before midnight
+        anchor = plugin._vpp_export_anchor_after_midnight(old_start, pre_total)
+        for after_midnight in (0.0, 0.7, 1.2):
+            self.assertAlmostEqual(
+                after_midnight - anchor,
+                (pre_total - old_start) + after_midnight)
+
+    def test_never_negative_for_a_real_window(self):
+        anchor = plugin._vpp_export_anchor_after_midnight(3.0, 7.5)
+        self.assertGreaterEqual(0.0 - anchor, 0.0)
 
 
 class TestVppPvStatus(unittest.TestCase):
