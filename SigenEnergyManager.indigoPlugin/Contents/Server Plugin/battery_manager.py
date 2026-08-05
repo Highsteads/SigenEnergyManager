@@ -116,64 +116,19 @@ from typing import Optional, List, Dict, Tuple
 # '22:45' != '23:45' — both exactly the BST offset. Duplication is why the two
 # were missed when octopus_api was given the same fix in v5.22.1 (27-May-2026).
 #
-# ZONEINFO IS PREFERRED over pytz, deliberately:
-#   * it is stdlib from Python 3.9, so it cannot go missing when a Packages
-#     rebuild fails — and this install has had Packages wiped and rebuilt more
-#     than once (ClaudeBridge's __init__ loss, the paho 1.6.1 -> 2.1.0 purge);
-#   * it has no .localize() requirement. Attaching a pytz zone with a bare
-#     `replace(tzinfo=...)` yields LMT — for London that is -00:01, a silently
-#     wrong answer by 60 seconds. zoneinfo has no such trap.
-# pytz is kept as a second source only for completeness.
+# v5.56.0: the implementation moved OUT of this module into `london_time.py`,
+# which sits below every module that needs it. v5.55.3 unified the five copies
+# HERE and stopped, and plugin.py then turned out to have fifteen more and
+# openmeteo_forecast four — including one whose zoneinfo branch omitted the fold
+# mapping, so the ambiguous October hour resolved differently depending on which
+# library was installed. The names below are kept as aliases so this module's
+# own call sites and tests read the same as before.
 
-def _london_tz():
-    """Return an Europe/London tzinfo, or None if no tz database is reachable.
-
-    None means "cannot convert" and callers must degrade explicitly — it must
-    never be confused with "the answer is UTC". On any supported Python this
-    returns a real zone, so the None path is effectively unreachable; it exists
-    so a broken interpreter fails visibly at the call site rather than here.
-    """
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("Europe/London")
-    except Exception:
-        try:
-            import pytz
-            return pytz.timezone("Europe/London")
-        except Exception:
-            return None
-
-
-def _london_localise(naive_dt):
-    """Attach Europe/London to a NAIVE datetime that is already local wall-clock.
-
-    THE reason this is a shared function: pytz and zoneinfo need different calls
-    for this and only this operation. pytz requires `tz.localize(naive)` (which
-    also resolves the DST gap/fold); zoneinfo requires `naive.replace(tzinfo=tz)`.
-    Using zoneinfo's form on a pytz zone gives LMT, and that is exactly the kind
-    of detail a copied block gets wrong.
-
-    Returns None when no zone is available, so a caller cannot mistake an
-    unconverted value for a converted one.
-    """
-    tz = _london_tz()
-    if tz is None:
-        return None
-    localise = getattr(tz, "localize", None)     # pytz only
-    return localise(naive_dt) if localise else naive_dt.replace(tzinfo=tz)
-
-
-def _to_london(dt):
-    """Convert an AWARE datetime to Europe/London.
-
-    A naive datetime is returned unchanged — callers that hold naive values
-    treat them as already-local, and silently stamping a zone on one would
-    invent information. Returns dt unchanged if no zone is available.
-    """
-    if dt is None or dt.tzinfo is None:
-        return dt
-    tz = _london_tz()
-    return dt.astimezone(tz) if tz is not None else dt
+from london_time import (            # noqa: E402  (see header — placed with its own comment block)
+    london_tz       as _london_tz,   # noqa: F401  (re-export: this module's historical surface)
+    london_localise as _london_localise,
+    to_london       as _to_london,
+)
 
 
 # Import tariff key constants

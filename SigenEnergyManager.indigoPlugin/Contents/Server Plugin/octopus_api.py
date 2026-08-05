@@ -38,6 +38,13 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
+# Europe/London from the ONE shared implementation. These four sites were
+# already zoneinfo-first (v5.22.1 fixed this module before any other), but
+# they were still four hand-rolled copies, and two of them ended in a bare
+# naive datetime — `.astimezone()` then reads it as the SERVER clock, which
+# on a UTC-hosted machine is an hour out for eight months of the year.
+from london_time import london_localise, london_now, london_tz
+
 try:
     import requests
     REQUESTS_AVAILABLE = True
@@ -408,17 +415,10 @@ class OctopusAPI:
             None                                 on auth/network failure
         """
         try:
-            try:
-                from zoneinfo import ZoneInfo
-                day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(
-                    tzinfo=ZoneInfo("Europe/London"))
-            except Exception:
-                try:
-                    import pytz
-                    day_start = pytz.timezone("Europe/London").localize(
-                        datetime.strptime(date_str, "%Y-%m-%d"))
-                except Exception:
-                    day_start = datetime.strptime(date_str, "%Y-%m-%d")
+            day_start = london_localise(datetime.strptime(date_str, "%Y-%m-%d"))
+            if day_start is None:
+                self._warn_no_tz()
+                return None
             day_end = day_start + timedelta(days=1)
             period_from = day_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
             period_to   = day_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -761,19 +761,29 @@ class OctopusAPI:
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
 
+    def _warn_no_tz(self):
+        """Report a missing tz database once per instance, not once per call.
+
+        Every use of Europe/London in this module bounds a BILLING day. An hour
+        of error moves half-hourly consumption slots between days and prices
+        them against the wrong tariff window, so this must never pass silently.
+        """
+        if getattr(self, "_tz_warned", False):
+            return
+        self._tz_warned = True
+        self.logger.error(
+            "No Europe/London time zone available (neither zoneinfo nor pytz) — "
+            "consumption day windows and rate schedules cannot be built correctly."
+        )
+
     def _london_today(self):
         """Today's date in Europe/London. Rate-schedule windows are LOCAL calendar
         days — using the UTC date picks the wrong day in the 00:00-01:00 BST hour."""
-        try:
-            from zoneinfo import ZoneInfo
-            return datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/London")).date()
-        except Exception:
-            try:
-                import pytz
-                return datetime.now(timezone.utc).astimezone(
-                    pytz.timezone("Europe/London")).date()
-            except Exception:
-                return datetime.now().date()
+        now = london_now()
+        if now is None:
+            self._warn_no_tz()
+            return datetime.now(timezone.utc).date()
+        return now.date()
 
     def get_active_rate_schedule(self, force=False):
         """Today's and tomorrow's raw rate slots for the ACTIVE import tariff.
@@ -899,19 +909,10 @@ class OctopusAPI:
         cheap_start = window.get("cheap_start", "02:00")
         cheap_end   = window.get("cheap_end", "05:00")
 
-        # Resolve Europe/London timezone once. Prefer stdlib zoneinfo
-        # (Python 3.9+) so the conversion works even when pytz isn't
-        # installed (e.g. test environments). pytz remains a fallback.
-        _tz_l = None
-        try:
-            from zoneinfo import ZoneInfo
-            _tz_l = ZoneInfo("Europe/London")
-        except ImportError:
-            try:
-                import pytz
-                _tz_l = pytz.timezone("Europe/London")
-            except ImportError:
-                _tz_l = None
+        # Europe/London resolved once, from the shared implementation.
+        _tz_l = london_tz()
+        if _tz_l is None:
+            self._warn_no_tz()
 
         # Group rates by time window
         cheap_rates    = []
@@ -1310,12 +1311,10 @@ class OctopusAPI:
         # LOCAL midnight to next local midnight, expressed in UTC.
         local_midnight = datetime(target_date.year, target_date.month,
                                   target_date.day, 0, 0, 0)
-        try:
-            from zoneinfo import ZoneInfo
-            start_dt = local_midnight.replace(tzinfo=ZoneInfo("Europe/London"))
-        except ImportError:
-            import pytz
-            start_dt = pytz.timezone("Europe/London").localize(local_midnight)
+        start_dt = london_localise(local_midnight)
+        if start_dt is None:
+            self._warn_no_tz()
+            return None
         end_dt      = start_dt + timedelta(days=1)
         period_from = start_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         period_to   = end_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

@@ -488,3 +488,44 @@ class TestPartialFetch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLocalKeyToUtc(unittest.TestCase):
+    """_local_key_to_utc — Open-Meteo returns LOCAL wall-clock keys, so this is
+    where a timezone mistake turns into a forecast slot in the wrong hour.
+
+    v5.56.0 moved it onto the shared london_time helper. The branch it replaced
+    had two faults, one of them dormant in summer: its zoneinfo path used a bare
+    replace(tzinfo=...) (fold=0) while its pytz path used is_dst=False (fold=1),
+    so the ambiguous October hour depended on which library was installed; and
+    its last-resort fell back to a flat "-1 hour", which is correct for BST and
+    an hour wrong for the four months of GMT."""
+
+    def _fc(self):
+        return OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+
+    def test_summer_key_is_one_hour_behind(self):
+        self.assertEqual(self._fc()._local_key_to_utc("2026-08-05 12:00:00"),
+                         "2026-08-05T11:00:00Z")
+
+    def test_winter_key_is_unchanged(self):
+        """The crude '-1 hour' fallback failed exactly here."""
+        self.assertEqual(self._fc()._local_key_to_utc("2026-01-05 12:00:00"),
+                         "2026-01-05T12:00:00Z")
+
+    def test_ambiguous_autumn_hour_takes_the_gmt_occurrence(self):
+        self.assertEqual(self._fc()._local_key_to_utc("2026-10-25 01:30:00"),
+                         "2026-10-25T01:30:00Z")
+
+    def test_unparseable_key_returns_none(self):
+        self.assertIsNone(self._fc()._local_key_to_utc("not-a-time"))
+
+
+class TestNowLocalIsAware(unittest.TestCase):
+    """The old fallback was a bare datetime.now() — the SERVER clock, an hour
+    behind local for eight months on a UTC-hosted machine, with nothing logged.
+    Every caller uses it to decide which forecast slot is 'now'."""
+
+    def test_now_local_is_timezone_aware(self):
+        fc = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+        self.assertIsNotNone(fc._now_local().tzinfo)

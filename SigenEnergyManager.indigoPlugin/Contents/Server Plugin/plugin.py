@@ -48,26 +48,46 @@
 # expected value is the VPP driver's own cap and the check runs only while bank
 # is live. Every other limit still stays untouched for the whole window.
 #
-# AND THE v5.55.3 TIME-ZONE SWEEP NEVER REACHED THIS FILE. That release unified
-# battery_manager on _london_tz / _london_localise / _to_london, with stdlib
-# zoneinfo preferred, precisely because five hand-rolled copies had left two
-# sites silently an hour out. plugin.py still had FIFTEEN of them — including
-# _local_today_str(), the midnight-rollover basis, which is the exact bug class
-# that release was written about, and _event_is_daytime(), where an hour's error
-# flips a dusk-edge window to daytime and runs the mode that curtails PV. All
-# fifteen now call the one shared implementation. A missing tz database logs an
-# ERROR once and says what it affects, instead of quietly answering in UTC.
+# AND THE TIME-ZONE SWEEP IS FINALLY FINISHED — IT HAD BEEN DONE THREE TIMES AND
+# NEVER FINISHED ONCE. v5.22.1 fixed octopus_api. v5.55.3 unified battery_manager
+# on _london_tz / _london_localise / _to_london with stdlib zoneinfo preferred,
+# and wrote a long, accurate note about why duplication caused the bug — filed in
+# plugin.py, which was one of the files it had NOT fixed. plugin.py still had
+# FIFTEEN hand-rolled copies, including _local_today_str() (the midnight-rollover
+# basis, the exact bug class that release was written about) and
+# _event_is_daytime() (where an hour's error flips a dusk-edge window to daytime
+# and runs the mode that curtails PV); openmeteo_forecast had four more.
+#
+# The implementation now lives in `london_time.py`, BELOW every module that needs
+# it, so there is no longer anywhere sensible to put a sixth copy. plugin.py,
+# battery_manager, octopus_api and openmeteo_forecast all import it; `import pytz`
+# appears in exactly one place in this plugin, inside that module, as the second
+# choice after zoneinfo.
+#
+# openmeteo_forecast was the piece v5.55.3 deliberately left out, because its dawn
+# parse asks for `is_dst=False` to resolve the October fallback hour and zoneinfo
+# spells that `fold=1` rather than a keyword. THE MAPPING TURNED OUT TO MATTER
+# MORE THAN THE NOTE SUGGESTED: battery_manager's own shared helper had the pytz
+# branch taking the SECOND (GMT) occurrence and the zoneinfo branch the FIRST
+# (BST), so that hour resolved differently depending on which library happened to
+# be installed. `london_localise(prefer_dst=)` now makes the choice explicit and
+# identical either way, pinned by tests asserting absolute UTC instants.
+# openmeteo's four sites all degraded silently too — three left the datetime
+# NAIVE and the fourth fell back to a flat "-1 hour", which is right for BST and
+# wrong for the four months of GMT. octopus_api's four were already
+# zoneinfo-first, but two ended in a bare naive datetime, and `.astimezone()` on
+# one of those reads the SERVER clock.
 #
 # The tests were lying in the same two ways as last time: a private _london_today
 # helper with its own pytz fallback (so it could disagree with the module for an
 # hour every night in BST), and a `("12:40", "11:40")` assertion tolerating a
 # pytz-less host — which would have passed against the very bug being removed.
-# Both replaced with exact assertions. Suite 434 -> 465, 0 skipped, green with
-# AND without pytz.
-#
-# Still deliberately NOT done, unchanged from v5.55.3: openmeteo_forecast.py
-# carries the same pattern and needs the localize(is_dst=False) -> fold=1 mapping
-# pinned by tests before it can move. Its own change.
+# WORSE, THE HARNESS THAT PROVED "GREEN WITHOUT PYTZ" WAS ITSELF A NO-OP: it
+# blocked the import via find_module/load_module, a protocol Python REMOVED in
+# 3.12, so it was silently ignored and pytz was present for every run that
+# claimed otherwise. Rewritten onto find_spec and self-tested before being
+# trusted. With it genuinely blocking, two of the new openmeteo cases fail
+# against the old code. Suite 434 -> 485, 0 skipped, green with and without.
 #
 # v5.55.5 (05-08-2026): SOLAR OVERFLOW WAS FLAPPING (battery_manager 3.9 -> 3.10).
 # Its physics gate — does today's remaining solar exceed the room left in the
@@ -1320,12 +1340,16 @@ except ImportError:
 from sigenergy_modbus import SigenergyModbus
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, GAS_KWH_PER_M3
+# The ONE Europe/London implementation. Imported, never re-declared: copies are
+# what put two sites an hour out in the first place, and there is no version of
+# "just this once" that does not end up as copy number six.
+from london_time import (
+    london_tz       as _london_tz,
+    london_localise as _london_localise,
+    to_london       as _to_london,
+)
 from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
-    # The ONE Europe/London implementation (v5.55.3). Imported rather than
-    # re-declared: five hand-rolled copies is what put two sites an hour out
-    # in the first place, and a sixth here would be the same mistake again.
-    _london_tz, _london_localise, _to_london,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT,

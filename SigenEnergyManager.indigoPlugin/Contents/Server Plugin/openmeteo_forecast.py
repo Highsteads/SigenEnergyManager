@@ -68,13 +68,20 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
-try:
-    import pytz
-    LONDON_TZ = pytz.timezone("Europe/London")
-    PYTZ_AVAILABLE = True
-except ImportError:
-    PYTZ_AVAILABLE = False
-    LONDON_TZ = None
+# Europe/London comes from the ONE shared implementation (london_time.py).
+# This module used to carry a module-level LONDON_TZ behind a PYTZ_AVAILABLE
+# gate, and all four of its call sites degraded silently when that gate was
+# False: three left the datetime NAIVE and the fourth fell back to a crude
+# "+1 hour", which is simply wrong for the four winter months. Open-Meteo
+# returns LOCAL wall-clock times, so every one of those is a dawn or a slot
+# key landing in the wrong hour.
+#
+# This was the piece deliberately left out of the v5.55.3 sweep, because its
+# dawn parse asks for `is_dst=False` to resolve the October fallback hour and
+# zoneinfo spells that `fold=1` rather than a keyword — swapping the constant
+# without that mapping would have broken the once-a-year path. The mapping now
+# lives in `london_localise(prefer_dst=)` and is pinned by tests.
+from london_time import london_localise, london_now
 
 
 # ============================================================
@@ -564,14 +571,15 @@ class OpenMeteoForecast:
             if wh_int >= PV_GENERATION_THRESHOLD_WH:
                 date_str = slot_date.strftime("%Y-%m-%d")
                 if date_str not in dawn_times:
-                    if PYTZ_AVAILABLE and LONDON_TZ:
-                        # is_dst=False handles the autumn fallback ambiguity
-                        # (01:00–02:00 BST exists twice on the last Sunday in
-                        # October). Without it, pytz raises AmbiguousTimeError
-                        # and crashes the forecast parse once a year.
-                        dt_aware = LONDON_TZ.localize(dt_naive, is_dst=False)
-                    else:
-                        dt_aware = dt_naive
+                    # prefer_dst=False resolves the autumn fallback ambiguity
+                    # (01:00-02:00 local exists twice on the last Sunday in
+                    # October). A dawn is never in that hour, but without an
+                    # answer pytz raises AmbiguousTimeError and takes the whole
+                    # forecast parse down once a year.
+                    dt_aware = london_localise(dt_naive)
+                    if dt_aware is None:
+                        self._warn_no_tz()
+                        continue          # a naive dawn compares wrongly later
                     dawn_times[date_str] = dt_aware
 
         # Remaining today: bias-corrected, with the current hour pro-rated.
@@ -1108,21 +1116,16 @@ class OpenMeteoForecast:
             return None
 
         try:
-            if PYTZ_AVAILABLE and LONDON_TZ:
-                # is_dst=False handles the autumn fallback ambiguity safely
-                dt_local = LONDON_TZ.localize(dt_naive, is_dst=False)
-                dt_utc   = dt_local.astimezone(timezone.utc)
-            else:
-                # pytz unavailable — use the stdlib zoneinfo (Python 3.9+, always
-                # present on Indigo 3.13) for a CORRECT BST/GMT conversion. Only if
-                # that also fails drop to the crude +1h (which is wrong in winter/GMT).
-                try:
-                    from zoneinfo import ZoneInfo
-                    dt_local = dt_naive.replace(tzinfo=ZoneInfo("Europe/London"))
-                    dt_utc   = dt_local.astimezone(timezone.utc)
-                except Exception:
-                    dt_utc = dt_naive.replace(tzinfo=timezone.utc) - timedelta(hours=1)
-            return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            # The old zoneinfo branch here used a bare replace(tzinfo=...), i.e.
+            # fold=0, while its pytz branch used is_dst=False, i.e. fold=1 — so
+            # the ambiguous October hour converted differently depending on which
+            # library was installed. It also ended in a crude "-1 hour", which is
+            # right for BST and wrong for the four months of GMT.
+            dt_local = london_localise(dt_naive)
+            if dt_local is None:
+                self._warn_no_tz()
+                return None
+            return dt_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             return None
 
@@ -1221,12 +1224,6 @@ class OpenMeteoForecast:
 
             # Reconstruct dawn_times from hourly buckets
             dawn_times = {}
-            try:
-                import pytz as _pytz
-                _london = _pytz.timezone("Europe/London")
-            except ImportError:
-                _london = None
-
             for kwh_dict in (
                 data.get("_hourly_p50_today", {}),
                 data.get("_hourly_p50_tomorrow", {}),
@@ -1235,12 +1232,10 @@ class OpenMeteoForecast:
                     if kwh_dict[key] >= PV_GENERATION_THRESHOLD_WH:
                         try:
                             dt_naive = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
-                            # is_dst=False to avoid AmbiguousTimeError on
-                            # the autumn fallback Sunday (01:00–02:00 occurs twice).
-                            dt       = (
-                                _london.localize(dt_naive, is_dst=False)
-                                if _london else dt_naive
-                            )
+                            dt       = london_localise(dt_naive)
+                            if dt is None:
+                                self._warn_no_tz()
+                                continue
                             date_str = dt_naive.strftime("%Y-%m-%d")
                             if date_str not in dawn_times:
                                 dawn_times[date_str] = dt
@@ -1277,10 +1272,31 @@ class OpenMeteoForecast:
     # ================================================================
 
     def _now_local(self):
-        """Return current datetime in Europe/London timezone."""
-        if PYTZ_AVAILABLE and LONDON_TZ:
-            return datetime.now(tz=LONDON_TZ)
-        return datetime.now()
+        """Return current datetime in Europe/London timezone.
+
+        The old fallback was a bare `datetime.now()` — the server clock, which
+        on a UTC-hosted machine is an hour behind local for eight months of the
+        year, with nothing logged. Every caller here is deciding which forecast
+        slot is "now", so that error moves the whole remaining-today figure by a
+        bucket. If the zone cannot be resolved we say so and use UTC knowingly,
+        rather than a local clock we cannot vouch for.
+        """
+        now = london_now()
+        if now is None:
+            self._warn_no_tz()
+            return datetime.now(timezone.utc)
+        return now
+
+    def _warn_no_tz(self):
+        """Report a missing tz database once per instance, not per slot."""
+        if getattr(self, "_tz_warned", False):
+            return
+        self._tz_warned = True
+        self.logger.error(
+            "[OpenMeteo] No Europe/London time zone available (neither zoneinfo "
+            "nor pytz) — Open-Meteo returns LOCAL times, so dawn detection and "
+            "the hourly slot keys cannot be trusted."
+        )
 
     # ================================================================
     # Remaining-Today Helper
