@@ -27,6 +27,9 @@ from battery_manager import (
     SufficiencyBalance,
     SOLAR_OVERFLOW_TARGET_SOC_PCT,
     SOLAR_OVERFLOW_MIN_END_SOC_PCT,
+    SOLAR_OVERFLOW_ENGAGE_KWH,
+    SOLAR_OVERFLOW_RELEASE_KWH,
+    SOLAR_OVERFLOW_MIN_DWELL_MIN,
 )
 
 
@@ -1643,6 +1646,163 @@ class TestSolarOverflowChargeTarget(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(SOLAR_OVERFLOW_TARGET_SOC_PCT, 90.0)
         self.assertEqual(SOLAR_OVERFLOW_MIN_END_SOC_PCT, 80.0)
+
+
+class TestSolarOverflowHysteresis(unittest.TestCase):
+    """v3.10: the engage/release boundary has a dead band and a re-engage dwell.
+
+    The physics gate used to be a hard cut at exactly zero. On 05-Aug-2026 the day's
+    physics surplus sat on that boundary and the decision flapped: nine transitions,
+    four of them inside twenty minutes, at surplus 0.0 / 0.4 / 0.2 kWh. Export stops
+    during every gap, so surplus PV banks into an already-high battery with the DNO
+    cap unused — which is the clipping the whole feature exists to prevent.
+
+    Everything here is asymmetric on purpose. Starting is made harder; stopping is
+    untouched and must stay immediate, because dusk, a storm and a collapsing
+    forecast all arrive through the same release path.
+    """
+
+    CAP = 35.04
+
+    def _snap(self, soc_pct=77.0, active=False, released_at=None, now=None):
+        return ManagerSnapshot(
+            current_soc_pct            = soc_pct,
+            capacity_kwh               = self.CAP,
+            export_enabled             = True,
+            max_export_kw              = 4.0,
+            pv_watts                   = 8500,
+            house_load_watts           = 750,
+            solar_overflow_active      = active,
+            solar_overflow_released_at = released_at,
+            now                        = now or _now(hour=14),
+        )
+
+    def _bal(self, surplus_kwh, soc_pct=77.0):
+        """Build a balance whose PHYSICS surplus is exactly surplus_kwh.
+
+        Derived from the gate's own definition rather than hand-tuned numbers, so a
+        change to the headroom term cannot leave these tests quietly measuring
+        something else.
+        """
+        headroom = (100.0 - soc_pct) / 100.0 * self.CAP
+        home     = 6.6
+        return SufficiencyBalance(
+            battery_kwh                = soc_pct / 100.0 * self.CAP,
+            remaining_solar_kwh        = surplus_kwh + headroom + home,
+            remaining_home_to_dusk_kwh = home,
+            is_daytime                 = True,
+            hours_to_dusk              = 7.0,
+            surplus_kwh                = 36.0,      # 24h gate: comfortably passed
+        )
+
+    def _decide(self, surplus_kwh, **kw):
+        soc = kw.pop("soc_pct", 77.0)
+        return BatteryManager()._check_solar_overflow(
+            self._snap(soc_pct=soc, **kw), self._bal(surplus_kwh, soc_pct=soc)
+        )
+
+    # ── The bug, pinned ────────────────────────────────────────────────────
+    def test_the_flapping_afternoon_no_longer_engages(self):
+        """The three surpluses measured during the 05-Aug-2026 flapping — every one of
+        them used to start an export, and none of them may now."""
+        for observed in (0.0, 0.4, 0.2):
+            with self.subTest(physics_surplus=observed):
+                self.assertIsNone(self._decide(observed, active=False))
+
+    def test_a_marginal_surplus_does_not_start_an_export(self):
+        self.assertIsNone(self._decide(SOLAR_OVERFLOW_ENGAGE_KWH - 0.1, active=False))
+
+    def test_a_clear_surplus_still_starts_one(self):
+        d = self._decide(SOLAR_OVERFLOW_ENGAGE_KWH + 0.1, active=False)
+        self.assertIsNotNone(d)
+        self.assertGreater(d.export_kw, 0.0)
+
+    # ── Asymmetry: the dead band only ever protects a RUNNING export ───────
+    def test_a_running_export_survives_the_marginal_band(self):
+        """The same surplus that may not START one must not STOP one either — that
+        gap between the two thresholds is the entire fix."""
+        marginal = SOLAR_OVERFLOW_ENGAGE_KWH - 0.1
+        self.assertIsNone(self._decide(marginal, active=False))
+        self.assertIsNotNone(self._decide(marginal, active=True))
+
+    def test_release_is_still_immediate_below_zero(self):
+        """Never delayed. Dusk, a storm and a collapsing forecast all land here."""
+        self.assertIsNone(self._decide(SOLAR_OVERFLOW_RELEASE_KWH - 0.01, active=True))
+
+    def test_release_ignores_the_dwell_entirely(self):
+        """A dwell that could postpone a stand-down would be a stale cap on the
+        inverter. Stamp the release clock as if we had only just released, and the
+        gate must still let go."""
+        now = _now(hour=14)
+        self.assertIsNone(self._decide(
+            -1.0, active=True, released_at=now, now=now,
+        ))
+
+    # ── The dwell ──────────────────────────────────────────────────────────
+    def test_dwell_blocks_a_re_engage_just_after_a_release(self):
+        now = _now(hour=14)
+        just_now = now - timedelta(minutes=SOLAR_OVERFLOW_MIN_DWELL_MIN / 2.0)
+        self.assertIsNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False,
+            released_at=just_now, now=now,
+        ))
+
+    def test_dwell_expires(self):
+        now = _now(hour=14)
+        old = now - timedelta(minutes=SOLAR_OVERFLOW_MIN_DWELL_MIN + 1.0)
+        self.assertIsNotNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False,
+            released_at=old, now=now,
+        ))
+
+    def test_no_release_stamp_means_not_blocked(self):
+        """The startup case. A plugin that has not released this run must never be
+        locked out of exporting — the helper fails open."""
+        self.assertIsNotNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False, released_at=None,
+        ))
+
+    def test_a_naive_release_stamp_does_not_raise(self):
+        """A datetime that lost its tzinfo would otherwise blow up the subtraction and
+        take the whole decision down. Treated as UTC, so it still blocks."""
+        now = _now(hour=14)
+        naive = (now - timedelta(minutes=1)).replace(tzinfo=None)
+        self.assertIsNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False,
+            released_at=naive, now=now,
+        ))
+
+    def test_a_future_release_stamp_does_not_block_forever(self):
+        """A clock step must not strand the export for the rest of the day."""
+        now = _now(hour=14)
+        future = now + timedelta(hours=3)
+        self.assertIsNotNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False,
+            released_at=future, now=now,
+        ))
+
+    def test_a_junk_release_stamp_fails_open(self):
+        self.assertIsNotNone(self._decide(
+            SOLAR_OVERFLOW_ENGAGE_KWH + 5.0, active=False, released_at="not a datetime",
+        ))
+
+    # ── The shared physics number ──────────────────────────────────────────
+    def test_gate_and_audit_read_the_same_surplus(self):
+        """One definition, so the log can never quote a figure the decision was not
+        made on — the v5.55.3 duplication lesson, applied up front."""
+        mgr = BatteryManager()
+        for wanted in (-2.0, 0.0, 0.4, 3.5):
+            with self.subTest(surplus=wanted):
+                self.assertAlmostEqual(
+                    mgr._overflow_physics_surplus(self._snap(), self._bal(wanted)),
+                    wanted, places=6,
+                )
+
+    def test_defaults(self):
+        self.assertEqual(SOLAR_OVERFLOW_ENGAGE_KWH, 1.0)
+        self.assertEqual(SOLAR_OVERFLOW_RELEASE_KWH, 0.0)
+        self.assertEqual(SOLAR_OVERFLOW_MIN_DWELL_MIN, 10.0)
+        self.assertGreater(SOLAR_OVERFLOW_ENGAGE_KWH, SOLAR_OVERFLOW_RELEASE_KWH)
 
 
 # Provide time module alias so the Modbus test above can grab a baseline timestamp

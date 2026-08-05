@@ -6,8 +6,40 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
-# Date:        04-08-2026
-# Version:     5.55.4
+# Date:        05-08-2026
+# Version:     5.55.5
+#
+# v5.55.5 (05-08-2026): SOLAR OVERFLOW WAS FLAPPING (battery_manager 3.9 -> 3.10).
+# Its physics gate — does today's remaining solar exceed the room left in the
+# battery — was a hard cut at exactly zero with no hysteresis, so a day sitting on
+# that boundary flipped the decision every few minutes. Measured on 05-Aug-2026:
+# nine transitions in a day, four inside twenty minutes, at physics surplus 0.0 /
+# 0.4 / 0.2 kWh. Each flip writes a full decision audit plus five Modbus registers.
+#
+# The cost is not just log noise. Export STOPS for every gap, so PV surplus banks
+# into an already-high battery with the DNO cap unused — the clipping the feature
+# exists to prevent. Live at the time: 86.5% SOC, 7.7 kW PV, grid at -7 W.
+#
+# It also self-destabilises. Engaging caps the charge, so SOC climbs slower, so
+# headroom to 100% stays large, so the surplus falls back under zero; releasing then
+# fills the battery fast and pushes it straight back over. Cloud (PV 8146 W ->
+# 2152 W in twelve minutes) only adds noise on top of that loop, which is why it
+# looked like weather.
+#
+# Fix is asymmetric and errs late: engaging now needs >= 1.0 kWh of physics surplus
+# AND ten minutes since the last release; releasing is unchanged at < 0 and stays
+# immediate, so dusk, a storm or a collapsing forecast still stand it down on the
+# next tick and no path can hold a stale cap. All four of that afternoon's
+# re-engages would have been refused by the threshold alone. Erring late is the
+# KPI-safe direction anyway — a kWh kept in the battery beats one exported at 12p.
+# SOLAR_OVERFLOW_CAP_DEADBAND_W has always damped cap REWRITES on exactly this
+# reasoning; it was simply never applied to the engage/release boundary.
+#
+# The OVERFLOW audit line now quotes the physics surplus and the threshold it was
+# judged against. The old bare "no surplus or conditions not met" was what made this
+# take a source read to diagnose. The gate and the log share one definition of that
+# number (_overflow_physics_surplus), so they cannot drift apart — the v5.55.3
+# lesson, applied before rather than after.
 #
 # v5.55.4 (04-08-2026): CI has been failing since 02-08 on two ruff F541s — an
 # f-string with no placeholders, in the charge-cutoff backstop warning at
@@ -1903,6 +1935,10 @@ class Plugin(indigo.PluginBase):
         # Solar overflow state (daytime charge-cap export)
         self.store["solar_overflow_active"]      = False
         self.store["solar_overflow_charge_cap_w"] = 0
+        # When the cap was last released (UTC datetime), for the manager's v3.10
+        # re-engage dwell. None = not released this run, which the manager treats as
+        # "not blocked" — a fresh start must never be locked out of exporting.
+        self.store["solar_overflow_released_at"]  = None
 
         # Flood prevention state (overnight pre-drain).
         # Persisted to pluginPrefs so a mid-pre-drain plugin restart doesn't leave
@@ -4606,6 +4642,7 @@ class Plugin(indigo.PluginBase):
             vpp_tomorrow_kwh            = vpp_tomorrow_kwh,
             solar_overflow_active       = self.store["solar_overflow_active"],
             solar_overflow_charge_cap   = self.store["solar_overflow_charge_cap_w"],
+            solar_overflow_released_at  = self.store.get("solar_overflow_released_at"),
             solar_overflow_target_pct   = _as_float(prefs.get("solarOverflowTargetSoc"),
                                                     SOLAR_OVERFLOW_TARGET_SOC_PCT),
             solar_overflow_min_end_pct  = _as_float(prefs.get("solarOverflowMinEndSoc"),
@@ -5385,6 +5422,8 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_self_consumption()   # resets charge limit to inv_max_w
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
+                # Starts the manager's re-engage dwell (battery_manager v3.10).
+                self.store["solar_overflow_released_at"]  = datetime.now(timezone.utc)
             elif inverter_stuck:
                 # Inverter is in wrong mode (e.g. stuck in 0x06 after restart cleared store flags)
                 log(f"[Manager] Inverter stuck in '{ems_mode_str}' — forcing self-consumption",
@@ -6587,6 +6626,9 @@ class Plugin(indigo.PluginBase):
             if self.store.get("solar_overflow_active"):
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
+                # Same dwell as an ordinary release: a daylight VPP window ending
+                # should not hand straight back to a marginal overflow decision.
+                self.store["solar_overflow_released_at"]  = datetime.now(timezone.utc)
 
             # Latch whether this is a daylight window (set once at entry). The live
             # sub-mode (bank-surplus vs discharge) is then re-decided every tick by

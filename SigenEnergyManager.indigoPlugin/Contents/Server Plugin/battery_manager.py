@@ -4,9 +4,29 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Fable 5
-# Date:        30-07-2026
-# Version:     3.9
+# Author:      CliveS & Claude Opus 5
+# Date:        05-08-2026
+# Version:     3.10
+# 3.10 — Solar overflow gets HYSTERESIS + a re-engage dwell. The physics gate was a
+#       hard cut at exactly zero, so whenever the day's physics surplus sat on the
+#       boundary the decision flapped: measured 05-Aug-2026, nine transitions in one
+#       day and four in twenty minutes, at physics surplus 0.0 / 0.4 / 0.2 kWh. Each
+#       flip costs a full decision audit plus five Modbus writes, and — worse — export
+#       stops during every gap, so PV surplus banks into an already-high battery with
+#       the DNO cap unused. Exactly the clipping the feature exists to prevent.
+#       It self-destabilises rather than merely being noisy: engaging caps the charge,
+#       so SOC climbs slower, so headroom to 100% stays large, so the surplus falls
+#       back under zero — releasing then fills the battery fast and pushes it back over.
+#       Cloud (PV 8146W -> 2152W in 12 min here) just adds noise on top of that loop.
+#       Fix is asymmetric, in the safe direction: ENGAGE needs surplus >= 1.0 kWh and
+#       at least 10 min since the last release; RELEASE is unchanged at < 0 and stays
+#       immediate, so dusk, a storm or a collapsing forecast still stands it down on
+#       the very next tick. Nothing can hold a stale cap. All four of the afternoon's
+#       re-engages would have been refused by the threshold alone; the dwell is
+#       belt-and-braces for a surplus that genuinely crosses 1.0 briefly.
+#       Same idea as SOLAR_OVERFLOW_CAP_DEADBAND_W, which has always damped cap
+#       REWRITES — it was simply never applied to the engage/release boundary itself.
+#       New snapshot field solar_overflow_released_at (None = no release this run).
 # 3.9 — Europe/London conversion consolidated into ONE implementation
 #       (_london_tz / _london_localise / _to_london) used by all five sites that
 #       needed it, and stdlib zoneinfo is now PREFERRED over pytz.
@@ -222,6 +242,26 @@ SOLAR_OVERFLOW_MIN_CHARGE_W   = 200   # minimum charge cap floor (avoid writing 
 SOLAR_OVERFLOW_CAP_DEADBAND_W = 500   # only rewrite limit if cap changes by > this
 SOLAR_DUSK_THRESHOLD_WH       = 500   # Wh/hr below which a slot is considered post-dusk
 
+# v3.10 — hysteresis on the ENGAGE side of the physics gate. The gate asks whether
+# today's remaining solar exceeds the room left in the battery; sitting on that
+# boundary it used to flip every few minutes (see the header note). Requiring a
+# margin to START, while leaving the STOP at zero, gives a dead band in the only
+# direction that is safe: an export already running keeps running, and anything that
+# genuinely ends the day's overflow — dusk, a storm, a collapsing forecast — still
+# stands it down on the very next tick.
+#
+# 1.0 kWh is roughly ten minutes of clear-sky August surplus here, so a bright day
+# still engages within a tick or two of genuinely qualifying, while the marginal
+# afternoons that caused the flapping stay out. Erring late costs nothing against the
+# self-sufficiency KPI: a kWh that stays in the battery beats one exported at 12p.
+SOLAR_OVERFLOW_ENGAGE_KWH     = 1.0   # physics surplus needed to START capping charge
+SOLAR_OVERFLOW_RELEASE_KWH    = 0.0   # fall below this to RELEASE (unchanged behaviour)
+
+# Minimum quiet period after a release before overflow may re-engage. Belt-and-braces
+# behind the threshold above: it bounds the transition rate no matter how the surplus
+# moves. Deliberately one-sided — it can only DELAY an engage, never delay a release.
+SOLAR_OVERFLOW_MIN_DWELL_MIN  = 10.0
+
 # v3.8 — the charge PACING target. Until now the overflow charge was paced to reach
 # 100% exactly at dusk, and because that pacing is subtracted from export BEFORE the
 # DNO cap is applied, a high target spends the low-surplus morning buying SOC out of
@@ -316,6 +356,12 @@ class ManagerSnapshot:
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
     solar_overflow_charge_cap: int  = 0       # current cap in watts
+
+    # When the overflow cap was last RELEASED (UTC), or None if it has not been
+    # released this run. Feeds the v3.10 re-engage dwell. Passed in rather than kept
+    # here so the manager stays stateless and the dwell is testable off snapshot.now
+    # instead of a live clock.
+    solar_overflow_released_at: Optional[datetime] = None
 
     # Solar overflow charge PACING target (v3.8). Charge is paced to reach this SOC at
     # dusk rather than 100% — see SOLAR_OVERFLOW_TARGET_SOC_PCT. A goal, not a ceiling:
@@ -508,7 +554,24 @@ class BatteryManager:
                 audit.append(("OVERFLOW", f"matched -> {overflow.reason}"))
                 overflow.audit_trail = audit
                 return overflow
-            audit.append(("OVERFLOW", "skipped — no surplus or conditions not met"))
+            # Quote the number the gate actually judged, and say which threshold it
+            # was measured against. The old bare "conditions not met" gave a reader no
+            # way to see the decision sitting on the boundary — diagnosing the
+            # 05-Aug-2026 flapping meant reading the source to find out what "not met"
+            # referred to. Costs one recompute of a subtraction.
+            if not balance.is_daytime:
+                audit.append(("OVERFLOW", "skipped — night (daytime gate)"))
+            else:
+                _surplus   = self._overflow_physics_surplus(snapshot, balance)
+                _threshold = (SOLAR_OVERFLOW_RELEASE_KWH if snapshot.solar_overflow_active
+                              else SOLAR_OVERFLOW_ENGAGE_KWH)
+                audit.append((
+                    "OVERFLOW",
+                    f"skipped — physics surplus {_surplus:+.1f} kWh vs "
+                    f"{_threshold:.1f} kWh {'release' if snapshot.solar_overflow_active else 'engage'} "
+                    f"threshold, 24h surplus {balance.surplus_kwh:.1f} kWh"
+                    + (", re-engage dwell running" if self._overflow_dwell_blocked(snapshot) else "")
+                ))
         else:
             audit.append(("OVERFLOW", "skipped — export not enabled"))
 
@@ -1267,6 +1330,52 @@ class BatteryManager:
     # Solar Overflow (Daytime Export)
     # ================================================================
 
+    @staticmethod
+    def _overflow_dwell_blocked(snapshot: ManagerSnapshot) -> bool:
+        """True while the post-release quiet period is still running (v3.10).
+
+        Bounds how often the overflow cap can be re-applied, whatever the surplus
+        does. Only ever blocks an ENGAGE — the release path never consults it.
+
+        Fails OPEN on anything unexpected. A missing or unusable stamp means the
+        plugin has not released this run (the normal case at startup), and an
+        unusable one must not be able to lock the export out for the day: the
+        threshold is the primary defence and this is only the backstop. Handles a
+        naive stamp too, since a datetime that lost its tzinfo would otherwise
+        raise on the subtraction and take the whole decision down with it.
+        """
+        released_at = snapshot.solar_overflow_released_at
+        if released_at is None:
+            return False
+        try:
+            if released_at.tzinfo is None:
+                released_at = released_at.replace(tzinfo=timezone.utc)
+            elapsed_min = (snapshot.now - released_at).total_seconds() / 60.0
+        except (TypeError, AttributeError, ValueError, OverflowError):
+            return False
+        # Negative elapsed = a stamp in the future (clock step). Treat as not blocked
+        # rather than as an unbounded block.
+        return 0.0 <= elapsed_min < SOLAR_OVERFLOW_MIN_DWELL_MIN
+
+    @staticmethod
+    def _overflow_physics_surplus(
+        snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> float:
+        """kWh of solar today that cannot fit in the battery: the physics gate's number.
+
+        > 0 means the day will genuinely overflow and the surplus should be exported
+        rather than clipped. The ONE definition — both the gate and the audit line read
+        it from here, so the log can never quote a different figure from the one the
+        decision was made on. (v3.9 consolidated five copies of a timezone conversion
+        for exactly this reason; two of them had silently drifted.)
+
+        Note the headroom term is to 100%, not to the pacing target: the question is
+        whether the energy physically fits, which the target does not change.
+        """
+        headroom_kwh   = (100.0 - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh
+        net_to_battery = balance.remaining_solar_kwh - balance.remaining_home_to_dusk_kwh
+        return net_to_battery - headroom_kwh
+
     def _check_solar_overflow(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> Optional[Decision]:
@@ -1281,6 +1390,10 @@ class BatteryManager:
              Only cap charge if solar would genuinely overflow the battery today.
              (24h surplus can be positive just because the battery is high, even
              if solar today won't fill it — no clipping risk in that case.)
+             v3.10: hysteresis. Starting needs a margin of SOLAR_OVERFLOW_ENGAGE_KWH
+             plus SOLAR_OVERFLOW_MIN_DWELL_MIN since the last release; an export
+             already running only stops below SOLAR_OVERFLOW_RELEASE_KWH. Stopping
+             is never delayed.
 
         If all three pass:
           required_charge_kw = headroom / hours_to_dusk  (fills battery exactly at dusk)
@@ -1301,13 +1414,22 @@ class BatteryManager:
         remaining_solar_kwh = balance.remaining_solar_kwh
         remaining_home_kwh  = balance.remaining_home_to_dusk_kwh
         hours_to_dusk       = balance.hours_to_dusk
-        headroom_kwh        = (100.0 - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh
-        net_to_battery      = remaining_solar_kwh - remaining_home_kwh
-        solar_surplus       = net_to_battery - headroom_kwh
+        solar_surplus       = self._overflow_physics_surplus(snapshot, balance)
 
-        if solar_surplus < 0:
-            # Solar can fill battery without clipping — no export needed today
-            return None
+        # v3.10: asymmetric thresholds. Already capping -> hold until the surplus goes
+        # properly negative (unchanged from pre-3.10). Not capping -> demand a margin
+        # AND a quiet period since the last release, so a surplus hovering on the
+        # boundary cannot restart the export every few minutes. Both extra conditions
+        # apply ONLY to starting; nothing here can delay a stand-down.
+        if snapshot.solar_overflow_active:
+            if solar_surplus < SOLAR_OVERFLOW_RELEASE_KWH:
+                # Solar can no longer fill the battery — release, caller handles it
+                return None
+        else:
+            if solar_surplus < SOLAR_OVERFLOW_ENGAGE_KWH:
+                return None
+            if self._overflow_dwell_blocked(snapshot):
+                return None
 
         # ── 3. Charge cap calculation ─────────────────────────────────────
         # Charge exactly fast enough to reach the TARGET at dusk; export everything
@@ -1343,7 +1465,7 @@ class BatteryManager:
         # Room up to the TARGET (not to 100%) is what sets the pacing rate. Clamped at
         # zero: at or above the target there is nothing left to pace towards, so export
         # runs at the full DNO cap and the battery simply takes the overspill.
-        # Deliberately mirrors the headroom_kwh expression above term-for-term, so a
+        # Deliberately mirrors the headroom term in _overflow_physics_surplus, so a
         # target of 100 reduces to exactly the pre-v3.8 formula — the change is provably
         # a no-op when the target is left at 100 (pinned by a contract test).
         headroom_to_target = max(
