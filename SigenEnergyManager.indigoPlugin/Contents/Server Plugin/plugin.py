@@ -5,9 +5,30 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5
-# Date:        06-08-2026
-# Version:     5.57.0
+# Author:      CliveS & Claude Opus 5 (1M context)
+# Date:        07-08-2026
+# Version:     5.58.0
+#
+# v5.58.0 (07-08-2026): LOW-SOC HEADS-UP BEFORE A VPP WINDOW. Pre-charge has
+# always compared SOC against what the window needs, and on a shortfall it
+# logged ONE line and did nothing else — so the first anyone knew of an
+# under-delivered event was the settlement figure days later. That was a fair
+# trade while events carried 18-24 h of notice and needed a manual opt-in.
+# Both halves of that changed on 07-08-2026: Axle now opt SigEnergy members
+# in BY DEFAULT from the 8th, and their new short-notice events give as little
+# as 2 h — far less room for solar to top the battery up before the window.
+# New _alert_vpp_shortfall Pushovers the figures, the window and where export
+# will stop. Deliberately priority 0 so quiet hours CAN suppress it: nothing
+# can be done at 03:00, because pre-charge never imports by design, and being
+# woken to be told the export will be smaller helps nobody — the WARNING (the
+# level was wrong too, so it had been logging as plain Info) is the durable
+# record. Wrapped whole: an advisory must never cost us the export. NOTHING
+# ELSE ON THE DRIVE PATH CHANGED — the lead-in stays at T-2min, measured as
+# already at full export by t=0 (05-Aug -0.66 s: -4000 W; 30-Jul +7.4 s:
+# -3908 W), so the community's "start 5-10 min early" fix addresses Axle's
+# CLOUD DISPATCH ramp, a path we do not use. Suite 500 -> 507; 4 of the 7 new
+# cases verified failing against 5.57.0, the other 3 deliberate regression
+# guards that pass on both sides.
 #
 # v5.57.0 (06-08-2026): ADVERSARIAL REVIEW OF THE VPP DRIVE PATH — the
 # money-bearing code, first fresh-eyes pass since the 5.30 series. Five
@@ -6740,10 +6761,48 @@ class Plugin(indigo.PluginBase):
             shortfall = required_kwh - current_kwh
             log(
                 f"[VPP] SOC low ({current_soc:.0f}%, shortfall {shortfall:.1f} kWh) — "
-                f"proceeding without grid import; Axle will assess at dispatch time"
+                f"proceeding without grid import; Axle will assess at dispatch time",
+                level="WARNING",
+            )
+            self._alert_vpp_shortfall(
+                event, current_soc, current_kwh, required_kwh, shortfall, is_daytime
             )
 
         self._vpp_transition(VPP_PRE_CHARGING)
+
+    def _alert_vpp_shortfall(self, event, current_soc, current_kwh,
+                             required_kwh, shortfall, is_daytime):
+        """Pushover a heads-up when pre-charge finds the battery short for the window.
+
+        Until v5.58.0 a shortfall produced ONE log line and nothing else, so the
+        first anyone knew of an under-delivered window was the settlement figure
+        days later. That mattered little while events arrived with 18-24 h of
+        notice and a manual opt-in; it matters now that Axle opt us in by default
+        (08-Aug-2026) and short-notice events give as little as 2 h, leaving far
+        less room for solar to top the battery up before the window opens.
+
+        Deliberately priority 0, so quiet hours CAN suppress it: there is nothing
+        to be done about it at 03:00 — pre-charge never imports by design (see
+        _start_vpp_precharge) — and being woken to be told the export will be
+        smaller helps nobody. The log line above is the durable record.
+
+        Wrapped whole: this is an advisory on the pre-charge path, and a failure
+        to describe the shortfall must never stop the window being driven.
+        """
+        try:
+            window = self._vpp_event_str() or "the next window"
+            floor = ("health floor (daytime — solar will recharge)" if is_daytime
+                     else "dawn reserve (night event)")
+            body = (
+                f"Battery short for the {window} VPP window.\n\n"
+                f"SOC {current_soc:.0f}% ({current_kwh:.1f} kWh) against "
+                f"{required_kwh:.1f} kWh needed — short by {shortfall:.1f} kWh.\n\n"
+                f"The window will still be driven; export simply stops when the "
+                f"battery reaches its {floor}. No grid import is used to cover it."
+            )
+            self._send_pushover("Sigen VPP — battery low for event", body, priority="0")
+        except Exception as exc:
+            log(f"[VPP] shortfall alert failed: {exc}", level="ERROR")
 
     def _set_vpp_discharge_cutoff(self, event, is_daytime=False):
         """Set discharge cutoff at pre-charge time (30 min before event).

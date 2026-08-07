@@ -2303,5 +2303,97 @@ class TestVppEventStr(unittest.TestCase):
         self.assertEqual(self._p(ev)._vpp_event_str(), "")
 
 
+class TestVppShortfallAlert(unittest.TestCase):
+    """Pre-charge Pushovers a heads-up when the battery is short (v5.58.0).
+
+    Before this, a shortfall produced ONE log line and nothing else, so the
+    first anyone knew of an under-delivered window was the settlement figure
+    days later. Axle opt SigEnergy members in BY DEFAULT from 08-Aug-2026, and
+    their new short-notice events give as little as 2 h — far less room for
+    solar to top the battery up before the window opens."""
+
+    def _p(self, soc_pct, cap_kwh=35.04, max_export_kw=4.0, daytime=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.modbus = MagicMock()
+        p.store  = {}
+        p.pluginPrefs = {
+            "batteryCapacityKwh": str(cap_kwh),
+            "maxExportKw":        str(max_export_kw),
+            "dawnSocTarget":      "15",
+        }
+        p.latest_inverter_data      = {"batterySoc": soc_pct}
+        p._event_is_daytime         = MagicMock(return_value=daytime)
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._vpp_transition           = MagicMock()
+        p._vpp_event_str            = MagicMock(return_value="21:00-22:00")
+        p._send_pushover            = MagicMock()
+        return p
+
+    @staticmethod
+    def _event(hours=1.0):
+        start = datetime.now(timezone.utc) + timedelta(minutes=30)
+        return {
+            "start_time":   start,
+            "end_time":     start + timedelta(hours=hours),
+            "duration_hrs": hours,
+        }
+
+    def test_sufficient_soc_sends_nothing(self):
+        """A full battery must stay silent — an alert per event would be noise
+        that trains the reader to ignore the one that matters."""
+        p = self._p(soc_pct=95.0)
+        p._start_vpp_precharge(self._event())
+        p._send_pushover.assert_not_called()
+
+    def test_shortfall_alerts(self):
+        p = self._p(soc_pct=5.0)
+        p._start_vpp_precharge(self._event())
+        p._send_pushover.assert_called_once()
+
+    def test_alert_is_priority_zero_so_quiet_hours_can_suppress_it(self):
+        """Nothing can be done about it at 03:00 — pre-charge never imports by
+        design — so this must never override quiet hours."""
+        p = self._p(soc_pct=5.0)
+        p._start_vpp_precharge(self._event())
+        self.assertEqual(p._send_pushover.call_args.kwargs.get("priority"), "0")
+
+    def test_body_carries_the_figures_and_the_window(self):
+        p = self._p(soc_pct=5.0)
+        p._start_vpp_precharge(self._event())
+        body = p._send_pushover.call_args.args[1]
+        self.assertIn("21:00-22:00", body)
+        self.assertIn("5%", body)
+        self.assertIn("short by", body)
+        # It must say the window is still driven, or the reader assumes it isn't.
+        self.assertIn("still be driven", body)
+
+    def test_night_and_day_name_different_floors(self):
+        """The floor decides where export stops, so the message must not
+        describe a dawn reserve on a daytime window or the reverse."""
+        day = self._p(soc_pct=5.0, daytime=True)
+        day._start_vpp_precharge(self._event())
+        self.assertIn("health floor", day._send_pushover.call_args.args[1])
+
+        night = self._p(soc_pct=5.0, daytime=False)
+        night._start_vpp_precharge(self._event())
+        self.assertIn("dawn reserve", night._send_pushover.call_args.args[1])
+
+    def test_a_failing_alert_never_stops_the_window_being_driven(self):
+        """This is an advisory on the pre-charge path. A Pushover outage, or a
+        bad pref inside the message build, must not cost us the export."""
+        p = self._p(soc_pct=5.0)
+        p._send_pushover.side_effect = RuntimeError("pushover down")
+        p._start_vpp_precharge(self._event())
+        p._vpp_transition.assert_called_once_with(plugin.VPP_PRE_CHARGING)
+
+    def test_cutoff_is_still_set_when_short(self):
+        """The hardware discharge floor is what actually stops the export early
+        — it must be written whether or not the battery is short."""
+        p = self._p(soc_pct=5.0)
+        p._start_vpp_precharge(self._event())
+        p._set_vpp_discharge_cutoff.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
