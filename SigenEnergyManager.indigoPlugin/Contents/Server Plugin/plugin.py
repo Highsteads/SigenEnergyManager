@@ -7,7 +7,41 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5 (1M context)
 # Date:        08-08-2026
-# Version:     5.59.0
+# Version:     5.60.0
+#
+# v5.60.0 (08-08-2026): INTELLIGENT OCTOPUS GO WAS UNRECOGNISABLE, AND THE GO
+# WINDOW HAD BEEN AN HOUR OUT SINCE v5.47.0. Four defects on the Go/IOG path,
+# all found by asking a plain question: does the plugin actually support the
+# tariff the house is switching to next spring?
+#   (1) DETECTION. Every live Intelligent Go product is `INTELLI-FIX-*` and Go
+#       12M Fixed is `GO-FIX-*`; the prefix table only knew `INTELLI-VAR` /
+#       `INTELLI-GO` / `GO-VAR`. Both fell through to TARIFF_UNKNOWN, whose
+#       planner branch imports AT ONCE at half inverter power — on IOG that is
+#       buying at 32.4p instead of waiting for the 8p window. Prefixes updated;
+#       an unrecognised tariff now logs a WARNING naming the product code
+#       instead of failing silently.
+#   (2) IGO/IFLUX RATES WERE NEVER FETCHED. `get_all_monitored_rates` looped
+#       over Go and Flux only, so even with detection fixed the active tariff's
+#       cheap window came back None and `_plan_tou_import` took its "cheap
+#       window unavailable, importing now" branch at 10 kW. Same shape as the
+#       v5.59.0 agile_slots bug: two correct halves, never joined.
+#   (3) THE GO WINDOW WAS WRONG. Stored 23:30-04:30 since v5.47.0; the product
+#       is 00:30-05:30 LOCAL. Verified against both a GMT day (2026-01-14) and
+#       a BST day (2026-08-07): the window is fixed in local time and the UTC
+#       timestamps move with the clocks, so the earlier "fix" read UTC as local.
+#       Cost: an hour bought at the ~30p day rate and an hour of 8.5p missed,
+#       every night, all year.
+#   (4) THE ROOT CAUSE OF (3) IS HARDCODING. The window is now DERIVED from the
+#       live rates (`_derive_cheap_window`), with TARIFF_WINDOWS as fallback and
+#       a WARNING when the two disagree. It refuses to guess for a flat, dynamic
+#       (Agile) or multi-window (Cosy) tariff, because a wrong window silently
+#       buys at peak and is worse than a missing one.
+# A first attempt at (4) assumed the Agile half-hourly shape and returned None
+# for every real time-of-use tariff — its unit tests passed because the fixture
+# was built the same wrong way. Only running it against the live API found it;
+# the fixtures now mirror what Octopus really serves (spans with valid_to).
+# 13 tests, 12 verified FAILING against 5.59.0; suite 512 -> 527. Live-verified
+# against real Octopus data for Go/Go-Fixed/IOG/Flux/Agile/Cosy/Tracker.
 #
 # v5.59.0 (08-08-2026): AGILE SUPPORT WAS A FACADE — NOW WIRED UP. The manager
 # has had a full Agile planner (_plan_agile_import: pick the cheapest half-hour

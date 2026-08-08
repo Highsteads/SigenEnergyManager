@@ -89,21 +89,43 @@ TARIFF_FLEXIBLE = "flexible"   # Octopus Flexible / standard variable rate
 TARIFF_UNKNOWN  = "unknown"
 
 # Product code prefixes for auto-detection
+# Product-code prefixes used to classify the account's tariff.
+#
+# THESE GO STALE WHEN OCTOPUS RE-VERSIONS A PRODUCT, AND THE FAILURE IS SILENT AND
+# EXPENSIVE. An unmatched code falls through to TARIFF_UNKNOWN, whose planner branch imports
+# immediately at half inverter power — on Intelligent Go that means buying at the 32.4p day
+# rate instead of waiting for the 8p window. Measured 08-Aug-2026: EVERY live Intelligent Go
+# product is `INTELLI-FIX-*` (INTELLI-FIX-12M-…, INTELLI-FIX-OEV-12M-…), which matched
+# NEITHER of the old INTELLI-VAR / INTELLI-GO prefixes, and Go 12M Fixed is `GO-FIX-*`, which
+# did not match `GO-VAR`. So both tariffs on the forward plan were unrecognisable.
+# Re-check against `/v1/products/` whenever a switch is planned.
+# NB `INTELLI-FIX` cannot collide with `INTELLI-FLUX` — they diverge at the 9th character.
 TARIFF_PRODUCT_PREFIXES = {
     TARIFF_TRACKER:  ("SILVER", "TRACKER"),
-    TARIFF_GO:       ("GO-VAR",),
+    TARIFF_GO:       ("GO-VAR", "GO-FIX"),
     TARIFF_FLUX:     ("FLUX-IMPORT",),
-    TARIFF_IGO:      ("INTELLI-VAR", "INTELLI-GO"),
+    TARIFF_IGO:      ("INTELLI-VAR", "INTELLI-GO", "INTELLI-FIX"),
     TARIFF_IFLUX:    ("INTELLI-FLUX",),
     TARIFF_AGILE:    ("AGILE-",),
     TARIFF_FLEXIBLE: ("VAR-", "FLEX-", "SILVER-FLEX"),
 }
 
-# Time-of-use windows for each tariff (local time, 24h)
+# Time-of-use windows, LOCAL time (Europe/London), 24h.
+#
+# FALLBACK ONLY as of v5.60.0 — _get_tou_rates now DERIVES the window from the live rates and
+# only consults this table when the shape is not a single nightly window. Keep it roughly
+# right, but do not rely on it.
+#
+# The Go entry was wrong from v5.47.0 until v5.60.0: stored 23:30-04:30, when the product has
+# always been **00:30-05:30 local**. Verified 08-Aug-2026 against both a GMT day (2026-01-14:
+# cheap from 00:30 UTC = 00:30 local) and a BST day (2026-08-07: cheap from 23:30 UTC = 00:30
+# local) — the window is fixed in LOCAL time and the UTC timestamps move with the clocks. The
+# earlier "fix" read UTC timestamps as local. Cost of the error: an hour bought at the ~30p
+# day rate and an hour of 8.5p missed, every night.
 TARIFF_WINDOWS = {
-    TARIFF_GO:    {"cheap_start": "23:30", "cheap_end": "04:30"},  # 23:30-04:30 (5h) — live GO-FIX product (region F, verified 05-Jul-2026)
+    TARIFF_GO:    {"cheap_start": "00:30", "cheap_end": "05:30"},  # 5h, local — verified 08-Aug-2026 in BOTH GMT and BST
     TARIFF_FLUX:  {"cheap_start": "02:00", "cheap_end": "05:00"},
-    TARIFF_IGO:   {"cheap_start": "23:30", "cheap_end": "05:30"},  # 23:30-05:30 (6h)
+    TARIFF_IGO:   {"cheap_start": "23:30", "cheap_end": "05:30"},  # 6h, local — verified 08-Aug-2026 (BST)
     TARIFF_IFLUX: {"cheap_start": "19:00", "cheap_end": "16:00"},  # 21h non-peak window (avoids 16:00-19:00 peak)
 }
 
@@ -323,7 +345,17 @@ class OctopusAPI:
         if tracker:
             result[TARIFF_TRACKER] = tracker
 
-        for tariff_key in (TARIFF_GO, TARIFF_FLUX):
+        # IGO and IFLUX were missing here until v5.60.0, and that alone broke Intelligent Go
+        # even once detection was fixed: _build_tariff_data reads rates[tariff_key] for the
+        # ACTIVE tariff's cheap window, so an absent entry left cheap_start/cheap_end None and
+        # _plan_tou_import took its "cheap window unavailable, importing now" branch at 10 kW.
+        # Go and Flux are always fetched for the monitor display; the other two are fetched
+        # when active, since each costs an API round-trip.
+        monitored = [TARIFF_GO, TARIFF_FLUX]
+        active_key = (tariff_info or {}).get("tariff_key")
+        if active_key in (TARIFF_IGO, TARIFF_IFLUX) and active_key not in monitored:
+            monitored.append(active_key)
+        for tariff_key in monitored:
             tou = self._get_tou_rates(tariff_key, force=force)
             if tou:
                 result[tariff_key] = tou
@@ -893,7 +925,22 @@ class OctopusAPI:
         if not slots:
             return {}
 
-        window = TARIFF_WINDOWS.get(tariff_key, {})
+        # Prefer the window the RATES actually show; fall back to the table only when the
+        # shape is not a single nightly window. See _derive_cheap_window.
+        window  = dict(TARIFF_WINDOWS.get(tariff_key, {}))
+        derived = self._derive_cheap_window(slots, london_tz())
+        if derived:
+            if (window.get("cheap_start"), window.get("cheap_end")) != derived:
+                self.logger.warning(
+                    f"[Octopus] {tariff_key} cheap window from live rates is "
+                    f"{derived[0]}-{derived[1]}, not the {window.get('cheap_start')}-"
+                    f"{window.get('cheap_end')} in TARIFF_WINDOWS — using the live one")
+            window["cheap_start"], window["cheap_end"] = derived
+        else:
+            self.logger.debug(
+                f"[Octopus] {tariff_key}: no single cheap window derivable, using table "
+                f"{window.get('cheap_start')}-{window.get('cheap_end')}")
+
         result = self._parse_tou_slots(slots, window)
 
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
@@ -930,6 +977,57 @@ class OctopusAPI:
         if rate is not None:
             self.logger.debug(f"Flexible rate: {rate:.4f}p/kWh ({product_code})")
         return result
+
+    @staticmethod
+    def _derive_cheap_window(slots, tz):
+        """Work the cheap window out from the RATES, in local time. None if not derivable.
+
+        A hardcoded window is a standing liability: Octopus re-versions products, and the
+        window is published in LOCAL time while the API serves UTC, so any hand-transcribed
+        value is one BST/GMT mix-up away from being an hour out — which is exactly what
+        happened to the Go window (stored 23:30-04:30 when the product has always been
+        00:30-05:30 local, so the manager would have bought an hour at the ~30p day rate
+        and skipped an hour at 8.5p, every night, all year).
+
+        Returns ("HH:MM", "HH:MM") for the cheapest span, or None when the shape is not a
+        single nightly window — a flat tariff, a dynamic one like Agile, or a multi-window
+        one like Cosy. Returning None rather than guessing is deliberate: a wrong window is
+        worse than a known-missing one, because it silently buys at peak.
+
+        A two-rate tariff does NOT publish 48 half-hourly records — it publishes a handful of
+        SPANS carrying valid_from and valid_to (measured 08-Aug-2026: Go returns 5 records
+        over two days, e.g. 8.625p from 23:30Z to 04:30Z). Reading those spans is the whole
+        job. An earlier attempt here assumed the Agile half-hourly shape, passed its unit
+        tests against a fixture built the same wrong way, and returned None for every real
+        time-of-use tariff — so the fixtures in the test file now mirror the API.
+        """
+        if not slots or tz is None:
+            return None
+        spans, rates = [], set()
+        for s in slots:
+            try:
+                if not s.get("valid_to"):
+                    continue                 # open-ended: a flat tariff, no window
+                f = datetime.fromisoformat(s["valid_from"].replace("Z", "+00:00")).astimezone(tz)
+                t = datetime.fromisoformat(s["valid_to"].replace("Z", "+00:00")).astimezone(tz)
+                r = round(float(s["value_inc_vat"]), 4)
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            spans.append((f, t, r))
+            rates.add(r)
+        # 2 rates is a Go/iGo shape; 3 is Flux-like. Many rates means a dynamic tariff such
+        # as Agile, where "the cheap window" is not a meaningful idea — refuse rather than
+        # hand back the single cheapest half hour, which is what a naive minimum would do.
+        if len(spans) < 2 or not 2 <= len(rates) <= 4:
+            return None
+
+        cheapest = min(rates)
+        windows = {(f.strftime("%H:%M"), t.strftime("%H:%M"))
+                   for f, t, r in spans if r == cheapest}
+        if len(windows) != 1:
+            return None                      # spans disagree (a DST changeover day) — fall back
+        start, end = windows.pop()
+        return None if start == end else (start, end)
 
     def _parse_tou_slots(self, slots, window):
         """Parse rate slots into cheap/standard/peak breakdown.
@@ -1267,6 +1365,15 @@ class OctopusAPI:
                         "display_name": display_names.get(tariff_key, tariff_key.title()),
                     }
 
+        # An unrecognised tariff is NOT a cosmetic problem: the planner's unknown branch
+        # imports immediately at half inverter power, so on a time-of-use tariff it buys at
+        # the day rate every time. It has to be loud, and it has to name the code so the
+        # prefix table can be corrected.
+        self.logger.warning(
+            f"[Octopus] UNRECOGNISED tariff product '{product_code}' (from '{tariff_code}'). "
+            f"The battery manager will fall back to importing on demand at whatever the "
+            f"current rate is, which on a time-of-use tariff means buying at the day rate. "
+            f"Add the prefix to TARIFF_PRODUCT_PREFIXES in octopus_api.py.")
         return {
             "tariff_key":   TARIFF_UNKNOWN,
             "tariff_code":  tariff_code,

@@ -393,5 +393,202 @@ class TestAgileSlotWiring(unittest.TestCase):
         self.assertTrue(all(dt.date() == self.today for dt, _ in slots))
 
 
+def _tou_spans(local_date, cheap_from, cheap_to, cheap_p, day_p, days=2):
+    """Rate SPANS as Octopus really serves a two-rate tariff, for a LOCAL cheap window.
+
+    Measured against the live API 08-Aug-2026: a two-rate product returns a handful of
+    records carrying valid_from AND valid_to, not 48 half-hourly rows — e.g. Go gives
+    `8.625p from 2026-08-07T23:30:00Z to 2026-08-08T04:30:00Z`.
+
+    The window is given here in LOCAL time and converted to UTC, because that is the way
+    round Octopus defines it. A fixture written directly in UTC would sail through the exact
+    BST/GMT confusion these tests exist to catch — which is how the Go window came to be
+    stored an hour out in the first place.
+    """
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    lon = ZoneInfo("Europe/London")
+    def z(d):
+        return d.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hh, hm = (int(x) for x in cheap_from.split(":"))
+    th, tm = (int(x) for x in cheap_to.split(":"))
+    out = []
+    for n in range(days):
+        base = local_date + _dt.timedelta(days=n)
+        start = _dt.datetime(base.year, base.month, base.day, hh, hm, tzinfo=lon)
+        end = _dt.datetime(base.year, base.month, base.day, th, tm, tzinfo=lon)
+        if end <= start:                      # window wraps midnight
+            end += _dt.timedelta(days=1)
+        out.append({"valid_from": z(start), "valid_to": z(end), "value_inc_vat": cheap_p})
+        out.append({"valid_from": z(end),
+                    "valid_to": z(start + _dt.timedelta(days=1)),
+                    "value_inc_vat": day_p})
+    return out
+
+
+class TestTariffDetection(unittest.TestCase):
+    """Every LIVE Octopus product must classify, measured against /v1/products 08-Aug-2026.
+
+    An unmatched code falls through to TARIFF_UNKNOWN, and that planner branch imports at
+    once at half inverter power — on Intelligent Go, buying at 32.4p instead of waiting for
+    8p. Both tariffs on the forward plan (Go 12M Fixed, Intelligent Go) were unmatched before
+    v5.60.0 because every live product had moved to GO-FIX-* / INTELLI-FIX-*.
+    """
+
+    CASES = [
+        ("SILVER-26-04-01",              octopus_api.TARIFF_TRACKER),
+        ("SILVER-25-04-11",              octopus_api.TARIFF_TRACKER),
+        ("AGILE-24-10-01",               octopus_api.TARIFF_AGILE),
+        ("GO-VAR-22-10-14",              octopus_api.TARIFF_GO),
+        ("GO-FIX-12M-26-06-30",          octopus_api.TARIFF_GO),
+        ("INTELLI-FIX-12M-26-06-13",     octopus_api.TARIFF_IGO),
+        ("INTELLI-FIX-OEV-12M-26-06-13", octopus_api.TARIFF_IGO),
+        ("INTELLI-FLUX-IMPORT-23-07-14", octopus_api.TARIFF_IFLUX),
+        ("FLUX-IMPORT-23-02-14",         octopus_api.TARIFF_FLUX),
+        ("VAR-22-11-01",                 octopus_api.TARIFF_FLEXIBLE),
+    ]
+
+    def test_every_live_product_classifies(self):
+        api = _make_api()
+        for product, expected in self.CASES:
+            with self.subTest(product=product):
+                got = api._classify_tariff_code(f"E-1R-{product}-F")
+                self.assertEqual(got["tariff_key"], expected)
+
+    def test_intelli_fix_does_not_swallow_intelli_flux(self):
+        # The two diverge at the 9th character; ordering in the dict must not matter.
+        api = _make_api()
+        self.assertEqual(
+            api._classify_tariff_code("E-1R-INTELLI-FLUX-IMPORT-23-07-14-F")["tariff_key"],
+            octopus_api.TARIFF_IFLUX)
+
+    def test_unknown_product_warns_loudly(self):
+        api = _make_api()
+        api.logger = MagicMock()
+        out = api._classify_tariff_code("E-1R-SOMETHING-NEW-27-01-01-F")
+        self.assertEqual(out["tariff_key"], octopus_api.TARIFF_UNKNOWN)
+        api.logger.warning.assert_called()          # silence here costs real money
+
+
+class TestCheapWindowDerivation(unittest.TestCase):
+    """The window must come from the rates, in LOCAL time, in BOTH GMT and BST.
+
+    The Go window sat wrong from v5.47.0 to v5.60.0 — stored 23:30-04:30 when the product is
+    00:30-05:30 local — because UTC timestamps were read as local. Deriving it kills the bug
+    class; these tests pin the timezone behaviour that caused it.
+    """
+
+    def setUp(self):
+        from zoneinfo import ZoneInfo
+        self.tz = ZoneInfo("Europe/London")
+        self.api = _make_api()
+
+    def test_go_window_derived_in_winter_gmt(self):
+        import datetime as _dt
+        s = _tou_spans(_dt.date(2026, 1, 14), "00:30", "05:30", 8.4998, 29.3523)
+        self.assertEqual(self.api._derive_cheap_window(s, self.tz), ("00:30", "05:30"))
+
+    def test_go_window_derived_in_summer_bst(self):
+        # Same LOCAL window, different UTC timestamps. This is the case that was got wrong.
+        import datetime as _dt
+        s = _tou_spans(_dt.date(2026, 8, 7), "00:30", "05:30", 8.6250, 29.7226)
+        self.assertEqual(self.api._derive_cheap_window(s, self.tz), ("00:30", "05:30"))
+
+    def test_igo_window_wraps_midnight(self):
+        import datetime as _dt
+        s = _tou_spans(_dt.date(2026, 8, 7), "23:30", "05:30", 8.0, 32.3623)
+        self.assertEqual(self.api._derive_cheap_window(s, self.tz), ("23:30", "05:30"))
+
+    def test_flat_tariff_yields_no_window(self):
+        # A flat tariff publishes ONE open-ended record with no valid_to.
+        self.assertIsNone(self.api._derive_cheap_window(
+            [{"valid_from": "2026-08-07T00:00:00Z", "valid_to": None,
+              "value_inc_vat": 21.84}], self.tz))
+
+    def test_dynamic_tariff_yields_no_window(self):
+        # Agile: 48 distinct half-hourly rates. The cheapest single half hour is NOT a
+        # window, and returning it would send the manager to buy in one 30-minute slot.
+        import datetime as _dt
+        spans = []
+        for i in range(48):
+            f = _dt.datetime(2026, 8, 7, 0, 0, tzinfo=_dt.timezone.utc) + _dt.timedelta(minutes=30*i)
+            spans.append({"valid_from": f.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "valid_to": (f + _dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "value_inc_vat": 10.0 + i * 0.5})
+        self.assertIsNone(self.api._derive_cheap_window(spans, self.tz))
+
+    def test_multi_window_tariff_yields_no_window(self):
+        # Cosy has THREE cheap blocks a day at the same price. Picking one of them would be
+        # worse than admitting we cannot tell, so this must return None and let the table
+        # stand. The cheap spans disagree, which is the signal.
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        lon = ZoneInfo("Europe/London")
+        def z(d):
+            return d.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out = []
+        for a, b in ((4, 7), (13, 16), (22, 24)):
+            f = _dt.datetime(2026, 8, 7, a, 0, tzinfo=lon)
+            t = _dt.datetime(2026, 8, 7, 0, 0, tzinfo=lon) + _dt.timedelta(hours=b)
+            out.append({"valid_from": z(f), "valid_to": z(t), "value_inc_vat": 14.0})
+        out.append({"valid_from": z(_dt.datetime(2026, 8, 7, 7, 0, tzinfo=lon)),
+                    "valid_to":   z(_dt.datetime(2026, 8, 7, 13, 0, tzinfo=lon)),
+                    "value_inc_vat": 30.0})
+        self.assertIsNone(self.api._derive_cheap_window(out, self.tz))
+
+    def test_single_record_is_refused(self):
+        self.assertIsNone(self.api._derive_cheap_window(
+            [{"valid_from": "2026-08-07T23:30:00Z", "valid_to": "2026-08-08T04:30:00Z",
+              "value_inc_vat": 8.6}], self.tz))
+
+    def test_no_timezone_is_refused_rather_than_guessed(self):
+        import datetime as _dt
+        s = _tou_spans(_dt.date(2026, 8, 7), "00:30", "05:30", 8.6, 29.7)
+        self.assertIsNone(self.api._derive_cheap_window(s, None))
+
+
+class TestIgoRatesAreFetchedWhenActive(unittest.TestCase):
+    """_build_tariff_data reads rates[active_key] for the cheap window.
+
+    IGO/IFLUX were never fetched before v5.60.0, so even with detection fixed the window came
+    back None and _plan_tou_import took its "cheap window unavailable, importing now" branch
+    at 10 kW — the same shape of failure as the Agile slots bug.
+    """
+
+    def setUp(self):
+        self.api = _make_api()
+        self.api._get_tracker_rates = lambda force=False: {"today_p": 21.84}
+        self.fetched = []
+
+        def _tou(key, force=False):
+            self.fetched.append(key)
+            return {"cheap_start": "23:30", "cheap_end": "05:30", "cheap_p": 8.0}
+
+        self.api._get_tou_rates = _tou
+
+    def _run(self, key):
+        self.api.get_current_tariff = lambda force=False: {"tariff_key": key}
+        return self.api.get_all_monitored_rates()
+
+    def test_igo_active_gets_its_window(self):
+        out = self._run(octopus_api.TARIFF_IGO)
+        self.assertIn(octopus_api.TARIFF_IGO, self.fetched)
+        self.assertEqual(out[octopus_api.TARIFF_IGO]["cheap_start"], "23:30")
+
+    def test_iflux_active_gets_its_window(self):
+        out = self._run(octopus_api.TARIFF_IFLUX)
+        self.assertIn(octopus_api.TARIFF_IFLUX, self.fetched)
+        self.assertIn(octopus_api.TARIFF_IFLUX, out)
+
+    def test_go_and_flux_still_fetched_for_the_monitor(self):
+        self._run(octopus_api.TARIFF_TRACKER)
+        self.assertIn(octopus_api.TARIFF_GO, self.fetched)
+        self.assertIn(octopus_api.TARIFF_FLUX, self.fetched)
+
+    def test_no_duplicate_fetch_when_go_is_active(self):
+        self._run(octopus_api.TARIFF_GO)
+        self.assertEqual(self.fetched.count(octopus_api.TARIFF_GO), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
