@@ -7,7 +7,15 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5 (1M context)
 # Date:        08-08-2026
-# Version:     5.60.0
+# Version:     5.60.1
+#
+# v5.60.1 (08-08-2026): REQUIRED Info.plist KEY. `CFBundleURLTypes` was PRESENT but
+# EMPTY, so the plugin shipped without the support URL that becomes its
+# "About" menu item — one of the SIX keys the official Developer's Guide lists as
+# required. An empty array satisfies "key exists" while giving users nowhere to go,
+# which is why an earlier sweep that only looked for a MISSING key passed it. Found
+# by an estate check auditing the VALUE rather than the key's presence.
+# No plugin logic changed.
 #
 # v5.60.0 (08-08-2026): INTELLIGENT OCTOPUS GO WAS UNRECOGNISABLE, AND THE GO
 # WINDOW HAD BEEN AN HOUR OUT SINCE v5.47.0. Four defects on the Go/IOG path,

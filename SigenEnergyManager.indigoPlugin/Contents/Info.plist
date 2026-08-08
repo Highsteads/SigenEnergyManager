@@ -13,7 +13,12 @@
 	<key>CFBundleShortVersionString</key>
 	<string>5.54.0</string>
 	<key>CFBundleURLTypes</key>
-	<array/>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>https://github.com/Highsteads/SigenEnergyManager</string>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>1.0.0</string>
 	<key>GithubInfo</key>
@@ -28,7 +33,7 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 CliveS. All rights reserved.</string>
 	<key>PluginVersion</key>
-	<string>5.60.0</string>
+	<string>5.60.1</string>
 	<key>ServerApiVersion</key>
 	<string>3.8</string>
 </dict>
