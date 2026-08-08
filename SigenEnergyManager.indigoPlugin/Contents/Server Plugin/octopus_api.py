@@ -334,6 +334,42 @@ class OctopusAPI:
             if flexible.get("today_p") is not None:
                 result[TARIFF_FLEXIBLE] = flexible
 
+        # Agile is priced per half-hour, so it needs its SLOTS, not a headline rate:
+        # battery_manager._plan_agile_import picks the cheapest slot before dawn.
+        #
+        # This wiring was missing until v5.59.0. get_agile_rates() existed and
+        # _plan_agile_import() existed, but nothing ever put an "agile_slots" key into the
+        # rates dict, so `rates.get("agile_slots", [])` in plugin._build_tariff_data was
+        # ALWAYS empty and the planner fell straight through to its no-rates branch —
+        # "importing now" at 10 kW, at whatever the current price happened to be, which on
+        # Agile can be the 38p evening peak. A facade: both halves present, never joined.
+        #
+        # TODAY AND TOMORROW BOTH MATTER. Dawn is tomorrow morning, and the planner filters
+        # `now < dt < dawn_dt`, so today's slots alone can never cover the decision. Octopus
+        # publishes tomorrow's Agile rates around 16:00; before then that fetch returns [],
+        # which is correct rather than fatal — the planner simply chooses from what exists.
+        if tariff_info and tariff_info.get("tariff_key") == TARIFF_AGILE:
+            today = datetime.now().date()
+            slots = []
+            for day in (today, today + timedelta(days=1)):
+                try:
+                    slots.extend(self.get_agile_rates(day, force=force))
+                except Exception as exc:                       # noqa: BLE001
+                    self.logger.warning(
+                        f"[Octopus] Agile slot fetch failed for {day}: "
+                        f"{type(exc).__name__}: {exc}")
+            slots.sort(key=lambda s: s[0])
+            result["agile_slots"] = slots
+
+            # The monitor device and dashboards read today_p. On Agile a single "today's
+            # rate" is ill-defined, so report the CURRENTLY ACTIVE half-hour slot — the
+            # price actually being paid right now. Without this the display falls back to
+            # the Tracker rate, i.e. a number from a tariff the house is not on.
+            now_utc = datetime.now(timezone.utc)
+            current = [r for dt, r in slots if dt <= now_utc]
+            if current:
+                result[TARIFF_AGILE] = {"today_p": current[-1]}
+
         return result
 
     def get_agile_rates(self, target_date=None, force=False):

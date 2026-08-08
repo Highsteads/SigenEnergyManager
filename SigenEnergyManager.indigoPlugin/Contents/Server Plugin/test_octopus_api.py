@@ -323,5 +323,75 @@ class TestGasZeroBoundary(unittest.TestCase):
         self.assertEqual(out["kwh"], 0.0)      # 0.0, not None — a real zero-gas day settles
 
 
+class TestAgileSlotWiring(unittest.TestCase):
+    """Regression guard for the v5.59.0 fix.
+
+    get_agile_rates() and battery_manager._plan_agile_import() both existed for months,
+    but nothing ever wrote an "agile_slots" key into the rates dict, so the planner's
+    `if not tariff.agile_slots` branch fired every single time and the manager imported
+    10 kW at the prevailing price — on Agile, possibly the 38p evening peak.
+
+    Neither half was broken on its own, which is exactly why unit tests over each half
+    stayed green. The test that catches it has to assert on the JOIN.
+    """
+
+    def setUp(self):
+        self.api = _make_api()
+        self.api._get_tracker_rates = lambda force=False: {"today_p": 21.84}
+        self.api._get_tou_rates     = lambda key, force=False: {}
+        self.today = octopus_api.datetime.now().date()
+        self.tomorrow = self.today + octopus_api.timedelta(days=1)
+
+        def _slots(target_date=None, force=False):
+            # Two slots a day, deliberately returned newest-first so the sort is tested.
+            base = octopus_api.datetime(target_date.year, target_date.month,
+                                        target_date.day, tzinfo=octopus_api.timezone.utc)
+            return [(base + octopus_api.timedelta(hours=20), 30.0),
+                    (base + octopus_api.timedelta(hours=2),   9.0)]
+
+        self.api.get_agile_rates = _slots
+
+    def _run(self, tariff_key):
+        self.api.get_current_tariff = lambda force=False: {"tariff_key": tariff_key}
+        return self.api.get_all_monitored_rates()
+
+    def test_agile_slots_present_and_sorted_across_both_days(self):
+        out = self._run(octopus_api.TARIFF_AGILE)
+        self.assertIn("agile_slots", out, "the key the planner reads must exist")
+        slots = out["agile_slots"]
+        self.assertEqual(len(slots), 4, "today AND tomorrow — dawn is tomorrow morning")
+        self.assertEqual([dt for dt, _ in slots], sorted(dt for dt, _ in slots))
+        self.assertEqual({dt.date() for dt, _ in slots}, {self.today, self.tomorrow})
+
+    def test_slots_are_timezone_aware(self):
+        # battery_manager compares them against an aware UTC `snapshot.now`; a naive
+        # datetime here would raise TypeError inside the planner, not here.
+        for dt, _ in self._run(octopus_api.TARIFF_AGILE)["agile_slots"]:
+            self.assertIsNotNone(dt.tzinfo)
+
+    def test_today_p_is_the_live_slot_not_the_tracker_rate(self):
+        out = self._run(octopus_api.TARIFF_AGILE)
+        self.assertIn(octopus_api.TARIFF_AGILE, out)
+        self.assertIn(out[octopus_api.TARIFF_AGILE]["today_p"], (9.0, 30.0))
+        self.assertNotEqual(out[octopus_api.TARIFF_AGILE]["today_p"], 21.84)
+
+    def test_not_fetched_when_agile_is_not_the_active_tariff(self):
+        # No pointless API round-trip for the tariffs that do not need slots.
+        self.assertNotIn("agile_slots", self._run(octopus_api.TARIFF_TRACKER))
+
+    def test_one_days_fetch_failing_does_not_lose_the_other(self):
+        good = self.api.get_agile_rates
+
+        def _flaky(target_date=None, force=False):
+            if target_date == self.tomorrow:
+                raise RuntimeError("Octopus 500")   # tomorrow's rates not published yet
+            return good(target_date)
+
+        self.api.get_agile_rates = _flaky
+        slots = self._run(octopus_api.TARIFF_AGILE)["agile_slots"]
+        self.assertEqual(len(slots), 2)
+        self.assertTrue(all(dt.date() == self.today for dt, _ in slots))
+
+
 if __name__ == "__main__":
     unittest.main()

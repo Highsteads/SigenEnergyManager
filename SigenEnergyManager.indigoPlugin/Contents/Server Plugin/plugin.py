@@ -6,8 +6,28 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5 (1M context)
-# Date:        07-08-2026
-# Version:     5.58.0
+# Date:        08-08-2026
+# Version:     5.59.0
+#
+# v5.59.0 (08-08-2026): AGILE SUPPORT WAS A FACADE — NOW WIRED UP. The manager
+# has had a full Agile planner (_plan_agile_import: pick the cheapest half-hour
+# slot before dawn, with a round-trip break-even gate) since v5.44.0, and
+# octopus_api has had get_agile_rates() to fetch those slots. Nothing ever
+# joined the two: no code path wrote an "agile_slots" key into the rates dict,
+# so plugin._build_tariff_data's `rates.get("agile_slots", [])` was ALWAYS
+# empty, get_agile_rates() had ZERO callers, and the planner fell every time
+# into its no-rates branch — "importing now" at 10 kW, at whatever the price
+# happened to be. On Agile that can be the 38p evening peak, i.e. the single
+# worst moment to buy. Both halves were individually correct and individually
+# tested, which is exactly why it stayed hidden.
+# get_all_monitored_rates now fetches today AND tomorrow's slots when Agile is
+# the active tariff (dawn is tomorrow morning, so today alone can never cover
+# the decision) and publishes them under "agile_slots"; a failed fetch for one
+# day no longer loses the other. The tariff device's today_p also stops
+# reporting the TRACKER rate while on Agile and reports the live half-hour slot
+# instead. 5 regression tests assert the JOIN, not either half — verified to
+# FAIL against v5.58.0. Found while pricing a no-EV winter tariff switch, where
+# Agile is the only time-of-use tariff this house is eligible for.
 #
 # v5.58.0 (07-08-2026): LOW-SOC HEADS-UP BEFORE A VPP WINDOW. Pre-charge has
 # always compared SOC against what the window needs, and on a shortfall it
@@ -1419,7 +1439,8 @@ except ImportError:
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
 from openmeteo_forecast import OpenMeteoForecast
-from octopus_api      import OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, GAS_KWH_PER_M3
+from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
+                              GAS_KWH_PER_M3)
 # The ONE Europe/London implementation. Imported, never re-declared: copies are
 # what put two sites an hour out in the first place, and there is no version of
 # "just this once" that does not end up as copy number six.
@@ -5400,6 +5421,12 @@ class Plugin(indigo.PluginBase):
         # Flexible is a flat rate — no tomorrow rate.
         if tariff_key == TARIFF_FLEXIBLE:
             today_rate_p    = rates.get(TARIFF_FLEXIBLE, {}).get("today_p")
+            tomorrow_rate_p = None
+        elif tariff_key == TARIFF_AGILE:
+            # Agile has 48 prices a day, so "today's rate" is the slot in force right now
+            # (octopus_api fills it). There is no single tomorrow rate. Falling through to
+            # the Tracker branch here would display a price from a tariff we are not on.
+            today_rate_p    = rates.get(TARIFF_AGILE, {}).get("today_p")
             tomorrow_rate_p = None
         else:
             today_rate_p    = tracker.get("today_p")
