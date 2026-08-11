@@ -2748,3 +2748,80 @@ class TestVppOverrunBackstop(unittest.TestCase):
         p = self._plugin()
         p._end_vpp_export.side_effect = RuntimeError("modbus down")
         self._run_at(p, self.END + timedelta(minutes=30))   # must not raise
+
+
+class TestPluginClassStructure(unittest.TestCase):
+    """A syntax check is NOT a structure check.
+
+    While adding the v5.63.0 filter a module-level helper was inserted INSIDE the
+    class body. `py_compile` passed — the file is valid Python — but the unindented
+    `def` TERMINATED the class, so every method below it became a nested function
+    and `Plugin` silently lost them. Nothing would have failed until the plugin
+    tried to call one at runtime. This pins the shape, not just the syntax.
+    """
+
+    CORE_METHODS = (
+        "startup", "shutdown", "runConcurrentThread",
+        "_evaluate_manager_impl", "_poll_vpp", "_apply_vpp_event",
+        "_end_vpp_export", "_check_vpp_overrun", "_summarise_vpp_event",
+        "_write_cost_variables", "_verify_ems_registers",
+    )
+
+    def _plugin_class(self):
+        import ast
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(plugin.__file__)), "plugin.py")
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        return tree, next(n for n in tree.body
+                          if isinstance(n, ast.ClassDef) and n.name == "Plugin")
+
+    def test_core_methods_are_really_on_the_class(self):
+        import ast
+        _tree, cls = self._plugin_class()
+        methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+        missing = [m for m in self.CORE_METHODS if m not in methods]
+        self.assertEqual(missing, [], f"not methods of Plugin: {missing}")
+
+    def test_the_class_still_holds_the_bulk_of_the_code(self):
+        """A dedent mid-class silently moves everything below it out. If this
+        number collapses, that is what happened."""
+        import ast
+        _tree, cls = self._plugin_class()
+        methods = [n for n in cls.body if isinstance(n, ast.FunctionDef)]
+        self.assertGreater(len(methods), 120,
+                           f"Plugin has only {len(methods)} methods — class body truncated?")
+
+    def test_module_helpers_are_not_nested_inside_the_class(self):
+        import ast
+        tree, _cls = self._plugin_class()
+        mod = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        self.assertIn("_snapshot_in_window", mod)
+
+
+class TestSnapshotWindowFilter(unittest.TestCase):
+    """v5.63.0 — one window's readings must never be summarised into another's."""
+
+    EV = {"duration_hrs": 1.0}
+
+    def test_in_window_snapshot_kept(self):
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": 1800.0}, self.EV))
+
+    def test_lead_in_and_trail_kept(self):
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": -0.66}, self.EV))
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": 3720.0}, self.EV))
+
+    def test_the_real_11_aug_pollution_is_rejected(self):
+        """31 snapshots landed in the next event's file at elapsed -1288 min."""
+        self.assertFalse(plugin._snapshot_in_window({"event_elapsed_secs": -1288.6 * 60}, self.EV))
+
+    def test_two_hour_window_keeps_its_second_hour(self):
+        """Tomorrow's event is 2 h — a 1 h assumption would drop half of it."""
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": 7000.0},
+                                                   {"duration_hrs": 2.0}))
+        self.assertFalse(plugin._snapshot_in_window({"event_elapsed_secs": 7000.0},
+                                                    {"duration_hrs": 1.0}))
+
+    def test_unknown_elapsed_or_duration_is_kept_not_dropped(self):
+        self.assertTrue(plugin._snapshot_in_window({}, self.EV))
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": "x"}, self.EV))
+        self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": 99999.0}, {}))

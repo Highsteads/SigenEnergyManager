@@ -7,7 +7,35 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        11-08-2026
-# Version:     5.62.0
+# Version:     5.63.0
+#
+# v5.63.0 (11-08-2026): THE POST-EVENT SUMMARY COULD REPORT ANOTHER EVENT'S READINGS.
+#              _summarise_vpp_event appended EVERY snapshot record in the file with no
+#              check that it belonged to the window being summarised — and files DO
+#              hold foreign snapshots: tonight's over-running window wrote 31 of them
+#              into the NEXT event's file at elapsed -1288 min. v5.61.1 stopped that at
+#              source, but the summariser had no defence of its own, so tomorrow's
+#              2-hour event would have had last night's peak grid export, min PV, mode
+#              list and driver folded into its report. A confidently wrong report is
+#              worse than a missing one, and this one would have been read as fact.
+#              New pure `_snapshot_in_window(rec, event, slack_mins=15)`: the driver
+#              runs T-2min to end+2min, so the bound is the window plus a generous 15
+#              min either side — a legitimate lead/trail sample is always kept while a
+#              different day's is rejected. An UNKNOWN elapsed or duration is KEPT, not
+#              dropped: silently shrinking the summary is the worse error. Foreign rows
+#              are COUNTED and WARNed, never discarded quietly, because their presence
+#              means something upstream filed them wrongly. The live 12-Aug file was
+#              also cleaned by hand (31 removed, .bak-polluted kept).
+#              **AND A NEAR-MISS WORTH THE ENTRY ON ITS OWN**: the first cut inserted
+#              the new module-level helper INSIDE the class body. `py_compile` PASSED —
+#              the file is valid Python — but an unindented `def` TERMINATES the class,
+#              so `_summarise_vpp_event` and every method below it became nested
+#              functions and `Plugin` silently lost 100+ methods. Nothing would have
+#              failed until the plugin called one at runtime. A SYNTAX CHECK IS NOT A
+#              STRUCTURE CHECK. New TestPluginClassStructure asserts, via ast, that the
+#              core methods really are methods of Plugin and that the class still holds
+#              the bulk of the code — so a dedent mid-class can never ship silently.
+#              Suite 547 -> 555.
 #
 # v5.62.0 (11-08-2026): A SECOND, INDEPENDENT GUARD ON AN OVER-RUNNING VPP EXPORT.
 #              v5.61.1 fixed the cause that fired tonight, but not the shape of the
@@ -2154,6 +2182,32 @@ def _local_today_str():
     reject (and silently drop) a fresh day's accumulators on a restart in that window.
     """
     return _london_today().strftime("%Y-%m-%d")
+
+
+def _snapshot_in_window(rec, event, slack_mins=15):
+    """True if a JSONL snapshot belongs to `event`'s window.
+
+    Pure and defensive — used by the post-event summariser so one window's
+    readings can never be attributed to another. The driver runs T-2min to
+    end+2min, so the bound is the window plus a generous `slack_mins` either
+    side: a legitimate lead/trail sample is always kept, while a snapshot from
+    an entirely different day (11-Aug-2026: elapsed -1288 min) is rejected.
+
+    An UNKNOWN elapsed or duration returns True — dropping a reading we cannot
+    place would silently shrink the summary, which is the worse error.
+    """
+    try:
+        elapsed = float(rec.get("event_elapsed_secs"))
+    except (TypeError, ValueError):
+        return True
+    try:
+        duration_hrs = float((event or {}).get("duration_hrs") or 0.0)
+    except (TypeError, ValueError):
+        duration_hrs = 0.0
+    if duration_hrs <= 0:
+        return True
+    slack = slack_mins * 60.0
+    return -slack <= elapsed <= duration_hrs * 3600.0 + slack
 
 
 class Plugin(indigo.PluginBase):
@@ -6789,6 +6843,7 @@ class Plugin(indigo.PluginBase):
         # Parse all snapshot records out of the JSONL file
         snapshots   = []
         ended       = None
+        foreign     = 0     # snapshots belonging to a different window (see below)
         if path and os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
@@ -6802,7 +6857,23 @@ class Plugin(indigo.PluginBase):
                             continue
                         rtype = rec.get("type")
                         if rtype == "snapshot":
-                            snapshots.append(rec)
+                            # Only snapshots belonging to THIS window (v5.63.0).
+                            # A file can hold foreign snapshots: on 11-Aug-2026 an
+                            # over-running window wrote 31 of them into the NEXT
+                            # event's file at elapsed -1288 min, because the driver
+                            # was logging against the event the API had just
+                            # returned. v5.61.1 stopped that at source, but the
+                            # summariser had no defence of its own and would have
+                            # mixed a previous night's readings into the next
+                            # event's peak grid export, min PV and mode list — a
+                            # confidently wrong report is worse than a missing one.
+                            # The bound is deliberately loose: the driver runs
+                            # T-2min to end+2min, so anything inside +/-15 min of
+                            # the window is legitimate and kept.
+                            if _snapshot_in_window(rec, event):
+                                snapshots.append(rec)
+                            else:
+                                foreign += 1
                         elif rtype == "announcement":
                             pass  # announcement records are not surfaced here
                         elif rtype == "event_ended":
@@ -6810,6 +6881,13 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 log(f"[VPP] Could not parse event log {path}: {exc}",
                     level="WARNING")
+        if foreign:
+            # Never silent: a file holding another window's readings means
+            # something upstream filed them wrongly, and that is worth knowing.
+            log(f"[VPP] Ignored {foreign} snapshot(s) in {os.path.basename(path)} "
+                f"that fall outside this event's window — they belong to a "
+                f"different event and would have skewed the summary.",
+                level="WARNING")
 
         def _to_float(v, default=0.0):
             try:
