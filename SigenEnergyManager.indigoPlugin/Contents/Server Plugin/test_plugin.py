@@ -2565,3 +2565,106 @@ class TestPeriodKwhTotals(unittest.TestCase):
         self.assertAlmostEqual(month["import_kwh"], 2.0, places=3)
         self.assertAlmostEqual(month["export_kwh"], 5.0, places=3)
         self.assertAlmostEqual(month["gas_kwh"], 3.0, places=3)
+
+
+class TestVppEndsOnStoredWindow(unittest.TestCase):
+    """v5.61.1 — the ACTIVE branch must judge the END against OUR STORED window,
+    never the event the Axle API just returned.
+
+    Axle publish the NEXT event within a minute of one finishing. Reading that
+    event's end_time made the stop test `now >= <tomorrow> + 2min`, false for a
+    further ~21 hours, so the plugin kept self-driving a 4 kW export from the
+    battery with a 1% discharge floor and nothing to halt it. Live-hit
+    11-Aug-2026: tonight's 19:30-20:30 window was still exporting at 21:15.
+    """
+
+    @staticmethod
+    def _apply_at(p, event, now):
+        """Drive _apply_vpp_event with the clock frozen at `now`.
+
+        It takes no `now` argument — it calls datetime.now(timezone.utc) itself —
+        so a subclass is patched in rather than a MagicMock, which would break the
+        constructor and every other datetime use inside the call."""
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+        real = plugin.datetime
+        plugin.datetime = _Frozen
+        try:
+            p._apply_vpp_event(event)
+        finally:
+            plugin.datetime = real
+
+    def _plugin(self, stored_event, now=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.modbus = MagicMock()
+        p.latest_inverter_data = {"batterySoc": 80.0}
+        p.pluginPrefs = {}
+        p.store = {
+            "vpp_state": plugin.VPP_ACTIVE,
+            "vpp_event": stored_event,
+            "vpp_active": True,
+            "export_active": True,
+            "grid_export_daily_kwh": 40.0,
+            "vpp_export_start_kwh": 30.0,
+        }
+        p._log_vpp_snapshot = MagicMock()
+        p._update_vpp_device = MagicMock()
+        p._end_vpp_export = MagicMock()
+        p._trigger_event = MagicMock()
+        p._write_vpp_event_header = MagicMock()
+        p._vpp_transition = MagicMock()
+        p._restore_discharge_cutoff = MagicMock()
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._event_is_daytime = MagicMock(return_value=True)
+        return p
+
+    @staticmethod
+    def _event(start, end):
+        return {"start_time": start, "end_time": end,
+                "import_export": "export", "duration_hrs": 1.0}
+
+    def test_future_event_returned_does_not_extend_the_active_window(self):
+        now      = datetime(2026, 8, 11, 19, 40, tzinfo=timezone.utc)   # 20:40 BST
+        tonight  = self._event(datetime(2026, 8, 11, 18, 30, tzinfo=timezone.utc),
+                               datetime(2026, 8, 11, 19, 30, tzinfo=timezone.utc))
+        tomorrow = self._event(datetime(2026, 8, 12, 17, 0, tzinfo=timezone.utc),
+                               datetime(2026, 8, 12, 18, 0, tzinfo=timezone.utc))
+        p = self._plugin(tonight, now)
+        self._apply_at(p, tomorrow, now)
+        p._end_vpp_export.assert_called_once()
+        # And the snapshot must land in TONIGHT's file, not the next event's.
+        self.assertIs(p._log_vpp_snapshot.call_args[0][0], tonight)
+
+    def test_window_still_running_is_not_ended_early(self):
+        now     = datetime(2026, 8, 11, 19, 0, tzinfo=timezone.utc)     # mid-window
+        tonight = self._event(datetime(2026, 8, 11, 18, 30, tzinfo=timezone.utc),
+                              datetime(2026, 8, 11, 19, 30, tzinfo=timezone.utc))
+        p = self._plugin(tonight, now)
+        self._apply_at(p, tonight, now)
+        p._end_vpp_export.assert_not_called()
+
+    def test_two_minute_tail_is_still_honoured(self):
+        tonight = self._event(datetime(2026, 8, 11, 18, 30, tzinfo=timezone.utc),
+                              datetime(2026, 8, 11, 19, 30, tzinfo=timezone.utc))
+        # 19:31 — inside the tail, must keep going.
+        p = self._plugin(tonight, None)
+        self._apply_at(p, tonight, datetime(2026, 8, 11, 19, 31, tzinfo=timezone.utc))
+        p._end_vpp_export.assert_not_called()
+        # 19:33 — past the tail, must stop.
+        p = self._plugin(tonight, None)
+        self._apply_at(p, tonight, datetime(2026, 8, 11, 19, 33, tzinfo=timezone.utc))
+        p._end_vpp_export.assert_called_once()
+
+    def test_no_stored_window_falls_back_to_the_returned_event(self):
+        """Defensive: an ACTIVE state with nothing stored must not crash, and must
+        still be able to stop."""
+        now     = datetime(2026, 8, 11, 19, 40, tzinfo=timezone.utc)
+        tonight = self._event(datetime(2026, 8, 11, 18, 30, tzinfo=timezone.utc),
+                              datetime(2026, 8, 11, 19, 30, tzinfo=timezone.utc))
+        p = self._plugin(tonight, now)
+        p.store["vpp_event"] = None
+        self._apply_at(p, tonight, now)
+        p._end_vpp_export.assert_called_once()

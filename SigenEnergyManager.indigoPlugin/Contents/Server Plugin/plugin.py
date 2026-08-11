@@ -7,7 +7,29 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        11-08-2026
-# Version:     5.61.0
+# Version:     5.61.1
+#
+# v5.61.1 (11-08-2026): A VPP WINDOW NEVER STOPPED — the export ran 45 min past the
+#              end and would have run for another 21 hours. Axle publish the NEXT event
+#              within a minute of one finishing, and the VPP_ACTIVE branch of
+#              _apply_vpp_event judged the stop against the event the API had JUST
+#              RETURNED rather than our own stored window. So the test became
+#              "now >= TOMORROW's end + 2min", false until 18:02 the following day, and
+#              the plugin carried on self-driving 4 kW out of the battery with the
+#              discharge cutoff at the 1% health floor and nothing left to halt it.
+#              LIVE-HIT tonight: the 19:30-20:30 BST window was still exporting at
+#              21:15, SOC 99% -> 73%, ~2.9 kWh sold at 12p that the house wanted at
+#              26p, and on that trajectory the pack would have been flat by ~00:30 and
+#              the house importing overnight. The tell was in the JSONL — snapshots
+#              were landing in the 12-Aug file at elapsed MINUS 1288 minutes.
+#              The end is now judged against self.store["vpp_event"], and the snapshot
+#              is written against it too so the readings stay in the running event's
+#              file. The `event is None` branch has always done exactly this and even
+#              carries a comment explaining why ("we self-drive on our OWN stored
+#              window"); this branch simply never got the same care. A future event
+#              returned mid-window is picked up on the next poll once the transition
+#              has put us back in IDLE. 4 tests, the load-bearing one verified FAILING
+#              against 5.61.0 (0 calls where 1 is required); suite 535 -> 539.
 #
 # v5.61.0 (11-08-2026): THE NINE kWh VARIABLES HAD NO WRITER ANYWHERE. elec_/gas_/
 #              export_ today/yesterday/month kWh lost their writer when the Octopus
@@ -6502,13 +6524,29 @@ class Plugin(indigo.PluginBase):
                     "(ignoring Axle dispatch; meter-settled).")
 
         elif current_state == VPP_ACTIVE:
-            # Periodic detailed snapshot — every poll cycle while active, so the
-            # plugin captures what Axle is doing for post-hoc analysis.
-            self._log_vpp_snapshot(event)
-            if now >= end_time + timedelta(minutes=2):
+            # THE END IS JUDGED AGAINST OUR OWN STORED WINDOW, NEVER THE EVENT THE
+            # API JUST HANDED BACK. Axle publish the NEXT event within a minute of
+            # one finishing, so `event` here can be TOMORROW's window while we are
+            # still driving tonight's — and reading its end_time made the stop test
+            # `now >= <tomorrow> + 2min`, which is false for a further ~21 hours.
+            # Live-hit 11-Aug-2026: tonight's 19:30-20:30 window did not stop at
+            # 20:32; at 20:31 the API returned the 12-Aug event and the plugin kept
+            # exporting 4 kW from the battery, with a 1% discharge floor and nothing
+            # to halt it before the pack was flat. Snapshots went into the NEXT
+            # event's file at elapsed -1288 min, which is how it was spotted.
+            # The `event is None` branch above has always used the stored window and
+            # says why; this branch simply never got the same care.
+            stored     = self.store.get("vpp_event") or event
+            stored_end = stored.get("end_time") or end_time
+            # Snapshot against the stored window too, so the readings land in the
+            # running event's file with a sane elapsed figure.
+            self._log_vpp_snapshot(stored)
+            if now >= stored_end + timedelta(minutes=2):
                 # Our timer drives the stop (+2-min tail past the window). We do not
                 # wait for Axle to release anything — we never handed it over.
-                self._end_vpp_export(now, event)
+                # A future event returned above is picked up on the next poll, once
+                # this transition has put us back in IDLE.
+                self._end_vpp_export(now, stored)
 
         self._update_vpp_device()
 
