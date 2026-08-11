@@ -2668,3 +2668,83 @@ class TestVppEndsOnStoredWindow(unittest.TestCase):
         p.store["vpp_event"] = None
         self._apply_at(p, tonight, now)
         p._end_vpp_export.assert_called_once()
+
+
+class TestVppOverrunBackstop(unittest.TestCase):
+    """v5.62.0 — the SECOND, independent guard on an over-running VPP export.
+
+    v5.61.1 fixed the cause that fired on 11-Aug-2026, but the end-of-window still
+    depended on ONE path (_poll_vpp -> _apply_vpp_event). The manager re-drives
+    ACTION_VPP_EXPORT from the `vpp_active` boolean and never looks at the clock,
+    so anything that stops that poll — axleEnabled unticked, token cleared, a
+    raise before the ACTIVE branch, the VPP tick task dying — leaves 4 kW pouring
+    out of the battery against a 1% floor for ever.
+    """
+
+    END = datetime(2026, 8, 11, 19, 30, tzinfo=timezone.utc)
+
+    def _plugin(self, state=None, event=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.store = {
+            "vpp_state": plugin.VPP_ACTIVE if state is None else state,
+            "vpp_event": {"start_time": self.END - timedelta(hours=1),
+                          "end_time": self.END} if event is None else event,
+        }
+        p._end_vpp_export = MagicMock()
+        return p
+
+    @staticmethod
+    def _run_at(p, now):
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+        real = plugin.datetime
+        plugin.datetime = _Frozen
+        try:
+            p._check_vpp_overrun()
+        finally:
+            plugin.datetime = real
+
+    def test_ends_a_window_running_long_past_its_end(self):
+        p = self._plugin()
+        self._run_at(p, self.END + timedelta(minutes=16))
+        p._end_vpp_export.assert_called_once()
+
+    def test_tonights_actual_overshoot_would_have_been_caught(self):
+        """11-Aug: the export was still running 45 min past the end."""
+        p = self._plugin()
+        self._run_at(p, self.END + timedelta(minutes=45))
+        p._end_vpp_export.assert_called_once()
+
+    def test_never_truncates_a_live_window(self):
+        p = self._plugin()
+        self._run_at(p, self.END - timedelta(minutes=10))
+        p._end_vpp_export.assert_not_called()
+
+    def test_leaves_the_primary_path_room_to_work(self):
+        """The poll stops at end+2min; the backstop must not race it."""
+        p = self._plugin()
+        self._run_at(p, self.END + timedelta(minutes=3))
+        p._end_vpp_export.assert_not_called()
+
+    def test_inactive_state_is_untouched(self):
+        p = self._plugin(state=plugin.VPP_IDLE)
+        self._run_at(p, self.END + timedelta(hours=5))
+        p._end_vpp_export.assert_not_called()
+
+    def test_missing_end_time_does_nothing_rather_than_guessing(self):
+        p = self._plugin(event={"start_time": self.END})
+        self._run_at(p, self.END + timedelta(hours=5))
+        p._end_vpp_export.assert_not_called()
+
+    def test_no_stored_event_does_nothing(self):
+        p = self._plugin(event={})
+        self._run_at(p, self.END + timedelta(hours=5))
+        p._end_vpp_export.assert_not_called()
+
+    def test_a_failure_inside_the_backstop_cannot_break_the_evaluate(self):
+        p = self._plugin()
+        p._end_vpp_export.side_effect = RuntimeError("modbus down")
+        self._run_at(p, self.END + timedelta(minutes=30))   # must not raise

@@ -7,7 +7,34 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        11-08-2026
-# Version:     5.61.1
+# Version:     5.62.0
+#
+# v5.62.0 (11-08-2026): A SECOND, INDEPENDENT GUARD ON AN OVER-RUNNING VPP EXPORT.
+#              v5.61.1 fixed the cause that fired tonight, but not the shape of the
+#              risk: an active window is ended by exactly ONE path — _poll_vpp ->
+#              _apply_vpp_event — while the manager re-drives ACTION_VPP_EXPORT every
+#              60 s from the `vpp_active` BOOLEAN ALONE and never looks at the clock.
+#              So every other route that stops that poll reaching its end test lands in
+#              exactly the same place as tonight: 4 kW out of the battery against a 1%
+#              discharge floor, for ever. Audited and real: `axleEnabled` unticked
+#              mid-window returns at the first line of _poll_vpp; a cleared token makes
+#              self.axle None and does the same; a raise before the ACTIVE branch skips
+#              the test every tick; and the VPP tick task dying while the manager lives
+#              leaves the manager happily re-asserting the export. NONE of these fired
+#              tonight — they are simply all still open, which is what "can it happen
+#              again" actually asks. New _check_vpp_overrun() runs at the TOP of
+#              _evaluate_manager_impl: manager cadence, no network, no prefs, no Axle,
+#              so it shares no dependency with the path it backs up. It force-ends
+#              through _end_vpp_export — the same path the poll uses, so summary, JSONL
+#              and state machine all land normally — and WARNs naming the overshoot,
+#              because reaching that line means the primary path failed. Conservative by
+#              construction: it acts only past our OWN STORED end + 15 min (the poll
+#              stops at end+2min on a 60 s cadence, so it can never truncate a live
+#              window), a missing or unparseable end time does NOTHING rather than
+#              guess, and the whole body is wrapped so the guard can never break the
+#              evaluate it protects. 8 tests incl. tonight's actual 45-min overshoot;
+#              all 8 error against 5.61.1 because the method does not exist there.
+#              Suite 539 -> 547.
 #
 # v5.61.1 (11-08-2026): A VPP WINDOW NEVER STOPPED — the export ran 45 min past the
 #              end and would have run for another 21 hours. Axle publish the NEXT event
@@ -1593,6 +1620,11 @@ OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
 COST_SETTLE_INTERVAL      = 21600 # 6 hours - backfill settled whole-house costs into daily_history
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
+# Backstop grace past the stored window end before the MANAGER force-ends an
+# over-running VPP export (v5.62.0). The primary path stops at end+2min on a
+# 60s poll, so 15 min leaves it ample room to do its job first; anything still
+# exporting a quarter of an hour late is a fault, not a late poll.
+VPP_OVERRUN_GRACE_MINS    = 15
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 STORM_WATCH_INTERVAL = 7200  # 2 hours
 
@@ -4614,6 +4646,23 @@ class Plugin(indigo.PluginBase):
                 dev.updateStateOnServer("managerStatus", value="Paused")
             return
 
+        # 0. VPP OVER-RUN BACKSTOP (v5.62.0). An active window is ended by exactly
+        #    ONE path — _poll_vpp -> _apply_vpp_event — and the manager below will
+        #    re-drive ACTION_VPP_EXPORT every tick for as long as `vpp_active` is
+        #    True, on nothing but that boolean. It never looks at the clock. So
+        #    ANY failure that stops the poll reaching its end test leaves 4 kW
+        #    pouring out of the battery against a 1% discharge floor with nothing
+        #    to stop it: `axleEnabled` unticked mid-window, the token cleared so
+        #    `self.axle` is None, a raise before the ACTIVE branch, or the VPP tick
+        #    task dying while the manager lives. v5.61.1 fixed the specific cause
+        #    that fired on 11-Aug-2026 (reading the NEXT event's end_time), but the
+        #    single point of failure remained — so this is the second, independent
+        #    guard: manager cadence, no network, no prefs, no Axle.
+        #    It can only ever act in a state that is ALREADY wrong (past our own
+        #    stored end), so it cannot cut a legitimate window short: the primary
+        #    path stops at end+2min and this waits VPP_OVERRUN_GRACE beyond that.
+        self._check_vpp_overrun()
+
         soc_pct = self.latest_inverter_data.get("batterySoc", 0.0)
 
         # 1. Power cut lockout (SOC- and forecast-aware — see _resolve_export_lockout).
@@ -6364,6 +6413,47 @@ class Plugin(indigo.PluginBase):
         self._record_vpp_api_status(self.axle.last_error)
         with self._state_lock:
             self._apply_vpp_event(event)
+
+    def _check_vpp_overrun(self):
+        """Force-end a VPP window that is running long past its own end time.
+
+        The SECOND, independent guard on the export (v5.62.0). See the call site
+        in _evaluate_manager_impl for why one is not enough: the manager re-drives
+        ACTION_VPP_EXPORT from the `vpp_active` boolean alone and never consults
+        the clock, so every route that stops _poll_vpp reaching its end test leaves
+        the export running for ever.
+
+        Deliberately conservative:
+          * acts ONLY past our own STORED end + VPP_OVERRUN_GRACE_MINS, so it can
+            never truncate a live window — and it uses the stored event for the
+            same reason v5.61.1 does, never anything an API just handed back;
+          * an unparseable or missing end time does NOTHING (a guess here would be
+            worse than the fault it guards);
+          * ends through _end_vpp_export, the same path the poll uses, so the
+            summary, the JSONL and the state machine all land exactly as normal;
+          * logs at WARNING naming the overshoot, because reaching this line at
+            all means the primary path failed and that is worth knowing.
+        """
+        try:
+            if self.store.get("vpp_state") != VPP_ACTIVE:
+                return
+            stored = self.store.get("vpp_event") or {}
+            end_time = stored.get("end_time")
+            if end_time is None:
+                return
+            now = datetime.now(timezone.utc)
+            deadline = end_time + timedelta(minutes=VPP_OVERRUN_GRACE_MINS)
+            if now < deadline:
+                return
+            overshoot = (now - end_time).total_seconds() / 60.0
+            log(f"[VPP] BACKSTOP — window ended {_local_time(end_time)} but the export "
+                f"is still running {overshoot:.0f} min later. The Axle poll has not "
+                f"closed it, so the manager is force-ending it now. Check why "
+                f"_poll_vpp stopped advancing the state machine.", level="WARNING")
+            self._end_vpp_export(now, stored)
+        except Exception as exc:
+            # Never let the backstop break the evaluate it is protecting.
+            log(f"[VPP] Over-run backstop failed: {exc}", level="ERROR")
 
     def _apply_vpp_event(self, event):
         """Advance the VPP state machine for a fetched event. Caller holds the lock."""
