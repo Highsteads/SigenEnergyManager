@@ -2397,3 +2397,171 @@ class TestVppShortfallAlert(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestCostKwhVariables(unittest.TestCase):
+    """v5.61.0 — the nine kWh variables are published from the SAME card as
+    the costs beside them.
+
+    They had no writer anywhere in the estate since the Octopus consumption
+    script was retired (12-Apr-2026), so they sat frozen next to live money:
+    export_today_kwh read 0.000 while export_today_revenue_gbp read GBP 2.12,
+    i.e. 17.69 kWh at 12p. The pair is now sourced from one dict, so it cannot
+    disagree again.
+    """
+
+    # ---- the cards carry the kWh they were costed from ----
+
+    def test_build_card_returns_its_kwh(self):
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=4.5, export_kwh=17.69, elec_unit_p=26.271,
+            export_rate_p=12.0, elec_standing_p=61.518, gas_kwh=7.5,
+            gas_unit_p=6.584, gas_standing_p=29.062,
+            provisional=True, gas_estimated=False)
+        self.assertEqual(card["import_kwh"], 4.5)
+        self.assertEqual(card["export_kwh"], 17.69)
+        self.assertEqual(card["gas_kwh"], 7.5)
+
+    def test_build_card_kwh_and_money_agree(self):
+        """The complaint, stated as an assertion: kWh x rate == the revenue."""
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=0.0, export_kwh=17.69, elec_unit_p=26.271,
+            export_rate_p=12.0, elec_standing_p=0.0, gas_kwh=0.0,
+            gas_unit_p=0.0, gas_standing_p=0.0,
+            provisional=True, gas_estimated=False)
+        self.assertAlmostEqual(
+            card["export_kwh"] * 12.0 / 100.0, card["export_gbp"], places=2)
+
+    def test_settled_card_uses_the_kwh_that_was_priced(self):
+        """import_kwh_octo is what the settle step billed — NOT grid_import_kwh,
+        which is the Sigen CT figure and differs."""
+        rec = {
+            "cost_settled": True,
+            "elec_unit_cost_gbp": 1.18, "elec_standing_gbp": 0.62,
+            "gas_unit_cost_gbp": 0.45, "gas_standing_gbp": 0.29,
+            "whole_house_bill_gbp": 2.54, "export_revenue_gbp": 2.12,
+            "wh_net_gbp": -0.42, "covered": False,
+            "import_kwh_octo": 4.49, "grid_import_kwh": 4.61,
+            "grid_export_kwh": 17.69, "gas_kwh": 6.777,
+        }
+        card = plugin.Plugin._wh_card_from_row(rec)
+        self.assertEqual(card["import_kwh"], 4.49)
+        self.assertNotEqual(card["import_kwh"], 4.61)
+        self.assertEqual(card["export_kwh"], 17.69)
+        self.assertEqual(card["gas_kwh"], 6.777)
+
+    def test_unsettled_row_returns_no_card(self):
+        self.assertIsNone(plugin.Plugin._wh_card_from_row({"cost_settled": False}))
+
+    # ---- the writer publishes them ----
+
+    def _run_writer(self, econ):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.octopus = None
+        p.logger = MagicMock()
+        p.store = {}
+        p._cost_vars_economics = lambda: econ
+        p._ensure_var = lambda name, folder_id: 1
+        written = {}
+        real_variable = getattr(plugin.indigo, "variable", None)
+        plugin.indigo.variable = MagicMock()
+        plugin.indigo.variable.updateValue.side_effect = (
+            lambda vid, value: None)
+
+        # Capture by wrapping _ensure_var instead: the name is what matters.
+        names = []
+
+        def _ensure(name, folder_id):
+            names.append(name)
+            return len(names)
+        p._ensure_var = _ensure
+        try:
+            p._write_cost_variables(folder_id=1)
+        finally:
+            if real_variable is None:
+                delattr(plugin.indigo, "variable")
+            else:
+                plugin.indigo.variable = real_variable
+        # Rebuild name->value from the update calls in order.
+        for i, name in enumerate(names):
+            written[name] = None
+        return names, written
+
+    def test_writer_publishes_all_nine_kwh_variables(self):
+        econ = {
+            "whole_house": {
+                "today":     {"import_kwh": 0.65, "export_kwh": 17.69,
+                              "gas_kwh": 23.38, "electric_gbp": 0.79,
+                              "gas_gbp": 1.83, "export_gbp": 2.12,
+                              "bill_gbp": 2.62},
+                "yesterday": {"import_kwh": 0.75, "export_kwh": 16.38,
+                              "gas_kwh": 46.40},
+            },
+            "periods": {"month": {"days": 11, "import_kwh": 16.49,
+                                  "export_kwh": 192.14, "gas_kwh": 420.88,
+                                  "export_total_gbp": 23.06,
+                                  "elec_whole_house_total_gbp": 12.10}},
+        }
+        names, _ = self._run_writer(econ)
+        for expected in ("elec_today_kwh", "gas_today_kwh", "export_today_kwh",
+                         "elec_yesterday_kwh", "gas_yesterday_kwh",
+                         "export_yesterday_kwh", "elec_month_kwh",
+                         "gas_month_kwh", "export_month_kwh"):
+            self.assertIn(expected, names, f"{expected} was not published")
+
+    def test_writer_skips_unknown_kwh_rather_than_writing_zero(self):
+        """A missing figure must leave the variable ALONE. Writing 0.000 would
+        state a measurement we do not have — the failure direction that makes a
+        dead sensor look healthy."""
+        econ = {
+            "whole_house": {"today": {"export_gbp": 2.12}, "yesterday": None},
+            "periods": {"month": {"days": 11}},
+        }
+        names, _ = self._run_writer(econ)
+        self.assertNotIn("export_today_kwh", names)
+        self.assertNotIn("export_yesterday_kwh", names)
+        self.assertNotIn("export_month_kwh", names)
+
+    def test_writer_survives_missing_whole_house_block(self):
+        names, _ = self._run_writer({"whole_house": None, "periods": {}})
+        self.assertNotIn("export_today_kwh", names)
+
+
+class TestPeriodKwhTotals(unittest.TestCase):
+    """The window's kWh must cover exactly the days its money covers."""
+
+    def _summary(self, records):
+        """_period_economics_summary reads daily_history.json out of
+        self.data_dir, so the fixture is a real file in a temp dir — stubbing a
+        loader that does not exist would have silently tested nothing."""
+        import json
+        import tempfile
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.store = {}
+        p._row_standing_p = lambda rec, fallback: 61.518
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "daily_history.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(records, f)
+            p.data_dir = d
+            return p._period_economics_summary(
+                export_rate_p=12.0, fallback_import_rate_p=None)
+
+    def test_rate_less_day_contributes_neither_money_nor_kwh(self):
+        today = datetime.now().date()
+        day = today.isoformat()
+        recs = [
+            {"date": day, "home_kwh": 10.0, "grid_import_kwh": 2.0,
+             "grid_export_kwh": 5.0, "gas_kwh": 3.0, "rate_today_p": 26.271},
+            # No rate at all — skipped for cost, so must be skipped for kWh.
+            {"date": day, "home_kwh": 99.0, "grid_import_kwh": 99.0,
+             "grid_export_kwh": 99.0, "gas_kwh": 99.0},
+        ]
+        out = self._summary(recs)
+        month = out.get("month") or {}
+        self.assertIn("import_kwh", month)
+        self.assertEqual(month["days"], 1)
+        self.assertAlmostEqual(month["import_kwh"], 2.0, places=3)
+        self.assertAlmostEqual(month["export_kwh"], 5.0, places=3)
+        self.assertAlmostEqual(month["gas_kwh"], 3.0, places=3)

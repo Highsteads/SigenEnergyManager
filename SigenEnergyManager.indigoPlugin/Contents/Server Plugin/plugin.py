@@ -5,9 +5,31 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Opus 5 (1M context)
-# Date:        08-08-2026
-# Version:     5.60.1
+# Author:      CliveS & Claude Opus 5
+# Date:        11-08-2026
+# Version:     5.61.0
+#
+# v5.61.0 (11-08-2026): THE NINE kWh VARIABLES HAD NO WRITER ANYWHERE. elec_/gas_/
+#              export_ today/yesterday/month kWh lost their writer when the Octopus
+#              consumption script was retired (12-Apr-2026) and were never picked up
+#              by the v5.41.0 revival, which took the RATES and COSTS only. So they sat
+#              frozen next to live money: export_today_kwh read 0.000 beside an
+#              export_today_revenue_gbp of GBP 2.12 (17.69 kWh at 12p), and
+#              gas_yesterday_kwh still held the 46 kWh April figure that caused a scare.
+#              Measured before touching anything: no writer in either script folder or
+#              any plugin bundle, no trigger/schedule/action-group reference, no
+#              dashboard reader, and no hard-coded id — dead in every direction.
+#              They are now published from the SAME card the costs come from
+#              (_wh_build_card / _wh_card_from_row / the period aggregate all carry the
+#              kWh they were priced on), so the pair cannot contradict each other again.
+#              The settled card deliberately publishes import_kwh_octo, NOT
+#              grid_import_kwh — the Octopus figure is what the settle step billed, and
+#              the Sigen CT figure differs. An unknown value leaves the variable ALONE
+#              rather than writing a confident 0.000, since a fabricated measurement is
+#              worse than a stale one. Window kWh accumulate over exactly the rows the
+#              window's money covers, so a day skipped for want of a rate contributes
+#              neither. Suite 527 -> 535; 5 of the 8 new cases verified FAILING against
+#              5.60.1, the other 3 deliberate both-sides guards.
 #
 # v5.60.1 (08-08-2026): REQUIRED Info.plist KEY. `CFBundleURLTypes` was PRESENT but
 # EMPTY, so the plugin shipped without the support URL that becomes its
@@ -3094,6 +3116,13 @@ class Plugin(indigo.PluginBase):
         gu = rec.get("gas_unit_cost_gbp")  or 0.0
         gs = rec.get("gas_standing_gbp")   or 0.0
         return {
+            # The kWh the settle step actually PRICED — import_kwh_octo, not
+            # grid_import_kwh.  Publishing any other figure beside these costs
+            # would let the two contradict each other, which is the whole
+            # reason the kWh are carried on the card at all.
+            "import_kwh":            rec.get("import_kwh_octo"),
+            "export_kwh":            rec.get("grid_export_kwh"),
+            "gas_kwh":               rec.get("gas_kwh"),
             "electric_unit_gbp":     round(eu, 2),
             "electric_standing_gbp": round(es, 2),
             "electric_gbp":          round(eu + es, 2),
@@ -3132,6 +3161,11 @@ class Plugin(indigo.PluginBase):
         er   = export_rate_p if export_rate_p is not None else DEFAULT_EXPORT_RATE_P
         exp  = (export_kwh or 0.0) * er / 100.0
         return {
+            # The kWh these costs were computed FROM, carried alongside them so
+            # a consumer cannot pair a live cost with a stale volume.
+            "import_kwh":            import_kwh,
+            "export_kwh":            export_kwh,
+            "gas_kwh":               gas_kwh,
             "electric_unit_gbp":     None if rate_missing else round(eu, 2),
             "electric_standing_gbp": round(es, 2),
             "electric_gbp":          None if rate_missing else round(eu + es, 2),
@@ -3291,12 +3325,26 @@ class Plugin(indigo.PluginBase):
             bill_sum = sum(float(r.get("whole_house_bill_gbp") or 0.0) for r in m_rows)
             exp_sum  = sum(float(r.get("export_revenue_gbp")   or 0.0) for r in m_rows)
             covered_days = sum(1 for r in m_rows if r.get("covered"))
+            def _kwh_sum(key):
+                total = 0.0
+                for r in m_rows:
+                    try:
+                        total += float(r.get(key) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                return round(total, 3)
+
             out["month"] = {
                 "bill_gbp":   round(bill_sum, 2),
                 "export_gbp": round(exp_sum, 2),
                 "net_gbp":    round(exp_sum - bill_sum, 2),
                 "in_credit":  bool(exp_sum >= bill_sum),
                 "days":       len(m_rows),
+                # Same rows, same keys the settle step priced — so the month's
+                # kWh and its £ are always the same set of days.
+                "import_kwh": _kwh_sum("import_kwh_octo"),
+                "export_kwh": _kwh_sum("grid_export_kwh"),
+                "gas_kwh":    _kwh_sum("gas_kwh"),
             }
             out["self_funded"] = {
                 "covered_days": covered_days,
@@ -3394,6 +3442,9 @@ class Plugin(indigo.PluginBase):
             total_imp_p = total_exp_p = 0.0
             total_no_solar_p = total_net_p = total_benefit_p = 0.0
             total_elec_wh_gbp = 0.0   # whole-house electric (unit + standing)
+            # kWh over the SAME rows the money is computed from — a day
+            # skipped for want of a rate must not contribute volume either.
+            total_imp_kwh = total_exp_kwh = total_gas_kwh = 0.0
             counted = 0
             for r in subset:
                 home  = float(r.get("home_kwh",        0) or 0)
@@ -3448,6 +3499,12 @@ class Plugin(indigo.PluginBase):
                                           + float(r.get("elec_standing_gbp") or 0))
                 else:
                     total_elec_wh_gbp += (imp_p + st_p) / 100.0
+                total_imp_kwh += imp_k
+                total_exp_kwh += exp_k
+                try:
+                    total_gas_kwh += float(r.get("gas_kwh") or 0.0)
+                except (TypeError, ValueError):
+                    pass
                 counted += 1
             if counted == 0:
                 return aggregate([])   # all rate-less, treat as empty
@@ -3467,6 +3524,11 @@ class Plugin(indigo.PluginBase):
                 "no_solar_avg_gbp":    _ga(total_no_solar_p),
                 "net_avg_gbp":         _ga(total_net_p),
                 "benefit_avg_gbp":     _ga(total_benefit_p),
+                # kWh over the same counted rows, so a consumer can never
+                # pair this window's money with a different set of days.
+                "import_kwh":          round(total_imp_kwh, 3),
+                "export_kwh":          round(total_exp_kwh, 3),
+                "gas_kwh":             round(total_gas_kwh, 3),
             }
 
         # Window selectors
@@ -8193,7 +8255,9 @@ class Plugin(indigo.PluginBase):
         # ---- today/month costs from the live economics (single source, no recompute) ----
         try:
             econ = self._cost_vars_economics() or {}
-            wh   = (econ.get("whole_house") or {}).get("today") or {}
+            whole = econ.get("whole_house") or {}
+            wh   = whole.get("today") or {}
+            yday = whole.get("yesterday") or {}
             mon  = (econ.get("periods") or {}).get("month") or {}
 
             def _add(name, val):
@@ -8202,10 +8266,33 @@ class Plugin(indigo.PluginBase):
                         updates.append((name, f"{float(val):.2f}"))
                     except (TypeError, ValueError):
                         pass
+
+            def _add_kwh(name, val):
+                # 3 dp to match the kWh convention these variables have always
+                # used; costs stay at 2. A None means "not known yet" and must
+                # leave the variable alone rather than writing a confident 0.
+                if val is not None:
+                    try:
+                        updates.append((name, f"{float(val):.3f}"))
+                    except (TypeError, ValueError):
+                        pass
             _add("elec_today_cost_gbp",       wh.get("electric_gbp"))
             _add("gas_today_cost_gbp",        wh.get("gas_gbp"))
             _add("export_today_revenue_gbp",  wh.get("export_gbp"))
             _add("combined_today_actual_gbp", wh.get("bill_gbp"))
+            # ---- the kWh behind those costs (v5.61.0) --------------------
+            # These nine variables have existed since the Octopus-script era
+            # and have had NO writer since it was retired (12-Apr-2026), so
+            # they sat frozen beside live £ figures — export_today_kwh read
+            # 0.000 next to an export_today_revenue_gbp of £2.12. They are
+            # published from the SAME card the money comes from, so the pair
+            # can never contradict each other again.
+            _add_kwh("elec_today_kwh",       wh.get("import_kwh"))
+            _add_kwh("gas_today_kwh",        wh.get("gas_kwh"))
+            _add_kwh("export_today_kwh",     wh.get("export_kwh"))
+            _add_kwh("elec_yesterday_kwh",   yday.get("import_kwh"))
+            _add_kwh("gas_yesterday_kwh",    yday.get("gas_kwh"))
+            _add_kwh("export_yesterday_kwh", yday.get("export_kwh"))
             # Companion flag: the today card's gas component is an ESTIMATE
             # (most recent settled day's kWh at current rates) until Octopus
             # settles the day — surface that to variable consumers, who can't
@@ -8220,6 +8307,9 @@ class Plugin(indigo.PluginBase):
                 # skipping here kept the closed month's totals showing all day.)
                 updates.append(("elec_month_cost_gbp",     "0.00"))
                 updates.append(("export_month_revenue_gbp", "0.00"))
+                updates.append(("elec_month_kwh",   "0.000"))
+                updates.append(("gas_month_kwh",    "0.000"))
+                updates.append(("export_month_kwh", "0.000"))
             else:
                 # Whole-house basis (unit + standing from settled rows) so the
                 # month figure matches elec_today_cost_gbp's basis; falls back
@@ -8229,6 +8319,9 @@ class Plugin(indigo.PluginBase):
                      if mon.get("elec_whole_house_total_gbp") is not None
                      else mon.get("import_total_gbp"))
                 _add("export_month_revenue_gbp", mon.get("export_total_gbp"))
+                _add_kwh("elec_month_kwh",   mon.get("import_kwh"))
+                _add_kwh("gas_month_kwh",    mon.get("gas_kwh"))
+                _add_kwh("export_month_kwh", mon.get("export_kwh"))
         except Exception as exc:
             log(f"[Cost Vars] economics read failed: {exc}", level="WARNING")
         # ---- write ----
