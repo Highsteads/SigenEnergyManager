@@ -530,9 +530,11 @@
                 <TriggerLabel>Last VPP min PV changed</TriggerLabel>
                 <ControlPageLabel>Last VPP Min PV (W)</ControlPageLabel>
             </State>
-            <!-- The PEAK is what the curtailment verdict rests on: a minimum of
-                 zero is normal for any window running into dusk, so only a peak
-                 that never lifts means the MPPT was actually shut down. -->
+            <!-- The PEAK is what the curtailment verdict rests on.  PV can
+                 touch zero mid-window for reasons that have nothing to do with
+                 the inverter (cloud, an eclipse, or a window that outlasts the
+                 daylight), so a zero minimum proves nothing; only a peak that
+                 never lifts means the MPPT was actually shut down. -->
             <State id="lastVppMaxPvW">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Last VPP peak PV changed</TriggerLabel>

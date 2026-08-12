@@ -9,23 +9,28 @@
 # Date:        12-08-2026
 # Version:     5.66.0
 #
-# v5.66.0 (12-08-2026): A WINDOW THAT RAN INTO DUSK WAS REPORTED AS CURTAILED.
+# v5.66.0 (12-08-2026): PV FELL TO ZERO MID-WINDOW AND WAS REPORTED AS CURTAILED.
 #              The PV verdict in _summarise_vpp_event was a bare `min_pv_w > 100`
-#              under the v5.56.0 daylight gate, so a DAYTIME window whose PV
-#              naturally fell to zero as the sun set failed the test. The first
-#              two-hour event (12-Aug-2026, 18:00-20:00 BST) hit it: PV declined
-#              1757 W -> 0 across the window and a textbook 8.26 kWh export was
-#              summarised "curtailed". Curtailment was not merely absent but
-#              IMPOSSIBLE — in mode 0x05 with charge pinned at 0, PV can only be
-#              curtailed once it exceeds house + the export cap (~4.99 kW that
-#              evening) and it peaked at 1.76 kW. v5.56.0 fixed the fully-dark
-#              window and left the window that SPANS dusk; a minimum of zero is
-#              the NORMAL end of any evening window, and only a peak that never
-#              lifts says the MPPT was shut down. Verdict now reads max_pv_w;
-#              min_pv_w is still reported (it is a real reading, just not the
-#              test), the summary line quotes BOTH, and the peak is recorded in
-#              a new `lastVppMaxPvW` state so the number the verdict rests on is
-#              durable rather than only in a log line.
+#              under the v5.56.0 daylight gate, so ANY daytime window whose PV
+#              touched zero at any point failed the test. The first two-hour
+#              event (12-Aug-2026, 18:00-20:00 BST) hit it: PV ran 1454 W at the
+#              start, spiked to 1757 W, then collapsed to 0 W from 18:58 and
+#              stayed there, and a textbook 8.26 kWh export was summarised
+#              "curtailed". Curtailment was not merely absent but IMPOSSIBLE —
+#              in mode 0x05 with charge pinned at 0, PV can only be curtailed
+#              once it exceeds house + the export cap (~4.99 kW that evening)
+#              and it peaked at 1.76 kW. THE CAUSE WAS EXTERNAL, NOT US, AND
+#              NOT SUNSET: sunset was 20:47:47, i.e. 48 min AFTER the window
+#              closed and 1h50m after PV hit zero (a partial solar eclipse that
+#              evening, plus cloud — the 551 W -> 1757 W recovery inside five
+#              minutes is cloud, not an astronomical curve). Verdict now reads
+#              max_pv_w: only a peak that never lifts means the MPPT was shut
+#              down, whereas a zero MINIMUM says nothing at all, because PV can
+#              reach zero mid-window for reasons that have nothing to do with
+#              the inverter. min_pv_w is still reported (a real reading, just
+#              not the test), the summary quotes BOTH, and the peak is recorded
+#              in a new `lastVppMaxPvW` state so the number the verdict rests on
+#              is durable rather than only in a log line.
 #
 # v5.65.0 (12-08-2026): DEEP REVIEW #4, BATCH A1 — the control-and-safety highs.
 # A 16-lens adversarially-verified review (187 confirmed findings, 0 critical,
@@ -7124,15 +7129,23 @@ class Plugin(indigo.PluginBase):
         # store has been cleared (a restart between event end and summary).
         #
         # AND THE VERDICT READS THE PEAK, NOT THE MINIMUM (v5.66.0).  v5.56.0
-        # fixed the fully-dark window but left the window that SPANS DUSK.  The
-        # first two-hour event (12-Aug-2026, 18:00-20:00 BST) hit it: PV fell
-        # naturally 1757 W -> 0 as the sun set, so the minimum was 0 and a
-        # textbook window was reported "curtailed".  Curtailment was not merely
-        # absent but IMPOSSIBLE — in mode 0x05 with charge pinned at 0, PV can
-        # only be curtailed once it exceeds house + the export cap (~4.99 kW
-        # that evening) and it peaked at 1.76 kW.  A minimum of zero is the
-        # NORMAL end of any window that runs into darkness; only a peak that
-        # never lifts says the MPPT was shut down.
+        # fixed the fully-dark window; this covers the DAYTIME window whose PV
+        # touches zero part-way through.  The first two-hour event (12-Aug-2026,
+        # 18:00-20:00 BST) hit it: PV ran at ~1.45 kW, peaked at 1757 W, then
+        # collapsed to 0 W from 18:58 and stayed there — so the minimum was 0
+        # and a textbook 8.26 kWh window was reported "curtailed".
+        #
+        # NOT SUNSET, AND NOT US.  Sunset that day was 20:47:47 — 48 min AFTER
+        # the window closed, 1h50m after PV hit zero.  The sun was well up
+        # throughout; a partial solar eclipse and cloud took the irradiance
+        # (a 551 W -> 1757 W recovery inside five minutes is cloud, not an
+        # astronomical curve).  Curtailment was IMPOSSIBLE anyway: in 0x05 with
+        # charge pinned at 0, PV can only be curtailed above house + export cap
+        # (~4.99 kW that evening) and it peaked at 1.76 kW.
+        #
+        # So a zero MINIMUM says nothing — PV can reach zero mid-window for
+        # eclipse, cloud, or simply a window that outlasts the daylight later in
+        # the year.  Only a peak that never lifts means the MPPT was shut down.
         daytime = self.store.get("vpp_is_daytime")
         if daytime is None:
             try:
