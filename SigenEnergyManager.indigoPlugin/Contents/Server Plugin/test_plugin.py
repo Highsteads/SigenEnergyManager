@@ -2825,3 +2825,128 @@ class TestSnapshotWindowFilter(unittest.TestCase):
         self.assertTrue(plugin._snapshot_in_window({}, self.EV))
         self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": "x"}, self.EV))
         self.assertTrue(plugin._snapshot_in_window({"event_elapsed_secs": 99999.0}, {}))
+
+
+class TestVppHandbackConfirmation(unittest.TestCase):
+    """v5.64.0 — the hand-back at window end must be CONFIRMED, not assumed.
+
+    Until v5.64 set_self_consumption()'s return value was discarded, so a
+    rejected / clamped / socket-dead write left the inverter selling the battery
+    while the state machine reported IDLE, and only the ~15-minute manager cycle
+    put it right. Predbat hit the same class of bug on the cloud path (#4477).
+    """
+
+    def _p(self, connected=True, results=(True,)):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.debug  = False
+        p.modbus = MagicMock()
+        p.modbus.connected = connected
+        p.modbus.set_self_consumption.side_effect = list(results)
+        p.store = {
+            "vpp_state":              plugin.VPP_ACTIVE,
+            "export_active":          True,
+            "import_active":          False,
+            "grid_export_daily_kwh":  10.0,
+            "vpp_export_start_kwh":   6.0,
+            "vpp_handback_pending":   False,
+        }
+        p._restore_discharge_cutoff = MagicMock()
+        p._vpp_transition           = MagicMock()
+        p._trigger_event            = MagicMock()
+        p._vpp_event_log_path       = MagicMock(return_value="/dev/null")
+        return p
+
+    # ---- _end_vpp_export -------------------------------------------------
+
+    def test_confirmed_handback_leaves_no_pending_flag(self):
+        p = self._p(results=(True,))
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        self.assertFalse(p.store["vpp_handback_pending"])
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 1)
+
+    def test_failed_write_is_retried_once_immediately(self):
+        p = self._p(results=(False, True))
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 2)
+        self.assertFalse(p.store["vpp_handback_pending"])
+
+    def test_both_attempts_failing_raises_the_flag_and_warns(self):
+        p = self._p(results=(False, False))
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        self.assertTrue(p.store["vpp_handback_pending"])
+
+    def test_disconnected_modbus_does_not_claim_success(self):
+        """The old code called through `if self.modbus:` with no connected check."""
+        p = self._p(connected=False)
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertTrue(p.store["vpp_handback_pending"])
+
+    def test_state_machine_still_reaches_idle_when_handback_fails(self):
+        """It must never wedge in ACTIVE — terminate, then keep re-asserting."""
+        p = self._p(results=(False, False))
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        p._vpp_transition.assert_called_once_with(plugin.VPP_IDLE)
+        self.assertFalse(p.store["export_active"])
+
+    # ---- _retry_vpp_handback --------------------------------------------
+
+    def _r(self, pending=True, state=None, connected=True, ok=True,
+           export=False, imp=False):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.modbus = MagicMock()
+        p.modbus.connected = connected
+        p.modbus.set_self_consumption.return_value = ok
+        p.store = {
+            "vpp_handback_pending": pending,
+            "vpp_state":            state or plugin.VPP_IDLE,
+            "export_active":        export,
+            "import_active":        imp,
+        }
+        return p
+
+    def test_retry_is_a_no_op_when_nothing_pending(self):
+        p = self._r(pending=False)
+        p._retry_vpp_handback()
+        p.modbus.set_self_consumption.assert_not_called()
+
+    def test_retry_clears_flag_on_success(self):
+        p = self._r()
+        p._retry_vpp_handback()
+        p.modbus.set_self_consumption.assert_called_once()
+        self.assertFalse(p.store["vpp_handback_pending"])
+
+    def test_retry_keeps_trying_while_it_fails(self):
+        p = self._r(ok=False)
+        p._retry_vpp_handback()
+        self.assertTrue(p.store["vpp_handback_pending"])
+
+    def test_retry_never_writes_during_a_live_window(self):
+        """Re-asserting 0x02 mid-event would kill a paid export."""
+        p = self._r(state=plugin.VPP_ACTIVE)
+        p._retry_vpp_handback()
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertFalse(p.store["vpp_handback_pending"])
+
+    def test_retry_stands_down_if_an_export_or_import_is_engaged(self):
+        for kwargs in ({"export": True}, {"imp": True}):
+            p = self._r(**kwargs)
+            p._retry_vpp_handback()
+            p.modbus.set_self_consumption.assert_not_called()
+            self.assertFalse(p.store["vpp_handback_pending"])
+
+    def test_retry_waits_quietly_while_the_socket_is_down(self):
+        p = self._r(connected=False)
+        p._retry_vpp_handback()
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertTrue(p.store["vpp_handback_pending"])   # still owed
+
+    def test_engaging_a_window_cancels_a_pending_retry(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.debug  = False
+        p.store  = {"vpp_state": plugin.VPP_IDLE, "vpp_handback_pending": True}
+        p._vpp_transition(plugin.VPP_PRE_CHARGING)
+        self.assertFalse(p.store["vpp_handback_pending"])

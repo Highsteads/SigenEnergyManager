@@ -6,8 +6,23 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
-# Date:        11-08-2026
-# Version:     5.63.0
+# Date:        12-08-2026
+# Version:     5.64.0
+#
+# v5.64.0 (12-08-2026): THE HAND-BACK AT WINDOW END WAS NEVER CONFIRMED.
+#   _end_vpp_export discarded set_self_consumption()'s return value, under a bare
+#   `if self.modbus:` with no .connected check, so a rejected/clamped/dead-socket
+#   write left the state machine IDLE while the inverter stayed in 0x05/0x06 still
+#   selling the battery. Only _verify_ems_registers caught it, on the ~15-MINUTE
+#   manager cycle — up to ~1.25 kWh to the grid outside the paid window, unpaid and
+#   silent (one generic Modbus ERROR, nothing VPP-tagged). Now confirmed, retried
+#   once immediately, WARNs in VPP terms, and sets vpp_handback_pending so the 10s
+#   tick re-asserts the safe baseline (see _retry_vpp_handback). IDLE is still
+#   reached regardless — a hand-back that wedged in ACTIVE would be worse than the
+#   bug (Predbat #4477 records exactly that latch). Prompted by Predbat's #4477,
+#   whose own bug is NOT ours: they drive the Sigenergy through the cloud gateway
+#   and must offboard a platform authorisation; we self-drive over local Modbus.
+#   The transferable lesson is only "latch on success, not attempt".
 #
 # v5.63.0 (11-08-2026): THE POST-EVENT SUMMARY COULD REPORT ANOTHER EVENT'S READINGS.
 #              _summarise_vpp_event appended EVERY snapshot record in the file with no
@@ -2356,6 +2371,13 @@ class Plugin(indigo.PluginBase):
         # "not blocked" — a fresh start must never be locked out of exporting.
         self.store["solar_overflow_released_at"]  = None
 
+        # Set when a VPP hand-back write was not confirmed, so the 10s tick
+        # re-asserts the safe baseline instead of waiting for the ~15-min manager
+        # cycle (see _retry_vpp_handback). Deliberately NOT persisted: a restart
+        # runs the stuck-mode recovery, which returns the inverter to
+        # self-consumption anyway, so a stale True would be noise.
+        self.store["vpp_handback_pending"] = False
+
         # Flood prevention state (overnight pre-drain).
         # Persisted to pluginPrefs so a mid-pre-drain plugin restart doesn't leave
         # the inverter cutoff register raised but the store flag empty — which
@@ -4387,6 +4409,43 @@ class Plugin(indigo.PluginBase):
             self._log_halfhourly_to_db()
             self._write_energy_summary_variables()
             self.store["last_energy_var"] = now
+
+        # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64)
+        self._retry_vpp_handback()
+
+    def _retry_vpp_handback(self):
+        """Re-assert Self Consumption after a VPP hand-back that was never confirmed.
+
+        Bounds the exposure at one 10s tick instead of the ~15-minute manager
+        cycle. Deliberately small and self-terminating:
+
+          * it only ever writes the SAFE baseline (0x02, no limits), which is what
+            the manager would ask for in this state anyway, so a spurious run
+            costs nothing;
+          * it clears the flag the moment a write is confirmed, so it cannot spin;
+          * it is gated on the state machine being genuinely IDLE with no import
+            or export engaged, so it can never fight a new window. _vpp_transition
+            clears the flag on any engagement as well — belt and braces, because
+            re-asserting 0x02 during a live export would cost a paid window.
+
+        Not a general retry framework. Predbat's #4477 ended by DELETING the
+        machinery its own earlier rounds had added; the lesson taken here is to
+        confirm the one write that matters and stop there.
+        """
+        if not self.store.get("vpp_handback_pending"):
+            return
+        if self.store.get("vpp_state", VPP_IDLE) != VPP_IDLE:
+            self.store["vpp_handback_pending"] = False
+            return
+        if self.store.get("export_active") or self.store.get("import_active"):
+            self.store["vpp_handback_pending"] = False
+            return
+        if not (self.modbus and self.modbus.connected):
+            return          # nothing to do until the socket is back
+        if self.modbus.set_self_consumption():
+            self.store["vpp_handback_pending"] = False
+            log("[VPP] Hand-back to Self Consumption confirmed on retry — "
+                "inverter is back on the safe baseline.")
 
     # ================================================================
     # Modbus Polling
@@ -7307,8 +7366,27 @@ class Plugin(indigo.PluginBase):
                       - self.store.get("vpp_export_start_kwh", 0.0))
         self.store["vpp_last_export_kwh"] = round(vpp_export, 2)
 
-        if self.modbus:
-            self.modbus.set_self_consumption()
+        # Hand the inverter back, and CONFIRM it landed. set_self_consumption()
+        # returns False when the write was rejected, clamped, or the socket was
+        # already dead — and until v5.64 that answer was thrown away, so the state
+        # machine went IDLE claiming the export had stopped while the inverter was
+        # still sitting in 0x05/0x06 selling the battery. The only backstop was
+        # _verify_ems_registers, which runs on the ~15-MINUTE manager cycle, so a
+        # failed hand-back drained up to ~1.25 kWh to the grid outside the paid
+        # window — unpaid, silent (one generic Modbus ERROR line, nothing
+        # VPP-tagged), and straight against the self-sufficiency KPI.
+        released = False
+        if self.modbus and self.modbus.connected:
+            released = bool(self.modbus.set_self_consumption())
+            if not released:
+                # One immediate retry: the commonest cause is a dropped socket,
+                # and the failed write already flags the connection for reconnect.
+                released = bool(self.modbus.set_self_consumption())
+        if not released:
+            log("[VPP] Hand-back to Self Consumption NOT confirmed at window end — "
+                "the inverter may still be exporting. Re-asserting every tick until "
+                "it lands.", level="WARNING")
+        self.store["vpp_handback_pending"] = not released
         self._restore_discharge_cutoff()
 
         self.store["export_active"]        = False
@@ -7348,6 +7426,11 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_state"] = new_state
         if self.debug:
             log(f"[VPP] State: {old_state} -> {new_state}")
+
+        # Any engagement cancels a pending hand-back retry — re-asserting the
+        # 0x02 baseline during a live window would kill a paid export (v5.64).
+        if new_state != VPP_IDLE:
+            self.store["vpp_handback_pending"] = False
 
         # On entry to VPP_ACTIVE we self-drive the export (v5.28). Axle settle on
         # the meter reading so exporting it ourselves counts identically — and
