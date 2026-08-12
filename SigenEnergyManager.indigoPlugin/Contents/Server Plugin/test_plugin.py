@@ -3118,5 +3118,131 @@ class TestScheduledImportSafety(unittest.TestCase):
 
         self.assertEqual(p.modbus.force_charge.call_args.args[0], 15000,
             "hardcoded 10000 W was right only on a 10 kW inverter")
+
+
+class TestVppPvVerdict(unittest.TestCase):
+    """v5.64.0 — the PV verdict reads the window's PEAK, not its minimum.
+
+    v5.56.0 fixed the fully-dark window ("n/a") but left the window that SPANS
+    DUSK. The first two-hour event (12-Aug-2026, 18:00-20:00 BST) hit it: PV fell
+    naturally 1757 W -> 0 as the sun set, the minimum was 0, and a textbook window
+    was reported as "curtailed". Curtailment was not just absent but IMPOSSIBLE —
+    in mode 0x05 with charge pinned at 0, PV can only be curtailed above
+    house + export cap (~4.99 kW), and it peaked at 1.76 kW.
+    """
+
+    @staticmethod
+    def _verdict(daytime, pv_watts):
+        """The shipped rule, in isolation."""
+        max_pv_w = int(max(pv_watts)) if pv_watts else 0
+        if not daytime:
+            return "n/a (dark window)"
+        if pv_watts and max_pv_w > 100:
+            return "ran"
+        return "curtailed"
+
+    def test_tonights_real_series_reads_ran_not_curtailed(self):
+        """PV declining to zero at dusk is sunset, not curtailment."""
+        series = [1476, 1459, 1200, 900, 600, 300, 120, 0, 0, 0, 0]
+        self.assertEqual(self._verdict(True, series), "ran")
+
+    def test_the_15_jun_failure_is_still_caught(self):
+        """Mode 0x06 shut the MPPT off for the whole window — zero throughout."""
+        self.assertEqual(self._verdict(True, [0] * 46), "curtailed")
+
+    def test_dark_window_is_still_not_an_alarm(self):
+        self.assertEqual(self._verdict(False, [0] * 45), "n/a (dark window)")
+
+    def test_full_sun_throughout_reads_ran(self):
+        self.assertEqual(self._verdict(True, [6000] * 40), "ran")
+
+    def test_minimum_based_rule_would_have_failed_this(self):
+        """Pins WHY the rule changed: the old test called tonight curtailed."""
+        series = [1476, 1459, 1200, 900, 600, 300, 120, 0, 0, 0, 0]
+        old_verdict = "ran" if (series and int(min(series)) > 100) else "curtailed"
+        self.assertEqual(old_verdict, "curtailed")          # the bug
+        self.assertEqual(self._verdict(True, series), "ran")  # the fix
+
+    def test_no_snapshots_is_not_reported_as_healthy(self):
+        self.assertEqual(self._verdict(True, []), "curtailed")
+
+
+class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
+    """Drive the SHIPPED _summarise_vpp_event, not a replica of its rule.
+
+    TestVppPvVerdict above re-implements the decision, so it can only ever
+    confirm the rule I wrote — it could not have caught the rule being wrong
+    in the first place.  This drives the real method over a real JSONL file
+    shaped like the 12-Aug-2026 event (PV declining to zero at dusk).
+    """
+
+    def _run(self, pv_series, daytime=True):
+        import json as _json
+        import tempfile
+        from unittest.mock import MagicMock as _MM
+
+        verdict = {}
+
+        class _Rec:
+            id = 1
+            states = {}
+            def updateStatesOnServer(_self, states):
+                for st in states:
+                    verdict[st["key"]] = st["value"]
+            def updateStateOnServer(_self, k, v, **kw):
+                verdict[k] = v
+
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = _MM()
+        p.store = {"vpp_is_daytime": daytime}
+        p.pluginPrefs = {}
+        p._send_pushover = lambda *a, **k: None
+        p._find_device = lambda type_id: _Rec()
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "event.jsonl")
+            step = (2.0 * 3600.0) / max(len(pv_series) - 1, 1)
+            with open(path, "w", encoding="utf-8") as fh:
+                for i, w in enumerate(pv_series):
+                    fh.write(_json.dumps({
+                        # "type" is REQUIRED: the parser filters on it, and a
+                        # fixture without it yields ZERO snapshots — which reads
+                        # as "curtailed" and would have passed the control test
+                        # for entirely the wrong reason.
+                        "type": "snapshot",
+                        "event_elapsed_secs": i * step,
+                        "pv_w": w, "battery_w": -2000.0, "grid_w": -4000.0,
+                        "ems_work_mode": "0x05", "driver": "self",
+                    }) + "\n")
+            p._vpp_event_log_path = lambda ev: path
+            saved_log = plugin.log
+            plugin.log = lambda *a, **k: None
+            try:
+                p._summarise_vpp_event({"duration_hrs": 2.0})
+            finally:
+                plugin.log = saved_log
+        return verdict
+
+    def test_dusk_window_declining_to_zero_reads_ran(self):
+        """The 12-Aug-2026 shape: 1757 W falling to 0 as the sun set."""
+        v = self._run([1757, 1476, 1200, 900, 600, 300, 120, 40, 0, 0, 0])
+        self.assertEqual(v.get("lastVppPvStatus"), "ran")
+        self.assertEqual(v.get("lastVppMaxPvW"), 1757)
+        self.assertEqual(v.get("lastVppMinPvW"), 0)
+        self.assertIs(v.get("lastVppPvSurvived"), True)
+
+    def test_pv_flat_at_zero_all_window_still_reads_curtailed(self):
+        """The 15-Jun-2026 fault must still be caught — this is the control."""
+        v = self._run([0] * 11)
+        self.assertEqual(v.get("lastVppPvStatus"), "curtailed")
+        self.assertEqual(v.get("lastVppMaxPvW"), 0)
+        self.assertIs(v.get("lastVppPvSurvived"), False)
+
+    def test_dark_window_is_not_an_alarm(self):
+        v = self._run([0] * 11, daytime=False)
+        self.assertEqual(v.get("lastVppPvStatus"), "n/a (dark window)")
+        self.assertIs(v.get("lastVppPvSurvived"), True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

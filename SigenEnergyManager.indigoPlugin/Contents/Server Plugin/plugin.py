@@ -7,7 +7,25 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        12-08-2026
-# Version:     5.65.0
+# Version:     5.66.0
+#
+# v5.66.0 (12-08-2026): A WINDOW THAT RAN INTO DUSK WAS REPORTED AS CURTAILED.
+#              The PV verdict in _summarise_vpp_event was a bare `min_pv_w > 100`
+#              under the v5.56.0 daylight gate, so a DAYTIME window whose PV
+#              naturally fell to zero as the sun set failed the test. The first
+#              two-hour event (12-Aug-2026, 18:00-20:00 BST) hit it: PV declined
+#              1757 W -> 0 across the window and a textbook 8.26 kWh export was
+#              summarised "curtailed". Curtailment was not merely absent but
+#              IMPOSSIBLE — in mode 0x05 with charge pinned at 0, PV can only be
+#              curtailed once it exceeds house + the export cap (~4.99 kW that
+#              evening) and it peaked at 1.76 kW. v5.56.0 fixed the fully-dark
+#              window and left the window that SPANS dusk; a minimum of zero is
+#              the NORMAL end of any evening window, and only a peak that never
+#              lifts says the MPPT was shut down. Verdict now reads max_pv_w;
+#              min_pv_w is still reported (it is a real reading, just not the
+#              test), the summary line quotes BOTH, and the peak is recorded in
+#              a new `lastVppMaxPvW` state so the number the verdict rests on is
+#              durable rather than only in a log line.
 #
 # v5.65.0 (12-08-2026): DEEP REVIEW #4, BATCH A1 — the control-and-safety highs.
 # A 16-lens adversarially-verified review (187 confirmed findings, 0 critical,
@@ -7081,6 +7099,7 @@ class Plugin(indigo.PluginBase):
                         if s.get("ems_work_mode")]
 
         min_pv_w           = int(min(pv_watts))                  if pv_watts   else 0
+        max_pv_w           = int(max(pv_watts))                  if pv_watts   else 0
         # battery discharging = negative watts; "max discharge" is most negative magnitude
         max_bat_dis_w      = int(-min(bat_watts))                if bat_watts  else 0
         # grid exporting = negative watts; "peak export" is most negative magnitude
@@ -7103,6 +7122,17 @@ class Plugin(indigo.PluginBase):
         # Pushover claiming PV had collapsed.  Gate on the daylight flag latched
         # at VPP_ACTIVE entry, falling back to a fresh solar-window check if the
         # store has been cleared (a restart between event end and summary).
+        #
+        # AND THE VERDICT READS THE PEAK, NOT THE MINIMUM (v5.66.0).  v5.56.0
+        # fixed the fully-dark window but left the window that SPANS DUSK.  The
+        # first two-hour event (12-Aug-2026, 18:00-20:00 BST) hit it: PV fell
+        # naturally 1757 W -> 0 as the sun set, so the minimum was 0 and a
+        # textbook window was reported "curtailed".  Curtailment was not merely
+        # absent but IMPOSSIBLE — in mode 0x05 with charge pinned at 0, PV can
+        # only be curtailed once it exceeds house + the export cap (~4.99 kW
+        # that evening) and it peaked at 1.76 kW.  A minimum of zero is the
+        # NORMAL end of any window that runs into darkness; only a peak that
+        # never lifts says the MPPT was shut down.
         daytime = self.store.get("vpp_is_daytime")
         if daytime is None:
             try:
@@ -7113,7 +7143,7 @@ class Plugin(indigo.PluginBase):
 
         if not daytime:
             pv_status = "n/a (dark window)"
-        elif pv_watts and min_pv_w > 100:   # 100 W tolerates the event-end sample
+        elif pv_watts and max_pv_w > 100:
             pv_status = "ran"
         else:
             pv_status = "curtailed"
@@ -7155,6 +7185,7 @@ class Plugin(indigo.PluginBase):
                     {"key": "lastVppExportKwh",            "value": round(export_kwh, 2)},
                     {"key": "lastVppPvKwh",                "value": round(pv_kwh,     2)},
                     {"key": "lastVppMinPvW",               "value": min_pv_w},
+                    {"key": "lastVppMaxPvW",               "value": max_pv_w},
                     {"key": "lastVppMaxBatteryDischargeW", "value": max_bat_dis_w},
                     {"key": "lastVppPeakGridExportW",      "value": peak_grid_export_w},
                     {"key": "lastVppPvSurvived",           "value": pv_survived},
@@ -7177,7 +7208,7 @@ class Plugin(indigo.PluginBase):
         title = f"VPP window done — {export_kwh:.2f} kWh exported"
         body_lines = [
             f"Export:   {export_kwh:.2f} kWh",
-            f"PV:       {pv_kwh:.2f} kWh ({pv_status}; min {min_pv_w} W)",
+            f"PV:       {pv_kwh:.2f} kWh ({pv_status}; peak {max_pv_w} W, min {min_pv_w} W)",
             f"Battery:  peak discharge {max_bat_dis_w} W",
             f"Grid:     peak export {peak_grid_export_w} W",
             f"EMS:      {ems_modes_str}",
