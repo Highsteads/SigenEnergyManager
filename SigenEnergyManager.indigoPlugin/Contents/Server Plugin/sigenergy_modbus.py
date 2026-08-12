@@ -202,11 +202,20 @@ class SigenergyModbus:
     """
 
     def __init__(self, ip, port=502, plant_address=247, inverter_address=1,
-                 logger=None, sleep_func=None):
+                 logger=None, sleep_func=None, inverter_max_w=10000):
         self.ip               = ip
         self.port             = port
         self.plant_address    = plant_address
         self.inverter_address = inverter_address
+        # The inverter's rated power, in watts. ONE source of truth on the object
+        # rather than a default repeated at each call site: set_self_consumption()
+        # used to reset both limits to a hardcoded 10000, which is exactly right on
+        # a 10 kW inverter and silently wrong on any other — it capped battery
+        # discharge for a whole verify interval after every return to
+        # self-consumption. Keeping it here means a new mode method cannot
+        # reintroduce the hardcode by omission. The plugin keeps it in step with
+        # the inverterMaxKw pref (set at construction and on every prefs save).
+        self.inverter_max_w   = int(inverter_max_w or 10000)
         self.logger           = logger or logging.getLogger("SigenEnergyManager.Modbus")
         self.client           = None
         self._connected       = False
@@ -976,7 +985,7 @@ class SigenergyModbus:
         self.logger.info(f"Force discharge active: {power_watts}W to grid")
         return True
 
-    def night_export(self, inverter_max_w=10000):
+    def night_export(self, inverter_max_w=None):
         """Discharge battery to grid while also supplying house load.
 
         Sets Discharge ESS First mode (0x06) with HOLD_ESS_MAX_DISCHARGE at inverter
@@ -986,6 +995,7 @@ class SigenergyModbus:
         Battery discharges at (house_load + grid_export), up to inverter_max_w.
         Grid always receives its full export allocation regardless of home consumption.
         """
+        inverter_max_w = inverter_max_w or self.inverter_max_w
         self.logger.info(
             f"Night export: mode 0x06, discharge limit {inverter_max_w}W "
             f"(inverter DNO cap enforces grid limit)"
@@ -999,7 +1009,7 @@ class SigenergyModbus:
         self.logger.info("Night export active: battery supplying house load + grid export")
         return True
 
-    def daytime_export(self, inverter_max_w=10000):
+    def daytime_export(self, inverter_max_w=None):
         """Discharge to grid PV-first, battery only covering the shortfall.
 
         Sets Discharge PV First mode (0x05) AND pins the charge limit to 0. The
@@ -1025,18 +1035,30 @@ class SigenergyModbus:
         not drained; the only cost is curtailing PV above the cap during the
         window (the export payment far outweighs the un-banked surplus, and the
         battery refills from solar after the event).
+
+        ORDER MATTERS, and it used to be wrong. Mode 0x05 was committed FIRST and
+        the charge limit pinned two writes later, which opens exactly the window
+        this method exists to close: with 0x05 live and the charge limit still at
+        inverter max (where set_self_consumption leaves it), high PV banks into
+        the battery instead of going to grid. The mode register reads a perfectly
+        correct 0x05 throughout, so nothing downstream can tell that a paid
+        window is exporting nothing. The limits are now written BEFORE the mode
+        commit — charge 0 while still in the previous mode costs at most a
+        sub-second pause in battery charging, against a silently unpaid slice of
+        a VPP window.
         """
+        inverter_max_w = inverter_max_w or self.inverter_max_w
         self.logger.info(
             f"Daytime export: mode 0x05 (PV first), discharge limit {inverter_max_w}W, "
             f"charge limit 0 (force PV to grid; inverter DNO cap enforces grid limit)"
         )
         if not self.enable_remote_ems():
             return False
-        if not self.set_remote_ems_mode(0x05):
+        if not self.set_charge_limit(0):
             return False
         if not self.set_discharge_limit(inverter_max_w):
             return False
-        if not self.set_charge_limit(0):
+        if not self.set_remote_ems_mode(0x05):
             return False
         self.logger.info("Daytime export active: PV forced to grid, battery covers any shortfall")
         return True
@@ -1048,7 +1070,9 @@ class SigenergyModbus:
         persistent registers — their values survive mode changes on the inverter.
         A previous force_charge() or force_discharge() call leaves a stale limit
         that caps battery output even in self-consumption mode. Both are reset to
-        the inverter maximum (10000W) here on every transition to self-consumption.
+        the inverter maximum (self.inverter_max_w) here on every transition to
+        self-consumption — that used to be a hardcoded 10000, correct only on a
+        10 kW inverter and a silent discharge cap on any other.
         """
         self.logger.info("Setting Remote EMS: Max Self Consumption")
         if not self.enable_remote_ems():
@@ -1059,8 +1083,8 @@ class SigenergyModbus:
         # reset means a stale force-charge/discharge cap may still throttle the
         # battery in self-consumption, so report it (the manager's verify pass
         # re-asserts the limits next cycle either way).
-        ok_discharge = self.set_discharge_limit(10000)
-        ok_charge    = self.set_charge_limit(10000)
+        ok_discharge = self.set_discharge_limit(self.inverter_max_w)
+        ok_charge    = self.set_charge_limit(self.inverter_max_w)
         if not (ok_discharge and ok_charge):
             self.logger.error(
                 f"Self Consumption set but limit reset failed "

@@ -278,7 +278,19 @@ class ManagerSnapshot:
     export_active:          bool  = False   # export active (flood prevention v4.4, or legacy v3.x)
     corrected_today_kwh:    float = 0.0     # bias-corrected forecast for today (kWh)
     corrected_tomorrow_kwh: float = 0.0     # bias-corrected forecast for tomorrow (kWh)
-    bias_factor:            float = 1.0     # forecast correction (applied to hourly values)
+    # v5.65.0: the CONTROL path takes the per-day BAND factor, same as the
+    # corrected_*_kwh figures beside it. It used to take `biasFactor`, the overall
+    # kWh-weighted scalar whose own source comment in openmeteo_forecast.py reads
+    # "display only" — so one energy balance mixed two different correction
+    # scales. The bands diverge most exactly where it matters: on a raw-30 kWh day
+    # the band was 1.199 against a global 0.885, 35% apart, so the engine
+    # understated remaining solar on the marginal days where the 1.0 kWh overflow
+    # threshold sits on the boundary. On a bright day the two agree within 3%,
+    # which is why a sunny-afternoon spot check showed nothing wrong.
+    # `bias_factor` is kept (still published, still display) — this is a second,
+    # separately-sourced field, not a rename.
+    bias_factor:            float = 1.0     # global kWh-weighted scalar — DISPLAY ONLY
+    bias_factor_today:      float = 1.0     # per-day band factor — the control path uses THIS
 
     # Tariff data
     tariff: TariffData = field(default_factory=TariffData)
@@ -802,7 +814,11 @@ class BatteryManager:
                     if key_dt == now_hour:
                         wh *= max(0.0, (60 - now_naive.minute) / 60.0)
                     remaining_solar_kwh += wh / 1000.0
-            remaining_solar_kwh *= snapshot.bias_factor
+            # Per-day band, NOT the global scalar — see bias_factor_today on the
+            # snapshot. These buckets are the same _hourly_p50_today the dashboard
+            # scales by biasFactorToday, so this is the codebase's own convention;
+            # the engine was the one place not following it.
+            remaining_solar_kwh *= snapshot.bias_factor_today
 
         # ── 24h surplus (export eligibility) ───────────────────────────────
         # DELIBERATELY CONSERVATIVE (owner decision, 02-07-2026, closing the

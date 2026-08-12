@@ -163,6 +163,57 @@ class TestStormWatchLegacyAndGuards(unittest.TestCase):
         level, _ = _run(_feed(entry))
         self.assertEqual(level, "red")
 
+class TestCompoundHazardTokens(unittest.TestCase):
+    """v5.65.0 — MeteoAlarm joins compound hazards with an UNDERSCORE.
 
+    `_` is a word character in Python's re, so the `\b` boundaries could never
+    fire beside it and snow_ice / rain_flood / coastal_flooding were silently
+    discarded — while the hyphenated snow-ice matched perfectly. This is the
+    power-cut reserve feature: a missed warning means the 50% reserve never
+    engages and check_storm_level still reports a confident all-clear.
+
+    The word boundaries are KEPT deliberately, so the over-match guards below
+    are part of the contract, not decoration.
+    """
+
+    def _matches(self, text):
+        return bool(storm_watch._HAZARD_RE.search(storm_watch._normalise_hazard(text)))
+
+    def test_underscore_compounds_match(self):
+        for event in ("Yellow snow_ice warning", "Amber rain_flood warning",
+                      "Yellow coastal_flooding warning"):
+            with self.subTest(event=event):
+                self.assertTrue(self._matches(event),
+                    f"{event!r} is a power-cut hazard and must match")
+
+    def test_hyphen_and_slash_compounds_match(self):
+        for event in ("Yellow snow-ice warning", "Amber rain/flood warning"):
+            with self.subTest(event=event):
+                self.assertTrue(self._matches(event))
+
+    def test_bare_flood_matches(self):
+        """'flooding' was in the set but 'flood' was not, separators aside."""
+        self.assertTrue(self._matches("Amber flood warning"))
+
+    def test_plain_hazards_still_match(self):
+        for event in ("Yellow wind warning", "Amber thunderstorm warning",
+                      "Yellow snow warning", "Storm Bert wind warning"):
+            with self.subTest(event=event):
+                self.assertTrue(self._matches(event))
+
+    def test_non_power_cut_hazards_still_rejected(self):
+        """extreme_heat is underscored too — normalising must not sweep it in."""
+        for event in ("Amber extreme_heat warning", "Yellow fog warning"):
+            with self.subTest(event=event):
+                self.assertFalse(self._matches(event))
+
+    def test_word_boundaries_still_guard_against_substrings(self):
+        """The reason boundaries exist: the title-fallback path feeds sentences."""
+        for text in ("please note this service notice",
+                     "training exercise predicted",
+                     "hundreds of homes covered"):
+            with self.subTest(text=text):
+                self.assertFalse(self._matches(text),
+                    f"{text!r} must not read as a hazard")
 if __name__ == "__main__":
     unittest.main(verbosity=2)

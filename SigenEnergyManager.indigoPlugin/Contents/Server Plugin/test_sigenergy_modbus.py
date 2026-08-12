@@ -664,6 +664,126 @@ class TestForceChargeCutoffBackstop(unittest.TestCase):
         self.assertTrue(modbus.force_charge(10000, cutoff_soc=52.0))
 
 
+
+
+class TestInverterMaxIsNotHardcoded(unittest.TestCase):
+    """v5.65.0 — the rated power lives on the object, not as a literal 10000.
+
+    `set_self_consumption()` reset both persistent limit registers to a hardcoded
+    10000 W. That is exactly right on this 10 kW inverter and silently wrong on
+    any other: on a 15 kW machine every return to self-consumption capped battery
+    discharge at 10 kW until the next verify pass re-asserted it, and the mode
+    register read perfectly correct throughout. Invisible here, which is why
+    three prior reviews walked past it.
+    """
+
+    def test_self_consumption_uses_the_configured_rating(self):
+        modbus, mock_client = _make_modbus()
+        modbus.inverter_max_w = 15000
+
+        modbus.set_self_consumption()
+
+        discharge = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
+        charge    = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_CHARGE)
+        self.assertEqual(discharge[-1], 15000,
+            "discharge limit must follow the configured rating, not a literal 10000")
+        self.assertEqual(charge[-1], 15000,
+            "charge limit must follow the configured rating, not a literal 10000")
+
+    def test_default_rating_preserves_existing_behaviour(self):
+        """A 10 kW install must be byte-for-byte unchanged by this fix."""
+        modbus, mock_client = _make_modbus()
+
+        modbus.set_self_consumption()
+
+        self.assertEqual(modbus.inverter_max_w, 10000)
+        self.assertEqual(
+            _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)[-1], 10000)
+
+    def test_export_modes_default_to_the_configured_rating(self):
+        for method in ("night_export", "daytime_export"):
+            with self.subTest(method=method):
+                modbus, mock_client = _make_modbus()
+                modbus.inverter_max_w = 15000
+
+                getattr(modbus, method)()
+
+                discharge = _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)
+                self.assertEqual(discharge[-1], 15000,
+                    f"{method} must fall back to the object's rating")
+
+    def test_explicit_argument_still_wins(self):
+        modbus, mock_client = _make_modbus()
+        modbus.inverter_max_w = 15000
+
+        modbus.night_export(4000)
+
+        self.assertEqual(
+            _decode_write_registers_calls(mock_client, HOLD_ESS_MAX_DISCHARGE)[-1], 4000)
+
+
+class TestDaytimeExportWriteOrder(unittest.TestCase):
+    """v5.65.0 — charge limit 0 must be written BEFORE mode 0x05 is committed.
+
+    The whole reason daytime_export pins charge to 0 is that in mode 0x05 with the
+    charge limit open, high PV banks into the battery instead of going to grid —
+    measured on hardware 15-Jun-2026. Committing 0x05 first and pinning the limit
+    two writes later re-opens that exact window, and set_self_consumption leaves
+    the charge limit at inverter max, so the window is entered in precisely the
+    wrong state. Nothing downstream can detect it: the mode register reads a
+    correct 0x05 while the paid window exports nothing.
+    """
+
+    @staticmethod
+    def _record_order(modbus):
+        """Spy on the two calls whose ORDER is the contract, in one shared list.
+
+        The client's 16-bit and 32-bit writes go through separate mocks, so their
+        relative order is not recoverable from call_args_list. Spying on the
+        modbus methods records the one ordering that matters and reads as the
+        guarantee itself.
+        """
+        order = []
+        real_limit, real_mode = modbus.set_charge_limit, modbus.set_remote_ems_mode
+
+        def limit(watts, *a, **k):
+            order.append(("charge_limit", watts))
+            return real_limit(watts, *a, **k)
+
+        def mode(value, *a, **k):
+            order.append(("mode", value))
+            return real_mode(value, *a, **k)
+
+        modbus.set_charge_limit    = limit
+        modbus.set_remote_ems_mode = mode
+        return order
+
+    def test_charge_limit_zero_precedes_the_mode_commit(self):
+        modbus, _ = _make_modbus()
+        order = self._record_order(modbus)
+
+        self.assertTrue(modbus.daytime_export())
+
+        self.assertIn(("charge_limit", 0), order,
+                      "daytime_export must pin the charge limit to 0")
+        self.assertIn(("mode", 0x05), order,
+                      "daytime_export must commit mode 0x05")
+        self.assertLess(
+            order.index(("charge_limit", 0)), order.index(("mode", 0x05)),
+            "charge limit 0 must be written BEFORE mode 0x05 — committing the mode "
+            "first re-opens the greedy-charge window this method exists to close")
+
+    def test_night_export_is_unaffected(self):
+        """0x06 never pinned charge to 0 — this fix must not change it."""
+        modbus, _ = _make_modbus()
+        order = self._record_order(modbus)
+
+        self.assertTrue(modbus.night_export())
+
+        self.assertNotIn(("charge_limit", 0), order,
+                         "night_export must not start pinning the charge limit")
+
+
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
     unittest.main(verbosity=2)

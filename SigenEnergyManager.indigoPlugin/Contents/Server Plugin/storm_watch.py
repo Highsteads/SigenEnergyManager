@@ -137,10 +137,35 @@ _MA_SEVERITY_MAP = {"minor": "yellow", "moderate": "yellow",
 # Matched on WORD BOUNDARIES: bare substring matching made "ice" match
 # notice/service and "rain" match training — the title-fallback path feeds
 # whole sentences into this matcher, exactly where loose matching bites.
-_WIND_TYPES = {"wind", "thunderstorm", "thunderstorms", "storm",
-               "snow", "ice", "rain", "flooding"}
+# v5.65.0: MeteoAlarm's cap:event vocabulary joins compound hazards with an
+# UNDERSCORE — snow_ice, rain_flood, coastal_flooding — and `_` is a word
+# character in Python's re, so `\b` cannot fire beside it and every compound
+# token was silently discarded. Measured against the shipped regex: snow_ice,
+# rain_flood and coastal_flooding all MISSED while the hyphenated snow-ice
+# matched. The live UK feed carries the underscored form today.
+#
+# This is the power-cut reserve feature, so a missed warning means the 50%
+# reserve never engages, the plugin keeps exporting and grid-charging into the
+# warning, and check_storm_level returns a confident "no active warnings".
+#
+# Fix: normalise the separators BEFORE matching rather than trying to enumerate
+# every compound in the keyword set — a vocabulary we do not control. The word
+# boundaries stay: they are what stops "ice" matching notice/service and "rain"
+# matching training on the title-fallback path, and tests pin that.
+# "flood" joins "flooding" — a plain flood warning missed on its own, separators
+# or not.
+_WIND_TYPES = {"wind", "winds", "gale", "gales", "thunderstorm", "thunderstorms",
+               "storm", "storms", "snow", "ice", "rain", "flood", "flooding"}
 _HAZARD_RE = re.compile(
     r"\b(" + "|".join(sorted(_WIND_TYPES, key=len, reverse=True)) + r")\b")
+# Separators MeteoAlarm uses to join compound event tokens. Collapsed to spaces
+# so the word-boundary matcher can see each component word.
+_SEPARATOR_RE = re.compile(r"[_\-/]+")
+
+
+def _normalise_hazard(text):
+    """Lower-case and split compound tokens so `\\b` can match each component."""
+    return _SEPARATOR_RE.sub(" ", (text or "").lower())
 
 # Colour words likewise on word boundaries ("red" is a substring of
 # predicted/hundred/covered); worst of ALL matches wins, not first-found.
@@ -200,6 +225,13 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
     pending       = []   # warnings that exist but are beyond the activation horizon
     entries_total = 0    # CAP entries seen
     entries_known = 0    # entries whose schema we could read (cap:event or awareness_type)
+    # v5.65.0: events read successfully but rejected by the hazard filter. The
+    # rejection used to be a silent `continue`, so a vocabulary change (the
+    # underscore compounds) left no trace anywhere — and the schema-drift guard
+    # cannot catch it either, because such an entry parses fine and increments
+    # entries_known. Surfaced in the all-clear reason so "no warnings" can never
+    # again mean "warnings I could not read".
+    ignored       = []
 
     for entry in root.findall(".//atom:entry", ns):
         entries_total += 1
@@ -232,8 +264,13 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
             continue
 
         # --- Hazard filter (power-cut-relevant only, word-boundary match) ---
-        hazard_lower = hazard_text.lower()
+        # Separators collapsed first — see _normalise_hazard. A rejection is now
+        # logged at DEBUG: the old silent `continue` meant a vocabulary change
+        # left no trace anywhere, and the schema-drift guard cannot catch it
+        # either (the entry parsed fine, so entries_known was incremented).
+        hazard_lower = _normalise_hazard(hazard_text)
         if not _HAZARD_RE.search(hazard_lower):
+            ignored.append(hazard_text.strip())
             continue
 
         # --- Severity: colour word in the event/title first, then cap:severity,
@@ -320,5 +357,10 @@ def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"
         base = f"MeteoAlarm: no active wind/storm warnings covering {location_name}"
         if pending:
             base += " | " + " | ".join(pending[:2])
+        if ignored:
+            # Names what was seen and set aside, so a warning the filter cannot
+            # read is visible rather than indistinguishable from a quiet day.
+            base += (f" | {len(ignored)} non-power-cut event(s) ignored: "
+                     + ", ".join(sorted(set(ignored))[:3]))
         return "none", base
     return highest, " | ".join(reasons[:3])

@@ -486,10 +486,6 @@ class TestPartialFetch(unittest.TestCase):
         self.assertIsNotNone(self.f._cached_forecast)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLocalKeyToUtc(unittest.TestCase):
     """_local_key_to_utc — Open-Meteo returns LOCAL wall-clock keys, so this is
     where a timezone mistake turns into a forecast slot in the wrong hour.
@@ -529,3 +525,5 @@ class TestNowLocalIsAware(unittest.TestCase):
     def test_now_local_is_timezone_aware(self):
         fc = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
         self.assertIsNotNone(fc._now_local().tzinfo)
+if __name__ == "__main__":
+    unittest.main()

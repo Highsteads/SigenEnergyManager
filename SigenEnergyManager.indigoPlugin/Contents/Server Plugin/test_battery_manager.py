@@ -96,6 +96,8 @@ def _make_snapshot(
     dawn_target_pct=DAWN_TARGET,
     weekday_kwh=22.0,
     weekend_kwh=30.0,
+    bias_factor=1.0,
+    bias_factor_today=1.0,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -117,6 +119,8 @@ def _make_snapshot(
         dawn_times = {tomorrow_str: _tomorrow_dawn(hour=7)}
 
     return ManagerSnapshot(
+        bias_factor            = bias_factor,
+        bias_factor_today      = bias_factor_today,
         current_soc_pct        = soc_pct,
         capacity_kwh           = CAPACITY_KWH,
         efficiency             = EFFICIENCY,
@@ -1809,6 +1813,59 @@ class TestSolarOverflowHysteresis(unittest.TestCase):
 import time as time_module
 
 
+class TestControlPathUsesPerDayBandFactor(unittest.TestCase):
+    """v5.65.0 — the control path takes the per-day BAND factor, not the global scalar.
+
+    `_calculate_24h_balance` corrected its remaining-solar sum with `biasFactor`,
+    the overall kWh-weighted scalar that openmeteo_forecast.py's own source calls
+    "display only", while corrected_today_kwh / corrected_tomorrow_kwh in the SAME
+    balance are built from the per-day band. One energy balance, two scales.
+
+    It is not cosmetic: the term feeds the overflow physics gate, surplus_kwh,
+    battery_at_dusk / battery_at_dawn (hence import_needed) and the post-power-cut
+    early release. Live bands on 12-Aug-2026 put the 30 kWh band at 1.199 against
+    a global 0.885 — 35% apart on exactly the marginal days where the 1.0 kWh
+    overflow threshold sits, and within 3% on a bright day, which is why a sunny
+    afternoon spot check showed nothing wrong.
+    """
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _remaining(self, **kw):
+        """remaining_solar_kwh for a daytime snapshot with real buckets to sum.
+
+        is_daytime needs TODAY's dawn present as well as the P50 data, and the
+        P50 keys are local "YYYY-MM-DD HH:MM:SS" strings — the same shape
+        _make_sunny_p50 produces. A hand-rolled "HH:00" dict summed to zero and
+        the guard assertion below caught it.
+        """
+        today_str    = _today_str()
+        tomorrow_str = (datetime.now(timezone.utc).date()
+                        + timedelta(days=1)).strftime("%Y-%m-%d")
+        snap = _make_snapshot(
+            now_hour=12,
+            forecast_p50=_make_sunny_p50(),
+            dawn_times={today_str: _now(hour=7), tomorrow_str: _tomorrow_dawn(hour=7)},
+            **kw)
+        return self.bm._calculate_24h_balance(snap).remaining_solar_kwh
+
+    def test_remaining_solar_scales_by_the_per_day_band(self):
+        base   = self._remaining(bias_factor=1.0, bias_factor_today=1.0)
+        banded = self._remaining(bias_factor=0.5, bias_factor_today=2.0)
+
+        self.assertGreater(base, 0.0, "fixture must produce solar to scale")
+        self.assertAlmostEqual(
+            banded, base * 2.0, places=3,
+            msg="must scale by the per-day band (2.0), not the display-only "
+                "global scalar (0.5)")
+
+    def test_display_only_scalar_cannot_move_a_control_decision(self):
+        a = self._remaining(bias_factor=0.5, bias_factor_today=1.0)
+        b = self._remaining(bias_factor=1.5, bias_factor_today=1.0)
+
+        self.assertAlmostEqual(a, b, places=6,
+            msg="biasFactor is display-only — changing it must not move the engine")
 if __name__ == "__main__":
     print(f"Running {globals().get('PLUGIN_NAME', 'SigenEnergyManager')} battery_manager tests")
     unittest.main(verbosity=2)

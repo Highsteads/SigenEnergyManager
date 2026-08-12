@@ -2395,10 +2395,6 @@ class TestVppShortfallAlert(unittest.TestCase):
         p._set_vpp_discharge_cutoff.assert_called_once()
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestCostKwhVariables(unittest.TestCase):
     """v5.61.0 — the nine kWh variables are published from the SAME card as
     the costs beside them.
@@ -2950,3 +2946,177 @@ class TestVppHandbackConfirmation(unittest.TestCase):
         p.store  = {"vpp_state": plugin.VPP_IDLE, "vpp_handback_pending": True}
         p._vpp_transition(plugin.VPP_PRE_CHARGING)
         self.assertFalse(p.store["vpp_handback_pending"])
+
+class TestNoTestsStrandedBelowMain(unittest.TestCase):
+    """Every test class must sit ABOVE the `if __name__ == "__main__"` block.
+
+    `unittest.main()` calls sys.exit(), so a class defined BELOW that block is
+    never reached on a direct `python3 test_x.py` run — it is collected only by
+    an importing runner. The two disagreed silently: test_plugin.py ran 223
+    tests directly against 263 imported, and test_openmeteo_forecast.py 36
+    against 41, so 45 tests — including every VPP guard added in v5.61.1
+    through v5.64.0 — were invisible to anyone following the repo's own
+    documented "run it directly" instructions. CI used discover() and was fine,
+    which is exactly why nobody noticed.
+
+    Structural, not behavioural: it asserts the shape that keeps the other
+    tests reachable, so it has to be a test rather than a comment.
+    """
+
+    def test_no_class_defined_after_the_main_block(self):
+        import ast
+        import glob
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(here, "test_*.py"))):
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            main_line = None
+            for node in tree.body:
+                if (isinstance(node, ast.If)
+                        and isinstance(node.test, ast.Compare)
+                        and isinstance(node.test.left, ast.Name)
+                        and node.test.left.id == "__name__"):
+                    main_line = node.lineno
+            if main_line is None:
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.lineno > main_line:
+                    offenders.append(
+                        f"{os.path.basename(path)}:{node.lineno} {node.name}")
+        self.assertEqual(
+            offenders, [],
+            "test class(es) defined below the __main__ block are unreachable on "
+            "a direct run — move the __main__ block to the end of the file: "
+            + ", ".join(offenders))
+
+
+class TestScheduledImportRetraction(unittest.TestCase):
+    """v5.65.0 — a queued grid import must not outlive the decision that queued it.
+
+    ACTION_SCHEDULE_IMPORT stored a time that NOTHING cleared but the firing
+    itself. When a later evaluate stopped wanting the import the stored time
+    survived, fired with no fresh check, and the anti-oscillation guard in the
+    SELF_CONSUMPTION branch then HELD the unwanted import until the stored target
+    SOC was reached. On Tracker the midnight-deferral path arms this ~8 hours
+    ahead — a long time for the forecast to improve. Cost per occurrence: 10 kW
+    of grid import nobody wanted, against the whole point of the plugin.
+
+    Two lenses of the review found this independently, one via a changed
+    decision and one via pause.
+    """
+
+    def _p(self, action, scheduled=True, import_active=False, paused=False):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.modbus      = MagicMock()
+        p.modbus.connected = True
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        # The SELF_CONSUMPTION branch reads the last inverter poll to spot a stuck
+        # mode; an empty dict is the honest "nothing polled yet" state.
+        p.latest_inverter_data = {}
+        p._restore_import_cutoff = MagicMock()
+        p._set_import_cutoff     = MagicMock()
+        p._trigger_event         = MagicMock()
+        p.store = {
+            "import_active":         import_active,
+            "export_active":         False,
+            "manager_paused":        paused,
+            "import_scheduled_time": (datetime(2026, 8, 13, 0, 5, tzinfo=timezone.utc)
+                                      if scheduled else None),
+            "import_scheduled_logged": True,
+            "import_target_soc":     12.0,
+            "vpp_active":            False,
+        }
+        dec = MagicMock()
+        dec.action = action
+        return p, dec
+
+    def test_a_different_decision_retracts_the_schedule(self):
+        p, dec = self._p(plugin.ACTION_SELF_CONSUMPTION)
+
+        p._act_on_decision(dec)
+
+        self.assertIsNone(p.store["import_scheduled_time"],
+            "a decision other than SCHEDULE_IMPORT means the manager changed its "
+            "mind — the queued import must be retracted")
+
+    def test_the_schedule_survives_while_still_wanted(self):
+        """SCHEDULE_IMPORT is re-emitted every tick while the import is wanted."""
+        p, dec = self._p(plugin.ACTION_SCHEDULE_IMPORT)
+        dec.scheduled_time = datetime(2026, 8, 13, 0, 5, tzinfo=timezone.utc)
+
+        p._act_on_decision(dec)
+
+        self.assertIsNotNone(p.store["import_scheduled_time"])
+
+    def test_a_running_import_is_not_retracted_here(self):
+        """Stopping an in-flight import is STOP_IMPORT's job, not this guard's."""
+        p, dec = self._p(plugin.ACTION_SELF_CONSUMPTION, import_active=True)
+
+        p._act_on_decision(dec)
+
+        self.assertIsNotNone(p.store["import_scheduled_time"],
+            "must not clear bookkeeping out from under a running import")
+
+
+class TestScheduledImportSafety(unittest.TestCase):
+    """v5.65.0 — the firing path's own guards."""
+
+    def _p(self, target_soc, paused=False, due=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.modbus      = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        when = datetime.now(timezone.utc) - timedelta(minutes=1 if due else -60)
+        p.store = {
+            "import_scheduled_time": when,
+            "import_target_soc":     target_soc,
+            "manager_paused":        paused,
+            "import_active":         False,
+            "had_import_today":      False,
+        }
+        p._set_import_cutoff = MagicMock()
+        p._trigger_event     = MagicMock()
+        return p
+
+    def test_zero_target_does_not_become_a_100_percent_cutoff(self):
+        """`(target or 100.0)` turned 0.0 into 'charge to full'.
+
+        0.0 is exactly what an intervening completed import leaves behind, so the
+        backstop meant to STOP a runaway import became permission for one.
+        """
+        p = self._p(target_soc=0.0)
+
+        p._check_scheduled_import_impl()
+
+        self.assertTrue(p.modbus.force_charge.called)
+        cutoff = p.modbus.force_charge.call_args.kwargs["cutoff_soc"]
+        self.assertLess(cutoff, 100.0,
+            "a 0.0 target must fall back to the conservative default, not 100%")
+        self.assertAlmostEqual(cutoff, 15.0, places=3)
+
+    def test_a_paused_manager_does_not_fire_the_import(self):
+        p = self._p(target_soc=12.0, paused=True)
+
+        p._check_scheduled_import_impl()
+
+        self.assertFalse(p.modbus.force_charge.called,
+            "the schedule check runs outside the paused gate — it must refuse "
+            "to drive the inverter while the manager is paused")
+        self.assertIsNotNone(p.store["import_scheduled_time"],
+            "held, not cancelled — resuming should keep the queued import")
+
+    def test_power_follows_the_configured_inverter_rating(self):
+        p = self._p(target_soc=12.0)
+        p.pluginPrefs = {"inverterMaxKw": "15.0"}
+
+        p._check_scheduled_import_impl()
+
+        self.assertEqual(p.modbus.force_charge.call_args.args[0], 15000,
+            "hardcoded 10000 W was right only on a 10 kW inverter")
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

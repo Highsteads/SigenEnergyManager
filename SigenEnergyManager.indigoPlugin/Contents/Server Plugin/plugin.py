@@ -7,7 +7,73 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Opus 5
 # Date:        12-08-2026
-# Version:     5.64.0
+# Version:     5.65.0
+#
+# v5.65.0 (12-08-2026): DEEP REVIEW #4, BATCH A1 — the control-and-safety highs.
+# A 16-lens adversarially-verified review (187 confirmed findings, 0 critical,
+# 13 high) against v5.60.1/5.64.0. This batch ships the five that can mis-drive
+# the hardware or spend money on THIS install, plus the test-integrity fix that
+# protects every batch after it. Full register in
+# ~/.claude/plans/sem-deep-review-2026-08-10/.
+#
+# * TEST INTEGRITY FIRST. `unittest.main()` calls sys.exit(), so any class
+#   defined BELOW the `if __name__ == "__main__"` block was unreachable on a
+#   direct run. Measured: test_plugin.py ran 223 tests directly against 263
+#   imported, test_openmeteo_forecast 36 against 41 — 45 tests invisible,
+#   INCLUDING every VPP guard added in v5.61.1 through v5.64.0. CI uses
+#   discover() so it never noticed, while the repo's own documented command is
+#   the direct one. Blocks moved to the end of three files, plus a new
+#   TestNoTestsStrandedBelowMain that walks every test_*.py with ast. It caught
+#   me making the identical mistake twice while adding this batch's own tests.
+# * SCHEDULED IMPORT COULD OUTLIVE THE DECISION THAT QUEUED IT (found
+#   independently by two lenses — a changed decision, and pause).
+#   ACTION_SCHEDULE_IMPORT stored a time that nothing cleared but the firing
+#   itself, so when a later evaluate stopped wanting the import the stored time
+#   survived, fired with no fresh check, and the anti-oscillation guard then HELD
+#   the unwanted import until the stored target SOC was reached. On Tracker the
+#   midnight-deferral path arms this ~8 hours ahead. Now retracted centrally in
+#   _act_on_decision on any other action (never while an import is running —
+#   that is STOP_IMPORT's job), and cancelled by _disengage_to_safe_baseline so
+#   pause and sleep cancel the drive they had queued. _check_scheduled_import
+#   runs OUTSIDE the paused gate, so it also refuses directly while paused.
+# * A 0.0 TARGET BECAME A 100% CHARGE CUTOFF. `(target_soc or 100.0) + 3.0` —
+#   and 0.0 is exactly what an intervening completed import leaves behind, so the
+#   backstop meant to STOP a runaway import became permission for one. The firing
+#   path also hardcoded 10000 W; it now follows inverterMaxKw like START_IMPORT.
+# * THE CONTROL PATH USED THE DISPLAY-ONLY BIAS SCALAR. _calculate_24h_balance
+#   scaled remaining solar by `biasFactor`, the global kWh-weighted number whose
+#   own source comment reads "display only", while corrected_today/tomorrow in
+#   the SAME balance used the per-day BAND factor — one energy balance, two
+#   scales. Live bands 12-Aug: the 30 kWh band was 1.199 against a global 0.885,
+#   35% apart on exactly the marginal days where the 1.0 kWh overflow threshold
+#   sits, and within 3% on a bright day, which is why spot checks saw nothing.
+#   New snapshot field bias_factor_today; bias_factor kept for display.
+# * set_self_consumption() HARDCODED 10000 W for both limit registers — right on
+#   this 10 kW inverter, a silent discharge cap on any other for a whole verify
+#   interval after every return to self-consumption. The rating now lives on the
+#   modbus object (SigenergyModbus.inverter_max_w, fed from inverterMaxKw and
+#   refreshed on every prefs save), and night_export/daytime_export default to
+#   it, so a future mode method cannot reintroduce the hardcode by omission.
+# * daytime_export() COMMITTED MODE 0x05 BEFORE PINNING CHARGE=0 — the exact
+#   greedy-charge window the method exists to close, entered from
+#   self-consumption where the charge limit sits at inverter max. With 0x05 live
+#   and charge open, high PV banks into the battery instead of going to grid, so
+#   a paid VPP window silently exports nothing while the mode register reads a
+#   perfectly correct 0x05. Limits are now written BEFORE the mode commit.
+# * STORM WATCH COULD NOT SEE HALF THE WARNINGS. `_` is a word character, so the
+#   `\b` hazard boundaries could never fire beside it and MeteoAlarm's compound
+#   tokens (snow_ice, rain_flood, coastal_flooding) were silently discarded —
+#   measured against the shipped regex, while the hyphenated form matched. This
+#   is the power-cut reserve feature: a missed warning means the 50% reserve
+#   never engages and check_storm_level still returns a confident all-clear.
+#   Separators are now collapsed before matching, "flood" joins "flooding", the
+#   word boundaries are KEPT (notice/training/predicted still rejected, pinned by
+#   tests), and ignored events are NAMED in the all-clear reason so "no warnings"
+#   can never again mean "warnings I could not read".
+# * Tests 527 -> 588, every fix mutation-tested (mutant made to fail, restored).
+#   NB one fixture bug caught only by a deliberate assertGreater(base, 0) guard:
+#   a hand-rolled P50 shape summed to zero, and without that guard both
+#   assertions would have compared 0.0 to 0.0 and passed against the bug.
 #
 # v5.64.0 (12-08-2026): THE HAND-BACK AT WINDOW END WAS NEVER CONFIRMED.
 #   _end_vpp_export discarded set_self_consumption()'s return value, under a bare
@@ -5131,6 +5197,12 @@ class Plugin(indigo.PluginBase):
             consumption_profile     = self.store.get("consumption_profile", []),
             now                     = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
+            # v5.65.0: the control path's own factor. Falls back to biasFactor and
+            # then 1.0, so a forecast payload predating the bands still behaves as
+            # it did rather than silently dropping the correction altogether.
+            bias_factor_today           = float(
+                self.latest_forecast_data.get("biasFactorToday")
+                or self.latest_forecast_data.get("biasFactor", 1.0) or 1.0),
             vpp_active                  = self.store["vpp_active"],
             vpp_reserved_kwh            = vpp_reserved_kwh,
             vpp_today_kwh               = vpp_today_kwh,
@@ -5739,6 +5811,30 @@ class Plugin(indigo.PluginBase):
         prev_import = self.store["import_active"]
         prev_export = self.store["export_active"]
 
+        # ── Retract a stale scheduled import (v5.65.0) ──────────────────────
+        # ACTION_SCHEDULE_IMPORT armed a stored time that NOTHING ever cleared
+        # except the firing itself. The manager re-emits SCHEDULE_IMPORT on every
+        # tick while it still wants the import, so any other action means it has
+        # changed its mind — but the stored time survived, fired regardless with
+        # no fresh import_needed check, and the anti-oscillation guard in the
+        # SELF_CONSUMPTION branch then HELD the unwanted import until the stored
+        # target SOC was reached. On Tracker the midnight-deferral path can arm
+        # this ~8 hours ahead, which is a long time for the forecast to improve.
+        # Cost when it fires: 10 kW of grid import nobody wanted, against the
+        # self-sufficiency KPI, with one INFO line to show for it.
+        #
+        # Deliberately does NOT retract while an import is actually running —
+        # that is the STOP_IMPORT branch's job, and clearing here would strand
+        # the in-flight import's bookkeeping.
+        if (action != ACTION_SCHEDULE_IMPORT
+                and not prev_import
+                and self.store.get("import_scheduled_time") is not None):
+            log(f"[Manager] Scheduled import retracted — manager now wants "
+                f"'{action}' instead of the import it had queued for "
+                f"{_local_time(self.store['import_scheduled_time'])}")
+            self.store["import_scheduled_time"]   = None
+            self.store["import_scheduled_logged"] = False
+
         if action == ACTION_START_IMPORT:
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
@@ -6191,6 +6287,20 @@ class Plugin(indigo.PluginBase):
         if scheduled is None:
             return
 
+        # v5.65.0: this runs from the tick, OUTSIDE the paused gate in
+        # _evaluate_manager_impl — so a pause used to stop the manager deciding
+        # while leaving it free to fire a queued 10 kW import. _disengage_to_safe_baseline
+        # now cancels the schedule when pause is set, and this is the second lock
+        # on the same door: whatever route set the flag, a paused manager drives
+        # nothing. Left armed rather than cleared, so resuming keeps the schedule
+        # the manager will re-emit anyway if it still wants it.
+        if self.store.get("manager_paused", False):
+            if not self.store.get("import_scheduled_paused_logged"):
+                self.store["import_scheduled_paused_logged"] = True
+                log("[Manager] Scheduled import held — manager is paused")
+            return
+        self.store["import_scheduled_paused_logged"] = False
+
         now_utc = datetime.now(timezone.utc)
         # Normalise scheduled time to UTC if naive. A naive value here is local
         # wall-clock, so it needs localising (pytz) or stamping (zoneinfo) — the
@@ -6206,9 +6316,17 @@ class Plugin(indigo.PluginBase):
 
         if now_utc >= scheduled:
             log("[Manager] Scheduled import window reached - starting import")
-            target_soc = self.store.get("import_target_soc", 12.0)
-            cutoff     = min((target_soc or 100.0) + 3.0, 100.0)
-            if self.modbus and self.modbus.force_charge(10000, cutoff_soc=cutoff):
+            # v5.65.0: `(target_soc or 100.0)` turned a target of 0.0 into a 100%
+            # charge cutoff — and 0.0 is exactly what an intervening completed
+            # import leaves behind. The backstop meant to STOP a runaway import
+            # became permission for one. A missing/zero target is now the same
+            # conservative default the .get() already uses, not "charge to full".
+            target_soc = self.store.get("import_target_soc") or 12.0
+            cutoff     = min(target_soc + 3.0, 100.0)
+            # Power follows the configured inverter rating, as the START_IMPORT
+            # branch already does — 10000 was right only on a 10 kW machine.
+            power_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+            if self.modbus and self.modbus.force_charge(power_w, cutoff_soc=cutoff):
                 self.store["import_active"]      = True
                 self.store["import_target_soc"]  = target_soc
                 self.store["import_scheduled_time"] = None
@@ -7353,6 +7471,18 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_cutoff_raised"] = False
         self.store["import_active"]     = False
         self.store["export_active"]     = False
+        # 4. Cancel any QUEUED import (v5.65.0). _check_scheduled_import runs on
+        #    the tick regardless of pause — it sits outside the paused gate — so a
+        #    schedule armed before the pause fired anyway: a full-power grid import
+        #    at 00:05 with the device reading "Paused", left in Charge Grid First
+        #    with a raised charge cutoff for the rest of the hands-off period.
+        #    Pause and sleep both mean "stop driving the inverter", and that has to
+        #    include the drive we had queued.
+        if self.store.get("import_scheduled_time") is not None:
+            log(f"[{reason}] Cancelled the queued grid import that was due at "
+                f"{_local_time(self.store['import_scheduled_time'])}")
+            self.store["import_scheduled_time"]   = None
+            self.store["import_scheduled_logged"] = False
 
     def _end_vpp_export(self, now, event):
         """Stop the self-driven VPP export at window end (+2-min tail).
@@ -9679,6 +9809,12 @@ class Plugin(indigo.PluginBase):
             plant_address=plant_addr, inverter_address=inv_addr,
             logger=self.logger,
             sleep_func=self.sleep,
+            # v5.65.0: the modbus layer now holds the rated power itself, so a mode
+            # method can no longer reset the limits to a hardcoded 10000 W — right
+            # on this 10 kW inverter, a silent discharge cap on any other. Re-set
+            # on every prefs save (closedPrefsConfigUi) so a corrected pref takes
+            # effect without a restart.
+            inverter_max_w=int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000),
         )
         # Startup Modbus initialisations — connect once for all startup writes.
         # HOLD_ESS_MAX_DISCHARGE (40034) persists across mode changes on the inverter.
