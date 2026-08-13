@@ -5,7 +5,9 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Fable 5
 # Date:        13-08-2026
-# Version:     1.9 (grid frequency 31002, probe-confirmed by its drift)
+# Version:     1.10 (PCS internal temp, insulation resistance, PACK count and
+#              alarm word — all NAMED from the official V2.7 protocol PDF)
+#              prior 1.9 (grid frequency 31002, probe-confirmed by its drift)
 #              prior 1.8 (per-PV-string block read 31025 + decode_pv_strings();
 #              absent-latch so an install without the block stops probing it)
 #              prior 1.7 (internal RLock, connect health probe + escalating
@@ -92,6 +94,26 @@ INV_PV_STRING_BLOCK_COUNT  = 10
 # NOMINAL 50.00 Hz rating, not a measurement — as is 31000 at exactly 230.0 V.
 # A register that never moves is a nameplate, not a reading.
 INV_GRID_FREQUENCY_HZ      = 31002    # U16, gain 100, Hz
+# All of the following are named from the OFFICIAL Sigenergy Modbus Protocol
+# V2.7 (the public PDF; sigenergy.com serves it only to a browser User-Agent,
+# a bare curl gets a "Blocked" HTML page). Reading the spec named five
+# registers this plugin had probed but could not identify — and confirmed
+# every empirical call, including that 31000/31001 are RATED values and 31002
+# is the live measurement.
+INV_PCS_INTERNAL_TEMP_C    = 31003    # S16, gain 10, degC — the inverter's OWN
+                                      # temperature. An inverter running hot
+                                      # is a real fault signal and nothing in
+                                      # the estate was watching it.
+INV_PACK_COUNT             = 31024    # U16 — how many battery PACKS the stack
+                                      # holds, straight from the hardware.
+                                      # Better than dividing capacity by a
+                                      # module size we assume.
+INV_INSULATION_RESISTANCE  = 31037    # U16, gain 1000, MOhm — PV array
+                                      # insulation. A falling value means
+                                      # moisture ingress or damaged cable,
+                                      # which is a safety matter, not a
+                                      # performance one.
+INV_ALARM1                 = 30605    # U16 bitfield (Appendix 2). 0 = clear.
 
 # --- Plant holding registers (slave address 247, read/write) ---
 # Read with function 0x03, write single with 0x06, write multiple with 0x10
@@ -749,6 +771,33 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
+        # Inverter self-diagnostics (v1.10), all named from the official V2.7
+        # protocol. Every one is NON-critical: a failure costs its own key and
+        # never the snapshot.
+        pcs_temp = self._read_int16(INV_PCS_INTERNAL_TEMP_C, slave=inv_addr)
+        if pcs_temp is not None:
+            data["pcsInternalTempC"] = round(pcs_temp / 10.0, 1)
+        else:
+            inv_errors += 1
+
+        insul = self._read_uint16(INV_INSULATION_RESISTANCE, slave=inv_addr)
+        if insul is not None:
+            data["insulationResistanceMohm"] = round(insul / 1000.0, 3)
+        else:
+            inv_errors += 1
+
+        packs = self._read_uint16(INV_PACK_COUNT, slave=inv_addr)
+        if packs is not None:
+            data["packCount"] = packs
+        else:
+            inv_errors += 1
+
+        alarm1 = self._read_uint16(INV_ALARM1, slave=inv_addr)
+        if alarm1 is not None:
+            data["alarm1Raw"] = alarm1
+        else:
+            inv_errors += 1
+
         # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
         # NON-critical by design: a failure costs the pvStrings key this cycle,
         # never the snapshot. The absent-latch stops an install whose firmware
@@ -803,13 +852,13 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=8
+        # read_all issues this many register reads per cycle (Phase A=10, B=12
         # incl. the per-string block, D=4). Keep in step if reads are
         # added/removed so the "more than half failed" disconnect threshold and
         # the error-ratio log lines stay self-consistent. Once the per-string
         # absent-latch engages the real count drops back to 20 — acceptable
         # slack in a >half threshold, not worth a moving constant.
-        TOTAL_READS  = 22
+        TOTAL_READS  = 26
         total_errors = plant_errors + inv_errors
         if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
             self.logger.error(

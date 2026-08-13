@@ -203,6 +203,34 @@
                 <TriggerLabel>Pack temperature spread changed</TriggerLabel>
                 <ControlPageLabel>Pack Temp Spread (degC)</ControlPageLabel>
             </State>
+            <!-- Inverter self-diagnostics (v5.69.0), named from the official
+                 V2.7 protocol. Insulation resistance is a SAFETY reading: a
+                 falling value means moisture ingress or damaged DC cable. -->
+            <State id="pcsInternalTempC">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Inverter internal temperature changed</TriggerLabel>
+                <ControlPageLabel>Inverter Temp (degC)</ControlPageLabel>
+            </State>
+            <State id="insulationResistanceMohm">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV insulation resistance changed</TriggerLabel>
+                <ControlPageLabel>PV Insulation (MOhm)</ControlPageLabel>
+            </State>
+            <State id="inverterAlarm">
+                <ValueType>
+                    <List>
+                        <Option value="clear">No alarm</Option>
+                        <Option value="raised">Alarm raised</Option>
+                    </List>
+                </ValueType>
+                <TriggerLabel>Inverter alarm changed</TriggerLabel>
+                <ControlPageLabel>Inverter Alarm</ControlPageLabel>
+            </State>
+            <State id="inverterAlarmRaw">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Inverter alarm word changed</TriggerLabel>
+                <ControlPageLabel>Inverter Alarm Code</ControlPageLabel>
+            </State>
             <State id="packBalance">
                 <ValueType>
                     <List>

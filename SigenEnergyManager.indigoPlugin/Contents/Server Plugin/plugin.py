@@ -5,9 +5,95 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5
+# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69)
 # Date:        13-08-2026
-# Version:     5.67.0
+# Version:     5.69.0
+#
+# v5.69.0 (13-08-2026): READ THE DOCUMENTATION — five registers NAMED, and a
+#              correction. CliveS showed the mySigen app listing all four
+#              packs' SOC and asked whether I had looked at the docs and API.
+#              I had not: v5.68.0 concluded per-pack data "does not exist"
+#              from a probe alone, when what a probe can show is only "not at
+#              the addresses I tried". Worse, I had ABANDONED the most
+#              promising line — separate slave IDs for the packs — because
+#              the scan was slow, and then wrote absence as fact.
+#              THE CONCLUSION SURVIVES, on far better evidence. The official
+#              Sigenergy Modbus Protocol V2.7 PDF contains exactly TWO SoC
+#              registers, 30014 (plant) and 30601 (inverter), both aggregate,
+#              and no per-pack temperature at all; the most complete
+#              community implementation (sigenergy2mqtt, ~2200 lines of
+#              sensor definitions) exposes the PACK COUNT and no per-pack
+#              value; and slaves 2-5 do not answer. So per-pack SOC is NOT on
+#              the local Modbus interface — the app reads it from Sigenergy's
+#              CLOUD, which is a different channel with a richer model.
+#              (Fetching the spec needs a browser User-Agent; a bare curl
+#              gets a "Blocked" HTML page, same trap as the Indigo docs.)
+#              WHAT THE DOCS PAID FOR: five registers this plugin had probed
+#              but could not identify are now named and four are shipped —
+#              31003 [PCS] internal temperature (the inverter's OWN
+#              temperature, 58.9 degC live, and nothing in the estate was
+#              watching it), 31037 insulation resistance (a SAFETY reading:
+#              falling means moisture ingress or damaged DC cable), 31024
+#              PACK count (so `_pack_count` now ASKS THE HARDWARE instead of
+#              dividing capacity by an assumed 8.76 kWh module), and 30605
+#              Alarm1 (reported as raised/clear — the Appendix 2 decode is
+#              not carried, and inventing a description for a code we cannot
+#              name would be worse than saying "something is raised").
+#              THE DOCS ALSO GRADED v5.68.0'S GUESSWORK, and it held: 31000
+#              and 31001 are indeed "Rated grid voltage" and "Rated grid
+#              frequency" while 31002 is the live "Grid frequency" — exactly
+#              what the sampling had concluded from the fact that only 31002
+#              moved. A register that never moves is a nameplate, not a
+#              reading, and that test cost 80 seconds.
+#
+# v5.68.0 (13-08-2026): WHAT CAN HONESTLY BE SAID ABOUT THE FOUR BATTERY
+#              PACKS, PLUS GRID FREQUENCY. Asked for per-pack SOC and
+#              temperature, the answer had to start with a measurement: this
+#              inverter DOES NOT EXPOSE THEM. Probed register by register on
+#              13-08-2026 across the inverter space (30560-31400) and the
+#              plant battery area — every battery figure is an aggregate
+#              (SOC, SOH, average cell voltage) or a max/min ACROSS clusters.
+#              Nothing per-pack exists at any address, and separate slave IDs
+#              do not answer at all. A register in the spec is not a register
+#              on the hardware, and neither is one you wish for.
+#              BUT max, min AND mean over N identical packs still BOUND the
+#              distribution: the other N-2 must average (mean*N - max - min)
+#              / (N-2), so whichever end sits furthest from that middle is
+#              the odd one out. New pure `analyse_pack_balance` does exactly
+#              that and returns "even" / "one_hot" / "one_cold" — a genuine
+#              per-pack signal recovered from aggregates, and precisely what
+#              an average is designed to hide. On the live reading (34.9 avg,
+#              39.0 max, 32.4 min, 4 packs) the middle two must average 34.1,
+#              putting ONE PACK 4.9 degC clear of its siblings while the cold
+#              end is only 1.7 off — one pack running hot, which nothing in
+#              the system would otherwise show. It REFUSES to answer when the
+#              figures cannot support it: a middle falling outside [min, max]
+#              means the mean is not the mean of these packs, so every
+#              conclusion from it would be fiction. (That guard earned itself
+#              immediately by rejecting an invented test fixture of mine.)
+#              Only claims an outlier at >= 2 degC AND >= twice the other
+#              gap — one warm pack in a tight group is not news.
+#              NEW STATES: `packTempSpreadC` (Number, so the SQL Logger
+#              charts it — one reading says little, a spread widening over
+#              weeks is a pack going off), `packBalance` (List enum, so a
+#              trigger can fire on "one pack running hot"), and
+#              `gridFrequencyHz`. Frequency is register 31002, CONFIRMED by
+#              sampling rather than assumed: it drifted 49.98 -> 49.95 ->
+#              49.96 Hz over 80 s, which nothing but mains frequency does,
+#              while its neighbours sat at exactly 5000 and 2300 throughout —
+#              those are the NOMINAL 50.00 Hz and 230.0 V ratings, and a
+#              register that never moves is a nameplate, not a reading. It
+#              belongs beside the VPP work: a grid event is ultimately a
+#              frequency problem, so this is the quantity the whole scheme
+#              exists to defend. /api/status `battery` gains the temperatures,
+#              cell voltage, SOH, pack_count and pack_balance; new
+#              `grid_quality` block carries the frequency. Pack count is
+#              DERIVED (capacity / 8.76 kWh module = 4 here), never painted
+#              in, with `batteryPackCount` / `batteryModuleKwh` prefs for a
+#              stack that differs; an unknown count simply skips the
+#              inference. The whole balance block is wrapped on the state
+#              path — it carries SOC, and an advisory figure must never cost
+#              it. Tests 611 -> 620.
 #
 # v5.67.0 (13-08-2026): PER-PV-STRING READINGS. The inverter's 31025 block
 #              (probed live on this SigenStor 10 kW: [string_count, mppt_count,
@@ -3151,6 +3237,17 @@ class Plugin(indigo.PluginBase):
                     # A grid event is ultimately a frequency problem, so this
                     # is the quantity the whole VPP scheme exists to defend.
                     "frequency_hz": inv.get("gridFrequencyHz"),
+                },
+                "inverter_health": {
+                    # v5.69.0 — the inverter's own diagnostics, named from the
+                    # official V2.7 protocol.
+                    "pcs_temp_c":     inv.get("pcsInternalTempC"),
+                    "insulation_mohm": inv.get("insulationResistanceMohm"),
+                    # An alarm word we cannot decode is still worth reporting
+                    # as raised-or-clear; inventing a description for an
+                    # unknown code would be worse than saying "something is".
+                    "alarm": (None if inv.get("alarm1Raw") is None
+                              else ("clear" if int(inv["alarm1Raw"]) == 0 else "raised")),
                 },
                 "solar": {
                     "power_w":        pv_w,
@@ -8348,17 +8445,22 @@ class Plugin(indigo.PluginBase):
     def _pack_count(self):
         """How many battery modules the stack holds.
 
-        DERIVED, not painted in: a SigenStor module is 8.76 kWh, so the
-        configured capacity divides straight out (35.04 -> 4, 26.28 -> 3).
-        The module size is a product fact rather than this house's config,
-        and `batteryPackCount` overrides it for any stack that differs.
-        Returns 0 when it cannot be worked out — the pack-balance inference
-        then simply doesn't run, which is the right answer for a system whose
-        shape we do not know."""
+        ASK THE HARDWARE FIRST: register 31024 is the PACK/BCU count in the
+        official protocol, so the inverter simply tells us (4 here). That
+        beats the old arithmetic, which divided capacity by an assumed
+        8.76 kWh module — right for a SigenStor, a guess for anything else.
+        Order: explicit pref -> the register -> the division -> 0.
+
+        Returns 0 when it cannot be worked out, and the pack-balance
+        inference then simply doesn't run, which is the right answer for a
+        system whose shape we do not know."""
         prefs = getattr(self, "pluginPrefs", None) or {}
         override = _as_int(prefs.get("batteryPackCount"), 0)
         if override > 0:
             return override
+        reported = _as_int((getattr(self, "latest_inverter_data", None) or {}).get("packCount"), 0)
+        if 0 < reported <= 16:          # the protocol's own sanity bound
+            return reported
         module = _as_float(prefs.get("batteryModuleKwh"), 8.76)
         if module <= 0:
             return 0
@@ -8438,6 +8540,22 @@ class Plugin(indigo.PluginBase):
         if data.get("gridFrequencyHz") is not None:
             states.append(_num_state("gridFrequencyHz",
                                      _as_float(data.get("gridFrequencyHz"), 0.0), 2))
+        # Inverter self-diagnostics (v5.69.0), named from the official V2.7
+        # protocol. Each written only when actually read.
+        if data.get("pcsInternalTempC") is not None:
+            states.append(_num_state("pcsInternalTempC",
+                                     _as_float(data.get("pcsInternalTempC"), 0.0), 1))
+        if data.get("insulationResistanceMohm") is not None:
+            states.append(_num_state("insulationResistanceMohm",
+                                     _as_float(data.get("insulationResistanceMohm"), 0.0), 3))
+        if data.get("alarm1Raw") is not None:
+            # The raw word decodes via Appendix 2, which we do NOT carry — so
+            # report the honest binary fact (something is raised / nothing is)
+            # rather than inventing a description for a code we cannot name.
+            states.append({"key": "inverterAlarm",
+                           "value": "clear" if int(data["alarm1Raw"]) == 0 else "raised"})
+            states.append(_num_state("inverterAlarmRaw",
+                                     _as_float(data.get("alarm1Raw"), 0.0), 0))
         # Pack balance (v5.68.0). Charting the SPREAD is the point: a single
         # reading says little, but a spread that widens week on week is a
         # cooling problem or a pack going off, and nothing else in the system
