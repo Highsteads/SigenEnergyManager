@@ -7,7 +7,26 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69)
 # Date:        13-08-2026
-# Version:     5.70.0
+# Version:     5.71.0
+#
+# v5.71.0 (13-08-2026): THE REAL GRID VOLTAGE — 252.21 V, and the ceiling is
+#              253.0. Register 31000 is the 230 V NAMEPLATE; the measurement
+#              is 31011 (U32, gain 100), found by reading the phase-voltage
+#              table in the official protocol after the CLOUD reported an
+#              actual 251.34 V that no local register was showing. UK
+#              statutory range is 230 V +10%/-6% = 216.2 to 253.0, and an
+#              inverter MUST curtail or disconnect above the ceiling — so a
+#              high reading here is lost export revenue, and the cause is the
+#              DNO's network, not anything in this house. Sitting 0.8 V under
+#              the limit is worth knowing about. Also reads 31017 phase
+#              current. Both are Number states so the SQL Logger charts them:
+#              the useful question is not "what is it now" but "how often does
+#              it touch 253", which is a week of history rather than a
+#              reading. 0xFFFFFFFF is this firmware's "not applicable" for an
+#              unused phase and is rejected — taken at face value it decodes
+#              to 42,949,672.95 V. /api/status `grid_quality` gains voltage,
+#              current and both statutory limits so a dashboard never has to
+#              hardcode them.
 #
 # v5.70.0 (13-08-2026): THE CONFIGURED BATTERY CAPACITY IS WRONG, AND THE
 #              DASHBOARDS WOULD NOT HAVE FOLLOWED THE FIX. Two findings.
@@ -3283,6 +3302,14 @@ class Plugin(indigo.PluginBase):
                     # A grid event is ultimately a frequency problem, so this
                     # is the quantity the whole VPP scheme exists to defend.
                     "frequency_hz": inv.get("gridFrequencyHz"),
+                    # v5.71.0 — the REAL measured voltage (register 31011), not
+                    # the 230 V nameplate. UK statutory ceiling is 253.0 V and
+                    # an inverter must curtail above it, so a high reading here
+                    # costs export revenue and the cause is the DNO's network.
+                    "voltage_v":     inv.get("gridVoltageV"),
+                    "current_a":     inv.get("gridCurrentA"),
+                    "statutory_max_v": 253.0,
+                    "statutory_min_v": 216.2,
                 },
                 "inverter_health": {
                     # v5.69.0 — the inverter's own diagnostics, named from the
@@ -8594,6 +8621,15 @@ class Plugin(indigo.PluginBase):
         if data.get("insulationResistanceMohm") is not None:
             states.append(_num_state("insulationResistanceMohm",
                                      _as_float(data.get("insulationResistanceMohm"), 0.0), 3))
+        # Grid voltage (v5.71.0). Numeric so the SQL Logger charts it — the
+        # useful question is not "what is it now" but "how often does it touch
+        # 253 V", which is a week of history, not a reading.
+        if data.get("gridVoltageV") is not None:
+            states.append(_num_state("gridVoltageV",
+                                     _as_float(data.get("gridVoltageV"), 0.0), 2))
+        if data.get("gridCurrentA") is not None:
+            states.append(_num_state("gridCurrentA",
+                                     _as_float(data.get("gridCurrentA"), 0.0), 2))
         if data.get("alarm1Raw") is not None:
             # The raw word decodes via Appendix 2, which we do NOT carry — so
             # report the honest binary fact (something is raised / nothing is)

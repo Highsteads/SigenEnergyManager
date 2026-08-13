@@ -5,7 +5,9 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Fable 5
 # Date:        13-08-2026
-# Version:     1.10 (PCS internal temp, insulation resistance, PACK count and
+# Version:     1.11 (REAL grid voltage 31011 + current 31017, rated capacity
+#              30548 — the nameplate/measurement distinction again)
+#              prior 1.10 (PCS internal temp, insulation resistance, PACK count and
 #              alarm word — all NAMED from the official V2.7 protocol PDF)
 #              prior 1.9 (grid frequency 31002, probe-confirmed by its drift)
 #              prior 1.8 (per-PV-string block read 31025 + decode_pv_strings();
@@ -114,6 +116,13 @@ INV_INSULATION_RESISTANCE  = 31037    # U16, gain 1000, MOhm — PV array
                                       # which is a safety matter, not a
                                       # performance one.
 INV_ALARM1                 = 30605    # U16 bitfield (Appendix 2). 0 = clear.
+# THE REAL grid voltage — not 31000, which is the 230.0 V nameplate. This one
+# read 252.21 V on 13-08-2026 against a UK statutory ceiling of 253.0 V
+# (230 V +10%), and an inverter must curtail or disconnect above it. So a
+# high reading here is money: export gets cut, and the cause is the DNO's
+# network rather than anything in this house.
+INV_PHASE_A_VOLTAGE        = 31011    # U32 (2 regs), gain 100, V
+INV_PHASE_A_CURRENT        = 31017    # U32 (2 regs), gain 100, A
 INV_RATED_CAPACITY_KWH     = 30548    # U32 (2 regs), gain 100, kWh — the pack's
                                       # NAMEPLATE. Reads 36.16 here, agreeing
                                       # exactly with the plant's own 30083 and
@@ -813,6 +822,20 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
+        volts = self._read_uint32(INV_PHASE_A_VOLTAGE, slave=inv_addr)
+        # 0xFFFFFFFF is this firmware's "not applicable" for an unused phase,
+        # and it decodes to a nonsense 42949672.95 V if taken at face value.
+        if volts is not None and volts != 0xFFFFFFFF:
+            data["gridVoltageV"] = round(volts / 100.0, 2)
+        else:
+            inv_errors += 1
+
+        amps = self._read_uint32(INV_PHASE_A_CURRENT, slave=inv_addr)
+        if amps is not None and amps != 0xFFFFFFFF:
+            data["gridCurrentA"] = round(amps / 100.0, 2)
+        else:
+            inv_errors += 1
+
         # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
         # NON-critical by design: a failure costs the pvStrings key this cycle,
         # never the snapshot. The absent-latch stops an install whose firmware
@@ -867,13 +890,13 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=13
+        # read_all issues this many register reads per cycle (Phase A=10, B=15
         # incl. the per-string block, D=4). Keep in step if reads are
         # added/removed so the "more than half failed" disconnect threshold and
         # the error-ratio log lines stay self-consistent. Once the per-string
         # absent-latch engages the real count drops back to 20 — acceptable
         # slack in a >half threshold, not worth a moving constant.
-        TOTAL_READS  = 27
+        TOTAL_READS  = 29
         total_errors = plant_errors + inv_errors
         if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
             self.logger.error(

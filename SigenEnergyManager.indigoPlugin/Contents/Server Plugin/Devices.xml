@@ -216,6 +216,20 @@
                 <TriggerLabel>PV insulation resistance changed</TriggerLabel>
                 <ControlPageLabel>PV Insulation (MOhm)</ControlPageLabel>
             </State>
+            <!-- The MEASURED grid voltage, not the 230 V nameplate. UK
+                 statutory ceiling is 253.0 V; above it an inverter must
+                 curtail, so this is an export-revenue matter and the cause
+                 lies with the DNO. Trigger on it to catch the excursions. -->
+            <State id="gridVoltageV">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid voltage changed</TriggerLabel>
+                <ControlPageLabel>Grid Voltage (V)</ControlPageLabel>
+            </State>
+            <State id="gridCurrentA">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid current changed</TriggerLabel>
+                <ControlPageLabel>Grid Current (A)</ControlPageLabel>
+            </State>
             <State id="inverterAlarm">
                 <ValueType>
                     <List>
