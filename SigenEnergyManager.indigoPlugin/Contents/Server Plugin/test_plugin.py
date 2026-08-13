@@ -3244,6 +3244,74 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
         self.assertIs(v.get("lastVppPvSurvived"), True)
 
 
+class TestAnalysePackBalance(unittest.TestCase):
+    """analyse_pack_balance — recovering a per-pack signal from the three
+    aggregates the inverter actually publishes (v5.68.0).
+
+    The live fixture is the real reading taken while building this: average
+    34.9, hottest cluster 39.0, coldest 32.4, four packs. The middle two must
+    therefore average (34.9*4 - 39.0 - 32.4)/2 = 34.1, putting the hot end
+    4.9 degC clear of its siblings and the cold end only 1.7 — one pack
+    running hot, which the plant average alone can never show."""
+
+    def test_live_reading_finds_the_hot_pack(self):
+        b = plugin.analyse_pack_balance(34.9, 39.0, 32.4, 4)
+        self.assertEqual(b["verdict"], "one_hot")
+        self.assertAlmostEqual(b["middle_c"], 34.1, places=1)
+        self.assertAlmostEqual(b["hot_gap_c"], 4.9, places=1)
+        self.assertAlmostEqual(b["cold_gap_c"], 1.7, places=1)
+        self.assertAlmostEqual(b["spread_c"], 6.6, places=1)
+
+    def test_a_lone_cold_pack_is_found_the_same_way(self):
+        # Mean sits high, so the LOW end is the one out of step: the middle
+        # two must average (33.0*4 - 35.0 - 28.0)/2 = 34.5, which is 6.5 degC
+        # clear of the cold end and only 0.5 off the hot one.
+        # NB the first draft of this case used (34.0, 35.0, 28.0), which is
+        # arithmetically IMPOSSIBLE — it needs the middle two to average 36.5,
+        # above the reported maximum — and the guard rightly refused it. The
+        # fixture was wrong, not the code.
+        b = plugin.analyse_pack_balance(33.0, 35.0, 28.0, 4)
+        self.assertEqual(b["verdict"], "one_cold")
+        self.assertAlmostEqual(b["middle_c"], 34.5, places=1)
+
+    def test_an_evenly_spread_battery_claims_no_outlier(self):
+        b = plugin.analyse_pack_balance(30.0, 31.0, 29.0, 4)
+        self.assertEqual(b["verdict"], "even")
+
+    def test_a_wide_but_symmetric_spread_is_still_even(self):
+        # both ends equally far from the middle: nothing singles either out
+        b = plugin.analyse_pack_balance(30.0, 35.0, 25.0, 4)
+        self.assertEqual(b["verdict"], "even")
+
+    def test_a_small_gap_is_not_news_however_lopsided(self):
+        b = plugin.analyse_pack_balance(30.05, 30.2, 30.0, 4)
+        self.assertEqual(b["verdict"], "even")
+
+    def test_impossible_aggregates_return_nothing_rather_than_fiction(self):
+        # a mean outside [min, max] is not the mean of these packs, so every
+        # conclusion drawn from it would be invented
+        self.assertIsNone(plugin.analyse_pack_balance(50.0, 39.0, 32.4, 4))
+        self.assertIsNone(plugin.analyse_pack_balance(10.0, 39.0, 32.4, 4))
+        self.assertIsNone(plugin.analyse_pack_balance(34.9, 32.0, 39.0, 4))
+
+    def test_missing_or_junk_figures_return_nothing(self):
+        self.assertIsNone(plugin.analyse_pack_balance(None, 39.0, 32.4, 4))
+        self.assertIsNone(plugin.analyse_pack_balance(34.9, None, 32.4, 4))
+        self.assertIsNone(plugin.analyse_pack_balance(34.9, 39.0, None, 4))
+        self.assertIsNone(plugin.analyse_pack_balance("warm", 39.0, 32.4, 4))
+
+    def test_too_few_packs_to_have_an_outlier(self):
+        # with two packs the max and min ARE the packs — no middle to be
+        # unlike, and an unknown count (0) must not guess
+        self.assertIsNone(plugin.analyse_pack_balance(34.9, 39.0, 32.4, 2))
+        self.assertIsNone(plugin.analyse_pack_balance(34.9, 39.0, 32.4, 0))
+
+    def test_three_packs_still_works(self):
+        b = plugin.analyse_pack_balance(34.0, 40.0, 31.0, 3)
+        self.assertIsNotNone(b)
+        self.assertEqual(b["packs"], 3)
+
+
 class TestParsePvStringLabels(unittest.TestCase):
     """_parse_pv_string_labels — the pvStringLabels pref parser (v5.67.0)."""
 

@@ -5,7 +5,8 @@
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Fable 5
 # Date:        13-08-2026
-# Version:     1.8 (per-PV-string block read 31025 + decode_pv_strings();
+# Version:     1.9 (grid frequency 31002, probe-confirmed by its drift)
+#              prior 1.8 (per-PV-string block read 31025 + decode_pv_strings();
 #              absent-latch so an install without the block stops probing it)
 #              prior 1.7 (internal RLock, connect health probe + escalating
 #              back-off, outage early-abort, pvPowerWatts critical,
@@ -85,6 +86,12 @@ INV_BATTERY_MIN_TEMP       = 30621    # S16, gain 10, degC
 # ONE undefined address inside a block read fails the WHOLE transaction.
 INV_PV_STRING_BLOCK        = 31025    # U16 x 10 (count + mppts + 4 V/I pairs)
 INV_PV_STRING_BLOCK_COUNT  = 10
+# Grid frequency, probed and CONFIRMED live 13-08-2026 by sampling: it drifted
+# 49.98 -> 49.95 -> 49.96 Hz over 80 s, which nothing but mains frequency does.
+# Its neighbour 31001 sat at exactly 5000 throughout, so that one is the
+# NOMINAL 50.00 Hz rating, not a measurement — as is 31000 at exactly 230.0 V.
+# A register that never moves is a nameplate, not a reading.
+INV_GRID_FREQUENCY_HZ      = 31002    # U16, gain 100, Hz
 
 # --- Plant holding registers (slave address 247, read/write) ---
 # Read with function 0x03, write single with 0x06, write multiple with 0x10
@@ -732,6 +739,16 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
+        # Grid frequency (v1.9). NON-critical: a failure costs this key, never
+        # the snapshot. Worth having beside the VPP work — a grid event is
+        # ultimately a frequency problem, so this is the quantity the whole
+        # scheme exists to defend.
+        grid_hz = self._read_uint16(INV_GRID_FREQUENCY_HZ, slave=inv_addr)
+        if grid_hz is not None:
+            data["gridFrequencyHz"] = round(grid_hz / 100.0, 2)
+        else:
+            inv_errors += 1
+
         # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
         # NON-critical by design: a failure costs the pvStrings key this cycle,
         # never the snapshot. The absent-latch stops an install whose firmware
@@ -786,13 +803,13 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=7
+        # read_all issues this many register reads per cycle (Phase A=10, B=8
         # incl. the per-string block, D=4). Keep in step if reads are
         # added/removed so the "more than half failed" disconnect threshold and
         # the error-ratio log lines stay self-consistent. Once the per-string
         # absent-latch engages the real count drops back to 20 — acceptable
         # slack in a >half threshold, not worth a moving constant.
-        TOTAL_READS  = 21
+        TOTAL_READS  = 22
         total_errors = plant_errors + inv_errors
         if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
             self.logger.error(

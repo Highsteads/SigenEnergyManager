@@ -190,6 +190,30 @@
                 <TriggerLabel>PV string 4 watts changed</TriggerLabel>
                 <ControlPageLabel>PV String 4 (W)</ControlPageLabel>
             </State>
+            <!-- Grid quality + battery pack balance (v5.68.0). The spread is
+                 numeric so the SQL Logger charts it: one reading says little,
+                 a spread that widens over weeks is a pack going off. -->
+            <State id="gridFrequencyHz">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid frequency changed</TriggerLabel>
+                <ControlPageLabel>Grid Frequency (Hz)</ControlPageLabel>
+            </State>
+            <State id="packTempSpreadC">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Pack temperature spread changed</TriggerLabel>
+                <ControlPageLabel>Pack Temp Spread (degC)</ControlPageLabel>
+            </State>
+            <State id="packBalance">
+                <ValueType>
+                    <List>
+                        <Option value="even">Packs even</Option>
+                        <Option value="one_hot">One pack running hot</Option>
+                        <Option value="one_cold">One pack running cold</Option>
+                    </List>
+                </ValueType>
+                <TriggerLabel>Pack balance changed</TriggerLabel>
+                <ControlPageLabel>Pack Balance</ControlPageLabel>
+            </State>
             <State id="modbusConnected">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Modbus connection changed</TriggerLabel>

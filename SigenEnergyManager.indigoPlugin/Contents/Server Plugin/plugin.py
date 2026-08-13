@@ -1839,6 +1839,60 @@ def _atomic_write_json(path, data, indent=2):
     os.replace(tmp, path)
 
 
+def analyse_pack_balance(avg_c, max_c, min_c, packs=4, outlier_c=2.0):
+    """Infer how the battery packs differ, from the three aggregates the
+    inverter actually publishes. Pure — the test seam.
+
+    WHY THIS EXISTS: this inverter's Modbus exposes NO per-pack registers
+    (probed register by register 13-08-2026 across the inverter and plant
+    spaces — every battery figure is an average or a max/min across
+    clusters). But max, min AND mean over N identical packs still bound the
+    distribution: the other N-2 packs must average
+        (mean*N - max - min) / (N - 2)
+    so whichever end sits furthest from that middle is the odd one out. With
+    four packs that is enough to say "one is running hot" — which the plant
+    average alone can never show, because it is exactly what an average
+    hides.
+
+    Returns None when the inputs cannot support the inference, rather than a
+    confident answer built on nothing:
+      * any figure missing
+      * fewer than 3 packs (nothing to be an outlier FROM)
+      * a middle that falls outside [min, max] — arithmetically impossible,
+        so the mean is not the mean of these packs and every conclusion
+        drawn from it would be fiction
+
+    verdict: "even" | "one_hot" | "one_cold". Only claims an outlier when
+    that end is at least outlier_c away from the middle AND at least twice
+    as far as the other end — one warm pack in a tight group is not news.
+    """
+    try:
+        avg = float(avg_c); hi = float(max_c); lo = float(min_c)
+        n = int(packs)
+    except (TypeError, ValueError):
+        return None
+    if n < 3 or hi < lo:
+        return None
+    middle = (avg * n - hi - lo) / (n - 2)
+    if middle < lo - 0.05 or middle > hi + 0.05:
+        return None                      # the aggregates disagree — say nothing
+    hot_gap = hi - middle
+    cold_gap = middle - lo
+    verdict = "even"
+    if hot_gap >= outlier_c and hot_gap >= cold_gap * 2:
+        verdict = "one_hot"
+    elif cold_gap >= outlier_c and cold_gap >= hot_gap * 2:
+        verdict = "one_cold"
+    return {
+        "spread_c":   round(hi - lo, 1),
+        "middle_c":   round(middle, 1),
+        "hot_gap_c":  round(hot_gap, 1),
+        "cold_gap_c": round(cold_gap, 1),
+        "verdict":    verdict,
+        "packs":      n,
+    }
+
+
 def _parse_pv_string_labels(raw, count):
     """Parse the pvStringLabels pref into exactly `count` label dicts.
 
@@ -3078,6 +3132,25 @@ class Plugin(indigo.PluginBase):
                     # its own 35.04 literal, which is wrong for anyone else
                     # running the plugin.
                     "capacity_kwh": BATTERY_CAPACITY_KWH,
+                    # v5.68.0 — what CAN be said about the individual packs.
+                    # The inverter publishes no per-pack registers, but the
+                    # three aggregates below bound the distribution, and
+                    # analyse_pack_balance turns them into a verdict. None
+                    # when the figures cannot support one.
+                    "temp_c":       inv.get("batteryTempC"),
+                    "temp_max_c":   inv.get("batteryMaxTempC"),
+                    "temp_min_c":   inv.get("batteryMinTempC"),
+                    "cell_v":       inv.get("batteryCellVoltage"),
+                    "soh_pct":      inv.get("batterySoh"),
+                    "pack_count":   self._pack_count(),
+                    "pack_balance": analyse_pack_balance(
+                        inv.get("batteryTempC"), inv.get("batteryMaxTempC"),
+                        inv.get("batteryMinTempC"), self._pack_count()),
+                },
+                "grid_quality": {
+                    # A grid event is ultimately a frequency problem, so this
+                    # is the quantity the whole VPP scheme exists to defend.
+                    "frequency_hz": inv.get("gridFrequencyHz"),
                 },
                 "solar": {
                     "power_w":        pv_w,
@@ -8272,6 +8345,30 @@ class Plugin(indigo.PluginBase):
     # Device State Updates
     # ================================================================
 
+    def _pack_count(self):
+        """How many battery modules the stack holds.
+
+        DERIVED, not painted in: a SigenStor module is 8.76 kWh, so the
+        configured capacity divides straight out (35.04 -> 4, 26.28 -> 3).
+        The module size is a product fact rather than this house's config,
+        and `batteryPackCount` overrides it for any stack that differs.
+        Returns 0 when it cannot be worked out — the pack-balance inference
+        then simply doesn't run, which is the right answer for a system whose
+        shape we do not know."""
+        prefs = getattr(self, "pluginPrefs", None) or {}
+        override = _as_int(prefs.get("batteryPackCount"), 0)
+        if override > 0:
+            return override
+        module = _as_float(prefs.get("batteryModuleKwh"), 8.76)
+        if module <= 0:
+            return 0
+        n = int(round(BATTERY_CAPACITY_KWH / module))
+        # Only trust a clean division — a capacity that is not a whole number
+        # of modules means the module size is wrong for this stack.
+        if n < 1 or abs(n * module - BATTERY_CAPACITY_KWH) > 0.5:
+            return 0
+        return n
+
     def _pv_strings_status(self, inv):
         """Per-string list for /api/status: [{n, label, v, a, w, kwp?}, ...].
 
@@ -8337,6 +8434,28 @@ class Plugin(indigo.PluginBase):
             states.append(_num_state(f"pv{i}Volts", s.get("v"), 1))
             states.append(_num_state(f"pv{i}Amps",  s.get("a"), 2))
             states.append(_num_state(f"pv{i}Watts", s.get("w"), 0))
+        # Grid frequency (v5.68.0) — same rule: only when actually read.
+        if data.get("gridFrequencyHz") is not None:
+            states.append(_num_state("gridFrequencyHz",
+                                     _as_float(data.get("gridFrequencyHz"), 0.0), 2))
+        # Pack balance (v5.68.0). Charting the SPREAD is the point: a single
+        # reading says little, but a spread that widens week on week is a
+        # cooling problem or a pack going off, and nothing else in the system
+        # would show it. Written only when the inference actually held.
+        # Wrapped whole: this is the write that carries SOC, and an advisory
+        # figure must never be able to cost it (the v5.58.0 rule — an extra
+        # on the drive path never breaks the thing it rides on).
+        try:
+            bal = analyse_pack_balance(data.get("batteryTempC"),
+                                       data.get("batteryMaxTempC"),
+                                       data.get("batteryMinTempC"),
+                                       self._pack_count())
+        except Exception as exc:
+            self.logger.debug(f"pack-balance skipped: {exc}")
+            bal = None
+        if bal:
+            states.append(_num_state("packTempSpreadC", bal["spread_c"], 1))
+            states.append({"key": "packBalance", "value": bal["verdict"]})
         dev.updateStatesOnServer(states)
         dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 
