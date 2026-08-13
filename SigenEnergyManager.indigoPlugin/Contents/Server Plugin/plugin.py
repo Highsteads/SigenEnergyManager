@@ -5,9 +5,30 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Opus 5
-# Date:        12-08-2026
-# Version:     5.66.0
+# Author:      CliveS & Claude Fable 5
+# Date:        13-08-2026
+# Version:     5.67.0
+#
+# v5.67.0 (13-08-2026): PER-PV-STRING READINGS. The inverter's 31025 block
+#              (probed live on this SigenStor 10 kW: [string_count, mppt_count,
+#              V1, I1 .. V4, I4], V gain 10, I gain 100; four powers summed to
+#              the plant PV total +6.8%, DC vs AC) is read once per poll cycle
+#              as a single transaction (sigenergy_modbus v1.8: _read_block_u16 +
+#              pure decode_pv_strings; NON-critical, and an absent-latch stops
+#              an install whose firmware lacks the block paying a failing read
+#              every cycle for ever — the 50000 pre-heat lesson). Each string
+#              lands as inverter device states pv1Volts/Amps/Watts..pv4 (Number,
+#              so the SQL Logger charts each string's day — that history is what
+#              will NAME the strings: East peaks mid-morning, West in the
+#              evening) and in /api/status solar.strings as [{n, label, v, a,
+#              w, kwp?}]. Labels from the new pvStringLabels pref ("South:4.275,
+#              East:4.275, ..." — kWp optional, for capacity-scaled bars),
+#              default PV1..PVn until a clear day names the curves; parsing is
+#              the pure _parse_pv_string_labels. States written only for
+#              strings actually reported — a transient block failure must not
+#              chart a phantom string dropout. Consumed by Dashboards v2.78.0
+#              (per-string strip + the actual-vs-expected solar progress chart,
+#              which itself needs no SEM change).
 #
 # v5.66.0 (12-08-2026): PV FELL TO ZERO MID-WINDOW AND WAS REPORTED AS CURTAILED.
 #              The PV verdict in _summarise_vpp_event was a bare `min_pv_w > 100`
@@ -1818,6 +1839,36 @@ def _atomic_write_json(path, data, indent=2):
     os.replace(tmp, path)
 
 
+def _parse_pv_string_labels(raw, count):
+    """Parse the pvStringLabels pref into exactly `count` label dicts.
+
+    Format: comma-separated names, each optionally carrying that string's kWp
+    after a colon — "South:4.275, East:4.275, West:2.85, NE:2.85". Blank or
+    short input pads with PV1..PVn, so the dashboards always get one label per
+    reported string and an unnamed install reads PV1-PV4 rather than nothing.
+    kWp is optional because the string→roof mapping is unknown until a clear
+    day names the curves; a junk kWp becomes None, never a dropped label.
+    Pure — the test seam."""
+    out = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, _, kwp_txt = part.partition(":")
+            name = name.strip()
+            try:
+                kwp = float(kwp_txt.strip())
+            except (TypeError, ValueError):
+                kwp = None
+        else:
+            name, kwp = part, None
+        out.append({"label": (name or f"PV{len(out) + 1}")[:20], "kwp": kwp})
+    while len(out) < count:
+        out.append({"label": f"PV{len(out) + 1}", "kwp": None})
+    return out[:count]
+
+
 ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo variables
 
 # Storm-level hierarchy (mirrors storm_watch._LEVELS)
@@ -3042,6 +3093,10 @@ class Plugin(indigo.PluginBase):
                     "peak_time":             store.get("peak_pv_time", ""),
                     "lifetime_kwh":          inv.get("pvLifetimeKwh"),
                     "total_kwp":             self._total_kwp(),
+                    # v5.67.0: live per-PV-string readings. [] when the
+                    # inverter doesn't report them — the dashboards hide the
+                    # strip rather than drawing invented zeros.
+                    "strings":               self._pv_strings_status(inv),
                 },
                 "grid": {
                     "power_w": grid_w,
@@ -8217,6 +8272,25 @@ class Plugin(indigo.PluginBase):
     # Device State Updates
     # ================================================================
 
+    def _pv_strings_status(self, inv):
+        """Per-string list for /api/status: [{n, label, v, a, w, kwp?}, ...].
+
+        [] when the inverter reports none — consumers hide rather than invent.
+        kwp rides along only when the pvStringLabels pref supplies it, so the
+        dashboards can scale each string's bar to its own capacity once the
+        string→roof mapping is named."""
+        strings = (inv or {}).get("pvStrings") or []
+        labels = _parse_pv_string_labels(
+            self.pluginPrefs.get("pvStringLabels", ""), len(strings))
+        out = []
+        for i, s in enumerate(strings):
+            entry = {"n": i + 1, "label": labels[i]["label"],
+                     "v": s.get("v"), "a": s.get("a"), "w": s.get("w")}
+            if labels[i]["kwp"]:
+                entry["kwp"] = labels[i]["kwp"]
+            out.append(entry)
+        return out
+
     def _update_inverter_device(self, data):
         """Push Modbus data to sigenergyInverter device."""
         dev = self._find_device("sigenergyInverter")
@@ -8254,6 +8328,15 @@ class Plugin(indigo.PluginBase):
             {"key": "modbusConnected",          "value": "True"},
             {"key": "lastUpdate",               "value": data.get("lastUpdate", "")},
         ]
+        # Per-PV-string readings (v5.67.0). Written only for strings the
+        # inverter actually reported — an unreported string's states stay at
+        # their last value rather than being stamped with a fabricated 0
+        # (states are only meaningful alongside a present pvStrings key, and
+        # a transient block failure must not chart a phantom string dropout).
+        for i, s in enumerate((data.get("pvStrings") or [])[:4], start=1):
+            states.append(_num_state(f"pv{i}Volts", s.get("v"), 1))
+            states.append(_num_state(f"pv{i}Amps",  s.get("a"), 2))
+            states.append(_num_state(f"pv{i}Watts", s.get("w"), 0))
         dev.updateStatesOnServer(states)
         dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 

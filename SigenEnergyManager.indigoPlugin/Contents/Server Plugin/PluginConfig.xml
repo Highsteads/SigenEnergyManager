@@ -54,6 +54,12 @@
     <Field id="siteArraysInfo" type="label">
         <Label>Example (one line per array, paste as a single JSON line): [{"name":"South","tilt":34,"azimuth":-13,"kwp":4.275,"shade":0.86},{"name":"West","tilt":32,"azimuth":77,"kwp":2.850,"shade":0.85}]. tilt=degrees from horizontal (0=flat, 90=vertical), azimuth=Open-Meteo convention (0=South, 90=West, -90=East, 180=North). If the JSON fails to parse, the built-in default is used and an ERROR is logged.</Label>
     </Field>
+    <Field id="pvStringLabels" type="textfield" defaultValue="">
+        <Label>PV string names (comma-separated, in PV1..PV4 order; blank = PV1, PV2...):</Label>
+    </Field>
+    <Field id="pvStringLabelsInfo" type="label">
+        <Label>Names the inverter's per-string readings on the dashboards. Optionally add each string's kWp after a colon so its bar can be scaled to capacity — e.g. "South:4.275, East:4.275, West:2.85, NE:2.85". The order is the inverter's own PV input order, which may not match the array order above; watch each string's morning/evening curve on a clear day to identify them before naming.</Label>
+    </Field>
 
     <Field id="separator_octopus" type="separator"/>
     <Field id="label_octopus" type="label">

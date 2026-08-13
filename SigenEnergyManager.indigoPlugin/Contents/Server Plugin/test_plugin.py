@@ -3244,5 +3244,34 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
         self.assertIs(v.get("lastVppPvSurvived"), True)
 
 
+class TestParsePvStringLabels(unittest.TestCase):
+    """_parse_pv_string_labels — the pvStringLabels pref parser (v5.67.0)."""
+
+    def test_blank_pads_pv_names(self):
+        out = plugin._parse_pv_string_labels("", 4)
+        self.assertEqual([x["label"] for x in out], ["PV1", "PV2", "PV3", "PV4"])
+        self.assertTrue(all(x["kwp"] is None for x in out))
+
+    def test_names_with_kwp(self):
+        out = plugin._parse_pv_string_labels(
+            "South:4.275, East:4.275, West:2.85, NE:2.85", 4)
+        self.assertEqual([x["label"] for x in out], ["South", "East", "West", "NE"])
+        self.assertEqual([x["kwp"] for x in out], [4.275, 4.275, 2.85, 2.85])
+
+    def test_short_input_pads_and_long_input_trims(self):
+        out = plugin._parse_pv_string_labels("South, East", 4)
+        self.assertEqual([x["label"] for x in out], ["South", "East", "PV3", "PV4"])
+        out = plugin._parse_pv_string_labels("A,B,C,D,E", 2)
+        self.assertEqual(len(out), 2)
+
+    def test_junk_kwp_keeps_the_label(self):
+        out = plugin._parse_pv_string_labels("South:lots", 1)
+        self.assertEqual(out[0]["label"], "South")
+        self.assertIsNone(out[0]["kwp"])
+
+    def test_zero_count_returns_empty(self):
+        self.assertEqual(plugin._parse_pv_string_labels("South", 0), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

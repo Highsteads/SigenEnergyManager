@@ -44,6 +44,7 @@ from sigenergy_modbus import (
     HOLD_GRID_MAX_EXPORT_LIMIT,
     HOLD_REMOTE_EMS_ENABLE,
     HOLD_REMOTE_EMS_MODE,
+    decode_pv_strings,
 )
 
 
@@ -521,7 +522,7 @@ class TestSignedRegisterDecode(unittest.TestCase):
         self.assertEqual(self.modbus._read_int32(30000), 65536)
 
 
-from sigenergy_modbus import PLANT_BATTERY_SOC, PLANT_ESS_SOH   # noqa: E402
+from sigenergy_modbus import PLANT_BATTERY_SOC, PLANT_ESS_SOH, INV_PV_STRING_BLOCK   # noqa: E402
 
 
 class TestReadAllPartial(unittest.TestCase):
@@ -545,6 +546,14 @@ class TestReadAllPartial(unittest.TestCase):
         for name in ("_read_uint16", "_read_int16", "_read_int32",
                      "_read_uint32", "_read_uint64"):
             setattr(m, name, _rd(100))
+
+        # The v1.8 per-string block primitive: a valid 4-string block unless
+        # its address is in the fail set.
+        def _blk(register, count, slave=None, *a, **k):
+            if register in fail:
+                return None
+            return [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
+        m._read_block_u16 = _blk
         return m
 
     def test_all_present_returns_dict(self):
@@ -563,13 +572,41 @@ class TestReadAllPartial(unittest.TestCase):
         self.assertNotIn("batterySoh", data)
         self.assertIn("batterySoc", data)        # critical data still delivered
 
+    def test_pv_strings_delivered_when_block_reads(self):
+        data = self._mk().read_all()
+        self.assertIsNotNone(data)
+        self.assertEqual(len(data.get("pvStrings", [])), 4)
+        self.assertEqual(data["pvStrings"][2]["w"], 2048)
+
+    def test_missing_pv_string_block_is_noncritical(self):
+        data = self._mk(fail_addrs={INV_PV_STRING_BLOCK}).read_all()
+        self.assertIsNotNone(data)               # snapshot survives
+        self.assertNotIn("pvStrings", data)      # key absent, never []-invented
+
+    def test_pv_string_absent_latch_after_three_misses(self):
+        """Three consecutive block failures on a healthy link latch the read
+        off — and once latched it is NOT retried even if the register would
+        now answer (re-probe is a restart, by design)."""
+        m = self._mk(fail_addrs={INV_PV_STRING_BLOCK})
+        for _ in range(3):
+            self.assertIsNotNone(m.read_all())
+        self.assertTrue(m._pv_strings_absent)
+        calls = []
+        def _blk_ok(register, count, slave=None, *a, **k):
+            calls.append(register)
+            return [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
+        m._read_block_u16 = _blk_ok
+        data = m.read_all()
+        self.assertNotIn("pvStrings", data)
+        self.assertEqual(calls, [])              # latched = not even attempted
+
     def test_majority_errors_marks_disconnected(self):
         m = SigenergyModbus("192.168.1.49")
         m._connected         = True
         m._last_request_time = 0
         m._sleep             = lambda _s: None
         for name in ("_read_uint16", "_read_int16", "_read_int32",
-                     "_read_uint32", "_read_uint64"):
+                     "_read_uint32", "_read_uint64", "_read_block_u16"):
             setattr(m, name, lambda *a, **k: None)   # everything fails
         self.assertIsNone(m.read_all())
         self.assertFalse(m._connected)
@@ -782,6 +819,55 @@ class TestDaytimeExportWriteOrder(unittest.TestCase):
 
         self.assertNotIn(("charge_limit", 0), order,
                          "night_export must not start pinning the charge limit")
+
+
+class TestDecodePvStrings(unittest.TestCase):
+    """decode_pv_strings — the pure per-string block decoder (v1.8).
+
+    The happy-path fixture is the REAL block read off the live inverter on
+    13-08-2026 (plant total PV 6142 W at the same instant), not an invented
+    shape — the fixture-shares-the-mistake lesson from v5.60.0."""
+
+    LIVE_BLOCK = [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
+
+    def test_live_probe_block_decodes_four_strings(self):
+        out = decode_pv_strings(self.LIVE_BLOCK)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[0], {"v": 210.1, "a": 6.33, "w": 1330})
+        self.assertEqual(out[1], {"v": 308.1, "a": 6.24, "w": 1923})
+        self.assertEqual(out[2], {"v": 314.6, "a": 6.51, "w": 2048})
+        self.assertEqual(out[3], {"v": 204.4, "a": 6.15, "w": 1257})
+
+    def test_live_probe_powers_sum_near_plant_total(self):
+        # DC-side string powers exceed the AC plant total by conversion losses
+        # — measured +6.8% on the live probe. Pin the band loosely so a decode
+        # regression (wrong gain, swapped V/I) fails loudly: a gain slip is a
+        # factor of 10, nowhere near the band.
+        total = sum(s["w"] for s in decode_pv_strings(self.LIVE_BLOCK))
+        self.assertGreater(total, 6142 * 0.95)
+        self.assertLess(total, 6142 * 1.20)
+
+    def test_count_register_trims_the_pairs(self):
+        two = decode_pv_strings([2, 2, 2101, 633, 3081, 624, 0, 0, 0, 0])
+        self.assertEqual(len(two), 2)
+        self.assertEqual(two[1]["w"], 1923)
+
+    def test_count_beyond_available_pairs_is_capped(self):
+        # A bigger inverter reporting 6 strings through a 10-register read
+        # yields the 4 pairs the block carries, not an index error.
+        out = decode_pv_strings([6, 6, 2101, 633, 3081, 624, 3146, 651, 2044, 615])
+        self.assertEqual(len(out), 4)
+
+    def test_night_block_decodes_to_zero_watt_strings(self):
+        out = decode_pv_strings([4, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(len(out), 4)
+        self.assertTrue(all(s["w"] == 0 for s in out))
+
+    def test_malformed_input_returns_empty_never_invents(self):
+        self.assertEqual(decode_pv_strings(None), [])
+        self.assertEqual(decode_pv_strings([]), [])
+        self.assertEqual(decode_pv_strings([4]), [])
+        self.assertEqual(decode_pv_strings([0, 0, 1, 2]), [])   # count 0
 
 
 if __name__ == "__main__":

@@ -126,6 +126,70 @@
                 <TriggerLabel>Daily home changed</TriggerLabel>
                 <ControlPageLabel>Home Daily (kWh)</ControlPageLabel>
             </State>
+            <!-- Per-PV-string readings (v5.67.0) — live V/A/W per string from
+                 the inverter's 31025 block. Numeric so the SQL Logger charts
+                 each string's day. Written only for strings the inverter
+                 reports; on a 2-string install pv3/pv4 simply never write. -->
+            <State id="pv1Volts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 1 volts changed</TriggerLabel>
+                <ControlPageLabel>PV String 1 (V)</ControlPageLabel>
+            </State>
+            <State id="pv1Amps">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 1 amps changed</TriggerLabel>
+                <ControlPageLabel>PV String 1 (A)</ControlPageLabel>
+            </State>
+            <State id="pv1Watts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 1 watts changed</TriggerLabel>
+                <ControlPageLabel>PV String 1 (W)</ControlPageLabel>
+            </State>
+            <State id="pv2Volts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 2 volts changed</TriggerLabel>
+                <ControlPageLabel>PV String 2 (V)</ControlPageLabel>
+            </State>
+            <State id="pv2Amps">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 2 amps changed</TriggerLabel>
+                <ControlPageLabel>PV String 2 (A)</ControlPageLabel>
+            </State>
+            <State id="pv2Watts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 2 watts changed</TriggerLabel>
+                <ControlPageLabel>PV String 2 (W)</ControlPageLabel>
+            </State>
+            <State id="pv3Volts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 3 volts changed</TriggerLabel>
+                <ControlPageLabel>PV String 3 (V)</ControlPageLabel>
+            </State>
+            <State id="pv3Amps">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 3 amps changed</TriggerLabel>
+                <ControlPageLabel>PV String 3 (A)</ControlPageLabel>
+            </State>
+            <State id="pv3Watts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 3 watts changed</TriggerLabel>
+                <ControlPageLabel>PV String 3 (W)</ControlPageLabel>
+            </State>
+            <State id="pv4Volts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 4 volts changed</TriggerLabel>
+                <ControlPageLabel>PV String 4 (V)</ControlPageLabel>
+            </State>
+            <State id="pv4Amps">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 4 amps changed</TriggerLabel>
+                <ControlPageLabel>PV String 4 (A)</ControlPageLabel>
+            </State>
+            <State id="pv4Watts">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV string 4 watts changed</TriggerLabel>
+                <ControlPageLabel>PV String 4 (W)</ControlPageLabel>
+            </State>
             <State id="modbusConnected">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Modbus connection changed</TriggerLabel>

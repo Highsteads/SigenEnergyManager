@@ -4,9 +4,12 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Fable 5
-# Date:        02-07-2026
-# Version:     1.7 (internal RLock, connect health probe + escalating back-off,
-#              outage early-abort, pvPowerWatts critical, verify-mismatch=False)
+# Date:        13-08-2026
+# Version:     1.8 (per-PV-string block read 31025 + decode_pv_strings();
+#              absent-latch so an install without the block stops probing it)
+#              prior 1.7 (internal RLock, connect health probe + escalating
+#              back-off, outage early-abort, pvPowerWatts critical,
+#              verify-mismatch=False)
 #
 # Register map reviewed against Sigenergy Modbus Protocol V2.9 (2026-05-13).
 # V2.9 is STILL the current protocol as of 21-07-2026 — re-checked that day after
@@ -73,6 +76,15 @@ INV_BATTERY_AVG_TEMP       = 30603    # S16, gain 10, degC
 INV_BATTERY_AVG_VOLTAGE    = 30604    # U16, gain 1000, V
 INV_BATTERY_MAX_TEMP       = 30620    # S16, gain 10, degC
 INV_BATTERY_MIN_TEMP       = 30621    # S16, gain 10, degC
+# Per-PV-string block, probed live on this SigenStor 10 kW 1ph 13-08-2026:
+# [string_count, mppt_count, V1, I1, V2, I2, V3, I3, V4, I4]. V gain 10
+# (200-320 V here — string voltages match the panel counts, 9x~34 V ≈ 310 V,
+# 6x ≈ 205 V), I gain 100. The four V*I powers summed to the plant PV total
+# +6.8% (DC side vs AC total), which is the confirmation the pairs are real.
+# Read EXACTLY this many registers: 31035+ is undefined on this firmware and
+# ONE undefined address inside a block read fails the WHOLE transaction.
+INV_PV_STRING_BLOCK        = 31025    # U16 x 10 (count + mppts + 4 V/I pairs)
+INV_PV_STRING_BLOCK_COUNT  = 10
 
 # --- Plant holding registers (slave address 247, read/write) ---
 # Read with function 0x03, write single with 0x06, write multiple with 0x10
@@ -168,6 +180,36 @@ GRID_STATUSES = {
 MIN_REQUEST_INTERVAL = 1.0
 
 
+def decode_pv_strings(regs):
+    """Decode the 31025 per-string block into [{"v", "a", "w"}, ...].
+
+    regs is the raw U16 list [count, mppts, V1, I1, ...]. Pure and
+    side-effect-free — the test seam. The count register is trusted only up
+    to the number of V/I pairs the block actually carries (4 in a 10-register
+    read), so a bigger inverter reporting 6 strings yields the first 4 rather
+    than an index error. Anything short or malformed returns [] — an absent
+    reading must never fabricate a string at 0 W.
+    """
+    if not regs or len(regs) < 4:
+        return []
+    try:
+        count = int(regs[0])
+    except (TypeError, ValueError):
+        return []
+    pairs_available = (len(regs) - 2) // 2
+    count = max(0, min(count, pairs_available))
+    out = []
+    for i in range(count):
+        try:
+            volts = int(regs[2 + i * 2]) / 10.0
+            amps = int(regs[3 + i * 2]) / 100.0
+        except (TypeError, ValueError):
+            return []
+        out.append({"v": round(volts, 1), "a": round(amps, 2),
+                    "w": int(round(volts * amps))})
+    return out
+
+
 def _locked(fn):
     """Serialise a primitive on the instance's RLock.
 
@@ -228,6 +270,14 @@ class SigenergyModbus:
         self._reconnect_delay_max  = 120
         self._reconnect_delay      = self._reconnect_delay_base
         self._last_request_time    = 0.0
+        # Per-string block absent-latch. The 31025 block exists on this
+        # firmware but may not on others (the 50000 pre-heat lesson: a spec
+        # register is not a hardware register). Three consecutive failures of
+        # ONLY this block latch it off for the life of the process, so an
+        # install without it does not burn a throttled failing read — and a
+        # debug line — every cycle for ever. A restart re-probes.
+        self._pv_strings_absent    = False
+        self._pv_strings_misses    = 0
         # sleep_func: callable taking seconds. When called from a plugin thread,
         # pass plugin.sleep so StopThread can interrupt the 1s throttle delay
         # between Modbus requests (read_all does ~16 reads = up to 16s blocking).
@@ -414,6 +464,43 @@ class SigenergyModbus:
             return None
 
     @_locked
+    def _read_block_u16(self, register, count, slave=None):
+        """Read `count` consecutive U16 registers in ONE transaction.
+
+        Returns the raw register list, or None on any failure. One throttled
+        request however many registers, which is why the per-string block is
+        a single call rather than ten _read_uint16s. NB a block containing
+        even one undefined address fails whole — size reads exactly.
+        """
+        if slave is None:
+            slave = self.plant_address
+        if not self._connected:
+            return None
+        self._throttle()
+        try:
+            result = self.client.read_holding_registers(
+                address=register, count=count, device_id=slave
+            )
+            if result.isError():
+                self.logger.debug(
+                    f"Error reading regs {register}-{register + count - 1} "
+                    f"(slave {slave}): {result}")
+                return None
+            return list(result.registers)
+        except (ModbusException, ConnectionException) as e:
+            self.logger.error(
+                f"Modbus read error regs {register}-{register + count - 1} "
+                f"(slave {slave}): {e}")
+            self._connected = False
+            return None
+        except Exception as e:
+            self.logger.error(
+                f"Unexpected read error regs {register}-{register + count - 1} "
+                f"(slave {slave}): {e}")
+            self._connected = False
+            return None
+
+    @_locked
     def _read_int32(self, register, slave=None):
         """Read a signed 32-bit value from two consecutive registers."""
         if slave is None:
@@ -529,7 +616,9 @@ class SigenergyModbus:
           dischargeCutoffSoc, batterySoh, batteryDailyChargeKwh,
           batteryDailyDischargeKwh, batteryTempC, batteryCellVoltage,
           batteryMaxTempC, batteryMinTempC, homePowerWatts,
-          modbusConnected, lastUpdate
+          modbusConnected, lastUpdate,
+          pvStrings (v1.8 — [{v, a, w}, ...] per PV string; key absent when
+          the block fails or the firmware lacks it, never an empty guess)
         """
         if not self._connected:
             if not self.connect():
@@ -643,6 +732,29 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
+        # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
+        # NON-critical by design: a failure costs the pvStrings key this cycle,
+        # never the snapshot. The absent-latch stops an install whose firmware
+        # lacks the block from paying a failing throttled read every cycle.
+        if not self._pv_strings_absent:
+            string_regs = self._read_block_u16(
+                INV_PV_STRING_BLOCK, INV_PV_STRING_BLOCK_COUNT, slave=inv_addr)
+            if string_regs is not None:
+                data["pvStrings"] = decode_pv_strings(string_regs)
+                self._pv_strings_misses = 0
+            else:
+                inv_errors += 1
+                if self._connected:
+                    # The link is up and only this block failed — count it as
+                    # a real "register absent" strike, not an outage symptom.
+                    self._pv_strings_misses += 1
+                    if self._pv_strings_misses >= 3:
+                        self._pv_strings_absent = True
+                        self.logger.info(
+                            "Per-PV-string registers (31025+) not answering on "
+                            "this inverter — per-string readings disabled until "
+                            "the next plugin restart.")
+
         # --- Phase D: Plant daily/lifetime energy registers ---
         # pvLifetimeKwh / gridImportLifetimeKwh / gridExportLifetimeKwh are LIFETIME
         # totals; plugin.py computes daily values as (current - start-of-day snapshot).
@@ -674,10 +786,13 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=6, D=4).
-        # Keep in step if reads are added/removed so the "more than half failed"
-        # disconnect threshold and the error-ratio log lines stay self-consistent.
-        TOTAL_READS  = 20
+        # read_all issues this many register reads per cycle (Phase A=10, B=7
+        # incl. the per-string block, D=4). Keep in step if reads are
+        # added/removed so the "more than half failed" disconnect threshold and
+        # the error-ratio log lines stay self-consistent. Once the per-string
+        # absent-latch engages the real count drops back to 20 — acceptable
+        # slack in a >half threshold, not worth a moving constant.
+        TOTAL_READS  = 21
         total_errors = plant_errors + inv_errors
         if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
             self.logger.error(
