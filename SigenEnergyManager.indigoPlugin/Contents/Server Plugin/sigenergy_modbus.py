@@ -114,6 +114,15 @@ INV_INSULATION_RESISTANCE  = 31037    # U16, gain 1000, MOhm — PV array
                                       # which is a safety matter, not a
                                       # performance one.
 INV_ALARM1                 = 30605    # U16 bitfield (Appendix 2). 0 = clear.
+INV_RATED_CAPACITY_KWH     = 30548    # U32 (2 regs), gain 100, kWh — the pack's
+                                      # NAMEPLATE. Reads 36.16 here, agreeing
+                                      # exactly with the plant's own 30083 and
+                                      # with the cloud, while the plugin was
+                                      # configured for 35.04. Published for
+                                      # comparison, NOT used for control: the
+                                      # measured SOC-to-kWh relationship (~35.6)
+                                      # is what a percentage actually converts
+                                      # at, and rated is not the same thing.
 
 # --- Plant holding registers (slave address 247, read/write) ---
 # Read with function 0x03, write single with 0x06, write multiple with 0x10
@@ -798,6 +807,12 @@ class SigenergyModbus:
         else:
             inv_errors += 1
 
+        rated = self._read_uint32(INV_RATED_CAPACITY_KWH, slave=inv_addr)
+        if rated is not None:
+            data["ratedCapacityKwh"] = round(rated / 100.0, 2)
+        else:
+            inv_errors += 1
+
         # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
         # NON-critical by design: a failure costs the pvStrings key this cycle,
         # never the snapshot. The absent-latch stops an install whose firmware
@@ -852,13 +867,13 @@ class SigenergyModbus:
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=12
+        # read_all issues this many register reads per cycle (Phase A=10, B=13
         # incl. the per-string block, D=4). Keep in step if reads are
         # added/removed so the "more than half failed" disconnect threshold and
         # the error-ratio log lines stay self-consistent. Once the per-string
         # absent-latch engages the real count drops back to 20 — acceptable
         # slack in a >half threshold, not worth a moving constant.
-        TOTAL_READS  = 26
+        TOTAL_READS  = 27
         total_errors = plant_errors + inv_errors
         if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
             self.logger.error(

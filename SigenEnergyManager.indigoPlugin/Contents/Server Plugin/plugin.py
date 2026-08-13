@@ -7,7 +7,41 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69)
 # Date:        13-08-2026
-# Version:     5.69.0
+# Version:     5.70.0
+#
+# v5.70.0 (13-08-2026): THE CONFIGURED BATTERY CAPACITY IS WRONG, AND THE
+#              DASHBOARDS WOULD NOT HAVE FOLLOWED THE FIX. Two findings.
+#              (1) `/api/status` published the module CONSTANT
+#              (BATTERY_CAPACITY_KWH) while every control path — the 24h
+#              balance, the dawn reserve, flood prevention — reads the
+#              `batteryCapacityKwh` PREF with the constant only as a
+#              fallback. They agree today at 35.04 purely BY COINCIDENCE, so
+#              the moment the pref is corrected the dashboards would have
+#              silently disagreed with the battery logic, with nothing to
+#              show it. Status now reads the pref, like everything else.
+#              (2) 35.04 is not the right number. The pack's NAMEPLATE is
+#              36.16 kWh, agreed to the decimal by THREE independent sources
+#              — plant register 30083, inverter register 30548 (both newly
+#              read, gain 100) and the Sigenergy cloud's own systems list.
+#              But rated capacity is not what a SOC percentage converts at,
+#              so it was MEASURED instead, from six days of logged history:
+#              ten clean runs where only one energy counter moved give an
+#              implied capacity of 35.33 kWh from discharge and 35.85 from
+#              charge. Those BRACKET the truth — metered charge over-states
+#              (round-trip losses) and metered discharge under-states — so
+#              the real figure is ~35.6 kWh, and the bracket is the evidence
+#              rather than a single reading. Configured 35.04 therefore
+#              under-states stored energy by ~1.6%; the nameplate would
+#              over-state it by the same. `rated_capacity_kwh` is now
+#              published alongside so the two can never quietly drift again.
+#              THE PREF ITSELF IS CliveS's TO SET — it feeds battery control
+#              decisions, so this release exposes the evidence and changes no
+#              behaviour. (The history query needed FORWARD-FILL to work at
+#              all: the SQL Logger writes only CHANGED values, so a row
+#              carrying a new SOC usually has null counters, and the first
+#              pass — which required all three columns present — found ZERO
+#              runs in six days. The documented sparse-row trap, walked into
+#              in person.)
 #
 # v5.69.0 (13-08-2026): READ THE DOCUMENTATION — five registers NAMED, and a
 #              correction. CliveS showed the mySigen app listing all four
@@ -3217,7 +3251,19 @@ class Plugin(indigo.PluginBase):
                     # hardcoding this system's pack size — energy.html carried
                     # its own 35.04 literal, which is wrong for anyone else
                     # running the plugin.
-                    "capacity_kwh": BATTERY_CAPACITY_KWH,
+                    # v5.70.0: read the PREF, not the module constant. Every
+                    # control path (_calculate_24h_balance, the dawn reserve,
+                    # flood prevention) uses the pref with the constant only
+                    # as a fallback, so publishing the constant here meant the
+                    # dashboards would have silently disagreed with the battery
+                    # logic the moment the pref was changed — and it is about
+                    # to be, since the rated capacity is 36.16 kWh and the
+                    # measured SOC-to-kWh relationship is ~35.6, not 35.04.
+                    "capacity_kwh": _as_float(
+                        self.pluginPrefs.get("batteryCapacityKwh"), BATTERY_CAPACITY_KWH),
+                    # The inverter's own nameplate (register 30548 / plant
+                    # 30083), for comparison against the configured figure.
+                    "rated_capacity_kwh": inv.get("ratedCapacityKwh"),
                     # v5.68.0 — what CAN be said about the individual packs.
                     # The inverter publishes no per-pack registers, but the
                     # three aggregates below bound the distribution, and
