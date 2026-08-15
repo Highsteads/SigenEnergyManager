@@ -5,9 +5,52 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69)
-# Date:        13-08-2026
-# Version:     5.71.0
+# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1)
+# Date:        15-08-2026
+# Version:     5.71.1
+#
+# v5.71.1 (15-08-2026): A QUEUED IMPORT COULD FIRE INSIDE A PAID EXPORT WINDOW.
+#              Found by asking what Predbat's #4520 ("boost the import rate during
+#              an Axle export event, not just export") lands on us, not from any
+#              symptom. Their fix is planner pricing — an export event pays a
+#              premium, so charging through it forfeits that premium and their
+#              planner had no cost for it. The same opportunity cost is ours.
+#              The manager itself was already safe: BatteryManager.evaluate() is
+#              first-match-wins and step 1 is the VPP override, sitting ABOVE the
+#              import branch, and _verify_ems_registers deliberately stands down
+#              through PRE_CHARGING/ACTIVE. But _check_scheduled_import_impl runs
+#              from the 10s TICK and gated only on `manager_paused` — it fired on
+#              the clock alone. The manager evaluate that would retract the queue
+#              runs on the ~15-MINUTE cycle, and that retraction is skipped once
+#              an import is already running. So a schedule armed for a time inside
+#              a window started Charge Grid First at up to inverterMaxKw
+#              mid-export: buying at the import rate through the hour we are paid
+#              to sell, with the verify loop standing down and ACTION_VPP_EXPORT
+#              only re-driving the export (it never clears import_active, so the
+#              store then claimed import AND export together).
+#              Now gated on vpp_state, mirroring the manager_paused gate right
+#              above it, and HELD rather than cancelled — the battery still wants
+#              that charge, so it fires once the window closes; a gate that
+#              silently became an exclusion would be the worse fault.
+#              PRE_CHARGING is included (the plugin is already grid-charging to
+#              its own target there, and a second charge command with its own
+#              cutoff would fight it). ANNOUNCED is deliberately NOT — that can be
+#              hours ahead, and charging BEFORE a window is the arbitrage this
+#              plugin exists to do.
+#              actionForceGridImport carried the same fault plus one of its own:
+#              it sets export_active False beneath a state machine still driving
+#              the export. REFUSED there rather than held, because a person is
+#              behind that one and deserves an answer; pause the manager to
+#              override.
+#              LIKELIHOOD WAS LOW AND IS ABOUT TO RISE: on Tracker the deferral
+#              path rarely arms (no cheap window) and events are evening while
+#              imports are overnight — but CliveS leaves Tracker in October, and
+#              on a time-of-use tariff the queue arms nightly. The midnight
+#              deferral can arm ~8 hours ahead.
+#              Tests 620 -> 630; 6 of the 10 verified FAILING against 5.71.0, the
+#              other 4 deliberate both-sides guards (announced still fires, idle
+#              still fires, an absent vpp_state is not a permanent block, and the
+#              manual action still works when idle).
 #
 # v5.71.0 (13-08-2026): THE REAL GRID VOLTAGE — 252.21 V, and the ceiling is
 #              253.0. Register 31000 is the 230 V NAMEPLATE; the measurement
@@ -6622,6 +6665,33 @@ class Plugin(indigo.PluginBase):
             return
         self.store["import_scheduled_paused_logged"] = False
 
+        # v5.71.1: the same door, for a VPP window. This runs from the TICK, so it
+        # fires on the clock alone — while the manager's own override (which returns
+        # ACTION_VPP_EXPORT and would retract the schedule) only re-evaluates on the
+        # ~15-minute cycle, and that retraction is skipped once an import is running.
+        # A schedule armed for a time inside a window therefore fired mid-export:
+        # Charge Grid First at up to inverterMaxKw, buying at the import rate through
+        # the very hour we are being paid a premium to sell, with _verify_ems_registers
+        # deliberately standing down for the duration so nothing corrected it.
+        # Predbat reached the same conclusion from the planning side in #4520 — an
+        # export event makes importing expensive by exactly the premium it forfeits.
+        #
+        # HELD, not cancelled: the battery still wants that charge, so the schedule
+        # stays armed and fires once the window closes. PRE_CHARGING is included
+        # because the plugin is already grid-charging to its own target there, and a
+        # second charge command with its own cutoff would fight it. ANNOUNCED is NOT
+        # included — that can be hours ahead, and charging before a window is the
+        # arbitrage this plugin exists to do.
+        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        if _vpp_state in (VPP_PRE_CHARGING, VPP_ACTIVE):
+            if not self.store.get("import_scheduled_vpp_logged"):
+                self.store["import_scheduled_vpp_logged"] = True
+                log(f"[Manager] Scheduled import held — VPP window {_vpp_state} "
+                    f"(importing now would forfeit the export premium). It will "
+                    f"fire once the window closes.")
+            return
+        self.store["import_scheduled_vpp_logged"] = False
+
         now_utc = datetime.now(timezone.utc)
         # Normalise scheduled time to UTC if naive. A naive value here is local
         # wall-clock, so it needs localising (pytz) or stamping (zoneinfo) — the
@@ -9365,6 +9435,19 @@ class Plugin(indigo.PluginBase):
         """Action: Force immediate grid import. Clamps to the bounds the ConfigUI
         labels promise (power 0..inverterMaxKw, target SOC 10..100%)."""
         with self._state_lock:
+            # v5.71.1: same rule as the queued import — a grid charge inside a paid
+            # export window forfeits the premium, and it also sets export_active
+            # False beneath a state machine that is still driving the export, so the
+            # store would then disagree with the inverter. Refused rather than
+            # silently held, because this one has a person behind it who deserves an
+            # answer. Pause the manager first if the window really must be overridden.
+            _vpp_state = self.store.get("vpp_state", VPP_IDLE)
+            if _vpp_state in (VPP_PRE_CHARGING, VPP_ACTIVE):
+                log(f"[Action] Force grid import REFUSED — a VPP window is "
+                    f"{_vpp_state} and importing now would forfeit the export "
+                    f"premium. Pause the manager first if you need to override it.",
+                    level="WARNING")
+                return
             props      = action.props
             inv_max_kw = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
             power_kw   = min(max(0.0, _as_float(props.get("powerKw"), inv_max_kw)), inv_max_kw)

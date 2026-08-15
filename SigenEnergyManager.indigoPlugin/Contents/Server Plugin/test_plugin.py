@@ -16,7 +16,7 @@ import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # ---- Mock the Indigo runtime + pymodbus so plugin.py imports standalone ----
 _indigo = types.ModuleType("indigo")
@@ -3118,6 +3118,172 @@ class TestScheduledImportSafety(unittest.TestCase):
 
         self.assertEqual(p.modbus.force_charge.call_args.args[0], 15000,
             "hardcoded 10000 W was right only on a 10 kW inverter")
+
+
+class TestScheduledImportVppGate(unittest.TestCase):
+    """v5.71.1 — a queued import must not fire inside a paid export window.
+
+    `_check_scheduled_import_impl` runs from the 10s TICK and gated only on
+    `manager_paused`, so it fired on the clock alone. The manager's own VPP
+    override (which returns ACTION_VPP_EXPORT and retracts the queue) only
+    re-evaluates on the ~15-minute cycle, and that retraction is skipped once an
+    import is already running — so a schedule armed for a time inside a window
+    started Charge Grid First at up to inverterMaxKw mid-export, buying at the
+    import rate through the hour we are paid a premium to sell, with
+    _verify_ems_registers deliberately standing down for the duration.
+
+    Low odds on Tracker (no cheap window, so the deferral path rarely arms) but
+    routine on a time-of-use tariff, which is where this house is heading.
+    """
+
+    def _p(self, vpp_state, due=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.modbus      = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        when = datetime.now(timezone.utc) - timedelta(minutes=1 if due else -60)
+        p.store = {
+            "import_scheduled_time": when,
+            "import_target_soc":     12.0,
+            "manager_paused":        False,
+            "vpp_state":             vpp_state,
+            "import_active":         False,
+            "had_import_today":      False,
+        }
+        p._set_import_cutoff = MagicMock()
+        p._trigger_event     = MagicMock()
+        return p
+
+    def test_an_active_window_holds_the_queued_import(self):
+        p = self._p(plugin.VPP_ACTIVE)
+
+        p._check_scheduled_import_impl()
+
+        self.assertFalse(p.modbus.force_charge.called,
+            "a grid charge inside a paid export window forfeits the premium")
+        self.assertIsNotNone(p.store["import_scheduled_time"],
+            "held, not cancelled — the battery still wants that charge")
+
+    def test_pre_charging_holds_it_too(self):
+        """The plugin is already grid-charging to its own target in PRE_CHARGING.
+
+        A second charge command with its own cutoff would fight it.
+        """
+        p = self._p(plugin.VPP_PRE_CHARGING)
+
+        p._check_scheduled_import_impl()
+
+        self.assertFalse(p.modbus.force_charge.called)
+        self.assertIsNotNone(p.store["import_scheduled_time"])
+
+    def test_announced_does_NOT_hold_it(self):
+        """An announcement can be hours ahead.
+
+        Charging BEFORE a window is the arbitrage this plugin exists to do, so
+        blocking it there would be a worse fault than the one being fixed.
+        """
+        p = self._p(plugin.VPP_ANNOUNCED)
+
+        p._check_scheduled_import_impl()
+
+        self.assertTrue(p.modbus.force_charge.called,
+            "an announced window is not a running one")
+
+    def test_idle_still_fires_normally(self):
+        """The regression guard — the common case must be untouched."""
+        p = self._p(plugin.VPP_IDLE)
+
+        p._check_scheduled_import_impl()
+
+        self.assertTrue(p.modbus.force_charge.called)
+        self.assertIsNone(p.store["import_scheduled_time"],
+            "a fired schedule clears itself")
+
+    def test_a_held_schedule_fires_once_the_window_closes(self):
+        """Held means deferred, not lost — otherwise the gate is an exclusion."""
+        p = self._p(plugin.VPP_ACTIVE)
+        p._check_scheduled_import_impl()
+        self.assertFalse(p.modbus.force_charge.called)
+
+        p.store["vpp_state"] = plugin.VPP_IDLE
+        p._check_scheduled_import_impl()
+
+        self.assertTrue(p.modbus.force_charge.called,
+            "the queued import must survive the window and fire afterwards")
+
+    def test_the_hold_is_logged_once_per_window_not_once_per_tick(self):
+        """The tick is 10s. One line per window, or it drowns the log."""
+        p = self._p(plugin.VPP_ACTIVE)
+        with patch.object(plugin, "log") as mock_log:
+            for _ in range(5):
+                p._check_scheduled_import_impl()
+            held = [c for c in mock_log.call_args_list
+                    if "Scheduled import held" in str(c)]
+        self.assertEqual(len(held), 1, f"expected one hold line, got {len(held)}")
+
+    def test_an_absent_vpp_state_is_treated_as_idle(self):
+        """A store without the key must not become a permanent block."""
+        p = self._p(plugin.VPP_IDLE)
+        del p.store["vpp_state"]
+
+        p._check_scheduled_import_impl()
+
+        self.assertTrue(p.modbus.force_charge.called)
+
+
+class TestForceGridImportVppGate(unittest.TestCase):
+    """v5.71.1 — the manual action carries the same fault, plus one of its own.
+
+    It sets export_active False beneath a state machine that is still driving the
+    export, so the store would disagree with the inverter. Refused rather than
+    silently held: there is a person behind this one and they deserve an answer.
+    """
+
+    def _p(self, vpp_state):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p._state_lock = threading.RLock()
+        p.modbus      = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        p.store = {"vpp_state": vpp_state, "import_active": False,
+                   "export_active": True}
+        p._set_import_cutoff = MagicMock()
+        return p
+
+    @staticmethod
+    def _action():
+        a = MagicMock()
+        a.props = {"powerKw": "5.0", "targetSocPct": "80"}
+        return a
+
+    def test_refused_during_an_active_window(self):
+        p = self._p(plugin.VPP_ACTIVE)
+
+        p.actionForceGridImport(self._action())
+
+        self.assertFalse(p.modbus.force_charge.called)
+        self.assertTrue(p.store["export_active"],
+            "the refusal must leave the running export's state alone")
+
+    def test_refused_during_pre_charging(self):
+        p = self._p(plugin.VPP_PRE_CHARGING)
+
+        p.actionForceGridImport(self._action())
+
+        self.assertFalse(p.modbus.force_charge.called)
+
+    def test_allowed_when_idle(self):
+        """Both-sides guard — a refusal that refuses everything is not a fix."""
+        p = self._p(plugin.VPP_IDLE)
+
+        p.actionForceGridImport(self._action())
+
+        self.assertTrue(p.modbus.force_charge.called)
+        self.assertEqual(p.modbus.force_charge.call_args.args[0], 5000)
 
 
 class TestVppPvVerdict(unittest.TestCase):
