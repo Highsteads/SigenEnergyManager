@@ -5,9 +5,38 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1)
-# Date:        15-08-2026
-# Version:     5.71.1
+# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
+# Date:        18-08-2026
+# Version:     5.72.0
+#
+# v5.72.0 (18-08-2026): THE VPP EARNINGS LEDGER — WHAT AXLE ACTUALLY PAID.
+#              The plugin has always known what it EXPORTED and never what it
+#              EARNED, and the two are different numbers. Axle settles on
+#              `flex_kwh`, the change in energy flow measured against a
+#              baseline, so a window our snapshots record as 4.23 kWh settles
+#              at 3.838. Every previous session read that ~0.4 kWh gap as a
+#              shortfall to be chased; it is not a deduction at all, it is a
+#              different measurement, and the only place it exists is the Axle
+#              account. Confirmed 18-08-2026 by reading the account payload:
+#              credit_pence is exactly |flex_kwh| x 100, no deduction anywhere.
+#              New vpp_ledger.py holds two sources side by side and never
+#              merges them — `axle` (settled truth, imported wholesale) and
+#              `local` (our own per-event figure, an ESTIMATE and labelled so).
+#              THE RULE: an event with no Axle row is PENDING, not zero.
+#              Settlement runs days behind — 16-Aug was still unsettled on the
+#              18th — so a GBP 0.00 tile would report a loss that never
+#              happened. paid_gbp stays None until Axle says otherwise, and a
+#              genuine zero (20-Apr settled at 0.000 kWh) arrives as a real
+#              transaction and is a different thing. Earnings states are
+#              Strings for the same reason: a Float cannot say "pending".
+#              Also: /api/vpp (ledger + next window), a machine-readable
+#              next_event block on /api/status so a page can count down
+#              without parsing English, api_status carried alongside it (a
+#              dead feed and a quiet fortnight look identical otherwise —
+#              that is how a revoked token hid for six weeks), two menu items,
+#              and 33 contract tests weighted at absence.
+#              Axle rows arrive through ONE importer reading a drop file, so
+#              a future cookie fetch or a widened token changes nothing else.
 #
 # v5.71.1 (15-08-2026): A QUEUED IMPORT COULD FIRE INSIDE A PAID EXPORT WINDOW.
 #              Found by asking what Predbat's #4520 ("boost the import rate during
@@ -1909,6 +1938,7 @@ from battery_manager  import (
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
 from web_dashboard import WebDashboard
+import vpp_ledger as _vpp_ledger
 
 # ============================================================
 # Constants
@@ -3420,6 +3450,15 @@ class Plugin(indigo.PluginBase):
                     # "VPP event announced:" with the one useful fact — WHEN —
                     # missing. Live-spotted 30-07-2026 on the phone.
                     "event_str": self._vpp_event_str(),
+                    # The same window in parts, so a page can count down to it
+                    # without parsing that sentence. None = nothing announced.
+                    "next_event": self._vpp_next_event_info(),
+                    # Feed health travels WITH the answer. "No event announced"
+                    # and "the feed has been dead for six weeks" look identical
+                    # otherwise, and that is exactly how a revoked token hid
+                    # from 15-Jun to 30-Jul-2026.
+                    "api_status": store.get("vpp_api_error") or "OK",
+                    "earnings":   self._vpp_earnings_brief(),
                 },
                 "storm": {
                     "level": storm_level_now,
@@ -7579,6 +7618,12 @@ class Plugin(indigo.PluginBase):
             log(f"[VPP] Could not update axleVppMonitor summary states: {exc}",
                 level="WARNING")
 
+        # Add our own figure for this window to the ledger. It sits beside
+        # Axle's settled row for the same window once that arrives, and until
+        # then the event shows as pending rather than as nothing.
+        self._record_vpp_ledger_event(event, export_kwh,
+                                      driver=driver_str, log_path=path or "")
+
         # ----- Pushover: headline numbers + pre-formed Claude prompt -----
         # The prompt used to ask what AXLE did — wording left over from the
         # observe-and-hand-over model that v5.28.0 replaced with self-drive in
@@ -9346,6 +9391,196 @@ class Plugin(indigo.PluginBase):
             # down — every caller treats "" as "say nothing".
             return ""
 
+    # ================================================================
+    # VPP earnings ledger
+    # ================================================================
+    #
+    # What we EXPORTED and what Axle PAID are different numbers, and only the
+    # second one is earnings. Axle settles on `flex_kwh` — the change against a
+    # baseline — so a window our own snapshots record as 4.23 kWh settles at
+    # 3.838. The ledger holds both, side by side, and never averages them into
+    # a single figure that means neither.
+    #
+    # Axle's rows arrive through ONE importer (`importAxleLedger`) reading a
+    # drop file. Today that file is written by hand from the account page;
+    # a cookie-authenticated fetch or a widened API token would write the same
+    # file, and nothing downstream would need to change.
+
+    def _vpp_ledger_path(self):
+        return _vpp_ledger.ledger_path(self.data_dir)
+
+    def _vpp_ledger_summary(self):
+        """The ledger view, re-read when the file changes.
+
+        Three dashboard pages poll /api/status, so this is on a hot path. The
+        cache is keyed on mtime rather than a timer: an import must show up
+        immediately, and nothing else writes the file.
+        """
+        path = self._vpp_ledger_path()
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        cached = getattr(self, "_vpp_ledger_cache", None)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        try:
+            summary = _vpp_ledger.summarise(_vpp_ledger.load_ledger(path))
+        except Exception as exc:
+            # A broken ledger must not take the status endpoint down with it,
+            # and must not read as "no earnings" either.
+            log(f"[VPP] Ledger summary failed: {exc}", level="WARNING")
+            summary = {"load_error": f"{type(exc).__name__}: {exc}"}
+        self._vpp_ledger_cache = (mtime, summary)
+        return summary
+
+    def _record_vpp_ledger_event(self, event, export_kwh, driver="", log_path=""):
+        """Add what we observed for one finished event to the ledger.
+
+        Keyed on the window, so re-running the summariser corrects the row
+        rather than counting the event twice.
+        """
+        try:
+            start = (event or {}).get("start_time")
+            end   = (event or {}).get("end_time")
+            if not start:
+                return
+            path   = self._vpp_ledger_path()
+            rate   = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
+            ledger = _vpp_ledger.load_ledger(path)
+            _vpp_ledger.record_local_event(ledger, start, end, export_kwh, rate,
+                                           driver=driver, log_path=log_path)
+            _vpp_ledger.save_ledger(path, ledger)
+            self._vpp_ledger_cache = None
+            log(f"[VPP] Ledger: recorded {round(float(export_kwh), 2)} kWh for "
+                f"{_local_time(start, '%d/%m %H:%M')} (our figure — Axle settles later)")
+        except Exception as exc:
+            log(f"[VPP] Could not record event in ledger: {exc}", level="WARNING")
+
+    def importAxleLedger(self, valuesDict=None, typeId=None):
+        """Menu: merge <data_dir>/vpp_axle_import.json into the ledger.
+
+        A drop file rather than a paste box, because the payload is a few
+        kilobytes of JSON and an Indigo textfield is the wrong shape for it.
+        The file is the seam: anything that can write it can feed the ledger.
+
+        Take the whole `routes/account/index` loader object from the Axle
+        account page, or just its `balance`, `transactions` and `events` keys —
+        both are accepted.
+        """
+        if log_startup_banner:
+            log_startup_banner(self.pluginId, self.pluginDisplayName, self.pluginVersion)
+
+        drop = os.path.join(self.data_dir, "vpp_axle_import.json")
+        if not os.path.exists(drop):
+            log(f"[VPP] No import file found. Save the Axle account JSON to:\n"
+                f"      {drop}\n"
+                f"      then run this menu item again.", level="WARNING")
+            return
+
+        try:
+            with open(drop, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            log(f"[VPP] Import file could not be read: {exc}", level="ERROR")
+            return
+
+        # Accept the whole loader object as well as the trimmed form — pulling
+        # three keys out by hand is exactly where a paste goes wrong.
+        if "transactions" not in payload and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+
+        try:
+            path = self._vpp_ledger_path()
+            ledger = _vpp_ledger.load_ledger(path)
+            ledger, added = _vpp_ledger.import_axle_payload(ledger, payload)
+            _vpp_ledger.save_ledger(path, ledger)
+            self._vpp_ledger_cache = None
+        except Exception as exc:
+            log(f"[VPP] Import failed: {exc}", level="ERROR")
+            return
+
+        summary = self._vpp_ledger_summary()
+        life    = summary.get("lifetime_gbp")
+        log(f"[VPP] Ledger import complete — {added} new transaction(s). "
+            f"Lifetime {'£%.2f' % life if life is not None else 'unknown'}, "
+            f"{summary.get('events_settled', 0)} settled, "
+            f"{summary.get('events_pending', 0)} pending.")
+
+        # Rename rather than delete: if the merge was wrong, the source is
+        # still on disk to look at.
+        try:
+            os.replace(drop, drop + ".imported")
+        except OSError:
+            pass
+        self._update_vpp_device()
+
+    def _vpp_earnings_brief(self):
+        """The few ledger figures small enough to ride along with /api/status.
+
+        Deliberately not the event list — that is what /api/vpp is for. Keys
+        are None rather than 0 when unknown, and consumers must render them as
+        such.
+        """
+        s = self._vpp_ledger_summary()
+        return {
+            "lifetime_gbp":      s.get("lifetime_gbp"),
+            "available_gbp":     s.get("available_gbp"),
+            "month_to_date_gbp": s.get("month_to_date_gbp"),
+            "events_gbp":        (s.get("by_kind") or {}).get("events_gbp"),
+            "events_pending":    s.get("events_pending"),
+            "can_withdraw":      s.get("can_withdraw"),
+            "age_days":          s.get("axle_age_days"),
+        }
+
+    def get_dashboard_vpp(self):
+        """The /api/vpp payload: the ledger plus whatever is coming next."""
+        summary = dict(self._vpp_ledger_summary())
+        summary["next_event"] = self._vpp_next_event_info()
+        summary["state"]      = self.store.get("vpp_state", "idle")
+        summary["active"]     = self.store.get("vpp_active", False)
+        summary["rate_per_kwh"] = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
+        return summary
+
+    def _vpp_next_event_info(self):
+        """The announced window in machine-readable form, or None.
+
+        `_vpp_event_str` gives a phrase to append to a sentence; this gives the
+        parts, so a page can render a countdown without parsing English. None
+        means "nothing announced", which is a real answer and not an error —
+        read it alongside `apiStatus`, because a dead feed also has nothing to
+        announce.
+        """
+        event = self.store.get("vpp_event") or {}
+        start = event.get("start_time")
+        end   = event.get("end_time")
+        if not start or not end:
+            return None
+        try:
+            now = datetime.now(timezone.utc)
+            duration_hrs = event.get("duration_hrs") or 0.0
+            max_export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
+            rate = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
+            return {
+                "start_utc":    start.isoformat() if hasattr(start, "isoformat") else str(start),
+                "end_utc":      end.isoformat() if hasattr(end, "isoformat") else str(end),
+                "start_local":  _local_time(start, "%d %b %H:%M"),
+                "end_local":    _local_time(end, "%H:%M"),
+                "duration_hrs": round(duration_hrs, 2),
+                "seconds_until_start": int((start - now).total_seconds()),
+                "seconds_until_end":   int((end - now).total_seconds()),
+                "import_export": event.get("import_export", "export"),
+                # An ESTIMATE at the DNO cap, not a promise. Axle's own forecast
+                # is used when it sends one.
+                "estimate_gbp": round(max_export_kw * duration_hrs * rate, 2),
+                "axle_forecast_kwh": event.get("forecast_dispatch_kwh"),
+                "axle_estimate_gbp": (round(event["estimated_revenue_p"] / 100.0, 2)
+                                      if event.get("estimated_revenue_p") is not None else None),
+            }
+        except Exception as exc:
+            log(f"[VPP] Could not build next-event info: {exc}", level="WARNING")
+            return None
+
     def _update_vpp_device(self):
         """Push VPP state to axleVppMonitor device."""
         dev = self._find_device("axleVppMonitor")
@@ -9384,6 +9619,30 @@ class Plugin(indigo.PluginBase):
             {"key": "vppLastExportKwh",  "value": str(round(self.store.get("vpp_last_export_kwh", 0.0), 2))},
             {"key": "lastUpdate",        "value": datetime.now().strftime("%H:%M:%S")},
         ]
+
+        # Settled earnings, from the ledger. These are Axle's numbers, not
+        # ours. A figure Axle has not published yet reads "pending" — never
+        # 0.00, which on a control page is indistinguishable from "you earned
+        # nothing" and would be wrong for several days after every event.
+        try:
+            summary  = self._vpp_ledger_summary()
+            life     = summary.get("lifetime_gbp")
+            avail    = summary.get("available_gbp")
+            month    = summary.get("month_to_date_gbp")
+            by_kind  = summary.get("by_kind") or {}
+            pending  = summary.get("events_pending")
+            states += [
+                {"key": "lifetimeEarnings",  "value": "unknown" if life  is None else f"{life:.2f}"},
+                {"key": "availableBalance",  "value": "unknown" if avail is None else f"{avail:.2f}"},
+                {"key": "monthToDate",       "value": "pending" if month is None else f"{month:.2f}"},
+                {"key": "eventEarningsTotal","value": f"{by_kind.get('events_gbp', 0.0):.2f}"},
+                {"key": "eventsSettled",     "value": int(summary.get("events_settled", 0) or 0)},
+                {"key": "eventsPending",     "value": int(pending or 0)},
+                {"key": "ledgerUpdated",     "value": summary.get("axle_fetched_local") or "never"},
+            ]
+        except Exception as exc:
+            log(f"[VPP] Could not add ledger states: {exc}", level="WARNING")
+
         dev.updateStatesOnServer(states)
 
     # ================================================================
@@ -9856,6 +10115,67 @@ class Plugin(indigo.PluginBase):
                     log("[VPP] Pre-charge:          Not needed (SOC sufficient)")
 
         log("[VPP] =============================================")
+        return True
+
+    def menuShowVppEarnings(self):
+        """Menu: print the earnings ledger — what Axle has settled, beside ours.
+
+        Deliberately shows BOTH kWh columns. They differ by about 0.4 kWh on a
+        clean event, because Axle settles on the change against a baseline
+        rather than on raw export, and seeing the pair is the only way to tell
+        an ordinary baseline deduction from a window that genuinely went wrong
+        (11-Aug over-ran and shows a 3.2 kWh gap).
+        """
+        s = self._vpp_ledger_summary()
+
+        if s.get("load_error"):
+            log(f"[VPP] Ledger could not be read: {s['load_error']}", level="ERROR")
+            return True
+
+        def money(v, unknown="unknown"):
+            return unknown if v is None else f"GBP {v:.2f}"
+
+        by_kind = s.get("by_kind") or {}
+        log("[VPP] ============ EARNINGS LEDGER ============")
+        log(f"[VPP] Lifetime earnings:   {money(s.get('lifetime_gbp'))}")
+        log(f"[VPP] Available to draw:   {money(s.get('available_gbp'))}"
+            f"{'  (withdrawable now)' if s.get('can_withdraw') else ''}")
+        log(f"[VPP] This month:          {money(s.get('month_to_date_gbp'), 'nothing settled yet')}")
+        log("[VPP] ---- where the money came from ----")
+        log(f"[VPP]   Grid events:       GBP {by_kind.get('events_gbp', 0.0):.2f}")
+        log(f"[VPP]   Monthly top-ups:   GBP {by_kind.get('top_ups_gbp', 0.0):.2f}")
+        log(f"[VPP]   Bonuses/referrals: GBP {by_kind.get('other_gbp', 0.0):.2f}")
+        log(f"[VPP] Events: {s.get('events_settled', 0)} settled, "
+            f"{s.get('events_pending', 0)} awaiting settlement")
+
+        age = s.get("axle_age_days")
+        log(f"[VPP] Axle data imported:  {s.get('axle_fetched_local') or 'never'}"
+            f"{f'  ({age:.0f} days old)' if age is not None and age >= 1 else ''}")
+        if age is not None and age >= 14:
+            log("[VPP] Ledger is over a fortnight old — re-import from the Axle "
+                "account page to pick up newly settled events.", level="WARNING")
+
+        log("[VPP] ---- recent events (paid / ours) ----")
+        for e in s.get("events", []):
+            if e["settled"]:
+                paid = f"GBP {e['paid_gbp']:.2f} / {e['paid_kwh']:.3f} kWh"
+            else:
+                # Never "GBP 0.00" — settlement runs days behind the event.
+                paid = "awaiting settlement"
+            ours = f"{e['our_kwh']:.2f} kWh" if e["our_kwh"] is not None else "not logged"
+            diff = f"  diff {e['diff_kwh']:+.3f} kWh" if e["diff_kwh"] is not None else ""
+            log(f"[VPP]   {e['start_local']}-{e['end_local']}  {paid:<28} ours {ours}{diff}")
+
+        next_ev = self._vpp_next_event_info()
+        if next_ev:
+            hrs = next_ev["seconds_until_start"] / 3600.0
+            when = f"in {hrs:.1f}h" if hrs > 0 else "running now"
+            log(f"[VPP] Next event:          {next_ev['start_local']}-{next_ev['end_local']} ({when})")
+        else:
+            api = self.store.get("vpp_api_error")
+            log(f"[VPP] Next event:          none announced"
+                f"{f'  — WARNING, Axle feed is failing: {api}' if api else ''}")
+        log("[VPP] =========================================")
         return True
 
     def menuShowTodaySummary(self):

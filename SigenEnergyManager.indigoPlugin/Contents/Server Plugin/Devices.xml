@@ -705,6 +705,50 @@
                 <TriggerLabel>Last VPP log path changed</TriggerLabel>
                 <ControlPageLabel>Last VPP JSONL Path</ControlPageLabel>
             </State>
+            <!-- Settled earnings, from the ledger (v5.72.0). These are AXLE's
+                 figures, not ours — Axle pays on `flex_kwh`, the change against
+                 a baseline, which runs a little under what our own snapshots
+                 record for the same window. They are Strings rather than Floats
+                 on purpose: an amount Axle has not published yet must read
+                 "pending" or "unknown", and a Float state cannot say that. It
+                 would say 0.00, which on a control page is indistinguishable
+                 from "you earned nothing" and is wrong for the several days
+                 every event spends unsettled. -->
+            <State id="lifetimeEarnings">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Lifetime VPP earnings changed</TriggerLabel>
+                <ControlPageLabel>Lifetime Earnings (GBP)</ControlPageLabel>
+            </State>
+            <State id="availableBalance">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Axle available balance changed</TriggerLabel>
+                <ControlPageLabel>Available Balance (GBP)</ControlPageLabel>
+            </State>
+            <State id="monthToDate">
+                <ValueType>String</ValueType>
+                <TriggerLabel>VPP month-to-date earnings changed</TriggerLabel>
+                <ControlPageLabel>Earned This Month (GBP)</ControlPageLabel>
+            </State>
+            <State id="eventEarningsTotal">
+                <ValueType>String</ValueType>
+                <TriggerLabel>VPP event earnings changed</TriggerLabel>
+                <ControlPageLabel>Grid-Event Earnings, Lifetime (GBP)</ControlPageLabel>
+            </State>
+            <State id="eventsSettled">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Settled event count changed</TriggerLabel>
+                <ControlPageLabel>Events Settled</ControlPageLabel>
+            </State>
+            <State id="eventsPending">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Pending event count changed</TriggerLabel>
+                <ControlPageLabel>Events Awaiting Settlement</ControlPageLabel>
+            </State>
+            <State id="ledgerUpdated">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Ledger import time changed</TriggerLabel>
+                <ControlPageLabel>Ledger Last Imported</ControlPageLabel>
+            </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last update changed</TriggerLabel>

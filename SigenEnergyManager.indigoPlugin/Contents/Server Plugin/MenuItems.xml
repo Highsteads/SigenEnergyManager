@@ -31,6 +31,16 @@
         <CallbackMethod>menuShowVppExport</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuShowVppEarnings">
+        <Name>Show VPP Earnings Ledger</Name>
+        <CallbackMethod>menuShowVppEarnings</CallbackMethod>
+    </MenuItem>
+
+    <MenuItem id="importAxleLedger">
+        <Name>Import Axle Account Data...</Name>
+        <CallbackMethod>importAxleLedger</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuShowTodaySummary">
         <Name>Show Today's Energy Summary</Name>
         <CallbackMethod>menuShowTodaySummary</CallbackMethod>

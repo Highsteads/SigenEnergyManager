@@ -2011,6 +2011,13 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/export-sync":
             self._send_api(lambda: self._plugin_ref.get_dashboard_export_sync())
 
+        elif path == "/api/vpp":
+            # The earnings ledger plus the next announced window. Separate from
+            # /api/status because it carries the per-event list, which is far
+            # bigger than anything a 30-second status poll should be dragging
+            # around.
+            self._send_api(lambda: self._plugin_ref.get_dashboard_vpp())
+
         else:
             self._send(404, "text/plain", b"Not found")
 
