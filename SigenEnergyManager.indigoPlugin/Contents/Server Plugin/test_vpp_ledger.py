@@ -222,12 +222,17 @@ class TestSummaryEvents(unittest.TestCase):
         self.assertFalse(any(e["start"].startswith("2026-07-01") for e in s["events"]))
 
     def test_local_row_supplies_our_kwh_and_the_difference(self):
+        # The baseline is only claimed when our side covers the SAME hour, so
+        # the row has to carry the in-window figure for a difference to mean
+        # anything. Without it the run total is displayed and no gap claimed.
         led = _seeded()
         VL.record_local_event(led, "2026-08-14T19:00:00+00:00",
-                              "2026-08-14T20:00:00+00:00", 4.02, 1.0, driver="self")
+                              "2026-08-14T20:00:00+00:00", 4.23, 1.0,
+                              driver="self", window_kwh=4.02)
         s = VL.summarise(led, now=NOW)
         aug14 = [e for e in s["events"] if e["start"].startswith("2026-08-14")][0]
         self.assertEqual(aug14["our_kwh"], 4.02)
+        self.assertEqual(aug14["run_kwh"], 4.23)
         self.assertEqual(aug14["paid_kwh"], 3.838)
         self.assertEqual(aug14["diff_kwh"], 0.182)
 
@@ -283,6 +288,120 @@ class TestSummaryTimeAndStaleness(unittest.TestCase):
 
     def test_naive_timestamp_is_read_as_utc(self):
         self.assertEqual(VL._window_key("2026-08-14T19:00:00"), "2026-08-14T19:00")
+
+
+class TestWindowIntegration(unittest.TestCase):
+    """The in-window figure — the only one comparable with what Axle settles.
+
+    The plugin's own counter runs from two minutes before the window to two
+    minutes after, deliberately, so the full paid hour is captured rather than
+    ramped into. That makes it WIDER than Axle's basis, and on 11-Aug-2026 it
+    was wider by forty-five minutes because the window never stopped: 7.05 kWh
+    recorded for an hour whose export cap allows 4.
+    """
+
+    def _flat(self, watts, minutes, step_s=83):
+        """A window held at a steady export, sampled at the real cadence.
+
+        The last sample is pinned to the end of the span. Without it the
+        83-second cadence leaves up to 82 unmeasured seconds at the tail —
+        0.07 kWh at the export cap — which is a hole in the FIXTURE, not in
+        the integration. Real runs always have a sample past the window,
+        because the driver keeps going for two minutes after it closes.
+        """
+        end = int(minutes * 60)
+        pts = [(t, watts) for t in range(0, end + 1, step_s)]
+        if pts[-1][0] != end:
+            pts.append((end, watts))
+        return pts
+
+    def test_a_flat_hour_at_the_cap_integrates_to_the_cap(self):
+        kwh = VL.integrate_window_kwh(self._flat(-4000, 60), 1.0)
+        self.assertAlmostEqual(kwh, 4.0, places=1)
+
+    def test_two_hour_window_doubles_it(self):
+        kwh = VL.integrate_window_kwh(self._flat(-4000, 120), 2.0)
+        self.assertAlmostEqual(kwh, 8.0, places=1)
+
+    def test_export_AFTER_the_window_is_excluded(self):
+        # The 11-Aug shape: an hour at the cap, then 45 minutes more.
+        samples = self._flat(-4000, 105)
+        self.assertAlmostEqual(VL.integrate_window_kwh(samples, 1.0), 4.0, places=1)
+
+    def test_the_lead_in_is_excluded_too(self):
+        # The driver starts two minutes early; those minutes are not paid.
+        samples = [(t, -4000) for t in range(-120, 3600 + 120, 83)]
+        self.assertAlmostEqual(VL.integrate_window_kwh(samples, 1.0), 4.0, places=1)
+
+    def test_importing_minutes_do_not_subtract(self):
+        # Half an hour exporting, half an hour importing. The import earned
+        # nothing; letting it net off would give 1.0 rather than 2.0.
+        samples = [(t, -4000 if t < 1800 else 2000) for t in range(0, 3601, 60)]
+        kwh = VL.integrate_window_kwh(samples, 1.0)
+        # Bounded rather than exact: the single sample either side of the step
+        # makes that one 60-second segment genuinely ambiguous to a trapezoid.
+        # The point is that it lands near the exported half, not near 1.0.
+        self.assertGreater(kwh, 1.85)
+        self.assertLess(kwh, 2.05)
+
+    def test_nothing_to_integrate_is_None_not_zero(self):
+        self.assertIsNone(VL.integrate_window_kwh([], 1.0))
+        self.assertIsNone(VL.integrate_window_kwh([(0, -4000)], 1.0))
+
+    def test_a_missing_or_daft_duration_is_None(self):
+        s = self._flat(-4000, 60)
+        self.assertIsNone(VL.integrate_window_kwh(s, None))
+        self.assertIsNone(VL.integrate_window_kwh(s, 0))
+        self.assertIsNone(VL.integrate_window_kwh(s, -1))
+
+    def test_junk_samples_are_skipped_not_fatal(self):
+        samples = [(0, -4000), ("x", "y"), (1800, -4000), (None, None), (3600, -4000)]
+        self.assertAlmostEqual(VL.integrate_window_kwh(samples, 1.0), 4.0, places=1)
+
+    def test_unordered_samples_are_sorted(self):
+        s = self._flat(-4000, 60)
+        self.assertAlmostEqual(VL.integrate_window_kwh(list(reversed(s)), 1.0),
+                               VL.integrate_window_kwh(s, 1.0), places=3)
+
+
+class TestWindowVersusRun(unittest.TestCase):
+    """Both figures are kept, and only the comparable one is compared."""
+
+    def _led(self, run_kwh, window_kwh):
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), {
+            "transactions": [
+                {"transaction_id": "t1", "transaction_type": "flex event",
+                 "start_time": "2026-08-11T18:30:00+00:00",
+                 "end_time": "2026-08-11T19:30:00+00:00",
+                 "flex_kwh": -3.801, "credit_pence": 380}]})
+        VL.record_local_event(led, "2026-08-11T18:30:00+00:00",
+                              "2026-08-11T19:30:00+00:00", run_kwh, 1.0,
+                              window_kwh=window_kwh)
+        return led
+
+    def test_the_baseline_is_measured_against_the_WINDOW_figure(self):
+        # 4.00 in the window against 3.801 paid = the ~0.2 kWh baseline.
+        e = VL.summarise(self._led(7.05, 4.00), now=NOW)["events"][0]
+        self.assertEqual(e["our_kwh"], 4.0)
+        self.assertEqual(e["diff_kwh"], 0.199)
+
+    def test_the_over_run_is_reported_separately_not_as_a_shortfall(self):
+        e = VL.summarise(self._led(7.05, 4.00), now=NOW)["events"][0]
+        self.assertEqual(e["run_kwh"], 7.05)
+        self.assertEqual(e["outside_kwh"], 3.05)
+
+    def test_the_ordinary_two_minute_tails_are_NOT_an_over_run(self):
+        e = VL.summarise(self._led(4.23, 4.00), now=NOW)["events"][0]
+        self.assertIsNone(e["outside_kwh"])
+
+    def test_a_row_with_no_window_figure_claims_no_baseline(self):
+        # Rows recorded before the in-window figure existed. Falling back to
+        # the run total for display is fine; subtracting it from Axle's is not.
+        e = VL.summarise(self._led(7.05, None), now=NOW)["events"][0]
+        self.assertEqual(e["our_kwh"], 7.05)
+        self.assertFalse(e["in_window"])
+        self.assertIsNone(e["diff_kwh"])
+        self.assertIsNone(e["outside_kwh"])
 
 
 if __name__ == "__main__":

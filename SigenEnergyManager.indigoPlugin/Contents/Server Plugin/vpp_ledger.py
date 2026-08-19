@@ -228,15 +228,96 @@ def import_axle_payload(ledger, payload, fetched_at=None):
 
 
 # ======================================================================
+# What we exported INSIDE the paid window
+# ======================================================================
+
+def integrate_window_kwh(samples, duration_hrs):
+    """Grid export inside the paid window, in kWh, from per-minute snapshots.
+
+    `samples` is [(elapsed_seconds, grid_watts), ...] where grid watts are
+    NEGATIVE while exporting. Returns None when there is nothing to integrate.
+
+    WHY THIS EXISTS, and why the obvious number is the wrong one.
+    The plugin's own `export_kwh` is a counter delta across the whole time it
+    drove the export — and that is deliberately WIDER than the paid window: the
+    driver runs from two minutes before to two minutes after, so the full hour
+    is captured rather than ramped into. On an ordinary event that adds ~0.22
+    kWh of tails. On 11-Aug-2026 it added FORTY-FIVE MINUTES, because the
+    window never stopped (the v5.61.1 bug), and the counter read 7.05 kWh for
+    an hour whose DNO cap allows 4.
+
+    Comparing that against Axle's in-window figure puts two different
+    quantities in one subtraction. Measured across every event we have, the
+    counter sits 0.2-0.3 kWh above the window and the difference against Axle
+    scatters; integrated strictly inside the window it is 4.00 kWh every time
+    (8.01 on the two-hour event — the cap times the duration, as it must be),
+    and the gap against Axle collapses to a consistent +0.162 to +0.197 kWh.
+    THAT is the baseline, and it only becomes visible once both sides are
+    measured over the same hour.
+
+    Trapezoid rather than a counter read because there is no counter reading at
+    the window boundary — only the snapshots, at roughly 83-second spacing. The
+    curve is nearly flat (grid pinned at the export cap for the duration), so
+    the approximation is worth a couple of watt-hours, and it agrees with the
+    counter to within the known width of the tails.
+    """
+    try:
+        hrs = float(duration_hrs)
+    except (TypeError, ValueError):
+        return None
+    if hrs <= 0:
+        return None
+
+    pts = []
+    for s in (samples or []):
+        try:
+            t, w = float(s[0]), float(s[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        pts.append((t, w))
+    if len(pts) < 2:
+        return None
+    pts.sort()
+
+    end_s = hrs * 3600.0
+    kwh = 0.0
+    for (t0, w0), (t1, w1) in zip(pts, pts[1:]):
+        a, b = max(t0, 0.0), min(t1, end_s)
+        if b <= a or t1 == t0:
+            continue
+        # Interpolate to the clipped bounds so the lead-in and trail sit
+        # outside the sum rather than being counted at their full width.
+        f0 = w0 + (w1 - w0) * ((a - t0) / (t1 - t0))
+        f1 = w0 + (w1 - w0) * ((b - t0) / (t1 - t0))
+        # Export only. An importing minute inside the window did not earn
+        # anything, and letting it subtract would flatter the total.
+        exported_w = max(0.0, -(f0 + f1) / 2.0)
+        kwh += exported_w * (b - a) / 3600.0 / 1000.0
+    return round(kwh, 3)
+
+
+# ======================================================================
 # Recording what we saw ourselves
 # ======================================================================
 
 def record_local_event(ledger, start_time, end_time, export_kwh,
-                       rate_per_kwh, driver=None, log_path=None):
+                       rate_per_kwh, driver=None, log_path=None,
+                       window_kwh=None):
     """Upsert one locally-observed event, keyed on its window.
 
     Keyed on the window rather than appended, so a re-run of the summariser
     after a restart corrects the row instead of double-counting it.
+
+    TWO figures, because they answer different questions:
+      export_kwh  the counter delta over the whole time we drove the export,
+                  lead-in and trail included — what actually left the house.
+      window_kwh  integrated strictly inside the PAID window — the only one
+                  comparable with what Axle settled.
+    Where they differ by more than the ordinary couple of minutes of tails,
+    the export ran outside the paid hour and earned the standard export rate
+    rather than the event rate. Keeping both is what makes that visible;
+    keeping only the first is what made 11-Aug look like a 3.2 kWh shortfall
+    when the paid hour was in fact textbook.
     """
     key_start = _iso(start_time)
     key_end   = _iso(end_time)
@@ -252,10 +333,18 @@ def record_local_event(ledger, start_time, end_time, export_kwh,
     except (TypeError, ValueError):
         rate = 1.0
 
+    try:
+        win = round(float(window_kwh), 3) if window_kwh is not None else None
+    except (TypeError, ValueError):
+        win = None
+
     row = {
         "start_time":   key_start,
         "end_time":     key_end,
         "export_kwh":   round(kwh, 3),
+        # None means "not measured", never zero — an event whose snapshots we
+        # do not have must not read as an hour that exported nothing.
+        "window_kwh":   win,
         "rate_per_kwh": rate,
         "estimate_gbp": round(kwh * rate, 2),
         "driver":       driver or "",
@@ -352,7 +441,23 @@ def summarise(ledger, now=None, recent=12):
         loc = local_by_start.get(key)
         paid_gbp = _pence_to_gbp(tx.get("credit_pence")) if tx else None
         paid_kwh = abs(tx["flex_kwh"]) if tx and isinstance(tx.get("flex_kwh"), (int, float)) else None
-        our_kwh  = loc.get("export_kwh") if loc else None
+        run_kwh  = loc.get("export_kwh") if loc else None
+        # The in-window figure is the ONLY one comparable with Axle's. Older
+        # rows predate it being recorded and carry None; they fall back to the
+        # run total, which is what they always were — never to a zero.
+        our_kwh  = (loc.get("window_kwh") if loc and loc.get("window_kwh") is not None
+                    else run_kwh)
+        measured_in_window = bool(loc and loc.get("window_kwh") is not None)
+
+        # Export outside the paid hour. Real, but paid at the ordinary export
+        # rate rather than the event rate, so it is NOT a shortfall against
+        # Axle and must not be shown in the same column as one.
+        outside_kwh = None
+        if measured_in_window and run_kwh is not None:
+            gap = round(run_kwh - loc["window_kwh"], 3)
+            # The driver deliberately runs two minutes either side, so a small
+            # gap is the design working. Only flag a genuine over-run.
+            outside_kwh = gap if gap > 0.5 else None
 
         events.append({
             "start":       win["start"],
@@ -365,8 +470,15 @@ def summarise(ledger, now=None, recent=12):
             "paid_gbp":    paid_gbp,
             "paid_kwh":    round(paid_kwh, 3) if paid_kwh is not None else None,
             "our_kwh":     our_kwh,
+            "run_kwh":     run_kwh,
+            "in_window":   measured_in_window,
+            "outside_kwh": outside_kwh,
+            # The baseline: what Axle reckons the house would have done anyway.
+            # Only meaningful when both sides cover the same hour, so it is
+            # withheld rather than guessed when ours does not.
             "diff_kwh":    (round(our_kwh - paid_kwh, 3)
-                            if (our_kwh is not None and paid_kwh is not None) else None),
+                            if (measured_in_window and our_kwh is not None
+                                and paid_kwh is not None) else None),
             "settled_via": win.get("settled_via"),
             "driver":      (loc or {}).get("driver") or "",
         })

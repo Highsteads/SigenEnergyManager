@@ -7,7 +7,30 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
 # Date:        18-08-2026
-# Version:     5.72.0
+# Version:     5.72.1
+#
+# v5.72.1 (18-08-2026): THE LEDGER NOW RECORDS THE IN-WINDOW EXPORT TOO, and
+#              it changes what the comparison means. CliveS asked why 11-Aug
+#              showed 7.05 kWh against an hour whose DNO cap allows 4 — a fair
+#              question, because the figure being recorded was the counter
+#              delta across the WHOLE driven run. The driver deliberately runs
+#              T-2min to end+2min, so that is always wider than the paid
+#              window; on 11-Aug it was wider by FORTY-FIVE MINUTES, because
+#              the window never stopped (the v5.61.1 bug).
+#              MEASURED across every event: integrating grid export strictly
+#              INSIDE the window gives 4.00 kWh on every one-hour event and
+#              8.01 on the two-hour one — the cap times the duration, as it
+#              must be — and the gap against Axle collapses from a scattered
+#              0.4-3.2 to a consistent +0.162 to +0.197. THAT is the baseline,
+#              and it only becomes visible once both sides cover the same hour.
+#              New pure `integrate_window_kwh`; both figures stored; the
+#              baseline is claimed ONLY when ours is in-window, and an
+#              over-run is reported separately rather than as a shortfall.
+#              Historical rows re-seeded from the existing JSONLs. 13 tests
+#              (46 in the module), and the first three failures were all my own
+#              FIXTURES — a sample cadence that never reached the window end,
+#              a step change a trapezoid cannot resolve, and a case still
+#              asserting the old contract.
 #
 # v5.72.0 (18-08-2026): THE VPP EARNINGS LEDGER — WHAT AXLE ACTUALLY PAID.
 #              The plugin has always known what it EXPORTED and never what it
@@ -7618,11 +7641,25 @@ class Plugin(indigo.PluginBase):
             log(f"[VPP] Could not update axleVppMonitor summary states: {exc}",
                 level="WARNING")
 
-        # Add our own figure for this window to the ledger. It sits beside
-        # Axle's settled row for the same window once that arrives, and until
-        # then the event shows as pending rather than as nothing.
+        # Add our own figures for this window to the ledger — BOTH of them.
+        # `export_kwh` is the counter delta across the whole driven run,
+        # lead-in and trail included; the integrated figure covers only the
+        # paid window. They differ by a couple of minutes of tails normally,
+        # and by three quarters of an hour when a window fails to stop (11-Aug
+        # read 7.05 kWh for an hour whose cap allows 4). Only the second is
+        # comparable with what Axle settles.
+        window_kwh = None
+        try:
+            window_kwh = _vpp_ledger.integrate_window_kwh(
+                [(_to_float(s.get("event_elapsed_secs")), _to_float(s.get("grid_w")))
+                 for s in snapshots],
+                event.get("duration_hrs"))
+        except Exception as exc:
+            log(f"[VPP] Could not integrate in-window export: {exc}", level="WARNING")
+
         self._record_vpp_ledger_event(event, export_kwh,
-                                      driver=driver_str, log_path=path or "")
+                                      driver=driver_str, log_path=path or "",
+                                      window_kwh=window_kwh)
 
         # ----- Pushover: headline numbers + pre-formed Claude prompt -----
         # The prompt used to ask what AXLE did — wording left over from the
@@ -9434,7 +9471,8 @@ class Plugin(indigo.PluginBase):
         self._vpp_ledger_cache = (mtime, summary)
         return summary
 
-    def _record_vpp_ledger_event(self, event, export_kwh, driver="", log_path=""):
+    def _record_vpp_ledger_event(self, event, export_kwh, driver="", log_path="",
+                                 window_kwh=None):
         """Add what we observed for one finished event to the ledger.
 
         Keyed on the window, so re-running the summariser corrects the row
@@ -9449,7 +9487,8 @@ class Plugin(indigo.PluginBase):
             rate   = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
             ledger = _vpp_ledger.load_ledger(path)
             _vpp_ledger.record_local_event(ledger, start, end, export_kwh, rate,
-                                           driver=driver, log_path=log_path)
+                                           driver=driver, log_path=log_path,
+                                           window_kwh=window_kwh)
             _vpp_ledger.save_ledger(path, ledger)
             self._vpp_ledger_cache = None
             log(f"[VPP] Ledger: recorded {round(float(export_kwh), 2)} kWh for "
