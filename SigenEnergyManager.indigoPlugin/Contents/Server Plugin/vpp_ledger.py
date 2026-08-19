@@ -6,7 +6,7 @@
 #              ambiguous number.
 # Author:      CliveS & Claude Opus 5
 # Date:        18-08-2026
-# Version:     1.1
+# Version:     1.2
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -424,6 +424,29 @@ def summarise(ledger, now=None, recent=12):
             by_kind["other_gbp"] += gbp
     by_kind = {k: round(v, 2) for k, v in by_kind.items()}
 
+    # THE BALANCE BLOCK CAN FALL BEHIND ITS OWN ROWS, and silently.
+    # `lifetime_gbp` and `available_gbp` are Axle's figures, imported verbatim
+    # and never computed here - that is the rule the axle side turns on. But a
+    # payload carrying transactions and NO balance (a row typed from a
+    # settlement email, which is the normal way a fresh event arrives) leaves
+    # the headline stating one number while the table beneath it sums to
+    # another. Live on 19-Aug-2026: headline GBP 87.60, rows GBP 91.47, and the
+    # portal agreed with the rows.
+    # So the disagreement is DETECTED and REPORTED - never quietly corrected.
+    # Reporting a computed total as Axle's would be the worse fault: it reads
+    # as settled truth while being our arithmetic.
+    # Skipped entirely once any withdrawal row exists: a withdrawal reduces the
+    # available balance without reducing lifetime earnings, and this estate has
+    # never seen one, so the sign convention is UNVERIFIED and a check built on
+    # a guess is worse than no check.
+    rows_total_gbp   = round(sum(_pence_to_gbp(t.get("credit_pence")) or 0.0
+                                 for t in txs), 2)
+    balance_behind_gbp = None
+    if lifetime_gbp is not None and not by_kind["withdrawals_gbp"]:
+        gap = round(rows_total_gbp - lifetime_gbp, 2)
+        if abs(gap) >= 0.01:
+            balance_behind_gbp = gap
+
     settled_by_start = {}
     for tx in txs:
         if (tx.get("transaction_type") or "").strip() in FLEX_EVENT_TYPES:
@@ -530,6 +553,12 @@ def summarise(ledger, now=None, recent=12):
         "withdraw_threshold_gbp": threshold_gbp,
         "can_withdraw":       balance.get("can_withdraw"),
         "by_kind":            by_kind,
+        # What the transactions themselves add up to, and by how much Axle's
+        # stored headline disagrees (None = they agree, or a withdrawal makes
+        # the comparison unsafe). A non-None value means the balance block is
+        # older than the rows - import the account page to refresh it.
+        "rows_total_gbp":     rows_total_gbp,
+        "balance_behind_gbp": balance_behind_gbp,
         "events_total":       len(events),
         "events_settled":     len(events) - len(pending),
         "events_pending":     len(pending),

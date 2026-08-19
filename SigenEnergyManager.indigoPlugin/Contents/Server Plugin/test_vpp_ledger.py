@@ -475,5 +475,90 @@ class TestHandEnteredRowIsSuperseded(unittest.TestCase):
         self.assertEqual(len(led["axle"]["transactions"]), 2)
 
 
+class TestBalanceCanFallBehindItsRows(unittest.TestCase):
+    """The headline is Axle's figure; the rows are Axle's rows. They can drift.
+
+    A payload carrying transactions and no balance - which is exactly what a
+    settlement email gives you - leaves the stored headline stating one number
+    while the table under it sums to another. Live on 19-Aug-2026: headline
+    GBP 87.60, rows GBP 91.47, portal agreeing with the rows. Detected and
+    reported, never quietly corrected: publishing our arithmetic as Axle's
+    settled figure would be the worse fault.
+    """
+
+    # NB the shipped AXLE_PAYLOAD is a deliberate 5-row SUBSET of the real 17
+    # transactions kept beside the real GBP 87.60 balance, so it does NOT agree
+    # with itself - the first cut of these tests assumed it did and failed,
+    # which is the fixture doing its job. These cases set a balance that
+    # matches their own rows.
+    ROWS_GBP = 42.84
+
+    def _agreeing(self):
+        led = _seeded()
+        led, _ = VL.import_axle_payload(led, {"balance": {
+            "current_balance_pence": int(round(self.ROWS_GBP * 100)),
+            "total_earnings_pence":  int(round(self.ROWS_GBP * 100))}})
+        return led
+
+    def test_agreement_reports_nothing(self):
+        s = VL.summarise(self._agreeing())
+        self.assertEqual(s["rows_total_gbp"], self.ROWS_GBP)
+        self.assertIsNone(s["balance_behind_gbp"])
+
+    def test_a_partial_history_is_itself_a_disagreement(self):
+        # The stock fixture: real headline, only some of the rows. Saying so is
+        # correct - the rows on show do not account for the money claimed.
+        s = VL.summarise(_seeded())
+        self.assertEqual(s["balance_behind_gbp"], round(self.ROWS_GBP - 87.60, 2))
+
+    def test_a_transaction_only_import_is_flagged(self):
+        led = self._agreeing()
+        led, _ = VL.import_axle_payload(led, {"transactions": [{
+            "transaction_type": "flex event", "transaction_id": "email-0816",
+            "start_time": "2026-08-16T19:00:00+00:00",
+            "end_time": "2026-08-16T20:00:00+00:00",
+            "flex_kwh": -3.87, "credit_pence": 387}]})
+        s = VL.summarise(led)
+        self.assertEqual(s["balance_behind_gbp"], 3.87)
+        # The headline itself is UNTOUCHED - still Axle's last word.
+        self.assertEqual(s["lifetime_gbp"], self.ROWS_GBP)
+
+    def test_importing_the_balance_clears_it(self):
+        led = self._agreeing()
+        led, _ = VL.import_axle_payload(led, {"transactions": [{
+            "transaction_type": "flex event", "transaction_id": "email-0816",
+            "start_time": "2026-08-16T19:00:00+00:00",
+            "end_time": "2026-08-16T20:00:00+00:00",
+            "flex_kwh": -3.87, "credit_pence": 387}]})
+        fresh = int(round((self.ROWS_GBP + 3.87) * 100))
+        led, _ = VL.import_axle_payload(led, {"balance": {
+            "current_balance_pence": fresh, "total_earnings_pence": fresh}})
+        s = VL.summarise(led)
+        self.assertIsNone(s["balance_behind_gbp"])
+        self.assertEqual(s["lifetime_gbp"], round(self.ROWS_GBP + 3.87, 2))
+
+    def test_a_withdrawal_makes_the_check_UNSAFE_so_it_is_skipped(self):
+        # (uses the mismatched stock fixture on purpose - the point is that
+        # even a real gap is not reported once a withdrawal is in play.)
+        # A withdrawal reduces the available balance without reducing lifetime
+        # earnings, and this estate has never seen one, so the sign convention
+        # is unverified. A check resting on a guess is worse than no check.
+        led = _seeded()
+        led["axle"]["transactions"].append({
+            "transaction_type": "withdrawal", "transaction_id": "w-1",
+            "start_time": "2026-08-18T09:00:00+00:00", "credit_pence": -1000})
+        s = VL.summarise(led)
+        self.assertIsNone(s["balance_behind_gbp"])
+
+    def test_no_balance_at_all_claims_nothing(self):
+        led = VL.empty_ledger()
+        led, _ = VL.import_axle_payload(led, {"transactions": [{
+            "transaction_type": "flex event", "transaction_id": "t-x",
+            "start_time": "2026-08-16T19:00:00+00:00", "credit_pence": 387}]})
+        s = VL.summarise(led)
+        self.assertIsNone(s["lifetime_gbp"])
+        self.assertIsNone(s["balance_behind_gbp"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,7 +7,35 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
 # Date:        18-08-2026
-# Version:     5.72.2
+# Version:     5.72.3
+#
+# v5.72.3 (19-08-2026): THE HEADLINE COULD FALL BEHIND ITS OWN ROWS, SILENTLY.
+#              Straight after the 5.72.2 email import, the ledger reported a
+#              lifetime of GBP 87.60 while the transactions listed underneath
+#              it summed to GBP 91.47 — because `lifetime_gbp` and
+#              `available_gbp` are Axle's stored figures and a payload carrying
+#              transactions and NO balance (exactly what a settlement email
+#              gives you) never refreshes them. CliveS's screenshot of the
+#              Balance page settled it: GBP 91.47, agreeing with the ROWS.
+#              Two numbers in one ledger disagreeing, with nothing saying so.
+#              `summarise` now totals the rows and reports the gap as
+#              `balance_behind_gbp` — DETECTED AND REPORTED, never quietly
+#              corrected, because publishing our arithmetic as Axle's settled
+#              figure reads as truth while being a computation, which is the
+#              worse fault and the rule the whole axle side turns on. The menu
+#              says which figure is which and what to do; `/api/status` carries
+#              the flag. SKIPPED once any withdrawal row exists: a withdrawal
+#              cuts the available balance without cutting lifetime earnings and
+#              this estate has never seen one, so the sign convention is
+#              UNVERIFIED and a check built on a guess is worse than none.
+#              THE FIXTURE CAUGHT MY OWN ASSUMPTION: the test payload is a
+#              deliberate 5-row SUBSET of the real 17 kept beside the real
+#              GBP 87.60 balance, so it never agreed with itself and the first
+#              three cases failed. The tests were wrong, not the code.
+#              Tests 50 -> 56, 2/2 mutants killed with each mutation asserted
+#              to have applied. LIVE: the real balance imported from the
+#              account page, so lifetime, available and the rows all read
+#              GBP 91.47 and the flag is clear.
 #
 # v5.72.2 (19-08-2026): A HAND-ENTERED SETTLEMENT ROW CAN NO LONGER DOUBLE-
 #              COUNT. Axle email the result of an event days before their
@@ -9592,6 +9620,9 @@ class Plugin(indigo.PluginBase):
             "events_pending":    s.get("events_pending"),
             "can_withdraw":      s.get("can_withdraw"),
             "age_days":          s.get("axle_age_days"),
+            # Non-None when Axle's stored headline is older than the rows
+            # beneath it - see vpp_ledger.summarise.
+            "balance_behind_gbp": s.get("balance_behind_gbp"),
         }
 
     def get_dashboard_vpp(self):
@@ -10208,6 +10239,16 @@ class Plugin(indigo.PluginBase):
         log(f"[VPP]   Bonuses/referrals: GBP {by_kind.get('other_gbp', 0.0):.2f}")
         log(f"[VPP] Events: {s.get('events_settled', 0)} settled, "
             f"{s.get('events_pending', 0)} awaiting settlement")
+
+        # A headline that disagrees with its own rows is worse than no
+        # headline, so say which is which rather than quietly picking one.
+        behind = s.get("balance_behind_gbp")
+        if behind:
+            log(f"[VPP] NB the balance above is Axle's last reported figure and is "
+                f"GBP {abs(behind):.2f} {'behind' if behind > 0 else 'ahead of'} the "
+                f"transactions listed here (they total "
+                f"GBP {s.get('rows_total_gbp', 0.0):.2f}). Import the account page "
+                f"to refresh it.", level="WARNING")
 
         age = s.get("axle_age_days")
         log(f"[VPP] Axle data imported:  {s.get('axle_fetched_local') or 'never'}"
