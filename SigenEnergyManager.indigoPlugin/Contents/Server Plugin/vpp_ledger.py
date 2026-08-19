@@ -6,7 +6,7 @@
 #              ambiguous number.
 # Author:      CliveS & Claude Opus 5
 # Date:        18-08-2026
-# Version:     1.0
+# Version:     1.1
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -187,6 +187,26 @@ def import_axle_payload(ledger, payload, fetched_at=None):
                 for t in (axle.get("transactions") or [])
                 if isinstance(t, dict) and t.get("transaction_id")}
 
+    # A grid event settles ONCE, so its window identifies it as surely as its
+    # transaction id does - and sometimes more usefully. A row entered by hand
+    # from Axle's settlement email cannot know the id their account will later
+    # give it, so id-only dedupe would leave the hand row sitting beside the
+    # real one for ever and count the event twice. Keyed by window as well, the
+    # authentic row REPLACES the stand-in on the next import.
+    # Only flex events are collapsed this way: the monthly floor payment and
+    # the referral credit carry no window, and two of those in one month are
+    # two genuine payments.
+    def _flex_window(tx):
+        if (tx.get("transaction_type") or "").strip() not in FLEX_EVENT_TYPES:
+            return None
+        return _window_key(tx.get("start_time"))
+
+    by_window = {}
+    for tid, tx in existing.items():
+        w = _flex_window(tx)
+        if w:
+            by_window[w] = tid
+
     added = 0
     for tx in (payload.get("transactions") or []):
         if not isinstance(tx, dict):
@@ -194,11 +214,19 @@ def import_axle_payload(ledger, payload, fetched_at=None):
         tid = tx.get("transaction_id")
         if not tid:
             continue
+        w = _flex_window(tx)
         if tid not in existing:
-            added += 1
+            clash = by_window.get(w) if w else None
+            if clash and clash != tid:
+                # Same window, different id: the incoming row supersedes.
+                existing.pop(clash, None)
+            else:
+                added += 1
         # Later payloads win: `settlement_date` and `payment_status` are filled
         # in after the fact, so an existing row is stale by definition.
         existing[tid] = tx
+        if w:
+            by_window[w] = tid
 
     axle["transactions"] = sorted(
         existing.values(),

@@ -404,5 +404,76 @@ class TestWindowVersusRun(unittest.TestCase):
         self.assertIsNone(e["outside_kwh"])
 
 
+class TestHandEnteredRowIsSuperseded(unittest.TestCase):
+    """A row typed in from a settlement email must not double-count later.
+
+    Axle email the result days before the account page catches up, so it is
+    reasonable to enter the figure by hand - but a hand row cannot know the
+    transaction id Axle will eventually assign, and id-only dedupe would then
+    keep both for ever and count that event twice in the lifetime total.
+    """
+
+    EMAIL = {"transactions": [{
+        "transaction_type": "flex event",
+        "transaction_id": "email-2026-08-16T19:00",
+        "start_time": "2026-08-16T19:00:00+00:00",
+        "end_time": "2026-08-16T20:00:00+00:00",
+        "settlement_date": None, "flex_kwh": -3.87, "credit_pence": 387,
+    }]}
+
+    REAL = {"transactions": [{
+        "transaction_type": "flex event",
+        "transaction_id": "t-0816",
+        "start_time": "2026-08-16T19:00:00+00:00",
+        "end_time": "2026-08-16T20:00:00+00:00",
+        "settlement_date": "2026-09-30", "flex_kwh": -3.871, "credit_pence": 387,
+    }]}
+
+    def _both(self):
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), self.EMAIL)
+        led, added = VL.import_axle_payload(led, self.REAL)
+        return led, added
+
+    def test_the_real_row_replaces_the_hand_entered_one(self):
+        led, added = self._both()
+        ids = [t["transaction_id"] for t in led["axle"]["transactions"]]
+        self.assertEqual(ids, ["t-0816"])
+        # Nothing was ADDED - the event was already known, under another name.
+        self.assertEqual(added, 0)
+
+    def test_the_event_is_counted_once(self):
+        led, _ = self._both()
+        s = VL.summarise(led)
+        self.assertEqual(s["by_kind"]["events_gbp"], 3.87)
+        self.assertEqual(s["events_settled"], 1)
+
+    def test_a_DIFFERENT_window_is_still_a_new_row(self):
+        # The guard collapses one window, not every flex event in sight.
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), self.EMAIL)
+        other = {"transactions": [dict(self.REAL["transactions"][0],
+                                       transaction_id="t-0817",
+                                       start_time="2026-08-17T19:00:00+00:00",
+                                       end_time="2026-08-17T20:00:00+00:00")]}
+        led, added = VL.import_axle_payload(led, other)
+        self.assertEqual(added, 1)
+        self.assertEqual(len(led["axle"]["transactions"]), 2)
+
+    def test_non_events_are_NOT_collapsed_by_window(self):
+        # Two monthly top-ups can legitimately share a start time; neither is
+        # a stand-in for the other, and losing one loses real money.
+        a = {"transactions": [{"transaction_type": "flex period top-up",
+                               "transaction_id": "top-a",
+                               "start_time": "2026-07-01T00:00:00+00:00",
+                               "credit_pence": 618}]}
+        b = {"transactions": [{"transaction_type": "flex period top-up",
+                               "transaction_id": "top-b",
+                               "start_time": "2026-07-01T00:00:00+00:00",
+                               "credit_pence": 400}]}
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), a)
+        led, added = VL.import_axle_payload(led, b)
+        self.assertEqual(added, 1)
+        self.assertEqual(len(led["axle"]["transactions"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

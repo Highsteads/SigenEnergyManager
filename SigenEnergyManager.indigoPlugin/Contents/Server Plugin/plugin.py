@@ -7,7 +7,29 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
 # Date:        18-08-2026
-# Version:     5.72.1
+# Version:     5.72.2
+#
+# v5.72.2 (19-08-2026): A HAND-ENTERED SETTLEMENT ROW CAN NO LONGER DOUBLE-
+#              COUNT. Axle email the result of an event days before their
+#              account page catches up — the 16-Aug window arrived by email on
+#              the 19th (GBP 3.87 for 3.87 kWh) while the account still showed
+#              nothing — so entering the figure by hand is the sensible move.
+#              But `import_axle_payload` deduped on `transaction_id` ALONE, and
+#              a hand row cannot know the id Axle will later assign it, so the
+#              authentic row would have landed BESIDE the stand-in and the
+#              event would have been counted twice in the lifetime total for
+#              ever, with nothing to notice.
+#              A grid event settles once, so its WINDOW identifies it as surely
+#              as its id does: a new flex-event row whose window is already
+#              held now REPLACES the row that holds it. Deliberately flex
+#              events only — the monthly floor payment and the referral credit
+#              carry no window, and two top-ups in one month are two genuine
+#              payments, which is its own test.
+#              The 16-Aug row is now in the live ledger as email-sourced, so
+#              the next account import quietly corrects it. 4 tests (50 in the
+#              module); mutation-tested with the guard removed, and the
+#              mutation was ASSERTED to have applied before its result was
+#              believed.
 #
 # v5.72.1 (18-08-2026): THE LEDGER NOW RECORDS THE IN-WINDOW EXPORT TOO, and
 #              it changes what the comparison means. CliveS asked why 11-Aug
