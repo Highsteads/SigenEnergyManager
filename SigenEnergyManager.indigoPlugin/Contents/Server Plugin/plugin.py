@@ -7,7 +7,38 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
 # Date:        18-08-2026
-# Version:     5.72.3
+# Version:     5.73.0
+#
+# v5.73.0 (19-08-2026): "PV CURTAILED" WAS AN ALARM ABOUT THE SUN GOING DOWN.
+#              Found checking the device states after the 5.72.3 restart, not
+#              from any symptom. The 16-Aug window (19:00-20:00 UTC =
+#              20:00-21:00 BST) reported `lastVppPvStatus: curtailed` with PV
+#              at 0 W across all 48 snapshots. SUNSET WAS 20:40 BST, so the
+#              window opened 41 min before it and ran 19 min past — genuinely
+#              daytime by the dawn/dusk gate, which is why v5.56.0's dark-window
+#              branch did not catch it. But the FORECAST for that hour was
+#              153 W falling to zero: it had predicted the zero. And
+#              curtailment was IMPOSSIBLE anyway — in 0x05 with charge pinned
+#              at 0 it needs PV above house + export cap, about 5 kW, at five
+#              degrees of elevation.
+#              THE RULE WAS RIGHT AND ITS SCOPE WAS WRONG. v5.66.0 established
+#              that only a peak which never lifts means a shut-down MPPT; that
+#              holds mid-day and says nothing at the edge of the solar day,
+#              where nothing was coming anyway. So the verdict now asks what
+#              was EXPECTED: new pure `_forecast_peak_w_for_window` reads the
+#              hourly p50 buckets over the window's LOCAL hours, and a peak
+#              below PV_EXPECTED_MIN_W (200 W — 1.4% of nameplate, where a
+#              zero cannot be told from cloud) reads "n/a (no PV expected)".
+#              A substantial forecast still condemns a zero, which is the
+#              15-Jun-2026 failure this check exists for and is pinned as the
+#              control. An UNKNOWN forecast changes NOTHING — it must never
+#              quietly excuse a real fault — and that fallback is pinned too.
+#              Raw p50 deliberately, not bias-corrected: raw runs high here
+#              (0.883), so it over-states the expectation and makes the guard
+#              LESS willing to excuse, which is the safe direction.
+#              Reporting only — nothing on the drive path changed. Tests
+#              686 -> 696, 3/3 mutants killed with each mutation asserted to
+#              have applied.
 #
 # v5.72.3 (19-08-2026): THE HEADLINE COULD FALL BEHIND ITS OWN ROWS, SILENTLY.
 #              Straight after the 5.72.2 email import, the ledger reported a
@@ -2285,6 +2316,50 @@ def _export_locked_out(within_window, soc_pct, soc_floor):
     if soc_pct is None:
         return True
     return soc_pct < soc_floor
+
+
+PV_EXPECTED_MIN_W = 200
+
+
+def _forecast_peak_w_for_window(hourly, start_local, end_local):
+    """Peak FORECAST watts across the local hours a window touches.
+
+    `hourly` is the raw {"YYYY-MM-DD HH:MM:SS": watts} p50 bucket dict. Returns
+    None when the window's hours are simply not in the forecast - unknown is a
+    third answer here and must not be mistaken for zero.
+
+    Deliberately the RAW p50 rather than the bias-corrected figure: raw runs
+    high on this site (overall factor 0.883), and over-stating the expectation
+    makes the guard below LESS willing to excuse a zero, which is the safe
+    direction for a check whose whole job is catching a shut-down MPPT.
+    """
+    if not hourly or start_local is None or end_local is None:
+        return None
+    try:
+        first = start_local.replace(minute=0, second=0, microsecond=0)
+        last  = end_local.replace(minute=0, second=0, microsecond=0)
+    except AttributeError:
+        return None
+
+    peak, seen = 0.0, False
+    for slot, watts in hourly.items():
+        try:
+            slot_dt = datetime.strptime(str(slot), "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+        if first.tzinfo is not None:
+            slot_dt = _london_localise(slot_dt) or slot_dt
+        try:
+            if not (first <= slot_dt <= last):
+                continue
+        except TypeError:
+            continue
+        seen = True
+        try:
+            peak = max(peak, float(watts))
+        except (TypeError, ValueError):
+            continue
+    return peak if seen else None
 
 
 def _solar_refill_releases_lockout(is_daytime, soc_pct, min_soc_pct, battery_kwh,
@@ -7634,10 +7709,30 @@ class Plugin(indigo.PluginBase):
                 daytime = False
         daytime = bool(daytime)
 
+        # AND A DAYLIGHT WINDOW AT THE EDGE OF THE SOLAR DAY EXPECTS NOTHING
+        # ANYWAY (v5.73.0). The daytime gate brackets by dawn and dusk, so the
+        # last forty minutes before sunset count as daytime - and a 14.25 kWp
+        # array at five degrees of elevation makes essentially nothing, so a
+        # zero peak there is the sun, not a shut-down MPPT.
+        # Live-hit on the 16-Aug-2026 window (20:00-21:00 BST, sunset 20:40):
+        # PV read 0 W across all 48 snapshots and the report said "curtailed",
+        # while the forecast for that hour was 153 W falling to zero. It had
+        # predicted the zero. Curtailment was IMPOSSIBLE too - in 0x05 with
+        # charge pinned at 0 it needs PV above house + export cap, about 5 kW.
+        # So the verdict now asks what was EXPECTED. A negligible forecast
+        # excuses a zero; a substantial one still condemns it, which is the
+        # 15-Jun-2026 failure this check exists for (a mid-morning window whose
+        # forecast ran to kilowatts while mode 0x06 held the MPPT down).
+        # An UNKNOWN forecast changes nothing - it must not quietly excuse a
+        # real fault, so the older, noisier verdict stands in that case.
+        expected_pv_w = self._forecast_pv_peak_w(event)
+
         if not daytime:
             pv_status = "n/a (dark window)"
         elif pv_watts and max_pv_w > 100:
             pv_status = "ran"
+        elif expected_pv_w is not None and expected_pv_w < PV_EXPECTED_MIN_W:
+            pv_status = "n/a (no PV expected)"
         else:
             pv_status = "curtailed"
 
@@ -7952,6 +8047,44 @@ class Plugin(indigo.PluginBase):
             def _naive(dt):
                 return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
             return _naive(dawn) <= _naive(event_start) <= _naive(dusk)
+
+    def _forecast_pv_peak_w(self, event):
+        """Peak forecast watts over an event's window, or None if unknown.
+
+        Wraps the pure `_forecast_peak_w_for_window` with this plugin's
+        forecast store and the local-time conversion. Wrapped whole: an
+        advisory figure must never cost the summary that carries the export.
+        """
+        try:
+            def _iso_dt(v):
+                if v is None:
+                    return None
+                if isinstance(v, datetime):
+                    dt = v
+                else:
+                    try:
+                        dt = datetime.fromisoformat(str(v))
+                    except (TypeError, ValueError):
+                        return None
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+            start = _iso_dt(event.get("start_time")) if event else None
+            end   = _iso_dt(event.get("end_time"))   if event else None
+            if start is None:
+                return None
+            start_local = _to_london(start)
+            end_local   = _to_london(end) if end else start_local
+
+            fcast = self.latest_forecast_data or {}
+            peak  = None
+            for key in ("_hourly_p50_today", "_hourly_p50_tomorrow"):
+                got = _forecast_peak_w_for_window(fcast.get(key) or {},
+                                                  start_local, end_local)
+                if got is not None:
+                    peak = got if peak is None else max(peak, got)
+            return peak
+        except Exception:
+            return None
 
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""

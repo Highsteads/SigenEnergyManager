@@ -3342,7 +3342,7 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
     shaped like the 12-Aug-2026 event (PV declining to zero at dusk).
     """
 
-    def _run(self, pv_series, daytime=True):
+    def _run(self, pv_series, daytime=True, forecast=None, event=None):
         import json as _json
         import tempfile
         from unittest.mock import MagicMock as _MM
@@ -3364,6 +3364,10 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
         p.pluginPrefs = {}
         p._send_pushover = lambda *a, **k: None
         p._find_device = lambda type_id: _Rec()
+        # Absent by default, which is the point: with no forecast the verdict
+        # must fall back to the older, noisier rule rather than excusing a zero.
+        if forecast is not None:
+            p.latest_forecast_data = forecast
 
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "event.jsonl")
@@ -3384,7 +3388,7 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
             saved_log = plugin.log
             plugin.log = lambda *a, **k: None
             try:
-                p._summarise_vpp_event({"duration_hrs": 2.0})
+                p._summarise_vpp_event(event or {"duration_hrs": 2.0})
             finally:
                 plugin.log = saved_log
         return verdict
@@ -3408,6 +3412,90 @@ class TestVppPvVerdictOnRealSummariser(unittest.TestCase):
         v = self._run([0] * 11, daytime=False)
         self.assertEqual(v.get("lastVppPvStatus"), "n/a (dark window)")
         self.assertIs(v.get("lastVppPvSurvived"), True)
+
+
+    # ---- v5.73.0: what was EXPECTED, not merely what arrived ----------
+    #
+    # The 16-Aug-2026 window (20:00-21:00 BST, sunset 20:40) read 0 W across
+    # all 48 snapshots and was reported "curtailed". The forecast for that hour
+    # was 153 W falling to zero — it had predicted the zero — and curtailment
+    # needs PV above house + export cap, roughly 5 kW, at five degrees of
+    # elevation. The alarm was about the sun going down.
+    DUSK_EVENT = {"duration_hrs": 1.0,
+                  "start_time": "2026-08-16T19:00:00+00:00",
+                  "end_time":   "2026-08-16T20:00:00+00:00"}
+    DUSK_FORECAST = {"_hourly_p50_today": {"2026-08-16 19:00:00": 716,
+                                           "2026-08-16 20:00:00": 153,
+                                           "2026-08-16 21:00:00": 0}}
+
+    def test_a_zero_the_forecast_predicted_is_not_an_alarm(self):
+        v = self._run([0] * 11, forecast=self.DUSK_FORECAST, event=self.DUSK_EVENT)
+        self.assertEqual(v.get("lastVppPvStatus"), "n/a (no PV expected)")
+        self.assertIs(v.get("lastVppPvSurvived"), True)
+
+    def test_a_zero_the_forecast_did_NOT_predict_is_still_condemned(self):
+        # The 15-Jun-2026 fault, with a forecast running to kilowatts. This is
+        # the case the whole check exists for and it must not be excused.
+        busy = {"_hourly_p50_today": {"2026-08-16 19:00:00": 2600,
+                                      "2026-08-16 20:00:00": 4100}}
+        v = self._run([0] * 11, forecast=busy, event=self.DUSK_EVENT)
+        self.assertEqual(v.get("lastVppPvStatus"), "curtailed")
+        self.assertIs(v.get("lastVppPvSurvived"), False)
+
+    def test_an_unknown_forecast_excuses_nothing(self):
+        # A forecast that does not cover the window is UNKNOWN, and unknown
+        # must not quietly become "expected zero".
+        elsewhere = {"_hourly_p50_today": {"2026-07-04 12:00:00": 20}}
+        v = self._run([0] * 11, forecast=elsewhere, event=self.DUSK_EVENT)
+        self.assertEqual(v.get("lastVppPvStatus"), "curtailed")
+
+    def test_real_pv_still_reads_ran_whatever_the_forecast_said(self):
+        v = self._run([1757, 1200, 600, 0, 0], forecast=self.DUSK_FORECAST,
+                      event=self.DUSK_EVENT)
+        self.assertEqual(v.get("lastVppPvStatus"), "ran")
+
+
+class TestForecastPeakForWindow(unittest.TestCase):
+    """The pure half: what the forecast expected over a window's local hours."""
+
+    HOURLY = {"2026-08-16 19:00:00": 716,
+              "2026-08-16 20:00:00": 153,
+              "2026-08-16 21:00:00": 0}
+
+    def _local(self, h):
+        from london_time import london_localise
+        return london_localise(datetime(2026, 8, 16, h, 0))
+
+    def test_takes_the_peak_across_every_hour_touched(self):
+        self.assertEqual(
+            plugin._forecast_peak_w_for_window(self.HOURLY, self._local(19), self._local(21)),
+            716.0)
+
+    def test_a_single_hour_window(self):
+        self.assertEqual(
+            plugin._forecast_peak_w_for_window(self.HOURLY, self._local(20), self._local(20)),
+            153.0)
+
+    def test_unknown_hours_return_None_not_zero(self):
+        # None and 0.0 mean opposite things here - one is "no data", the other
+        # is "the forecast says nothing will be generated".
+        self.assertIsNone(
+            plugin._forecast_peak_w_for_window(self.HOURLY, self._local(2), self._local(3)))
+
+    def test_a_forecast_of_genuine_zero_is_zero_not_None(self):
+        self.assertEqual(
+            plugin._forecast_peak_w_for_window(self.HOURLY, self._local(21), self._local(21)),
+            0.0)
+
+    def test_empty_or_missing_inputs(self):
+        self.assertIsNone(plugin._forecast_peak_w_for_window({}, self._local(20), self._local(20)))
+        self.assertIsNone(plugin._forecast_peak_w_for_window(self.HOURLY, None, None))
+
+    def test_junk_slots_and_values_are_skipped_not_fatal(self):
+        junk = dict(self.HOURLY); junk["not-a-date"] = 999; junk["2026-08-16 20:00:00"] = "x"
+        self.assertEqual(
+            plugin._forecast_peak_w_for_window(junk, self._local(19), self._local(21)),
+            716.0)
 
 
 class TestAnalysePackBalance(unittest.TestCase):
