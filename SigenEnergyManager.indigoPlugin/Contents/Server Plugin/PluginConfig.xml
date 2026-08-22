@@ -274,7 +274,13 @@
         <Label>Daytime charge target floor (%):</Label>
     </Field>
     <Field id="solarOverflowMinEndSocInfo" type="label">
-        <Label>Safety net for dull days. If pacing to the target above would still leave the battery below this level at dusk, the day is too weak to be giving units away — the target reverts to 100% and every spare unit is kept in the battery instead of exported. Set this to the level you want available for a power cut. Default 80.</Label>
+        <Label>Safety net for the configured pacing target. The daytime overflow gate already stops export as soon as the remaining forecast can no longer fill the battery to 100%, so every spare unit is then kept. This floor prevents a mis-set target below the resilience level you want available for a power cut. Default 80.</Label>
+    </Field>
+    <Field id="solarOverflowShadowEnabled" type="checkbox" defaultValue="true">
+        <Label>Log-only 90% vs 95% daytime-target comparison:</Label>
+    </Field>
+    <Field id="solarOverflowShadowInfo" type="label">
+        <Label>No inverter setting is changed. The daily record compares the early export made available by the live 90% pacing with a 95% pacing estimate, then records observed end SOC, export and evening imports. It also prices the same observed imports at Tracker and published Agile half-hourly rates. This is evidence for a later decision, not an Agile dispatch simulation.</Label>
     </Field>
     <Field id="stormExportReleasePct" type="textfield" defaultValue="85">
         <Label>Storm export release SOC (%):</Label>

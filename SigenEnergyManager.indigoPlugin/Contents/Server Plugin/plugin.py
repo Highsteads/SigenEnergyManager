@@ -7,7 +7,18 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
 # Date:        18-08-2026
-# Version:     5.73.0
+# Version:     5.74.0
+#
+# v5.74.0 (20-08-2026): SHADOW-COMPARES 90% AND 95% DAYTIME PACING WITHOUT
+#              TOUCHING THE INVERTER.  Each solar-overflow evaluation now runs
+#              the same immutable snapshot through a 95% target and totals the
+#              extra early export that the live 90% setting makes available.
+#              At midnight it stores that estimate beside the observed end SOC,
+#              export and post-16:00 import.  It also records the actual import
+#              pattern at both Tracker's daily price and Agile's published
+#              half-hourly prices.  This is a SAME-CONSUMPTION tariff baseline,
+#              not a claim that Agile's battery scheduling would have behaved
+#              identically.  No control setting, charge cap or tariff changes.
 #
 # v5.73.0 (19-08-2026): "PV CURTAILED" WAS AN ALARM ABOUT THE SUN GOING DOWN.
 #              Found checking the device states after the 5.72.3 restart, not
@@ -1917,6 +1928,7 @@ import sqlite3
 import sys
 import threading
 import time
+import copy
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -2924,6 +2936,9 @@ class Plugin(indigo.PluginBase):
         # re-engage dwell. None = not released this run, which the manager treats as
         # "not blocked" — a fresh start must never be locked out of exporting.
         self.store["solar_overflow_released_at"]  = None
+        # Log-only 95% pacing counterfactual — never read by a control path.
+        self.store["shadow_95_export_foregone_kwh"] = 0.0
+        self.store["shadow_95_samples"]             = 0
 
         # Set when a VPP hand-back write was not confirmed, so the 10s tick
         # re-asserts the safe baseline instead of waiting for the ~15-min manager
@@ -5431,6 +5446,7 @@ class Plugin(indigo.PluginBase):
         # 5. Evaluate
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
+        self._record_solar_overflow_shadow(snapshot, decision)
 
         # 6. Log if action changed or heartbeat
         self._log_manager_decision(decision, snapshot, soc_pct)
@@ -5448,6 +5464,40 @@ class Plugin(indigo.PluginBase):
         #     reports the SAME gate the manager acts on (single source of truth — stops
         #     the advisory re-deriving and drifting; see the 23/24-Jun-2026 case).
         self._publish_flood_preview(snapshot, decision)
+
+    def _record_solar_overflow_shadow(self, snapshot, live_decision):
+        """Accumulate a 95%-target pacing estimate without changing control.
+
+        The physics, sufficiency and DNO gates are deliberately identical to the
+        live decision.  Only the charge pacing target changes.  The delta is an
+        estimate of export foregone / charge retained during this one-minute
+        evaluation interval; it is not an assertion about end-of-day SOC or PV
+        curtailment, both of which depend on later weather and inverter behaviour.
+        """
+        if not bool(self.pluginPrefs.get("solarOverflowShadowEnabled", True)):
+            return
+        if snapshot.storm_active or live_decision.action != ACTION_SOLAR_OVERFLOW:
+            return
+        # This experiment is explicitly 90% versus 95%. If the owner changes
+        # the live preference, do not silently label a different comparison 90/95.
+        if abs(float(snapshot.solar_overflow_target_pct) - 90.0) > 0.01:
+            return
+        try:
+            balance = self.manager._calculate_24h_balance(snapshot)
+            shadow_snapshot = copy.copy(snapshot)
+            shadow_snapshot.solar_overflow_target_pct = 95.0
+            shadow = self.manager._check_solar_overflow(shadow_snapshot, balance)
+            if shadow is None:
+                return
+            export_delta_kw = max(0.0, float(live_decision.export_kw) - float(shadow.export_kw))
+            self.store["shadow_95_export_foregone_kwh"] += (
+                export_delta_kw * MANAGER_EVAL_INTERVAL / 3600.0
+            )
+            self.store["shadow_95_samples"] += 1
+        except Exception as exc:
+            # Analysis must be invisible to the control path if an unexpected
+            # forecast/input shape occurs.
+            self.logger.debug(f"[Shadow] 90/95 pacing sample skipped: {exc!r}")
 
     def _publish_flood_preview(self, snapshot, decision):
         """Write sigen_flood_preview.json so openmeteo_battery_optimiser.py can report
@@ -6952,6 +7002,17 @@ class Plugin(indigo.PluginBase):
         try:
             tariff_info   = self.octopus.get_current_tariff(force=force)
             monitored     = self.octopus.get_all_monitored_rates(force=force)
+
+            # Keep today's Agile slots while on Tracker for the log-only
+            # same-consumption comparison. This is one cached public-rates
+            # request, not a tariff change and not an input to current control.
+            if bool(self.pluginPrefs.get("solarOverflowShadowEnabled", True)):
+                try:
+                    monitored["shadow_agile_slots"] = self.octopus.get_agile_rates(
+                        _london_today(), force=force)
+                except Exception as exc:
+                    monitored["shadow_agile_slots"] = []
+                    self.logger.debug(f"[Shadow] Agile comparison rates unavailable: {exc!r}")
 
             self.latest_rates_data = {
                 "tariff_info": tariff_info,
@@ -8532,6 +8593,68 @@ class Plugin(indigo.PluginBase):
         self._write_energy_summary_variables()
         self.store["last_energy_var"] = time.time()
 
+    def _shadow_tariff_baseline(self, date_str):
+        """Price the observed imports at Tracker and Agile, never reschedule them.
+
+        A true Agile result needs a dispatch simulation (and future prices known
+        when decisions were made). This intentionally answers the narrower,
+        auditable question: what would the exact imported half-hours have cost
+        at each tariff? Missing price coverage yields None rather than a made-up
+        total. Evening means slots ending at or after 16:00 local time.
+        """
+        result = {
+            "evening_import_kwh": 0.0, "priced_import_kwh": 0.0,
+            "tracker_cost_gbp": None, "agile_cost_gbp": None,
+            "priced_slots": 0, "missing_price_slots": 0,
+        }
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        if not os.path.exists(db_path):
+            return result
+        try:
+            con = sqlite3.connect(db_path, timeout=5.0)
+            rows = con.execute(
+                """SELECT slot_end, grid_import_kwh, tracker_price_p, agile_price_p
+                     FROM halfhourly WHERE substr(slot_end, 1, 10) = ?
+                     ORDER BY slot_end""", (date_str,)).fetchall()
+            con.close()
+        except sqlite3.Error as exc:
+            self.logger.debug(f"[Shadow] Cannot read tariff baseline: {exc}")
+            return result
+
+        tracker_cost = agile_cost = 0.0
+        any_import = False
+        complete = True
+        for slot_end, import_kwh, tracker_p, agile_p in rows:
+            try:
+                imported = max(0.0, float(import_kwh or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if imported <= 0:
+                continue
+            any_import = True
+            try:
+                if int(str(slot_end)[11:13]) >= 16:
+                    result["evening_import_kwh"] += imported
+            except (TypeError, ValueError):
+                pass
+            try:
+                tracker = float(tracker_p)
+                agile = float(agile_p)
+            except (TypeError, ValueError):
+                complete = False
+                result["missing_price_slots"] += 1
+                continue
+            result["priced_import_kwh"] += imported
+            result["priced_slots"] += 1
+            tracker_cost += imported * tracker / 100.0
+            agile_cost += imported * agile / 100.0
+        result["evening_import_kwh"] = round(result["evening_import_kwh"], 3)
+        result["priced_import_kwh"] = round(result["priced_import_kwh"], 3)
+        if any_import and complete:
+            result["tracker_cost_gbp"] = round(tracker_cost, 4)
+            result["agile_cost_gbp"] = round(agile_cost, 4)
+        return result
+
     def _write_daily_history(self, date_str):
         """Append today's totals to the all-time daily history.
 
@@ -8569,6 +8692,14 @@ class Plugin(indigo.PluginBase):
                 day_gas_unit_p     = _fin["gas"].get("unit_p")
                 day_gas_standing_p = _fin["gas"].get("standing_p")
 
+        shadow_tariff = self._shadow_tariff_baseline(date_str)
+        try:
+            end_soc_pct = round(float(self.latest_inverter_data.get("batterySoc")), 1)
+        except (TypeError, ValueError):
+            end_soc_pct = None
+        shadow_export = round(float(self.store.get("shadow_95_export_foregone_kwh", 0.0)), 3)
+        shadow_samples = int(self.store.get("shadow_95_samples", 0) or 0)
+
         record = {
             "date":                 date_str,
             "month":                date_str[:7],
@@ -8594,6 +8725,17 @@ class Plugin(indigo.PluginBase):
             "import_events": 1 if self.store.get("had_import_today", False) else 0,
             "export_events": self.store.get("export_count_today", 0),
             "vpp_event":  self.store.get("had_vpp_today", False),
+            "solar_overflow_shadow": {
+                "enabled": bool(self.pluginPrefs.get("solarOverflowShadowEnabled", True)),
+                "live_target_pct": 90.0,
+                "shadow_target_pct": 95.0,
+                "samples": shadow_samples,
+                # Positive = export available at 90% but withheld by a 95% pace.
+                "estimated_export_foregone_kwh": shadow_export,
+                "observed_end_soc_pct": end_soc_pct,
+                "observed_evening_import_kwh": shadow_tariff["evening_import_kwh"],
+                "tariff_baseline": shadow_tariff,
+            },
         }
 
         path    = os.path.join(self.data_dir, "daily_history.json")
@@ -8619,6 +8761,8 @@ class Plugin(indigo.PluginBase):
         self.store["had_import_today"]   = False
         self.store["export_count_today"] = 0
         self.store["had_vpp_today"]      = False
+        self.store["shadow_95_export_foregone_kwh"] = 0.0
+        self.store["shadow_95_samples"]             = 0
 
     # ================================================================
     # Data directory backup (weekly, Monday midnight)
@@ -9193,9 +9337,16 @@ class Plugin(indigo.PluginBase):
                     battery_soc_end_pct   REAL,
                     battery_net_kwh  REAL,
                     tracker_price_p  REAL,
+                    agile_price_p    REAL,
                     manager_action   TEXT
                 )
             """)
+            # Existing installations have the older table. SQLite only gained
+            # ADD COLUMN support suitable for this small migration long ago;
+            # inspect first so startup remains idempotent.
+            columns = {row[1] for row in con.execute("PRAGMA table_info(halfhourly)")}
+            if "agile_price_p" not in columns:
+                con.execute("ALTER TABLE halfhourly ADD COLUMN agile_price_p REAL")
             con.commit()
             log(f"[Timeseries] DB ready: {db_path}")
         except sqlite3.Error as exc:
@@ -9270,6 +9421,19 @@ class Plugin(indigo.PluginBase):
         except Exception:
             pass
 
+        # Agile's published half-hourly rate for this same observed slot. It is
+        # gathered even while Tracker is active solely for the shadow tariff
+        # baseline; it never feeds the manager unless Agile is actually active.
+        agile_p = None
+        now_utc = datetime.now(timezone.utc)
+        try:
+            for start, rate in reversed(self.latest_rates_data.get("shadow_agile_slots", [])):
+                if start <= now_utc < start + timedelta(minutes=30):
+                    agile_p = float(rate)
+                    break
+        except (TypeError, ValueError):
+            agile_p = None
+
         action = ""
         if self.latest_decision:
             action = str(self.latest_decision.action)
@@ -9282,12 +9446,12 @@ class Plugin(indigo.PluginBase):
                    (slot_start, slot_end,
                     grid_import_kwh, grid_export_kwh, pv_kwh, home_kwh,
                     battery_soc_start_pct, battery_soc_end_pct, battery_net_kwh,
-                    tracker_price_p, manager_action)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    tracker_price_p, agile_price_p, manager_action)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (slot_start, slot_end,
                  delta_import, delta_export, delta_pv, delta_home,
                  anchor_soc, cur_soc, battery_net,
-                 tracker_p, action)
+                 tracker_p, agile_p, action)
             )
             con.commit()
         except sqlite3.Error as exc:
@@ -10240,6 +10404,40 @@ class Plugin(indigo.PluginBase):
             )
         return True
 
+    def menuShowSolarOverflowShadow(self):
+        """Log recent log-only 90%/95% pacing and tariff-baseline evidence."""
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError) as exc:
+            log(f"[Shadow] No completed-day comparison available: {exc}", level="WARNING")
+            return True
+
+        rows = [r for r in records if r.get("solar_overflow_shadow")][-21:]
+        if not rows:
+            log("[Shadow] No completed-day comparison available yet — first row is written at midnight")
+            return True
+        log(f"[Shadow] 90% live vs 95% pacing / Tracker vs Agile baseline ({len(rows)} days)")
+        for row in reversed(rows):
+            s = row["solar_overflow_shadow"]
+            tariff = s.get("tariff_baseline", {})
+            export = float(s.get("estimated_export_foregone_kwh", 0.0) or 0.0)
+            soc = s.get("observed_end_soc_pct")
+            tracker = tariff.get("tracker_cost_gbp")
+            agile = tariff.get("agile_cost_gbp")
+            costs = (f"Tracker £{tracker:.2f} / Agile £{agile:.2f}"
+                     if tracker is not None and agile is not None else
+                     f"tariff coverage incomplete ({tariff.get('missing_price_slots', 0)} import slots)")
+            log(
+                f"[Shadow] {row.get('date', '?')}: samples={s.get('samples', 0)} "
+                f"95% would retain/export-withhold ~{export:.2f}kWh; "
+                f"end SOC={soc if soc is not None else '?'}%; "
+                f"evening import={s.get('observed_evening_import_kwh', 0):.2f}kWh; {costs}"
+            )
+        log("[Shadow] Tariff figures hold import timing constant; they are not an Agile battery-dispatch forecast.")
+        return True
+
     def menuShowTariffRates(self):
         """Menu: Log current Tracker/Go/Flux rates from cached Octopus data."""
         rates = self.latest_rates_data
@@ -10972,6 +11170,10 @@ class Plugin(indigo.PluginBase):
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
             "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
+            # Log-only 90% vs 95% daytime pacing counterfactual. Persist it so a
+            # restart cannot turn a partial day into an apparently clean day.
+            "shadow_95_export_foregone_kwh": self.store.get("shadow_95_export_foregone_kwh", 0.0),
+            "shadow_95_samples":             self.store.get("shadow_95_samples", 0),
             # Storm state is NOT day-specific (a warning can span midnight) — persist it
             # so a restart during an active warning doesn't re-send the Pushover.
             "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
@@ -11115,6 +11317,8 @@ class Plugin(indigo.PluginBase):
                 self.store["pv_lifetime_start_kwh"]     = data.get("pv_lifetime_start_kwh")
                 self.store["import_lifetime_start_kwh"] = data.get("import_lifetime_start_kwh")
                 self.store["export_lifetime_start_kwh"] = data.get("export_lifetime_start_kwh")
+                self.store["shadow_95_export_foregone_kwh"] = data.get("shadow_95_export_foregone_kwh", 0.0)
+                self.store["shadow_95_samples"]             = data.get("shadow_95_samples", 0)
                 self.logger.debug("Restored daily accumulators from disk")
         except Exception as e:
             self.logger.warning(f"Cannot load accumulators: {e}")

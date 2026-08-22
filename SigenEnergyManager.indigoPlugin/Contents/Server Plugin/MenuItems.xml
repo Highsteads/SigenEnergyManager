@@ -16,6 +16,11 @@
         <CallbackMethod>menuShowDailyHistory</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuShowSolarOverflowShadow">
+        <Name>Show 90% vs 95% / Agile Shadow Comparison</Name>
+        <CallbackMethod>menuShowSolarOverflowShadow</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuShowTariffRates">
         <Name>Show Current Tariff Rates</Name>
         <CallbackMethod>menuShowTariffRates</CallbackMethod>

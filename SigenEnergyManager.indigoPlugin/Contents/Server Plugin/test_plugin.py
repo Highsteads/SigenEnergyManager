@@ -13,6 +13,8 @@
 import os
 import sys
 import threading
+import sqlite3
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -106,6 +108,52 @@ class TestConfigCoercion(unittest.TestCase):
         st = plugin._num_state("x", None, 2)
         self.assertEqual(st["value"], 0.0)
         self.assertEqual(st["decimalPlaces"], 2)
+
+
+class TestSolarOverflowShadow(unittest.TestCase):
+    """The 90%/95% and tariff comparison must remain reporting-only."""
+
+    def test_pacing_shadow_accumulates_only_the_export_delta(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.pluginPrefs = {"solarOverflowShadowEnabled": True}
+        p.store = {"shadow_95_export_foregone_kwh": 0.0, "shadow_95_samples": 0}
+        p.logger = MagicMock()
+        p.manager = MagicMock()
+        p.manager._calculate_24h_balance.return_value = object()
+        p.manager._check_solar_overflow.return_value = types.SimpleNamespace(export_kw=1.5)
+        snap = types.SimpleNamespace(storm_active=False, solar_overflow_target_pct=90.0)
+        live = types.SimpleNamespace(action=plugin.ACTION_SOLAR_OVERFLOW, export_kw=2.5)
+
+        p._record_solar_overflow_shadow(snap, live)
+
+        self.assertEqual(p.store["shadow_95_samples"], 1)
+        self.assertAlmostEqual(p.store["shadow_95_export_foregone_kwh"], 1.0 / 60.0)
+        self.assertEqual(snap.solar_overflow_target_pct, 90.0)  # copy, never mutate live snapshot
+
+    def test_tariff_baseline_requires_complete_price_coverage(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "energy_timeseries.db")
+            con = sqlite3.connect(db)
+            con.execute("""CREATE TABLE halfhourly (
+                slot_end TEXT, grid_import_kwh REAL, tracker_price_p REAL, agile_price_p REAL)""")
+            con.executemany("INSERT INTO halfhourly VALUES (?,?,?,?)", [
+                ("2026-09-17T15:30:00", 1.0, 25.0, 10.0),
+                ("2026-09-17T16:00:00", 2.0, 25.0, 30.0),
+                ("2026-09-17T18:00:00", 1.0, 25.0, None),
+            ])
+            con.commit()
+            con.close()
+            p = plugin.Plugin.__new__(plugin.Plugin)
+            p.data_dir = td
+            p.logger = MagicMock()
+
+            result = p._shadow_tariff_baseline("2026-09-17")
+
+        self.assertEqual(result["evening_import_kwh"], 3.0)
+        self.assertEqual(result["priced_import_kwh"], 3.0)
+        self.assertEqual(result["missing_price_slots"], 1)
+        self.assertIsNone(result["tracker_cost_gbp"])
+        self.assertIsNone(result["agile_cost_gbp"])
 
 
 class TestDriveVppExport(unittest.TestCase):
