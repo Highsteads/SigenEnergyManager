@@ -14,6 +14,7 @@
 # Date:        24-08-2026
 # Version:     1.0
 
+import json
 import os
 import sys
 import unittest
@@ -210,6 +211,119 @@ class TestLiveLoopbackServer(unittest.TestCase):
                 web_dashboard._DashboardHandler._client_is_loopback = original
         finally:
             dash.stop()
+
+
+class _StubPlugin:
+    """Answers every producer the dashboard routes call, with the right shape."""
+    def get_dashboard_data(self):      return {"battery": {"soc_pct": 50}}
+    def get_dashboard_history(self, hours=24): return {"slots": []}
+    def get_dashboard_daily(self, days=30):    return {"records": []}
+    def get_dashboard_export_sync(self):       return {"rows": [], "summary": {}}
+    def get_dashboard_calendar(self, year):    return {"months": [], "year": year}
+    def get_dashboard_years(self):     return {"years": [2026]}
+    def get_dashboard_vpp(self):       return {"events": []}
+
+
+class TestApiSurface(unittest.TestCase):
+    """The seven JSON endpoints the Dashboards plugin proxies to.
+
+    v5.76.0 stripped this server's own page back to an outage view and moved the
+    charts to the Dashboards energy page. The PAGE shrank; the API must not. If
+    any of these stops answering, the Energy and Cost pages lose data silently —
+    the proxy returns the error as data and the cards just go blank.
+
+    The list is deliberately hardcoded rather than derived from the handler, so
+    deleting a route makes this fail instead of quietly agreeing with itself.
+    """
+
+    # Mirrors Dashboards' _SIGEN_ALLOWED_PATHS.
+    REQUIRED = ["/api/status", "/api/history", "/api/daily", "/api/export-sync",
+                "/api/years", "/api/calendar", "/api/vpp"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18190
+        cls.dash = web_dashboard.WebDashboard(
+            plugin=_StubPlugin(), port=cls.port,
+            bind_host=web_dashboard.DASHBOARD_BIND_LOOPBACK, auth_token="")
+        cls.dash.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dash.stop()
+
+    def _get(self, path):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path)
+        r = conn.getresponse()
+        body = r.read()
+        conn.close()
+        return r.status, body
+
+    def test_every_proxied_endpoint_answers(self):
+        for path in self.REQUIRED:
+            with self.subTest(path=path):
+                status, body = self._get(path)
+                self.assertEqual(status, 200, f"{path} returned {status}")
+                json.loads(body)   # must be valid JSON, not an HTML error page
+
+    def test_page_is_served(self):
+        status, body = self._get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Sigenergy", body)
+
+    def test_page_came_from_disk_not_the_placeholder(self):
+        """A missing dashboard.html degrades to a placeholder. Catch that in CI
+        rather than discovering it during a power cut."""
+        self.assertNotEqual(web_dashboard.DASHBOARD_HTML, web_dashboard._FALLBACK_HTML,
+                            "dashboard.html did not load - serving the placeholder")
+
+    def test_unknown_path_404s(self):
+        status, _ = self._get("/api/nonsense")
+        self.assertEqual(status, 404)
+
+    def test_chart_js_route_is_gone(self):
+        """The 200 KB Chart.js bundle left with the charts."""
+        status, _ = self._get("/chart.js")
+        self.assertEqual(status, 404)
+
+
+class TestPageContent(unittest.TestCase):
+    """What the outage page must and must not contain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = web_dashboard.DASHBOARD_HTML
+
+    def test_keeps_the_outage_essentials(self):
+        for needle in ["Live Power Flow", "Battery State", "Live Power",
+                       "Manager Decision", "flow-svg", "soc-ring"]:
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.html)
+
+    def test_duplicated_cards_are_gone(self):
+        """These live on the Dashboards energy and cost pages. Two copies of a
+        chart is two things to keep in step, and one of them always rots."""
+        for needle in ["chart-soc", "chart-energy", "chart-daily", "cal-tbody",
+                       "period-tbody", "exp-sync-tbody", "fc-svg", "tar-rate"]:
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, self.html)
+
+    def test_no_reference_to_the_removed_chart_bundle(self):
+        self.assertNotIn("/chart.js", self.html)
+
+    def test_page_has_no_unresolved_element_lookups(self):
+        """Every getElementById literal must match an id that exists in the page.
+
+        The three legitimate exceptions are built at runtime.
+        """
+        import re
+        ids = set(re.findall(r'id="([a-zA-Z0-9_-]+)"', self.html))
+        allowed_dynamic = {"help-tip", "dot-"}
+        missing = {m for m in re.findall(r"getElementById\(\s*['\"]([a-zA-Z0-9_-]+)['\"]", self.html)
+                   if m not in ids and m not in allowed_dynamic}
+        self.assertEqual(missing, set(), f"page references ids that do not exist: {missing}")
 
 
 if __name__ == "__main__":

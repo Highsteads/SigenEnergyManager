@@ -8,7 +8,35 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0)
 # Date:        24-08-2026
-# Version:     5.75.0
+# Version:     5.76.0
+#
+# v5.76.0 (24-08-2026): THE PLUGIN CARRIED A SECOND COPY OF THE DASHBOARDS
+#              ENERGY PAGE.  web_dashboard.py was 2,217 lines, of which about
+#              1,800 were an HTML/JS page held in a Python string - so no
+#              linter, no editor and no `node --check` had ever looked at it,
+#              and an unclosed brace in there was a blank page with no clue
+#              where to start.  It also rendered charts, a calendar, tariff,
+#              cost, period totals and an export-sync table that the Dashboards
+#              plugin already draws from the same JSON.
+#              The page now lives in dashboard.html beside the module, and it
+#              has been cut back to what a fallback view is actually for:
+#              power flow, battery state, live power, the manager's decision
+#              and today's totals.  That is the view you want when IWS is
+#              wedged or the broadband is down, which is the only reason this
+#              server has a page at all.
+#              THE JSON API IS UNCHANGED.  All seven endpoints - status,
+#              history, daily, export-sync, years, calendar, vpp - answer
+#              exactly as before, because Dashboards proxies every one of them.
+#              A new test pins that list so a later tidy-up cannot quietly
+#              break the Energy and Cost pages.
+#              The bundled Chart.js (200 KB) and the /chart.js route went with
+#              the charts.  43 orphaned CSS rules went too, several of them
+#              dead since the flow diagram stopped using chevrons.
+#              scripts/check_dashboard_js.py runs the page's own update() over
+#              a real payload in a stub DOM, so a stale element reference fails
+#              a check instead of blanking half the cards in a browser.
+#              web_dashboard.py 2,217 -> 390 lines. Page 1,835 -> 1,044.
+#              Tests 734 -> 743.
 #
 # v5.75.0 (24-08-2026): THE WEB DASHBOARD ASKED NOBODY FOR ANYTHING.  Since it
 #              was written it bound every network interface on port 8179 and

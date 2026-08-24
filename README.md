@@ -71,13 +71,16 @@ battery genuinely cannot reach the configured minimum SOC by next sunrise.
 
 **Web dashboard (`web_dashboard.py`)**
 - Local HTTP server on port 8179 — **this machine only by default**, with a
-  token required if you widen it to the network *(v5.75)* — live power-flow
-  diagram, status chips
-  for grid state and current manager mode, and Chart.js charts (bundled with
-  the plugin and served from `/chart.js`, so they draw with no internet — the
-  CDN is a fallback only): 24h / 48h / 7d SOC line, stacked half-hourly energy
-  bars (PV / export / import / home), 30-day daily totals
-- JSON API: `/api/status`, `/api/history`, `/api/daily`, `/api/export-sync`
+  token required if you widen it to the network *(v5.75)*. Since v5.76 the page
+  is a focused fallback view — power flow, battery, live power, the manager's
+  decision and today's totals — for when IWS is wedged or the broadband is
+  down. It carries the animated power-flow diagram, a SOC ring with a 24-hour
+  sparkline, and status chips for grid state and manager mode. Charts, tariff,
+  cost, the calendar and export-sync live on the Dashboards plugin's Energy and
+  Cost pages, which read the same JSON
+- JSON API — unchanged and fully proxied by Dashboards: `/api/status`,
+  `/api/history`, `/api/daily`, `/api/export-sync`, `/api/years`,
+  `/api/calendar`, `/api/vpp`
 
 **Indigo integration**
 - Five custom device types: Battery Manager, Sigenergy Inverter,
@@ -132,6 +135,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.76.0 | 24-Aug-2026 | **The plugin carried a second copy of the Dashboards energy page.** `web_dashboard.py` was 2,217 lines, of which roughly 1,800 were an HTML/JS page held inside a Python string — so no linter, no editor and no `node --check` had ever looked at it, and an unclosed brace in there meant a blank page with no clue where to start. It also drew charts, a calendar, tariff, cost, period totals and an export-sync table that the Dashboards plugin already draws from the same JSON. The page now lives in `dashboard.html` beside the module, and is cut back to what a fallback view is for: power flow, battery state, live power, the manager's decision and today's totals — the view you want when IWS is wedged or the broadband is down, which is the only reason this server has a page at all. **The JSON API is unchanged** — all seven endpoints answer exactly as before, and a new test pins that list so a later tidy-up cannot quietly break the Energy and Cost pages. The bundled Chart.js (200 KB) and the `/chart.js` route went with the charts, along with 43 orphaned CSS rules, several dead since the flow diagram stopped using chevrons. `scripts/check_dashboard_js.py` runs the page's own `update()` over a real payload in a stub DOM, so a stale element reference fails a check instead of blanking half the cards. Tests 734 → 743. |
 | 5.75.0 | 24-Aug-2026 | **The web dashboard asked nobody for anything.** Since it was written it bound every network interface on port 8179 and served the whole energy API — SOC, tariff, VPP, power-cut history — to any device on the network, with no authentication at all. On a home network that was a known trade. It stops being one the moment the port is reached through a tunnel. It now binds **loopback by default**, which changes nothing you can see: the Dashboards plugin proxies to 127.0.0.1 server-side, so its Energy and Cost pages carry on as before. What goes away is the exposure. A new **Dashboard access** setting widens it to the whole network, and that path **requires a token** — the server refuses to start rather than open an unauthenticated port. The token comes from `SIGEN_DASHBOARD_TOKEN` in `IndigoSecrets.py`, then the config field, then one the plugin generates and keeps mode 0600 in its own data folder. Send it as a `Bearer` header, an `X-Auth-Token` header or a `?token=` query string, and the page sets a cookie so a browser only needs it once. Loopback callers are exempt, which is what keeps the proxy working. New menu item **Show Web Dashboard Access**. Also adds `read_export_limit()` to the Modbus client, reading back the commissioned grid export cap at 40038 — the write side already existed — so the standalone SigenVPP daemon can share that file byte for byte instead of carrying a local edit. Tests 696 → 734. |
 | 5.74.0 | 20-Aug-2026 | **A decision between a 90% and a 95% daytime battery target needs evidence, not a hunch.** The manager now runs a completely passive shadow calculation whenever its live 90% solar-overflow pacing is active: it asks what a 95% pace would have withheld from early export, but never sends that answer to the inverter. At midnight the daily history keeps the estimate beside the observed end SOC, actual export and imports after 16:00. It also records the actual imported half-hours at both the live Tracker price and Octopus Agile's published half-hourly prices, ready for the likely autumn tariff decision. That tariff comparison deliberately holds the home's import timing fixed: it says what the same imports would have cost, **not** what an Agile battery-dispatch simulation might achieve. Missing price coverage stays unknown rather than being filled with a guess. The new **Show 90% vs 95% / Agile Shadow Comparison** menu item prints the recent rows. There is no change to charging, export, tariff, or any inverter register. |
 | 5.73.0 | 19-Aug-2026 | **A grid event at dusk was reporting the solar as curtailed when the sun was simply going down.** The check that spots the inverter shutting the panels down looks for a window where the solar never lifts off zero — sound in the middle of the day, meaningless in the last forty minutes before sunset, when nothing was coming anyway. The 16 August event ran from forty minutes before sunset to twenty minutes after it, read zero throughout, and was reported as a fault; the forecast for that hour had predicted 153 watts falling to nothing. The verdict now asks what was expected before it complains: a negligible forecast excuses a zero, a substantial one still condemns it, and an unknown forecast excuses nothing at all. Reporting only — nothing that drives the battery changed. |
@@ -707,11 +711,15 @@ time, so you only paste it once per browser.
 
 Never forward port 8179 from your router. Use Tailscale or a Cloudflare Tunnel.
 
-The page has **Chart.js charts**
-(v5.2): a 24h/48h/7d SOC line + stacked energy bars (PV / export / import / home)
-and a 30-day daily totals bar chart. Chart.js ships inside the plugin and is
-served from `/chart.js` (v5.43.1), so the charts draw during a broadband
-outage — which is exactly when you check the battery. The JSON API:
+The page shows the power-flow diagram, battery state, live power, what the
+manager is doing and why, and today's running totals. It deliberately stops
+there. Charts, tariff, cost, the calendar and export-sync all live on the
+Dashboards plugin's Energy and Cost pages, which read the same JSON — two
+copies of a chart is two things to keep in step, and one of them always rots.
+
+The charts the page used to draw were removed in v5.76, and the bundled Chart.js
+went with them. **The JSON API did not change** — all seven endpoints answer
+exactly as before, because the Dashboards plugin proxies every one of them:
 
 | Endpoint | Returns |
 |----------|---------|
