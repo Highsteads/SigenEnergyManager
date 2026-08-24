@@ -671,7 +671,7 @@ class BatteryManager:
                                         snapshot.tariff.cheap_end):
                 return None
 
-        buffer_pct    = snapshot.dawn_target_pct          # default 10%
+        buffer_pct    = snapshot.dawn_target_pct          # default 15%, minimum 15
         buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
         cap_kwh       = snapshot.capacity_kwh
         deficit_kwh   = (buffer_pct - snapshot.current_soc_pct) / 100.0 * cap_kwh

@@ -3734,5 +3734,40 @@ class TestDashboardAccessControl(unittest.TestCase):
         self.assertIn("token=abc123", p._dashboard_url())
 
 
+class TestDawnTargetPct(unittest.TestCase):
+    """v5.77.0 — one reader for the summer resilience floor.
+
+    Four call sites used to coerce `dawnSocTarget` independently and every one
+    fell back to 10, a value the plugin refuses: save-time validation rejects
+    anything under 15 and the startup migration raises a stored value below it.
+    A fallback of 10 put the floor ON the 10% health cutoff it exists to sit
+    above.
+    """
+
+    def _plugin(self, prefs):
+        p = object.__new__(plugin.Plugin)
+        p.pluginPrefs = prefs
+        return p
+
+    def test_reads_the_configured_value(self):
+        self.assertEqual(self._plugin({"dawnSocTarget": "22"})._dawn_target_pct(), 22)
+
+    def test_absent_pref_falls_back_to_the_enforced_minimum(self):
+        """Not 10. 10 is the health floor, not a resilience buffer."""
+        self.assertEqual(self._plugin({})._dawn_target_pct(), 15)
+
+    def test_blank_pref_falls_back_to_the_enforced_minimum(self):
+        self.assertEqual(self._plugin({"dawnSocTarget": ""})._dawn_target_pct(), 15)
+
+    def test_junk_pref_falls_back_rather_than_raising(self):
+        """A ValueError here would abort snapshot building on every tick."""
+        self.assertEqual(self._plugin({"dawnSocTarget": "banana"})._dawn_target_pct(), 15)
+
+    def test_fallback_is_never_below_the_health_floor(self):
+        """Whatever the fallback becomes, it must stay above the 1% health
+        cutoff and above the 10% figure this rule was written to clear."""
+        self.assertGreater(self._plugin({})._dawn_target_pct(), 10)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

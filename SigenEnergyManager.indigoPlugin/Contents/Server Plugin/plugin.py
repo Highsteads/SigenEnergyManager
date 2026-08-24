@@ -8,7 +8,29 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0)
 # Date:        24-08-2026
-# Version:     5.76.0
+# Version:     5.77.0
+#
+# v5.77.0 (24-08-2026): ONE READER FOR THE SUMMER RESILIENCE FLOOR.  Four call
+#              sites coerced `dawnSocTarget` independently and every one of them
+#              fell back to 10 - a value this plugin refuses.  Save-time
+#              validation rejects anything under 15, and the startup migration
+#              raises a stored value below it, so the only state that could
+#              produce a 10 was a pref that had never been written.  And 10 is
+#              the HEALTH floor this buffer exists to sit above, so the fallback
+#              put the resilience floor exactly on the line it is meant to clear.
+#              All four now go through `_dawn_target_pct()`, fallback 15.  The
+#              migration's own read is deliberately left raw: it has to see the
+#              pre-migration value to know whether to raise it.
+#              Doc corrections that came with it - the README and the repo notes
+#              both claimed a "10% summer floor", which has been 15 since v3.0,
+#              and battery_manager carried a stale "default 10%" comment.
+#              Companion script `openmeteo_battery_optimiser.py` v3.15 was fixed
+#              in the same pass: it mirrored the seasonal rule WITHOUT the
+#              plugin's guard, returning the winter buffer unconditionally where
+#              `_apply_seasonal_override` applies it only when it exceeds the
+#              summer floor.  Harmless at today's 15/20, silently wrong the
+#              moment a dawn target above 20 is set.
+#              Tests 743 -> 748.
 #
 # v5.76.0 (24-08-2026): THE PLUGIN CARRIED A SECOND COPY OF THE DASHBOARDS
 #              ENERGY PAGE.  web_dashboard.py was 2,217 lines, of which about
@@ -3164,7 +3186,7 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             export_kw  = 4.0
         try:
-            dawn_pct   = _as_float(prefs.get("dawnSocTarget"), "10")
+            dawn_pct   = self._dawn_target_pct()
         except (TypeError, ValueError):
             dawn_pct   = 10.0
         try:
@@ -5847,7 +5869,7 @@ class Plugin(indigo.PluginBase):
             current_soc_pct    = soc_pct,
             capacity_kwh       = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
             efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
-            dawn_target_pct    = _as_float(prefs.get("dawnSocTarget"), 10),    # v4.0: retained for VPP/storm
+            dawn_target_pct    = self._dawn_target_pct(),                      # v4.0: retained for VPP/storm
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
@@ -6052,6 +6074,22 @@ class Plugin(indigo.PluginBase):
             log(f"[Web] Could not auto-detect LAN IP ({exc}); falling back to localhost", level="WARNING")
             host = "localhost"
         return host
+
+    def _dawn_target_pct(self):
+        """The summer resilience floor, as a percent.
+
+        One reader for one rule. Four call sites used to coerce this pref
+        independently, every one of them falling back to 10 — a value the plugin
+        itself refuses: `validatePrefsConfigUi` rejects anything under 15 at save
+        time, and the startup migration raises a stored value below 15. So the
+        only state that could ever have produced a 10 was a pref that had never
+        been written, and 10 is exactly the health floor this buffer exists to
+        sit above.
+
+        The migration's own read is deliberately NOT routed through here — it has
+        to see the raw pre-migration value to know whether to raise it.
+        """
+        return _as_float(self.pluginPrefs.get("dawnSocTarget"), 15)
 
     def _resolve_dashboard_bind(self):
         """Return the address the dashboard should bind to.
@@ -8055,7 +8093,7 @@ class Plugin(indigo.PluginBase):
         if cap_kwh <= 0:
             cap_kwh = BATTERY_CAPACITY_KWH   # guard the (required_kwh / cap_kwh) divisions below
         max_export_kw   = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
-        dawn_target_pct = _as_float(self.pluginPrefs.get("dawnSocTarget"), 10)
+        dawn_target_pct = self._dawn_target_pct()
 
         # For daytime events solar will recharge during/after the event, so we
         # only need to hold the export energy itself.  For night events we must
@@ -8155,7 +8193,7 @@ class Plugin(indigo.PluginBase):
         determined, NOT at announcement time.
         """
         health_floor    = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
-        dawn_target_pct = _as_float(self.pluginPrefs.get("dawnSocTarget"), 10)
+        dawn_target_pct = self._dawn_target_pct()
 
         if is_daytime:
             floor_pct = health_floor
