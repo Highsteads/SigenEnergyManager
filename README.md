@@ -70,7 +70,9 @@ battery genuinely cannot reach the configured minimum SOC by next sunrise.
   after grid restoration; menu item to inspect the log
 
 **Web dashboard (`web_dashboard.py`)**
-- Local HTTP server on port 8179 with live power-flow diagram, status chips
+- Local HTTP server on port 8179 — **this machine only by default**, with a
+  token required if you widen it to the network *(v5.75)* — live power-flow
+  diagram, status chips
   for grid state and current manager mode, and Chart.js charts (bundled with
   the plugin and served from `/chart.js`, so they draw with no internet — the
   CDN is a fallback only): 24h / 48h / 7d SOC line, stacked half-hourly energy
@@ -130,6 +132,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.75.0 | 24-Aug-2026 | **The web dashboard asked nobody for anything.** Since it was written it bound every network interface on port 8179 and served the whole energy API — SOC, tariff, VPP, power-cut history — to any device on the network, with no authentication at all. On a home network that was a known trade. It stops being one the moment the port is reached through a tunnel. It now binds **loopback by default**, which changes nothing you can see: the Dashboards plugin proxies to 127.0.0.1 server-side, so its Energy and Cost pages carry on as before. What goes away is the exposure. A new **Dashboard access** setting widens it to the whole network, and that path **requires a token** — the server refuses to start rather than open an unauthenticated port. The token comes from `SIGEN_DASHBOARD_TOKEN` in `IndigoSecrets.py`, then the config field, then one the plugin generates and keeps mode 0600 in its own data folder. Send it as a `Bearer` header, an `X-Auth-Token` header or a `?token=` query string, and the page sets a cookie so a browser only needs it once. Loopback callers are exempt, which is what keeps the proxy working. New menu item **Show Web Dashboard Access**. Also adds `read_export_limit()` to the Modbus client, reading back the commissioned grid export cap at 40038 — the write side already existed — so the standalone SigenVPP daemon can share that file byte for byte instead of carrying a local edit. Tests 696 → 734. |
 | 5.74.0 | 20-Aug-2026 | **A decision between a 90% and a 95% daytime battery target needs evidence, not a hunch.** The manager now runs a completely passive shadow calculation whenever its live 90% solar-overflow pacing is active: it asks what a 95% pace would have withheld from early export, but never sends that answer to the inverter. At midnight the daily history keeps the estimate beside the observed end SOC, actual export and imports after 16:00. It also records the actual imported half-hours at both the live Tracker price and Octopus Agile's published half-hourly prices, ready for the likely autumn tariff decision. That tariff comparison deliberately holds the home's import timing fixed: it says what the same imports would have cost, **not** what an Agile battery-dispatch simulation might achieve. Missing price coverage stays unknown rather than being filled with a guess. The new **Show 90% vs 95% / Agile Shadow Comparison** menu item prints the recent rows. There is no change to charging, export, tariff, or any inverter register. |
 | 5.73.0 | 19-Aug-2026 | **A grid event at dusk was reporting the solar as curtailed when the sun was simply going down.** The check that spots the inverter shutting the panels down looks for a window where the solar never lifts off zero — sound in the middle of the day, meaningless in the last forty minutes before sunset, when nothing was coming anyway. The 16 August event ran from forty minutes before sunset to twenty minutes after it, read zero throughout, and was reported as a fault; the forecast for that hour had predicted 153 watts falling to nothing. The verdict now asks what was expected before it complains: a negligible forecast excuses a zero, a substantial one still condemns it, and an unknown forecast excuses nothing at all. Reporting only — nothing that drives the battery changed. |
 | 5.72.3 | 19-Aug-2026 | **The earnings headline could quietly fall behind the transactions listed under it.** The lifetime and available figures are Axle's own, stored as they report them — so a settlement figure entered from an email, which carries no balance, left the headline saying £87.60 while the rows beneath it added up to £91.47. The account page agreed with the rows. The ledger now totals its own rows and says plainly when the two disagree, rather than silently showing one or quietly replacing it with the other: publishing a computed total as Axle's settled figure would read as truth while being arithmetic. The check stands down entirely once a withdrawal appears, since a withdrawal reduces what you can draw without reducing what you have earned. |
@@ -344,6 +347,10 @@ PUSHOVER_USER_TOKEN = ""
 
 # Web dashboard (optional — blank = auto-detect LAN IP via socket)
 DASHBOARD_HOST      = ""
+
+# Web dashboard access token (optional — blank = the plugin generates one,
+# and it is only needed at all if you widen the dashboard to the network)
+SIGEN_DASHBOARD_TOKEN = ""
 ```
 
 ### Plugin preferences
@@ -351,6 +358,8 @@ DASHBOARD_HOST      = ""
 | Setting | Description |
 |---------|-------------|
 | Inverter IP | Sigenergy inverter LAN address (e.g. 192.168.1.49 — find it in your router or the Sigenergy app) |
+| Dashboard access | Where the built-in dashboard on port 8179 listens. *This machine only* (the default) or *Whole network*, which requires a token |
+| Access token | Token for the dashboard when it is open to the network. Blank generates one automatically |
 | Modbus port | Inverter Modbus TCP port (default 502) |
 | Plant slave address | Modbus slave address for plant data (default 247) |
 | Inverter slave address | Modbus slave address for inverter data (default 1) |
@@ -683,8 +692,22 @@ Custom Indigo triggers that fire from the plugin (use **New Trigger** → **Plug
 
 ## Web dashboard
 
-Local HTTP dashboard runs on port **8179** by default. Visit
-`http://<your-indigo-host>:8179/` for a live view, now with **Chart.js charts**
+Local HTTP dashboard runs on port **8179**. Since v5.75 it listens on
+**this machine only**, so visit `http://127.0.0.1:8179/` from the Indigo server
+itself. Nothing else changes: the Dashboards plugin fetches this data through a
+server-side proxy, so its Energy and Cost pages work exactly as before.
+
+To open it from a phone, a tablet or another computer, set **Dashboard access**
+to *Whole network* in the plugin's configuration. That path needs an access
+token and the plugin will refuse to start the dashboard without one — an
+unauthenticated port is not something to leave to a warning in a log. The token
+is generated for you, and **Plugins → Sigenergy Manager → Show Web Dashboard
+Access** prints the link with the token in it. The link sets a cookie the first
+time, so you only paste it once per browser.
+
+Never forward port 8179 from your router. Use Tailscale or a Cloudflare Tunnel.
+
+The page has **Chart.js charts**
 (v5.2): a 24h/48h/7d SOC line + stacked energy bars (PV / export / import / home)
 and a 30-day daily totals bar chart. Chart.js ships inside the plugin and is
 served from `/chart.js` (v5.43.1), so the charts draw during a broadband

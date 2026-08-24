@@ -71,6 +71,11 @@
         <CallbackMethod>menuShowPowerCutLog</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuShowDashboardAccess">
+        <Name>Show Web Dashboard Access</Name>
+        <CallbackMethod>menuShowDashboardAccess</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuOpenDashboard">
         <Name>Open Web Dashboard</Name>
         <CallbackMethod>menuOpenDashboard</CallbackMethod>

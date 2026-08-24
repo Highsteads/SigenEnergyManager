@@ -3,9 +3,11 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Fable 5
-# Date:        13-08-2026
-# Version:     1.11 (REAL grid voltage 31011 + current 31017, rated capacity
+# Author:      CliveS & Claude Opus 5
+# Date:        24-08-2026
+# Version:     1.12 (read_export_limit() — reads back the commissioned grid
+#              export cap 40038; the write side already existed)
+#              prior 1.11 (REAL grid voltage 31011 + current 31017, rated capacity
 #              30548 — the nameplate/measurement distinction again)
 #              prior 1.10 (PCS internal temp, insulation resistance, PACK count and
 #              alarm word — all NAMED from the official V2.7 protocol PDF)
@@ -163,7 +165,7 @@ HOLD_ESS_DISCHARGE_CUTOFF  = 40048    # U16 RW, gain 10, % - min discharge SOC (
 #   50183            U16 RW  Pre-heating reserved SoC, gain 100, %
 #
 # We do NOT read any of these, because OUR INVERTER DOES NOT HAVE THEM. Probed
-# live on 21-07-2026 against 192.168.100.49 (plant address 247, firmware
+# live on 21-07-2026 against a SigenStor 10 kW 1ph (plant address 247, firmware
 # V100R001C22SPC113): every one of the addresses above returns Modbus exception
 # 2, ILLEGAL DATA ADDRESS. So does every other probe across the whole 50k range
 # (49999 / 50100 / 50200 / 50500) — the range is simply not implemented in this
@@ -1347,6 +1349,22 @@ class SigenergyModbus:
         if raw is None:
             return None
         self.logger.debug(f"Charge limit read: {raw}W")
+        return raw
+
+    def read_export_limit(self):
+        """Read current HOLD_GRID_MAX_EXPORT_LIMIT (registers 40038-40039). Returns watts or None.
+
+        The commissioned grid export cap — your DNO / G99 limit, set at
+        commissioning. Reading it back lets a setup wizard pre-fill the export
+        target from what the inverter is actually capped to, rather than asking
+        the user to remember it.
+        """
+        if not self._connected:
+            return None
+        raw = self._read_uint32(HOLD_GRID_MAX_EXPORT_LIMIT)
+        if raw is None:
+            return None
+        self.logger.debug(f"Export limit read: {raw}W")
         return raw
 
     # ================================================================

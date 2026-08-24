@@ -4,15 +4,19 @@
 # Description: Lightweight HTTP server serving live Sigenergy battery dashboard.
 #              Runs on port 8179. Exposes / (HTML) and /api/status (JSON).
 #              Started from plugin.startup(), stopped on plugin.shutdown().
-# Author:      CliveS & Claude Opus 4.8
-# Date:        26-06-2026
-# Version:     1.4 (same-origin CORS, real HTTP error codes, JS null-safety)
+# Author:      CliveS & Claude Opus 5
+# Date:        24-08-2026
+# Version:     1.5 (loopback bind by default + bearer/query/cookie token auth;
+#              refuses to start on a network interface without a token)
+# 1.4 — same-origin CORS, real HTTP error codes, JS null-safety
 # 1.3 — NaN/Infinity-safe JSON (one non-finite float no longer breaks the whole live
 #       update); calendar view state (_calCurrentYear/_calYearsLoaded) hoisted to
 #       <script> scope so the selected year tab survives the 5s refresh; Back link
 #       host-relative (was a hardcoded LAN IP, Clive-only).
 
+import hmac
 import http.server
+import ipaddress
 import json
 import logging
 import math
@@ -21,6 +25,17 @@ import socketserver
 import threading
 
 DASHBOARD_PORT = 8179
+
+# Bind address. Loopback is the default and the Dashboards plugin proxies to it
+# server-side from 127.0.0.1, so the energy and cost pages are unaffected by it.
+# Widening this to every interface puts the whole API on the LAN, which is why
+# the server refuses to do that without a token (see WebDashboard.start).
+DASHBOARD_BIND_LOOPBACK = "127.0.0.1"
+DASHBOARD_BIND_ALL      = ""
+
+# Name of the cookie that carries the token once a browser has presented it in
+# a query string, so the 5s poll does not have to repeat the token every time.
+AUTH_COOKIE = "sigen_dash"
 
 # Bundled Chart.js (chart.umd.min.js, v4.4.0) served from /chart.js so the
 # charts render without internet — a broadband outage is precisely when
@@ -1919,6 +1934,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # Set by WebDashboard.start() before the server thread launches.
     _plugin_ref = None
 
+    # Shared secret required from any client that is not on the loopback
+    # interface. Empty means the server is loopback-only, where a token would
+    # add nothing — anything able to reach 127.0.0.1 already runs as this user.
+    _auth_token = ""
+
     # Per-connection socket timeout: reaps dead/half-open connections so a
     # slowloris-style client can't pin ThreadingMixIn threads indefinitely.
     timeout = 30
@@ -1929,6 +1949,69 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
 
     def _query(self):
         return self.path.split("?", 1)[1] if "?" in self.path else ""
+
+    # ---------------------------------------------------------------- #
+    # Authentication
+    #
+    # Until v1.5 this server bound every interface and asked for nothing, so
+    # anyone on the LAN could read the house's energy, tariff and VPP data. On
+    # the LAN that was a known trade. Behind a tunnel it would be a hole, and a
+    # tunnel is exactly where this is heading.
+    # ---------------------------------------------------------------- #
+
+    def _client_is_loopback(self):
+        """True when the request came from this machine.
+
+        The Dashboards plugin proxies to 127.0.0.1 server-side, so its requests
+        land here as loopback and need no token.
+        """
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except (ValueError, IndexError):
+            return False
+
+    def _presented_token(self):
+        """Return whatever token the client offered, from any of the four places.
+
+        Header first (what a script uses), then the query string (what a person
+        pastes into a browser once), then the cookie the query string sets.
+        """
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            return header[7:].strip()
+
+        header = self.headers.get("X-Auth-Token", "")
+        if header:
+            return header.strip()
+
+        for pair in self._query().split("&"):
+            if pair.startswith("token="):
+                from urllib.parse import unquote
+                return unquote(pair.split("=", 1)[1])
+
+        for crumb in self.headers.get("Cookie", "").split(";"):
+            name, _, value = crumb.strip().partition("=")
+            if name == AUTH_COOKIE:
+                return value
+
+        return ""
+
+    def _authorised(self):
+        """True when this request may proceed.
+
+        No token configured means loopback-only, which start() has already
+        enforced. Otherwise compare in constant time.
+        """
+        if not self._auth_token:
+            return True
+        if self._client_is_loopback():
+            return True
+        return hmac.compare_digest(self._presented_token(), self._auth_token)
+
+    def _send_unauthorised(self):
+        body = (b'{"error":"unauthorised - append ?token=... or send '
+                b'an Authorization: Bearer header"}')
+        self._send(401, "application/json", body)
 
     def _int_param(self, name, default, lo, hi):
         for kv in self._query().split("&"):
@@ -1961,9 +2044,21 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             return   # client went away mid-write — nothing useful to do
 
     def do_GET(self):
+        if not self._authorised():
+            self._send_unauthorised()
+            return
+
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", _DASHBOARD_BYTES)
+            # A browser that authenticated with ?token= gets a cookie, so the
+            # page's own 5s poll carries the token without it sitting in every
+            # URL (and in the browser history, and in any referrer).
+            headers = None
+            if self._auth_token and not self._client_is_loopback():
+                headers = [("Set-Cookie",
+                            f"{AUTH_COOKIE}={self._auth_token}; Path=/; "
+                            f"HttpOnly; SameSite=Strict; Max-Age=31536000")]
+            self._send(200, "text/html; charset=utf-8", _DASHBOARD_BYTES, headers)
 
         elif path == "/chart.js":
             # Bundled Chart.js — keeps the charts working with no internet.
@@ -2021,11 +2116,13 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"Not found")
 
-    def _send(self, code, content_type, body):
+    def _send(self, code, content_type, body, extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or ()):
+            self.send_header(name, value)
         # Same-origin only: the dashboard page and its /api endpoints are served from
         # this same host:port (the Dashboards plugin iframes it), so no cross-origin
         # header is needed. The previous wildcard `*` let ANY browser page read this
@@ -2045,29 +2142,66 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
 class WebDashboard:
     """Manages the lifecycle of the HTTP dashboard server thread."""
 
-    def __init__(self, plugin, port=DASHBOARD_PORT):
-        self._plugin = plugin
-        self._port   = port
-        self._server = None
-        self._thread = None
+    def __init__(self, plugin, port=DASHBOARD_PORT,
+                 bind_host=DASHBOARD_BIND_LOOPBACK, auth_token=""):
+        self._plugin    = plugin
+        self._port      = port
+        self._bind_host = bind_host
+        self._token     = (auth_token or "").strip()
+        self._server    = None
+        self._thread    = None
+
+    def _is_loopback_bind(self):
+        """True when this will only ever accept connections from this machine."""
+        if not self._bind_host:
+            return False          # "" means every interface
+        try:
+            return ipaddress.ip_address(self._bind_host).is_loopback
+        except ValueError:
+            return self._bind_host == "localhost"
 
     def start(self):
+        """Start the server, refusing to open an unauthenticated network port.
+
+        Binding every interface with no token is how this server spent its first
+        five versions, and it put the whole energy API on the LAN. It is now a
+        hard refusal rather than a warning: a dashboard that fails to start is
+        noticed and fixed, whereas a warning in a busy log is not.
+        """
+        log = logging.getLogger("Sigenergy")
+
+        if not self._is_loopback_bind() and not self._token:
+            log.error(
+                "[Web] Dashboard NOT started: it is set to listen on every "
+                "interface but no access token is configured, which would put "
+                "the energy API on the LAN unauthenticated. Set a token in the "
+                "plugin config, or set the bind address back to loopback."
+            )
+            return
+
         _DashboardHandler._plugin_ref = self._plugin
-        self._server = _DashboardTCPServer(("", self._port), _DashboardHandler)
+        _DashboardHandler._auth_token = self._token
+        self._server = _DashboardTCPServer((self._bind_host, self._port),
+                                           _DashboardHandler)
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             name="SigenWebDash",
             daemon=True,
         )
         self._thread.start()
-        logging.getLogger("Sigenergy").info(
-            f"[Web] Dashboard started on port {self._port}"
-        )
+
+        if self._is_loopback_bind():
+            log.info(f"[Web] Dashboard started on 127.0.0.1:{self._port} "
+                     f"(this machine only)")
+        else:
+            log.info(f"[Web] Dashboard started on port {self._port}, all "
+                     f"interfaces, token required")
 
     def stop(self):
         # Re-arm the 503 'plugin not ready' guard so late requests during (or
         # after) a stop/start cycle can't hit a half-stopped plugin.
         _DashboardHandler._plugin_ref = None
+        _DashboardHandler._auth_token = ""
         if self._server:
             try:
                 self._server.shutdown()

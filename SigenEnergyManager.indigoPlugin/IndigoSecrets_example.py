@@ -198,8 +198,15 @@ AXLE_API_TOKEN = ""
 #                        escalation alert (sent if Axle has not returned the
 #                        inverter to self-consumption mode 45 minutes after a
 #                        VPP event ends).
-DASHBOARD_HOST     = ""
-AXLE_SUPPORT_EMAIL = ""
+# SIGEN_DASHBOARD_TOKEN — access token for the plugin's own dashboard on port
+#                        8179.  Leave blank: the dashboard listens on this
+#                        machine only by default, and if you widen it to the
+#                        network the plugin generates a token for you and keeps
+#                        it mode 0600 in its own data folder.  Set this only if
+#                        you want to choose the token yourself.
+DASHBOARD_HOST        = ""
+AXLE_SUPPORT_EMAIL    = ""
+SIGEN_DASHBOARD_TOKEN = ""
 
 # ============================
 # Claude Bridge plugin (optional)

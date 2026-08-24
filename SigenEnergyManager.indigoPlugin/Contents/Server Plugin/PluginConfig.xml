@@ -188,6 +188,27 @@
         <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
     </Field>
 
+    <Field id="separator_dashboard" type="separator"/>
+    <Field id="label_dashboard" type="label">
+        <Label>WEB DASHBOARD (port 8179)</Label>
+    </Field>
+    <Field id="label_dashboard_info" type="label">
+        <Label>The plugin serves a live dashboard on port 8179. Until v5.75.0 it listened on every network interface and asked for nothing, so anyone on your network could read your energy, tariff and VPP data. It now listens on this machine only, which is the right setting for almost everyone: the Dashboards plugin fetches this data through a server-side proxy, so its Energy and Cost pages work exactly as before. Choose "Whole network" only if you want to open http://&lt;server&gt;:8179/ from a phone, tablet or another computer. Doing so requires an access token, and the plugin will refuse to start the dashboard without one. Use Plugins -&gt; Sigenergy Manager -&gt; Show Web Dashboard Access to get the link.</Label>
+    </Field>
+    <Field id="dashboardBind" type="menu" defaultValue="loopback">
+        <Label>Dashboard access:</Label>
+        <List>
+            <Option value="loopback">This machine only (recommended)</Option>
+            <Option value="all">Whole network (token required)</Option>
+        </List>
+    </Field>
+    <Field id="dashboardToken" type="textfield" defaultValue="">
+        <Label>Access token (blank = auto-generated):</Label>
+    </Field>
+    <Field id="dashboardTokenInfo" type="label">
+        <Label>Leave blank and the plugin generates a strong token for you and stores it in its own data folder, readable only by this user. Set SIGEN_DASHBOARD_TOKEN in IndigoSecrets.py to override both. Never expose port 8179 to the internet by forwarding a port — use Tailscale or a Cloudflare Tunnel instead.</Label>
+    </Field>
+
     <Field id="separator_pushover" type="separator"/>
     <Field id="label_pushover" type="label">
         <Label>PUSHOVER NOTIFICATIONS (credentials in IndigoSecrets.py take priority)</Label>

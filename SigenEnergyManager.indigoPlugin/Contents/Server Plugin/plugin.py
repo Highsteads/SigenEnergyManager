@@ -5,9 +5,39 @@
 #              Sigenergy solar/battery systems. Replaces SigenergySolar v3.1.
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
-# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1, 5.72.0)
-# Date:        18-08-2026
-# Version:     5.74.0
+# Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
+#              5.72.0, 5.75.0)
+# Date:        24-08-2026
+# Version:     5.75.0
+#
+# v5.75.0 (24-08-2026): THE WEB DASHBOARD ASKED NOBODY FOR ANYTHING.  Since it
+#              was written it bound every network interface on port 8179 and
+#              served the whole energy API - SOC, tariff, VPP, power cuts, the
+#              lot - to any device on the LAN, with no authentication at all.
+#              On a home network that was a known trade.  It stops being one
+#              the moment the port is reached through a tunnel, and that is
+#              where this is heading.
+#              It now binds LOOPBACK by default.  Nothing user-facing changes:
+#              the Dashboards plugin proxies to 127.0.0.1 server-side, so its
+#              Energy and Cost pages carry on exactly as before.  What goes
+#              away is the LAN exposure.
+#              A new "Dashboard access" config setting widens it to the whole
+#              network, and that path REQUIRES a token - the server refuses to
+#              start rather than opening an unauthenticated port, because a
+#              dashboard that fails to start gets noticed and a warning in a
+#              busy log does not.  The token comes from IndigoSecrets
+#              (SIGEN_DASHBOARD_TOKEN), then the config field, then one the
+#              plugin generates and keeps 0600 in its own data folder.  It is
+#              accepted as a Bearer header, an X-Auth-Token header, a ?token=
+#              query string, or the cookie the query string sets, so a browser
+#              only needs it once.  Loopback callers are exempt, which is what
+#              keeps the Dashboards proxy working.
+#              New menu item: Show Web Dashboard Access.
+#              Also adds sigenergy_modbus read_export_limit() (reads back the
+#              commissioned grid export cap 40038; the write side already
+#              existed) so the standalone SigenVPP daemon can share this file
+#              byte for byte instead of carrying a local edit.
+#              Tests 696 -> 734.
 #
 # v5.74.0 (20-08-2026): SHADOW-COMPARES 90% AND 95% DAYTIME PACING WITHOUT
 #              TOUCHING THE INVERTER.  Each solar-overflow evaluation now runs
@@ -1995,6 +2025,10 @@ try:
     from IndigoSecrets import DASHBOARD_HOST
 except ImportError:
     DASHBOARD_HOST = ""
+try:
+    from IndigoSecrets import SIGEN_DASHBOARD_TOKEN
+except ImportError:
+    SIGEN_DASHBOARD_TOKEN = ""
 # Site coordinates — IndigoSecrets first, PluginConfig fallback, Big Ben default.
 # Names match the existing IndigoSecrets convention (LATITUDE / LONGITUDE).
 try:
@@ -2053,7 +2087,8 @@ from battery_manager  import (
 )
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
-from web_dashboard import WebDashboard
+from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
+                           DASHBOARD_BIND_LOOPBACK)
 import vpp_ledger as _vpp_ledger
 
 # ============================================================
@@ -3040,10 +3075,12 @@ class Plugin(indigo.PluginBase):
         log(f"{PLUGIN_NAME} ready")
 
         try:
-            self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT)
+            self.web_dashboard = WebDashboard(
+                self, port=WEB_DASHBOARD_PORT,
+                bind_host=self._resolve_dashboard_bind(),
+                auth_token=self._resolve_dashboard_token())
             self.web_dashboard.start()
-            host = self._resolve_dashboard_host()
-            log(f"[Web] Dashboard at http://{host}:{WEB_DASHBOARD_PORT}")
+            log(f"[Web] Dashboard at {self._dashboard_url()}")
         except Exception as exc:
             log(f"[Web] Dashboard failed to start: {exc}", level="ERROR")
 
@@ -3325,10 +3362,12 @@ class Plugin(indigo.PluginBase):
         log("Mac woke — restarting dashboard; modbus reconnects on next poll, manager re-evaluates within 60s")
         super().wake_up()
         try:
-            self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT)
+            self.web_dashboard = WebDashboard(
+                self, port=WEB_DASHBOARD_PORT,
+                bind_host=self._resolve_dashboard_bind(),
+                auth_token=self._resolve_dashboard_token())
             self.web_dashboard.start()
-            host = self._resolve_dashboard_host()
-            log(f"[Web] Dashboard at http://{host}:{WEB_DASHBOARD_PORT}")
+            log(f"[Web] Dashboard at {self._dashboard_url()}")
         except Exception as exc:
             log(f"[Web] Dashboard restart on wake failed: {exc}", level="ERROR")
         # Force a fresh modbus poll on the next tick (not wait the full
@@ -5985,6 +6024,61 @@ class Plugin(indigo.PluginBase):
             log(f"[Web] Could not auto-detect LAN IP ({exc}); falling back to localhost", level="WARNING")
             host = "localhost"
         return host
+
+    def _resolve_dashboard_bind(self):
+        """Return the address the dashboard should bind to.
+
+        Loopback is the default and the right answer for almost everyone: the
+        Dashboards plugin proxies to 127.0.0.1 server-side, so the energy and
+        cost pages keep working, and nothing is exposed to the LAN. Widening it
+        is deliberate, and requires a token.
+        """
+        if self.pluginPrefs.get("dashboardBind", "loopback") == "all":
+            return DASHBOARD_BIND_ALL
+        return DASHBOARD_BIND_LOOPBACK
+
+    def _resolve_dashboard_token(self):
+        """Return the dashboard access token, generating and storing one if needed.
+
+        IndigoSecrets first, then PluginConfig, then a generated token kept in a
+        0600 file beside the plugin's other data. The file rather than the prefs
+        because pluginPrefs are only flushed on a graceful shutdown, and a token
+        that vanishes after a crash locks the user out of their own dashboard.
+        """
+        token = (SIGEN_DASHBOARD_TOKEN
+                 or self.pluginPrefs.get("dashboardToken", "")).strip()
+        if token:
+            return token
+
+        path = os.path.join(self.data_dir, "dashboard_token.txt")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                token = handle.read().strip()
+            if token:
+                return token
+        except OSError:
+            pass
+
+        # No token anywhere — mint one. Done even for a loopback bind so that
+        # widening the bind later is a one-field change rather than a puzzle.
+        import secrets
+        token = secrets.token_urlsafe(24)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(token)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            log(f"[Web] Could not save the dashboard token to {path}: {exc}",
+                level="WARNING")
+        return token
+
+    def _dashboard_url(self):
+        """The URL that actually works right now, token included where needed."""
+        if self._resolve_dashboard_bind() == DASHBOARD_BIND_LOOPBACK:
+            return f"http://127.0.0.1:{WEB_DASHBOARD_PORT}/"
+        host = self._resolve_dashboard_host()
+        return (f"http://{host}:{WEB_DASHBOARD_PORT}/"
+                f"?token={self._resolve_dashboard_token()}")
 
     def _is_in_quiet_hours(self):
         """True if the current local time falls within the configured Pushover
@@ -10844,9 +10938,11 @@ class Plugin(indigo.PluginBase):
             api_key = INDIGO_API_KEY or CLAUDEBRIDGE_BEARER_TOKEN
             url_open = f"{url_log}?api-key={api_key}" if api_key else url_log
         else:
-            host = self._resolve_dashboard_host()
-            url_log  = f"http://{host}:{WEB_DASHBOARD_PORT}/"
-            url_open = url_log
+            # The internal dashboard binds to loopback unless widened, so ask
+            # for the URL that actually works rather than assembling one that
+            # looks right and refuses the connection.
+            url_open = self._dashboard_url()
+            url_log  = url_open.split("?", 1)[0]   # never log the token
         log(f"[Menu] Dashboards: {url_log}")
         try:
             import webbrowser
@@ -10857,6 +10953,31 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             log(f"[Menu] Browser launch failed ({exc}) — open the URL above manually",
                 level="WARNING")
+        return True
+
+    def menuShowDashboardAccess(self):
+        """Menu: report where the internal dashboard is listening and how to reach it.
+
+        The token is logged here deliberately. It is the only way to get it onto
+        a phone or a tablet, the log is local, and a token nobody can find is a
+        dashboard nobody can open.
+        """
+        bind = self._resolve_dashboard_bind()
+        if bind == DASHBOARD_BIND_LOOPBACK:
+            log(f"[Web] Dashboard is listening on 127.0.0.1:{WEB_DASHBOARD_PORT} "
+                f"— this machine only.")
+            log(f"[Web] Open it here: http://127.0.0.1:{WEB_DASHBOARD_PORT}/")
+            log("[Web] The Dashboards plugin's energy and cost pages reach it "
+                "through a server-side proxy, so they work either way.")
+            log("[Web] To reach it from another device, set 'Dashboard access' to "
+                "'Whole network' in this plugin's config. A token is already "
+                "generated and will be required.")
+        else:
+            log(f"[Web] Dashboard is listening on ALL interfaces, port "
+                f"{WEB_DASHBOARD_PORT}, and requires a token.")
+            log(f"[Web] Open it here: {self._dashboard_url()}")
+            log("[Web] That link sets a cookie on first use, so the token only "
+                "needs pasting once per browser.")
         return True
 
     def menuShowPowerCutLog(self):

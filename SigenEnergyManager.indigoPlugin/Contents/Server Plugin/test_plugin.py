@@ -3643,5 +3643,96 @@ class TestParsePvStringLabels(unittest.TestCase):
         self.assertEqual(plugin._parse_pv_string_labels("South", 0), [])
 
 
+
+
+class TestDashboardAccessControl(unittest.TestCase):
+    """v5.75.0 — the dashboard's bind address and token resolution.
+
+    Before this the server bound every interface with no token, so the whole
+    energy API sat on the LAN unauthenticated. These pin the replacement: closed
+    by default, a stable generated token, and no token leaking into a URL that
+    does not need one.
+    """
+
+    def _plugin(self, prefs=None, data_dir=None):
+        p = object.__new__(plugin.Plugin)
+        p.pluginPrefs = prefs if prefs is not None else {}
+        p.data_dir = data_dir or tempfile.mkdtemp()
+        p.logger = MagicMock()
+        return p
+
+    # --- bind address ---
+
+    def test_default_bind_is_loopback(self):
+        """A fresh install, with no pref saved, must be closed."""
+        p = self._plugin()
+        self.assertEqual(p._resolve_dashboard_bind(), plugin.DASHBOARD_BIND_LOOPBACK)
+
+    def test_bind_all_when_explicitly_chosen(self):
+        p = self._plugin({"dashboardBind": "all"})
+        self.assertEqual(p._resolve_dashboard_bind(), plugin.DASHBOARD_BIND_ALL)
+
+    def test_unrecognised_bind_pref_falls_back_to_loopback(self):
+        """Junk in the pref must fail closed, not open."""
+        p = self._plugin({"dashboardBind": "banana"})
+        self.assertEqual(p._resolve_dashboard_bind(), plugin.DASHBOARD_BIND_LOOPBACK)
+
+    # --- token resolution ---
+
+    def test_token_from_prefs_is_used(self):
+        p = self._plugin({"dashboardToken": "  from-prefs  "})
+        self.assertEqual(p._resolve_dashboard_token(), "from-prefs")
+
+    def test_indigosecrets_beats_prefs(self):
+        p = self._plugin({"dashboardToken": "from-prefs"})
+        with patch.object(plugin, "SIGEN_DASHBOARD_TOKEN", "from-secrets"):
+            self.assertEqual(p._resolve_dashboard_token(), "from-secrets")
+
+    def test_token_is_generated_and_persisted_when_absent(self):
+        data_dir = tempfile.mkdtemp()
+        p = self._plugin(data_dir=data_dir)
+        token = p._resolve_dashboard_token()
+        self.assertTrue(len(token) >= 20, "generated token is too short")
+        path = os.path.join(data_dir, "dashboard_token.txt")
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read().strip(), token)
+
+    def test_generated_token_file_is_owner_only(self):
+        data_dir = tempfile.mkdtemp()
+        p = self._plugin(data_dir=data_dir)
+        p._resolve_dashboard_token()
+        mode = os.stat(os.path.join(data_dir, "dashboard_token.txt")).st_mode
+        self.assertEqual(mode & 0o077, 0, "token file is readable by others")
+
+    def test_generated_token_is_stable_across_calls(self):
+        """A token that changes each call would lock the user out on restart."""
+        data_dir = tempfile.mkdtemp()
+        first = self._plugin(data_dir=data_dir)._resolve_dashboard_token()
+        second = self._plugin(data_dir=data_dir)._resolve_dashboard_token()
+        self.assertEqual(first, second)
+
+    def test_blank_token_file_is_replaced_not_returned(self):
+        """An empty file must not read as a configured empty token."""
+        data_dir = tempfile.mkdtemp()
+        with open(os.path.join(data_dir, "dashboard_token.txt"), "w") as handle:
+            handle.write("   \n")
+        token = self._plugin(data_dir=data_dir)._resolve_dashboard_token()
+        self.assertTrue(token.strip(), "blank token file produced a blank token")
+
+    # --- the URL shown in the log ---
+
+    def test_loopback_url_carries_no_token(self):
+        """No point putting a secret in a URL that cannot use it."""
+        url = self._plugin()._dashboard_url()
+        self.assertIn("127.0.0.1", url)
+        self.assertNotIn("token=", url)
+
+    def test_all_interfaces_url_carries_the_token(self):
+        p = self._plugin({"dashboardBind": "all", "dashboardToken": "abc123"})
+        p._resolve_dashboard_host = lambda: "192.168.1.50"
+        self.assertIn("token=abc123", p._dashboard_url())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
