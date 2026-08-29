@@ -15,6 +15,78 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.78.0 — 29-08-2026
+
+AWAY MODE — a second consumption profile, for the days the house is empty.
+
+**The problem.** `_refresh_consumption_profile_impl` builds the 48-slot profile as a
+**cumulative mean over every polling day**, and the accumulators persist across restarts.
+That is the right shape for a house someone lives in and the wrong shape for one nobody
+does. Six weeks away neither moves the mean far enough to change any decision during the
+trip, nor stays out of it afterwards — so the plugin plans the battery for a full house
+all holiday and then carries the quiet weeks home for months.
+
+**The measurement, not an estimate.** Octopus half-hourly import, 15-Oct to 28-Nov 2025,
+2,160 slots, 45 days. That absence predates the Sigen install, so grid import *was* house
+load with nothing in between:
+
+    12.16 kWh/day mean (min 11.4, max 18.3)
+    flat 507 W, 1.2x trough to peak, no weekly cycle at all
+
+The occupied default shape has a morning and an evening. Falling back to it for an empty
+house invents a peak that is not coming, which is why away gets its own seed rather than
+a scale factor on the existing one.
+
+**What was added.**
+- `_away_seed_profile(daily_kwh)` — module-level pure function, flat 48 slots, guarded
+  coercion (blank / non-numeric / <=0 / >100 all fall back to `AWAY_DAILY_KWH_DEFAULT`).
+- `away_profile_watts_sum` / `away_profile_count` — a second accumulator pair, fed only
+  while away. `_accumulate_home_profile` picks by `store["away_active"]`.
+- `_is_away()` — reads the configured Indigo variable by NAME (per the global rule: a
+  name survives a recreate, an id does not). Warns ONCE on a missing variable, because it
+  runs every Modbus poll.
+- `_refresh_away_state()` — called from the merge immediately BEFORE the accumulate, so a
+  transition cannot file a full-house reading against the empty-house profile. Rebuilds
+  the live profile on change rather than waiting for the next scheduled refresh.
+- `awayMode` state on `batteryManager`, behind the same `in dev.states` guard as
+  `currentMode` (a state added this version is unregistered on the first tick after
+  restart, and writing it early logs a red line for nothing).
+- Config: `awayEnabled` / `awayVariable` / `awayDailyKwh`.
+
+**It fails towards OCCUPIED, and that is the whole design.** The two errors are not
+symmetrical. Believing the house is empty when it is not under-imports and leaves the
+battery short on a winter evening. Believing it occupied when it is empty buys a little
+more than needed, and the existing SOC guard caps that anyway. So a missing variable, a
+blank name, a junk value and an exception all return False. This is
+`feedback_absent_state_is_never_a_match` applied to a config read: unknown must not
+resolve to the interesting branch just because the interesting branch is the new one.
+
+**The weekend uplift is suppressed while away** (`_build_snapshot`). The x1.30 models
+people being home on a Saturday. The 45-day measurement has no weekly cycle whatever, so
+applying it would invent 30% of Saturday demand and buy for it.
+
+**Persistence is additive.** `away_watts_sum` / `away_count` are new keys in
+`home_load_profile.json`; a file written by <=5.77.3 simply lacks them and the away
+accumulators start empty. `_load_home_profile` also seeds `away_active` from `_is_away()`
+BEFORE the rebuild, so a restart mid-trip does not resume on the occupied profile.
+
+**Sizing, for whoever wonders whether it was worth it.** 3-Dec to 15-Jan is 43 days,
+~523 kWh of demand against ~250 kWh of December PV, so ~273 kWh net. Priced against the
+real region-F Agile rates for 3-Dec-2025 to 15-Jan-2026: buying nightly costs £31.84
+(11.8 p/kWh), buying across a 5-day window costs £19.56 (7.2 p/kWh). **~£12.** Modest, but
+the mechanism matters more than the money — a 35 kWh battery against 6.3 kWh/day of net
+need is five days of slack, and only a correct profile lets the planner use it.
+
+**Tests.** `test_away_profile.py`, 25 cases: seed flatness and every coercion guard, all
+six unhappy paths of `_is_away`, accumulator routing both ways, which profile the refresh
+publishes, the persistence round trip including a pre-5.78 file, and the restart-while-away
+case. Suite 782 -> 807. **Mutation-checked 4/4** — fail-safe direction flipped, routing
+pinned to home, away fallback swapped for the occupied default, and away keys dropped from
+the save, each run in a fresh subprocess with `__pycache__` cleared first and the restore
+asserted byte-exact.
+
+---
+
 ## v5.77.1 — 25-08-2026
 
 THIS FILE. The developer changelog had grown to 2,002 lines at the top of `plugin.py` — a

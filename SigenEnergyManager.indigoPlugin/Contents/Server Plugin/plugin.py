@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0)
-# Date:        25-08-2026
-# Version:     5.77.3
+#              5.72.0, 5.75.0, 5.78.0)
+# Date:        29-08-2026
+# Version:     5.78.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -190,6 +190,21 @@ ACTION_MODE_TOKEN = {
 # in that time-slot (one reading per day during that 30-min window).
 HOME_PROFILE_MIN_READINGS = 5
 
+# --- Away mode (v5.78.0) -------------------------------------------------
+# An empty house draws a completely different load, and the occupied profile
+# cannot represent it.  Measured off the Octopus import meter across the 45-day
+# Oct-Nov 2025 absence (pre-battery, so import WAS house load): a flat 507 W,
+# 12.16 kWh/day, varying only 1.2x from trough to peak.  Two consequences, and
+# they are why away days get their own accumulators rather than a fudge factor:
+#   1. A cumulative mean will not move far enough in six weeks to notice, so
+#      the occupied profile would keep predicting a full house all trip.
+#   2. Those six weeks would otherwise pollute the occupied profile for months
+#      afterwards.
+AWAY_PROFILE_MIN_READINGS = 5
+AWAY_VARIABLE_DEFAULT     = "Away"
+AWAY_DAILY_KWH_DEFAULT    = 12.0
+AWAY_TRUTHY               = ("true", "1", "yes", "on", "away")
+
 # Polling intervals (seconds).
 # MODBUS_POLL_INTERVAL is the default fallback when no value is in pluginPrefs;
 # the actual interval used at runtime is `self.modbus_poll_s`, set in
@@ -211,6 +226,26 @@ VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 VPP_OVERRUN_GRACE_MINS    = 15
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 STORM_WATCH_INTERVAL = 7200  # 2 hours
+
+
+def _away_seed_profile(daily_kwh):
+    """Flat 48-slot half-hourly profile (kWh per slot) for an empty house.
+
+    Flat because the measurement says flat — 1.2x trough to peak over 45 days
+    is noise, not a shape.  Used until enough real away readings accumulate,
+    and as the permanent fallback for any slot that never fills.
+
+    Guarded like every other config coercion here: a blank, non-numeric or
+    absurd value falls back to the documented default rather than raising in
+    the middle of a manager evaluation.
+    """
+    try:
+        total = float(daily_kwh)
+    except (TypeError, ValueError):
+        total = AWAY_DAILY_KWH_DEFAULT
+    if not (0.0 < total <= 100.0):
+        total = AWAY_DAILY_KWH_DEFAULT
+    return [round(total / 48.0, 4)] * 48
 
 
 def _as_float(value, fallback):
@@ -1070,6 +1105,15 @@ class Plugin(indigo.PluginBase):
         # Built from real homePowerWatts inverter readings, one reading per Modbus poll.
         self.store["home_profile_watts_sum"] = [0.0] * 48
         self.store["home_profile_count"]     = [0]   * 48
+
+        # Away-load profile — the same accumulators again, fed only on days the
+        # house is empty, so the two never contaminate each other.
+        self.store["away_profile_watts_sum"] = [0.0] * 48
+        self.store["away_profile_count"]     = [0]   * 48
+        # Last known away state.  False, not None: an unreadable variable must
+        # read as OCCUPIED (see _is_away for why that is the safe direction).
+        self.store["away_active"]            = False
+        self.store["away_warned"]            = False
 
         self._load_accumulators()
         self._load_home_profile()   # restore accumulated inverter profile from disk
@@ -2604,6 +2648,7 @@ class Plugin(indigo.PluginBase):
         self._accumulate_daily_energy(data)
 
         # Accumulate home load into persistent half-hourly profile
+        self._refresh_away_state()
         self._accumulate_home_profile(max(0.0, float(data.get("homePowerWatts", 0))))
 
         # Update device states
@@ -3158,7 +3203,14 @@ class Plugin(indigo.PluginBase):
             if not weekend_user_override:
                 # Weekend tends to be ~30% higher in CliveS' data — preserve
                 # ratio if the user hasn't customised it.
-                weekend_pref = round(live_daily * 1.30, 1)
+                #
+                # v5.78.0: NOT while the house is empty. The uplift models people
+                # being at home on a Saturday, and there are none. The 45-day
+                # measurement is flat to within 1.2x trough-to-peak with no weekly
+                # cycle at all, so applying it would invent a 30% Saturday demand
+                # out of nothing and buy for it.
+                weekend_pref = round(live_daily * (1.0 if self.store.get("away_active")
+                                                   else 1.30), 1)
 
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
@@ -4554,6 +4606,66 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             log(f"[Octopus] Tariff-schedule variable write failed: {exc}", level="WARNING")
 
+    def _is_away(self):
+        """True when the configured Indigo variable says the house is empty.
+
+        FAILS TOWARDS OCCUPIED, deliberately.  The two errors are not
+        symmetrical: believing the house is empty when it is not under-imports
+        and leaves the battery short on a winter evening, while believing it is
+        occupied when it is empty merely buys a little more than needed and the
+        SOC guard caps that anyway.  So a missing variable, a missing config, a
+        junk value or an exception all return False rather than propagating an
+        unknown.  Same reasoning as the absent-state rule applied to a device.
+        """
+        prefs = getattr(self, "pluginPrefs", None) or {}
+        if not prefs.get("awayEnabled", False):
+            return False
+        name = str(prefs.get("awayVariable") or AWAY_VARIABLE_DEFAULT).strip()
+        if not name:
+            return False
+        try:
+            if name not in indigo.variables:
+                # Warn ONCE.  This runs every Modbus poll, so an unconditional
+                # warning would be ~1400 identical lines a day.
+                if not self.store.get("away_warned"):
+                    self.store["away_warned"] = True
+                    log(f"[Away] Variable '{name}' does not exist — treating the "
+                        f"house as occupied. Set the correct name in Configure, "
+                        f"or untick Away mode.", level="WARNING")
+                return False
+            self.store["away_warned"] = False
+            return str(indigo.variables[name].value).strip().lower() in AWAY_TRUTHY
+        except Exception as exc:                                   # noqa: BLE001
+            if not self.store.get("away_warned"):
+                self.store["away_warned"] = True
+                log(f"[Away] Could not read variable '{name}' "
+                    f"({type(exc).__name__}: {exc}) — treating the house as occupied.",
+                    level="WARNING")
+            return False
+
+    def _refresh_away_state(self):
+        """Re-read the away flag, and on a change swap which profile is live.
+
+        Called from the Modbus merge, i.e. once per poll, immediately before the
+        reading is accumulated — so a reading is never filed against the wrong
+        profile across a transition.
+        """
+        now_away = self._is_away()
+        was_away = bool(self.store.get("away_active", False))
+        if now_away != was_away:
+            self.store["away_active"] = now_away
+            counts   = self.store["away_profile_count" if now_away else "home_profile_count"]
+            real     = sum(1 for c in counts if c >= (AWAY_PROFILE_MIN_READINGS
+                                                      if now_away else HOME_PROFILE_MIN_READINGS))
+            log(f"[Away] House is now {'EMPTY' if now_away else 'OCCUPIED'} — "
+                f"switching to the {'away' if now_away else 'occupied'} consumption "
+                f"profile ({real}/48 slots from real data)")
+            # Rebuild immediately: the manager may evaluate before the next
+            # scheduled refresh, and it must not plan tonight against the
+            # profile for the house it is no longer in.
+            self._refresh_consumption_profile()
+        return now_away
+
     def _accumulate_home_profile(self, home_watts):
         """Accumulate one inverter home-load reading into the 48-slot half-hourly profile.
 
@@ -4565,8 +4677,12 @@ class Plugin(indigo.PluginBase):
         now  = datetime.now()
         slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
         slot = max(0, min(47, slot))
-        self.store["home_profile_watts_sum"][slot] += home_watts
-        self.store["home_profile_count"][slot]     += 1
+        # v5.78.0: file the reading against whichever house this is. The away
+        # state is refreshed immediately before this call, so a transition
+        # cannot land a full-house reading in the empty-house profile.
+        prefix = "away" if self.store.get("away_active") else "home"
+        self.store[f"{prefix}_profile_watts_sum"][slot] += home_watts
+        self.store[f"{prefix}_profile_count"][slot]     += 1
 
     def _refresh_consumption_profile(self, force=False):
         # v5.45.0: reads the profile accumulators + writes the store — locked
@@ -4585,13 +4701,26 @@ class Plugin(indigo.PluginBase):
         Profile values are kWh per half-hourly slot (watts × 0.5 h / 1000).
         """
         try:
-            default  = OctopusAPI._default_consumption_profile()
-            watts_sum = self.store["home_profile_watts_sum"]
-            counts    = self.store["home_profile_count"]
+            # v5.78.0: two profiles, one live. The fallback differs too — an
+            # empty house must fall back to the flat away seed, never to the
+            # UK-typical occupied shape, or the first days of a trip plan
+            # against an evening peak that is not going to happen.
+            away = bool(self.store.get("away_active"))
+            if away:
+                default   = _away_seed_profile(
+                    _as_float(self.pluginPrefs.get("awayDailyKwh"), AWAY_DAILY_KWH_DEFAULT))
+                watts_sum = self.store["away_profile_watts_sum"]
+                counts    = self.store["away_profile_count"]
+                min_reads = AWAY_PROFILE_MIN_READINGS
+            else:
+                default   = OctopusAPI._default_consumption_profile()
+                watts_sum = self.store["home_profile_watts_sum"]
+                counts    = self.store["home_profile_count"]
+                min_reads = HOME_PROFILE_MIN_READINGS
             profile   = []
             real_slots = 0
             for i in range(48):
-                if counts[i] >= HOME_PROFILE_MIN_READINGS:
+                if counts[i] >= min_reads:
                     avg_watts = watts_sum[i] / counts[i]
                     profile.append(round(avg_watts * 0.5 / 1000.0, 4))
                     real_slots += 1
@@ -4601,8 +4730,8 @@ class Plugin(indigo.PluginBase):
             self.store["consumption_profile"] = profile
             daily_kwh = sum(profile)
             log(
-                f"[Profile] Consumption profile updated from inverter data — "
-                f"daily: {daily_kwh:.1f} kWh  "
+                f"[Profile] {'Away' if away else 'Occupied'} consumption profile "
+                f"updated from inverter data — daily: {daily_kwh:.1f} kWh  "
                 f"({real_slots}/48 slots from real data, "
                 f"{48 - real_slots} using default)"
             )
@@ -4629,6 +4758,10 @@ class Plugin(indigo.PluginBase):
         data = {
             "watts_sum": self.store["home_profile_watts_sum"],
             "count":     self.store["home_profile_count"],
+            # v5.78.0. New keys, so a file written by <=5.77.3 simply lacks them
+            # and the away accumulators start empty — no migration needed.
+            "away_watts_sum": self.store["away_profile_watts_sum"],
+            "away_count":     self.store["away_profile_count"],
             "saved_at":  datetime.now().isoformat(),
         }
         try:
@@ -4653,14 +4786,25 @@ class Plugin(indigo.PluginBase):
                 data = json.load(f)
             watts_sum = data.get("watts_sum", [])
             counts    = data.get("count", [])
+            away_sum  = data.get("away_watts_sum", [])
+            away_cnt  = data.get("away_count", [])
+            if len(away_sum) == 48 and len(away_cnt) == 48:
+                self.store["away_profile_watts_sum"] = [float(v) for v in away_sum]
+                self.store["away_profile_count"]     = [int(v)   for v in away_cnt]
             if len(watts_sum) == 48 and len(counts) == 48:
                 self.store["home_profile_watts_sum"] = [float(v) for v in watts_sum]
                 self.store["home_profile_count"]     = [int(v)   for v in counts]
+                # Seed the away flag BEFORE the rebuild, or a restart during a
+                # trip comes back up on the occupied profile until the next poll.
+                self.store["away_active"] = self._is_away()
                 # Immediately build consumption_profile from restored data
                 self._refresh_consumption_profile()
                 real_slots = sum(1 for c in counts if c >= HOME_PROFILE_MIN_READINGS)
+                away_real  = sum(1 for c in away_cnt if c >= AWAY_PROFILE_MIN_READINGS)
                 self.logger.info(
-                    f"Home load profile restored — {real_slots}/48 slots from real data"
+                    f"Home load profile restored — {real_slots}/48 slots from real "
+                    f"data ({away_real}/48 away)"
+                    + ("  [house is currently EMPTY]" if self.store["away_active"] else "")
                 )
         except Exception as e:
             self.logger.warning(f"Cannot load home profile: {e}")
@@ -6690,6 +6834,12 @@ class Plugin(indigo.PluginBase):
         if "currentMode" in dev.states:
             states.append({"key": "currentMode",
                            "value": ACTION_MODE_TOKEN.get(decision.action, "selfConsumption")})
+        # v5.78.0. Same first-tick guard as currentMode above — a state added in
+        # this version is not registered until stateListOrDisplayStateIdChanged
+        # has run, and writing it early logs a red line for nothing.
+        if "awayMode" in dev.states:
+            states.append({"key": "awayMode",
+                           "value": str(bool(self.store.get("away_active")))})
         dev.updateStatesOnServer(states)
 
     def _update_forecast_device(self, data):

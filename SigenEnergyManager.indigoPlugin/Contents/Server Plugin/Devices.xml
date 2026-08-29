@@ -287,6 +287,13 @@
                 <TriggerLabel>Manager status changed</TriggerLabel>
                 <ControlPageLabel>Manager Status</ControlPageLabel>
             </State>
+            <!-- v5.78.0. True while the configured Away variable says the house
+                 is empty, so the away consumption profile is the live one. -->
+            <State id="awayMode">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Away mode changed</TriggerLabel>
+                <ControlPageLabel>Away Mode</ControlPageLabel>
+            </State>
             <State id="currentAction">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Manager action changed</TriggerLabel>

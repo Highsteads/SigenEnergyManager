@@ -163,6 +163,29 @@
         <Label>Weekend daily consumption (kWh Sat-Sun, default 30):</Label>
     </Field>
 
+    <Field id="separator_away" type="separator"/>
+    <Field id="label_away" type="label">
+        <Label>AWAY MODE (empty house)</Label>
+    </Field>
+    <Field id="label_away_help" type="label" fontSize="small">
+        <Label>An empty house draws a flat base load with none of the usual daily shape, so planning against the normal profile buys for people who are not there. Point this at an Indigo variable your holiday schedules already set, and the plugin keeps a second consumption profile for the days the house is empty. The two never mix, so a long trip cannot skew the normal one either. If the variable is missing or unreadable the house is treated as occupied.</Label>
+    </Field>
+    <Field id="awayEnabled" type="checkbox" defaultValue="false">
+        <Label>Use a separate profile when the house is empty:</Label>
+    </Field>
+    <Field id="awayVariable" type="textfield" defaultValue="Away"
+           visibleBindingId="awayEnabled" visibleBindingValue="true">
+        <Label>Indigo variable name (true = house empty):</Label>
+    </Field>
+    <Field id="awayDailyKwh" type="textfield" defaultValue="12.0"
+           visibleBindingId="awayEnabled" visibleBindingValue="true">
+        <Label>Expected daily consumption when away (kWh, default 12):</Label>
+    </Field>
+    <Field id="label_away_seed" type="label" fontSize="small"
+           visibleBindingId="awayEnabled" visibleBindingValue="true">
+        <Label>Used as a flat starting estimate only. Once the house has been empty for a few days the plugin learns the real shape from the inverter and uses that instead.</Label>
+    </Field>
+
     <Field id="separator_export" type="separator"/>
     <Field id="label_export" type="label">
         <Label>GRID EXPORT (enable when export MPAN is active)</Label>
