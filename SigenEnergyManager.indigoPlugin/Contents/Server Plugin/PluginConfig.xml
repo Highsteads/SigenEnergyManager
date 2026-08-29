@@ -231,6 +231,12 @@
     <Field id="dashboardTokenInfo" type="label">
         <Label>Leave blank and the plugin generates a strong token for you and stores it in its own data folder, readable only by this user. Set SIGEN_DASHBOARD_TOKEN in IndigoSecrets.py to override both. Never expose port 8179 to the internet by forwarding a port — use Tailscale or a Cloudflare Tunnel instead.</Label>
     </Field>
+    <Field id="dashboardHost" type="textfield" defaultValue="">
+        <Label>Dashboard host (blank = auto-detect):</Label>
+    </Field>
+    <Field id="dashboardHostInfo" type="label">
+        <Label>Only affects the address the plugin advertises for the dashboard. Leave blank to auto-detect the LAN IP, or set DASHBOARD_HOST in IndigoSecrets.py, or type a hostname or static IP your other devices can reach.</Label>
+    </Field>
 
     <Field id="separator_pushover" type="separator"/>
     <Field id="label_pushover" type="label">
@@ -331,17 +337,6 @@
     </Field>
     <Field id="stormExportReleasePctInfo" type="label">
         <Label>During an active storm warning, export is held off so the battery banks charge ahead of a possible power cut — but only while it is below this percentage. At or above it the reserve is already banked, so export resumes (Solar Overflow throttles the charge and pushes surplus to grid) rather than ramming the battery to 100% and clipping every watt of PV above your export cap. Never drops below the storm reserve target (50% yellow / 80% amber-red). Default 85.</Label>
-    </Field>
-
-    <Field id="separator_dashboard" type="separator"/>
-    <Field id="label_dashboard" type="label">
-        <Label>WEB DASHBOARD</Label>
-    </Field>
-    <Field id="label_dashboard_info" type="label">
-        <Label>The dashboard runs on this Indigo server. Leave the host blank to auto-detect the LAN IP, or set DASHBOARD_HOST in IndigoSecrets.py / fill it in below to override (e.g. a hostname or static IP visible to your other devices).</Label>
-    </Field>
-    <Field id="dashboardHost" type="textfield" defaultValue="">
-        <Label>Dashboard host (blank = auto-detect):</Label>
     </Field>
 
     <Field id="separator_debug" type="separator"/>

@@ -15,6 +15,43 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.78.1 — 29-08-2026
+
+CONFIGURE DIALOG WAS DEAD FOR FIVE DAYS.
+
+`PAXDialogControllerError -- Field ID separator_dashboard was already used.` Indigo will not
+build a dialog containing two `<Field>` elements with the same `id`, and v5.75.0 (24-Aug) added
+a second WEB DASHBOARD section that reused three IDs from the existing one:
+`separator_dashboard`, `label_dashboard`, `label_dashboard_info`. Every attempt to open
+Plugins -> Sigenergy Manager -> Configure failed outright, so NO setting could be changed.
+
+**Why it survived five days and two releases.** Nothing in the plugin reads its own dialog XML —
+Indigo's client parses it, at the moment a user opens the dialog. So the failure is invisible to
+`python3 -m unittest`, to `ruff`, to a plugin restart, and to every smoke test in the release
+ritual. It surfaced only when CliveS went to tick a new setting. Note the wrinkle from the
+client-XML-caching rule: a client holding the pre-5.75.0 XML would have opened the dialog fine,
+which is another way this hides.
+
+**Fix.** The two sections merged into one, `dashboardHost` folded in after the token fields where
+it belongs (it is the same subject), and the duplicate heading deleted rather than renamed —
+two "WEB DASHBOARD" headings in one dialog was the real defect, the ID clash was the symptom.
+
+**Guard.** `test_config_xml.py` walks every `*.xml` in the Server Plugin folder and asserts, per
+dialog scope (the root for PluginConfig, each `<ConfigUI>` elsewhere):
+- every file parses
+- no duplicate `Field` id within one dialog
+- no `Field` without an id
+- every `visibleBindingId` names a field present in the same dialog
+
+That last one is not the bug that was hit, but it is the same family and it fails SILENTLY — a
+mistyped binding hides the row instead of raising, so the setting simply never appears. The
+suite also asserts the glob matched something, since a glob matching nothing makes the other
+four pass vacuously. Mutation-checked 3/3.
+
+Tests 807 -> 812.
+
+---
+
 ## v5.78.0 — 29-08-2026
 
 AWAY MODE — a second consumption profile, for the days the house is empty.
