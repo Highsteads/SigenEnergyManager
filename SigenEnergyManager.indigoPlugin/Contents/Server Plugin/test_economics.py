@@ -332,5 +332,124 @@ class TestMalformedHistoryIsSurvivable(_EconBase):
             self.fail(f"a bare row raised {type(exc).__name__}: {exc}")
 
 
+class TestWholeHouseCardArithmetic(unittest.TestCase):
+    """Pin every term of the whole-house card independently.
+
+    The characterisation tests above cover shape and specific paths, and a mutation
+    run showed that is not enough: flipping `*` to `+` in the gas unit cost,
+    turning `eu + es` into `eu - es` in the electricity total, dropping the gas
+    standing charge from the bill, and — worst — reversing the sign of `net_gbp`
+    all survived them. `net_gbp` is the headline figure on the cost page, so a
+    silent sign flip there reports a bill as a profit.
+
+    The inputs are chosen so that EVERY intermediate is a different number:
+
+        electricity unit     10 kWh x 30p   = 3.00
+        electricity standing        50p     = 0.50
+        gas unit              8 kWh x  7p   = 0.56
+        gas standing                27p     = 0.27
+        bill                                = 4.33
+        export               21 kWh x 15p   = 3.15
+        net                  3.15 - 4.33    = -1.18   (negative on purpose)
+
+    No two terms are equal and no two sums coincide, so any swapped operand,
+    flipped operator or dropped term changes a value this class asserts.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.card = plugin.Plugin._wh_build_card(
+            import_kwh=10.0, export_kwh=21.0, elec_unit_p=30.0, export_rate_p=15.0,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+
+    def test_electricity_unit_is_kwh_times_rate(self):
+        self.assertEqual(self.card["electric_unit_gbp"], 3.00)
+
+    def test_electricity_standing_is_pence_converted(self):
+        self.assertEqual(self.card["electric_standing_gbp"], 0.50)
+
+    def test_electricity_total_ADDS_standing_to_unit(self):
+        """eu - es would give 2.50 and survived the earlier tests."""
+        self.assertEqual(self.card["electric_gbp"], 3.50)
+
+    def test_gas_unit_MULTIPLIES_kwh_by_rate(self):
+        """gas_kwh + gas_unit_p/100 would give 8.07 and survived."""
+        self.assertEqual(self.card["gas_unit_gbp"], 0.56)
+
+    def test_gas_standing_is_pence_converted(self):
+        self.assertEqual(self.card["gas_standing_gbp"], 0.27)
+
+    def test_gas_total_adds_standing_to_unit(self):
+        self.assertEqual(self.card["gas_gbp"], 0.83)
+
+    def test_bill_includes_all_four_components(self):
+        """Dropping the gas standing charge gives 4.06 and survived."""
+        self.assertEqual(self.card["bill_gbp"], 4.33)
+
+    def test_export_is_kwh_times_export_rate(self):
+        self.assertEqual(self.card["export_gbp"], 3.15)
+
+    def test_net_is_export_MINUS_bill_and_can_be_negative(self):
+        """bill - exp gives +1.18. Same magnitude, opposite meaning: it reports a
+        loss as a gain on the page's headline number."""
+        self.assertEqual(self.card["net_gbp"], -1.18)
+
+    def test_not_covered_when_export_falls_short_of_the_bill(self):
+        self.assertIs(self.card["covered"], False)
+
+    def test_covered_when_export_beats_the_bill(self):
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=1.0, export_kwh=40.0, elec_unit_p=30.0, export_rate_p=15.0,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+        self.assertEqual(card["export_gbp"], 6.00)
+        self.assertEqual(card["bill_gbp"], 1.63)          # 0.30+0.50+0.56+0.27
+        self.assertEqual(card["net_gbp"], 4.37)          # 6.00 - 1.63
+        self.assertIs(card["covered"], True)
+
+    def test_the_kwh_are_carried_beside_the_costs(self):
+        """So a consumer cannot pair a live cost with a stale volume."""
+        self.assertEqual(self.card["import_kwh"], 10.0)
+        self.assertEqual(self.card["export_kwh"], 21.0)
+        self.assertEqual(self.card["gas_kwh"], 8.0)
+
+    def test_a_zero_export_rate_is_a_real_rate_not_a_missing_one(self):
+        """0p must not fall back to the 12p default."""
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=10.0, export_kwh=21.0, elec_unit_p=30.0, export_rate_p=0.0,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+        self.assertEqual(card["export_gbp"], 0.0)
+
+    def test_absent_export_rate_uses_the_default(self):
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=10.0, export_kwh=21.0, elec_unit_p=30.0, export_rate_p=None,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+        self.assertEqual(card["export_gbp"], 2.52)        # 21 x 12p
+
+    def test_unknown_unit_rate_with_real_import_refuses_to_guess(self):
+        """Returning 0.00 left the standing charge as the whole bill, which beat
+        the export revenue and painted a green Covered badge over a bill nobody
+        had worked out."""
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=10.0, export_kwh=21.0, elec_unit_p=None, export_rate_p=15.0,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+        self.assertTrue(card["rate_missing"])
+        for field in ("electric_unit_gbp", "electric_gbp", "bill_gbp", "net_gbp", "covered"):
+            self.assertIsNone(card[field], field)
+
+    def test_no_import_and_no_rate_is_not_a_missing_rate(self):
+        """Nothing was bought, so the unknown price of it does not matter."""
+        card = plugin.Plugin._wh_build_card(
+            import_kwh=0.0, export_kwh=21.0, elec_unit_p=None, export_rate_p=15.0,
+            elec_standing_p=50.0, gas_kwh=8.0, gas_unit_p=7.0, gas_standing_p=27.0,
+            provisional=False, gas_estimated=False)
+        self.assertFalse(card["rate_missing"])
+        self.assertEqual(card["bill_gbp"], 1.33)          # 0 + 0.50 + 0.56 + 0.27
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
