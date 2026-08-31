@@ -7065,8 +7065,15 @@ class Plugin(indigo.PluginBase):
         # HTML sites and a List enum key off those strings, and a hold is not a new
         # action, it is self-consumption with a reason. The reason is where it shows.
         _bank_first_holding = bool(getattr(decision, "bank_first_holding", False))
+        # Publish the CONFIGURED gate whether or not the hold is currently biting.
+        # The decision only carries a gate while it is holding, and publishing that
+        # 0.0 the rest of the time would put a number on the device that means
+        # nothing — which a reader will take to mean the gate is zero. Read the pref
+        # instead, and show a real level all day.
         _bank_first_gate    = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
-                                  max(0.0, float(getattr(decision, "bank_first_gate_pct", 0.0) or 0.0)))
+                                  max(0.0, _as_float(
+                                      self.pluginPrefs.get("solarOverflowBankFirstSoc"),
+                                      SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)))
         _reason_display     = (
             f"Banking first to {_bank_first_gate:.0f}% — daytime export held | {decision.reason}"
             if _bank_first_holding else decision.reason
@@ -7078,10 +7085,6 @@ class Plugin(indigo.PluginBase):
             # currentMode (List enum) appended below, guarded — see note before
             # the updateStatesOnServer call.
             {"key": "currentReason",       "value": _reason_display[:255]},
-            {"key": "bankFirstActive",     "value": str(_bank_first_holding)},
-            {"key": "bankFirstTargetSoc",  "value": str(round(_bank_first_gate, 1))},
-            {"key": "bankFirstForecastKwh", "value": str(round(
-                float(snapshot.raw_today_kwh or 0.0), 1))},
             {"key": "dawnViable",          "value": str(decision.dawn_viable)},
             {"key": "socAtDawn",           "value": str(round(decision.soc_at_dawn_kwh, 2))},
             {"key": "importActive",        "value": str(self.store["import_active"])},
@@ -7119,6 +7122,17 @@ class Plugin(indigo.PluginBase):
         if "awayMode" in dev.states:
             states.append({"key": "awayMode",
                            "value": str(bool(self.store.get("away_active")))})
+        # v5.79.0. Same first-tick guard again — these three did not exist before
+        # this version, so on the tick straight after the upgrade they are not yet
+        # registered.
+        if "bankFirstActive" in dev.states:
+            states.append({"key": "bankFirstActive", "value": str(_bank_first_holding)})
+        if "bankFirstTargetSoc" in dev.states:
+            states.append({"key": "bankFirstTargetSoc",
+                           "value": str(round(_bank_first_gate, 1))})
+        if "bankFirstForecastKwh" in dev.states:
+            states.append({"key": "bankFirstForecastKwh",
+                           "value": str(round(float(snapshot.raw_today_kwh or 0.0), 1))})
         dev.updateStatesOnServer(states)
 
     def _update_forecast_device(self, data):
