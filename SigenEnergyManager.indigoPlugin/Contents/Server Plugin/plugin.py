@@ -8,7 +8,7 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1)
 # Date:        29-08-2026
-# Version:     5.78.1
+# Version:     5.79.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -151,6 +151,9 @@ from battery_manager  import (
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
+    SOLAR_OVERFLOW_CAP_DEADBAND_W,
+    SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
+    SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX, SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX,
 )
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
@@ -1078,6 +1081,34 @@ class Plugin(indigo.PluginBase):
         self.store["shadow_95_export_foregone_kwh"] = 0.0
         self.store["shadow_95_samples"]             = 0
 
+        # ── Bank-first export hold (v5.79.0) ────────────────────────────────
+        # A one-way day latch: set only from a COMPLETE forecast, and only ever to
+        # True. A forecast oscillating around the threshold can therefore tip the
+        # day into "small" but can never tip it back out, which is the safe
+        # direction — the cost of banking a day that turns out big is a few kWh of
+        # export, the cost of releasing a day that turns out small is the whole
+        # point of the feature.
+        self.store["bank_first_small_latched"]  = False
+        self.store["bank_first_latch_date"]     = ""
+        # Daily measurement. Counted in manager ticks, which are one a minute.
+        self.store["bank_first_blocked_samples"]   = 0
+        self.store["bank_first_withheld_kwh"]      = 0.0
+        self.store["bank_first_first_block_local"] = ""
+        self.store["bank_first_released_local"]    = ""
+        self.store["bank_first_logged_date"]       = ""
+        self.store["bank_first_release_logged"]    = False
+        # Measured, not forecast. clip_boundary_minutes is the only honest detector
+        # of the cost this feature could impose: minutes in which export was pinned
+        # at the DNO cap while the battery had stopped taking anything. An
+        # "SOC >= 99.5" counter would read zero on exactly the days it exists to
+        # catch, because a BMS taper stops the charge well before 100%.
+        self.store["bank_first_minutes_soc_ge_95"]  = 0
+        self.store["bank_first_minutes_soc_ge_99"]  = 0
+        self.store["bank_first_clip_boundary_min"]  = 0
+        self.store["bank_first_arm_minutes"]        = 0
+        self.store["bank_first_first_arm_local"]    = ""
+        self.store["bank_first_peak_surplus_kw"]    = 0.0
+
         # Set when a VPP hand-back write was not confirmed, so the 10s tick
         # re-asserts the safe baseline instead of waiting for the ~15-min manager
         # cycle (see _retry_vpp_handback). Deliberately NOT persisted: a restart
@@ -1209,6 +1240,11 @@ class Plugin(indigo.PluginBase):
         # Write the shared site_config.json so the companion optimiser script
         # always uses the same numbers as the plugin (no constant drift).
         self._write_site_config()
+
+        # One line naming the bank-first setting. A deliberate exception to the
+        # quiet-boot convention: v5.79.0 changes when the system exports, and a
+        # behaviour change that arrives silently on upgrade is not acceptable.
+        self._log_bank_first_setting()
 
         # Auto-update check (best-effort, daily-cached, fully silent on failure).
         try:
@@ -2876,6 +2912,7 @@ class Plugin(indigo.PluginBase):
         decision = self.manager.evaluate(snapshot)
         self.latest_decision = decision
         self._record_solar_overflow_shadow(snapshot, decision)
+        self._record_bank_first_metrics(snapshot, decision, soc_pct)
 
         # 6. Log if action changed or heartbeat
         self._log_manager_decision(decision, snapshot, soc_pct)
@@ -2893,6 +2930,123 @@ class Plugin(indigo.PluginBase):
         #     reports the SAME gate the manager acts on (single source of truth — stops
         #     the advisory re-deriving and drifting; see the 23/24-Jun-2026 case).
         self._publish_flood_preview(snapshot, decision)
+
+    def _record_bank_first_metrics(self, snapshot, decision, soc_pct):
+        """Measure what the bank-first hold did today. Never touches control.
+
+        Three jobs, all of them measurement:
+          1. Latch the day SMALL, once, from a COMPLETE forecast only. A partial or
+             failed fetch reads low, and reading low is exactly when you want to keep
+             the kWh — but a degraded reading must not LOCK the day, or one bad fetch
+             decides the afternoon.
+          2. Count the hold: samples, minutes, and the export actually withheld,
+             obtained by re-running the gate against a copy of the snapshot with the
+             feature switched off. The 0.0-means-off contract is what makes that
+             counterfactual a one-scalar change rather than a second code path.
+          3. Count the MEASURED cost. clip_boundary_minutes is the number that decides
+             whether this feature is free: minutes with export pinned at the DNO cap
+             and the battery no longer taking anything, which is the state in which PV
+             is being thrown away. It reads the meter, not the forecast, and it fires
+             whether the cause is a full battery or a BMS taper.
+
+        Wrapped whole: analysis must be invisible to the control path.
+        """
+        try:
+            store = self.store
+            # Establish every counter up front. __init__ seeds them, but an
+            # accumulators.json written by a version that predates this feature
+            # restores a partial store, and a counter that only materialises when its
+            # event fires reads as "never happened" and as "not measured" in exactly
+            # the same way. They must be distinguishable.
+            for _key, _default in (
+                ("bank_first_blocked_samples",   0),
+                ("bank_first_withheld_kwh",      0.0),
+                ("bank_first_first_block_local", ""),
+                ("bank_first_released_local",    ""),
+                ("bank_first_minutes_soc_ge_95", 0),
+                ("bank_first_minutes_soc_ge_99", 0),
+                ("bank_first_clip_boundary_min", 0),
+                ("bank_first_arm_minutes",       0),
+                ("bank_first_first_arm_local",   ""),
+                ("bank_first_peak_surplus_kw",   0.0),
+                ("bank_first_small_latched",     False),
+            ):
+                store.setdefault(_key, _default)
+
+            local_now = _to_london(snapshot.now)
+            today_str = local_now.strftime("%Y-%m-%d")
+
+            # ── 1. the day latch ────────────────────────────────────────────
+            if store.get("bank_first_latch_date") != today_str:
+                store["bank_first_latch_date"]    = today_str
+                store["bank_first_small_latched"] = False
+            max_kwh = min(float(snapshot.solar_overflow_bank_first_max_kwh or 0.0),
+                          SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+            status  = str(self.latest_forecast_data.get("forecastStatus", ""))
+            raw_kwh = float(snapshot.raw_today_kwh or 0.0)
+            if (max_kwh > 0.0 and status.upper().startswith("OK")
+                    and raw_kwh > 0.0 and raw_kwh < max_kwh):
+                store["bank_first_small_latched"] = True
+
+            # ── 2. the hold ─────────────────────────────────────────────────
+            if getattr(decision, "bank_first_holding", False):
+                store["bank_first_blocked_samples"] = int(
+                    store.get("bank_first_blocked_samples", 0)) + 1
+                if not store.get("bank_first_first_block_local"):
+                    store["bank_first_first_block_local"] = local_now.strftime("%H:%M")
+                # What the legacy gate would have exported this minute. Same balance,
+                # same physics, one scalar different — so any divergence is the gate
+                # under test and nothing else.
+                legacy = copy.copy(snapshot)
+                legacy.solar_overflow_bank_first_max_kwh = 0.0
+                legacy.bank_first_small_latched          = False
+                shadow = self.manager._check_solar_overflow(
+                    legacy, self.manager._calculate_24h_balance(legacy))
+                if shadow is not None:
+                    store["bank_first_withheld_kwh"] = float(
+                        store.get("bank_first_withheld_kwh", 0.0)
+                    ) + float(shadow.export_kw) * MANAGER_EVAL_INTERVAL / 3600.0
+            elif (int(store.get("bank_first_blocked_samples", 0)) > 0
+                  and not store.get("bank_first_released_local")):
+                store["bank_first_released_local"] = local_now.strftime("%H:%M")
+
+            # ── 3. the measured cost ────────────────────────────────────────
+            inv        = self.latest_inverter_data or {}
+            grid_w     = float(inv.get("gridPowerWatts", 0.0) or 0.0)
+            batt_w     = float(inv.get("batteryPowerWatts", 0.0) or 0.0)
+            max_exp_w  = float(snapshot.max_export_kw or 0.0) * 1000.0
+            surplus_w  = max(0.0, float(snapshot.pv_watts) - float(snapshot.house_load_watts))
+
+            if soc_pct >= 95.0:
+                store["bank_first_minutes_soc_ge_95"] = int(
+                    store.get("bank_first_minutes_soc_ge_95", 0)) + 1
+            if soc_pct >= 99.0:
+                store["bank_first_minutes_soc_ge_99"] = int(
+                    store.get("bank_first_minutes_soc_ge_99", 0)) + 1
+
+            # Export pinned at the cap AND the battery no longer absorbing AND the
+            # battery high enough that it is the battery, not the house, that stopped
+            # taking it. All three, or a windy evening reads as clipping.
+            if (max_exp_w > 0.0 and -grid_w >= max_exp_w - 100.0
+                    and batt_w < 200.0 and soc_pct >= 97.0):
+                store["bank_first_clip_boundary_min"] = int(
+                    store.get("bank_first_clip_boundary_min", 0)) + 1
+
+            # Arming: minutes in which the MEASURED surplus could actually fill the
+            # export cable. Recorded now, consulted by a later stage — a day that has
+            # never armed has never demonstrated that exporting early protects
+            # anything.
+            if max_exp_w > 0.0 and surplus_w >= max_exp_w:
+                store["bank_first_arm_minutes"] = int(
+                    store.get("bank_first_arm_minutes", 0)) + 1
+                if not store.get("bank_first_first_arm_local"):
+                    store["bank_first_first_arm_local"] = local_now.strftime("%H:%M")
+
+            if surplus_w / 1000.0 > float(store.get("bank_first_peak_surplus_kw", 0.0)):
+                store["bank_first_peak_surplus_kw"] = round(surplus_w / 1000.0, 2)
+
+        except Exception as exc:
+            self.logger.debug(f"[BankFirst] metrics sample skipped: {exc!r}")
 
     def _record_solar_overflow_shadow(self, snapshot, live_decision):
         """Accumulate a 95%-target pacing estimate without changing control.
@@ -3251,6 +3405,20 @@ class Plugin(indigo.PluginBase):
                                                     SOLAR_OVERFLOW_TARGET_SOC_PCT),
             solar_overflow_min_end_pct  = _as_float(prefs.get("solarOverflowMinEndSoc"),
                                                     SOLAR_OVERFLOW_MIN_END_SOC_PCT),
+            # RAW todayKwh, never correctedTodayKwh: the 40 kWh threshold is
+            # calibrated against the raw model total, and the bias band factor
+            # reaches ~1.2 around 30 kWh, so feeding the corrected figure to a
+            # raw-calibrated gate would move it by a fifth without anyone noticing.
+            raw_today_kwh               = _as_float(
+                self.latest_forecast_data.get("todayKwh"), 0.0),
+            bank_first_small_latched    = bool(
+                self.store.get("bank_first_small_latched", False)),
+            solar_overflow_bank_first_max_kwh = _as_float(
+                prefs.get("solarOverflowBankFirstMaxKwh"),
+                SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH),
+            solar_overflow_bank_first_soc     = _as_float(
+                prefs.get("solarOverflowBankFirstSoc"),
+                SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT),
             # storm_active is set by _apply_storm_override AFTER the snapshot is built
             # (it already mutates dawn_target_pct/export_enabled there) — see step 4.
             flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
@@ -3338,10 +3506,61 @@ class Plugin(indigo.PluginBase):
             )
         self.store["storm_export_suppressed"] = suppress
 
+    def _log_bank_first(self, decision, snapshot, soc_pct):
+        """One line when the hold starts, one when it lifts. At most two a day.
+
+        Without the second line, "banking correctly" and "the gate is stuck" look
+        exactly the same in the log.
+        """
+        try:
+            store     = self.store
+            local_now = _to_london(snapshot.now)
+            today_str = local_now.strftime("%Y-%m-%d")
+            if store.get("bank_first_logged_date") != today_str:
+                store["bank_first_logged_date"]    = ""
+                store["bank_first_release_logged"] = False
+
+            holding = bool(getattr(decision, "bank_first_holding", False))
+            gate    = float(getattr(decision, "bank_first_gate_pct", 0.0) or 0.0)
+            gate    = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX, max(0.0, gate))
+
+            if holding and store.get("bank_first_logged_date") != today_str:
+                store["bank_first_logged_date"] = today_str
+                max_kwh = min(float(snapshot.solar_overflow_bank_first_max_kwh or 0.0),
+                              SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+                log(f"[Manager] Banking first — daytime export held until SOC reaches "
+                    f"{gate:.0f}%. SOC {soc_pct:.1f}%, today's forecast "
+                    f"{float(snapshot.raw_today_kwh or 0.0):.1f} kWh is below the "
+                    f"{max_kwh:.1f} kWh cap-saturation threshold, so nothing is gained "
+                    f"by selling early — the surplus is still there this afternoon.")
+
+            if (not holding
+                    and store.get("bank_first_logged_date") == today_str
+                    and not store.get("bank_first_release_logged")
+                    and int(store.get("bank_first_blocked_samples", 0)) > 0):
+                store["bank_first_release_logged"] = True
+                held_min  = int(store.get("bank_first_blocked_samples", 0))
+                withheld  = float(store.get("bank_first_withheld_kwh", 0.0))
+                peak_kw   = float(store.get("bank_first_peak_surplus_kw", 0.0))
+                log(f"[Manager] Bank-first satisfied at {local_now.strftime('%H:%M')} — "
+                    f"SOC {soc_pct:.1f}%, export handed back to the overflow gate. "
+                    f"Held {held_min // 60}h{held_min % 60:02d}m, {withheld:.1f} kWh not "
+                    f"exported, peak surplus {peak_kw:.1f} kW "
+                    f"(cap {float(snapshot.max_export_kw or 0.0):.1f} kW).")
+        except Exception as exc:
+            self.logger.debug(f"[BankFirst] log skipped: {exc!r}")
+
     def _log_manager_decision(self, decision, snapshot, soc_pct):
         """Log manager decisions only on action change — no periodic heartbeat."""
         last_action    = self.store.get("last_manager_action", "")
         action_changed = decision.action != last_action
+
+        # Bank-first gets its own matched pair, ABOVE the action-change gate. It has
+        # to: the action does not change when the hold bites — the manager was
+        # already sitting on self_consumption overnight — so every path below returns
+        # early and the hold would be completely silent. An absence always reads as a
+        # fault, and a page that withholds something must say so.
+        self._log_bank_first(decision, snapshot, soc_pct)
 
         if decision.action == ACTION_SOLAR_OVERFLOW:
             if not action_changed:
@@ -4059,7 +4278,7 @@ class Plugin(indigo.PluginBase):
                 self.store["solar_overflow_charge_cap_w"] = cap_w
                 self.store["export_active"]               = False
                 self.store["import_active"]               = False
-            elif abs(prev_cap - cap_w) > 500:
+            elif abs(prev_cap - cap_w) > SOLAR_OVERFLOW_CAP_DEADBAND_W:
                 # Cap has shifted by more than deadband — update inverter register silently.
                 # No log here: Indigo shows all indigo.server.log() calls regardless of
                 # level= so any per-cap-change line floods the event log. The 15-min
@@ -6298,6 +6517,12 @@ class Plugin(indigo.PluginBase):
             end_soc_pct = None
         shadow_export = round(float(self.store.get("shadow_95_export_foregone_kwh", 0.0)), 3)
         shadow_samples = int(self.store.get("shadow_95_samples", 0) or 0)
+        _bf_threshold = min(_as_float(self.pluginPrefs.get("solarOverflowBankFirstMaxKwh"),
+                                      SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH),
+                            SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+        _bf_gate      = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+                            max(0.0, _as_float(self.pluginPrefs.get("solarOverflowBankFirstSoc"),
+                                               SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)))
 
         record = {
             "date":                 date_str,
@@ -6335,6 +6560,31 @@ class Plugin(indigo.PluginBase):
                 "observed_evening_import_kwh": shadow_tariff["evening_import_kwh"],
                 "tariff_baseline": shadow_tariff,
             },
+            # Separate from solar_overflow_shadow above, deliberately: that block is a
+            # specific 90-vs-95 pacing experiment with hardcoded labels, and folding a
+            # second question into it would make both reports lie.
+            "bank_first": {
+                "mode":                  "live",
+                "threshold_kwh":         _bf_threshold,
+                "gate_soc_pct":          _bf_gate,
+                "classified_small":      bool(self.store.get("bank_first_small_latched", False)),
+                "classified_from_kwh":   round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
+                "forecast_status":       str(self.latest_forecast_data.get("forecastStatus", "")),
+                "blocked_samples":       int(self.store.get("bank_first_blocked_samples", 0)),
+                "first_block_local":     self.store.get("bank_first_first_block_local") or None,
+                "released_local":        self.store.get("bank_first_released_local") or None,
+                "minutes_held":          int(self.store.get("bank_first_blocked_samples", 0)),
+                "export_withheld_kwh":   round(float(self.store.get("bank_first_withheld_kwh", 0.0)), 3),
+                "peak_soc_pct":          round(self.store["peak_soc"], 1),
+                "minutes_soc_ge_95":     int(self.store.get("bank_first_minutes_soc_ge_95", 0)),
+                "minutes_soc_ge_99":     int(self.store.get("bank_first_minutes_soc_ge_99", 0)),
+                # The number that decides whether this feature is free. Zero on every
+                # small day means banking cost nothing measurable.
+                "clip_boundary_minutes": int(self.store.get("bank_first_clip_boundary_min", 0)),
+                "arm_minutes":           int(self.store.get("bank_first_arm_minutes", 0)),
+                "first_arm_local":       self.store.get("bank_first_first_arm_local") or None,
+                "measured_peak_surplus_kw": round(float(self.store.get("bank_first_peak_surplus_kw", 0.0)), 2),
+            },
         }
 
         path    = os.path.join(self.data_dir, "daily_history.json")
@@ -6362,6 +6612,20 @@ class Plugin(indigo.PluginBase):
         self.store["had_vpp_today"]      = False
         self.store["shadow_95_export_foregone_kwh"] = 0.0
         self.store["shadow_95_samples"]             = 0
+        # Bank-first daily counters. The LATCH is not reset here — it is keyed on the
+        # local date inside _record_bank_first_metrics, so it clears itself on the
+        # first tick of the new day whether or not midnight recording ran.
+        self.store["bank_first_blocked_samples"]   = 0
+        self.store["bank_first_withheld_kwh"]      = 0.0
+        self.store["bank_first_first_block_local"] = ""
+        self.store["bank_first_released_local"]    = ""
+        self.store["bank_first_release_logged"]    = False
+        self.store["bank_first_minutes_soc_ge_95"] = 0
+        self.store["bank_first_minutes_soc_ge_99"] = 0
+        self.store["bank_first_clip_boundary_min"] = 0
+        self.store["bank_first_arm_minutes"]       = 0
+        self.store["bank_first_first_arm_local"]   = ""
+        self.store["bank_first_peak_surplus_kw"]   = 0.0
 
     # ================================================================
     # Data directory backup (weekly, Monday midnight)
@@ -6797,12 +7061,27 @@ class Plugin(indigo.PluginBase):
                               else snapshot.weekday_kwh)
         _tomorrow_solar_kwh = snapshot.corrected_tomorrow_kwh
 
+        # currentAction and currentMode deliberately keep their existing tokens — seven
+        # HTML sites and a List enum key off those strings, and a hold is not a new
+        # action, it is self-consumption with a reason. The reason is where it shows.
+        _bank_first_holding = bool(getattr(decision, "bank_first_holding", False))
+        _bank_first_gate    = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+                                  max(0.0, float(getattr(decision, "bank_first_gate_pct", 0.0) or 0.0)))
+        _reason_display     = (
+            f"Banking first to {_bank_first_gate:.0f}% — daytime export held | {decision.reason}"
+            if _bank_first_holding else decision.reason
+        )
+
         states = [
             {"key": "managerStatus",       "value": "Running" if not self.store["vpp_active"] else "VPP Active"},
             {"key": "currentAction",       "value": action_display},
             # currentMode (List enum) appended below, guarded — see note before
             # the updateStatesOnServer call.
-            {"key": "currentReason",       "value": decision.reason[:255]},
+            {"key": "currentReason",       "value": _reason_display[:255]},
+            {"key": "bankFirstActive",     "value": str(_bank_first_holding)},
+            {"key": "bankFirstTargetSoc",  "value": str(round(_bank_first_gate, 1))},
+            {"key": "bankFirstForecastKwh", "value": str(round(
+                float(snapshot.raw_today_kwh or 0.0), 1))},
             {"key": "dawnViable",          "value": str(decision.dawn_viable)},
             {"key": "socAtDawn",           "value": str(round(decision.soc_at_dawn_kwh, 2))},
             {"key": "importActive",        "value": str(self.store["import_active"])},
@@ -8043,6 +8322,52 @@ class Plugin(indigo.PluginBase):
         log("[Shadow] Tariff figures hold import timing constant; they are not an Agile battery-dispatch forecast.")
         return True
 
+    def menuShowBankFirstReport(self):
+        """Log the last 21 days of the bank-first record.
+
+        clip_boundary_minutes is the column that matters: zero on every small day
+        means holding export back cost nothing measurable. Anything else means the
+        threshold is too high and should come down.
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (OSError, ValueError) as exc:
+            log(f"[BankFirst] No completed-day record available: {exc}", level="WARNING")
+            return True
+
+        rows = [r for r in records if r.get("bank_first")][-21:]
+        if not rows:
+            log("[BankFirst] No completed-day record yet — the first row is written at midnight")
+            return True
+
+        log(f"[BankFirst] Daytime export hold, last {len(rows)} days")
+        log("[BankFirst] date        fcst  small  held   withheld  peakSOC  >=95m  >=99m  clip  arm")
+        for row in reversed(rows):
+            b = row["bank_first"]
+            held = int(b.get("minutes_held", 0))
+            log(f"[BankFirst] {row.get('date', '?'):<10} "
+                f"{float(b.get('classified_from_kwh', 0.0)):5.1f}  "
+                f"{'yes' if b.get('classified_small') else 'no ':<5} "
+                f"{held // 60}h{held % 60:02d}m  "
+                f"{float(b.get('export_withheld_kwh', 0.0)):7.2f}  "
+                f"{float(b.get('peak_soc_pct', 0.0)):6.1f}  "
+                f"{int(b.get('minutes_soc_ge_95', 0)):5d}  "
+                f"{int(b.get('minutes_soc_ge_99', 0)):5d}  "
+                f"{int(b.get('clip_boundary_minutes', 0)):4d}  "
+                f"{int(b.get('arm_minutes', 0)):3d}")
+        _clip = sum(int(r["bank_first"].get("clip_boundary_minutes", 0)) for r in rows)
+        _held = sum(float(r["bank_first"].get("export_withheld_kwh", 0.0)) for r in rows)
+        if _clip == 0:
+            log(f"[BankFirst] No clip-boundary minutes across {len(rows)} days — holding "
+                f"export back cost nothing measurable. {_held:.1f} kWh delayed, not lost.")
+        else:
+            log(f"[BankFirst] {_clip} clip-boundary minutes across {len(rows)} days — solar "
+                f"was being thrown away with the battery full. Lower the kWh threshold.",
+                level="WARNING")
+        return True
+
     def menuShowTariffRates(self):
         """Menu: Log current Tracker/Go/Flux rates from cached Octopus data."""
         rates = self.latest_rates_data
@@ -8565,6 +8890,39 @@ class Plugin(indigo.PluginBase):
             # any tariff / battery / inverter changes immediately rather than
             # waiting for the next plugin restart.
             self._write_site_config()
+        self._log_bank_first_setting()
+
+    def _log_bank_first_setting(self):
+        """Say what the export hold is set to, at startup and on every prefs save.
+
+        A behaviour change that arrives silently on upgrade is not acceptable; an
+        announced one is. It also puts the kill switch in the same line the owner
+        reads when he wonders why nothing exported this morning.
+        """
+        try:
+            max_kwh = _as_float(self.pluginPrefs.get("solarOverflowBankFirstMaxKwh"),
+                                SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH)
+            if max_kwh <= 0.0:
+                log("[Manager] Bank-first export hold: OFF (threshold 0) — daytime export "
+                    "follows the forecast gate alone.")
+                return
+            gate = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+                       max(0.0, _as_float(self.pluginPrefs.get("solarOverflowBankFirstSoc"),
+                                          SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)))
+            clamped = min(max_kwh, SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+            log(f"[Manager] Bank-first export hold: ON — daytime export waits for "
+                f"{gate:.0f}% SOC on days forecast below {clamped:.1f} kWh "
+                f"(set the threshold to 0 to disable).")
+            if max_kwh > SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX:
+                log(f"[Manager] Bank-first threshold {max_kwh:.1f} kWh is above the "
+                    f"{SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX:.0f} kWh clamp and has been "
+                    f"capped there.", level="WARNING")
+            elif clamped >= 65.0:
+                log(f"[Manager] Bank-first threshold {clamped:.1f} kWh is higher than any "
+                    f"day this system has ever produced, so export will be held on "
+                    f"essentially every day. Intended?", level="WARNING")
+        except Exception as exc:
+            self.logger.debug(f"[BankFirst] setting announcement skipped: {exc!r}")
 
     # ================================================================
     # Initialisation Helpers
@@ -8806,6 +9164,24 @@ class Plugin(indigo.PluginBase):
             # restart cannot turn a partial day into an apparently clean day.
             "shadow_95_export_foregone_kwh": self.store.get("shadow_95_export_foregone_kwh", 0.0),
             "shadow_95_samples":             self.store.get("shadow_95_samples", 0),
+            # Bank-first day state. Persisted so a restart cannot turn a held morning
+            # into an apparently clean day, and so the day's classification survives —
+            # otherwise a lunchtime restart re-reads a forecast that has already
+            # drifted and can reclassify a day that was settled hours ago.
+            "bank_first_small_latched":      self.store.get("bank_first_small_latched", False),
+            "bank_first_latch_date":         self.store.get("bank_first_latch_date", ""),
+            "bank_first_blocked_samples":    self.store.get("bank_first_blocked_samples", 0),
+            "bank_first_withheld_kwh":       self.store.get("bank_first_withheld_kwh", 0.0),
+            "bank_first_first_block_local":  self.store.get("bank_first_first_block_local", ""),
+            "bank_first_released_local":     self.store.get("bank_first_released_local", ""),
+            "bank_first_logged_date":        self.store.get("bank_first_logged_date", ""),
+            "bank_first_release_logged":     self.store.get("bank_first_release_logged", False),
+            "bank_first_minutes_soc_ge_95":  self.store.get("bank_first_minutes_soc_ge_95", 0),
+            "bank_first_minutes_soc_ge_99":  self.store.get("bank_first_minutes_soc_ge_99", 0),
+            "bank_first_clip_boundary_min":  self.store.get("bank_first_clip_boundary_min", 0),
+            "bank_first_arm_minutes":        self.store.get("bank_first_arm_minutes", 0),
+            "bank_first_first_arm_local":    self.store.get("bank_first_first_arm_local", ""),
+            "bank_first_peak_surplus_kw":    self.store.get("bank_first_peak_surplus_kw", 0.0),
             # Storm state is NOT day-specific (a warning can span midnight) — persist it
             # so a restart during an active warning doesn't re-send the Pushover.
             "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
@@ -8951,6 +9327,23 @@ class Plugin(indigo.PluginBase):
                 self.store["export_lifetime_start_kwh"] = data.get("export_lifetime_start_kwh")
                 self.store["shadow_95_export_foregone_kwh"] = data.get("shadow_95_export_foregone_kwh", 0.0)
                 self.store["shadow_95_samples"]             = data.get("shadow_95_samples", 0)
+                for _bf_key, _bf_default in (
+                    ("bank_first_small_latched",     False),
+                    ("bank_first_latch_date",        ""),
+                    ("bank_first_blocked_samples",   0),
+                    ("bank_first_withheld_kwh",      0.0),
+                    ("bank_first_first_block_local", ""),
+                    ("bank_first_released_local",    ""),
+                    ("bank_first_logged_date",       ""),
+                    ("bank_first_release_logged",    False),
+                    ("bank_first_minutes_soc_ge_95", 0),
+                    ("bank_first_minutes_soc_ge_99", 0),
+                    ("bank_first_clip_boundary_min", 0),
+                    ("bank_first_arm_minutes",       0),
+                    ("bank_first_first_arm_local",   ""),
+                    ("bank_first_peak_surplus_kw",   0.0),
+                ):
+                    self.store[_bf_key] = data.get(_bf_key, _bf_default)
                 self.logger.debug("Restored daily accumulators from disk")
         except Exception as e:
             self.logger.warning(f"Cannot load accumulators: {e}")

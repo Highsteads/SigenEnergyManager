@@ -6,7 +6,34 @@
 #              No overnight forced discharge.
 # Author:      CliveS & Claude Opus 5
 # Date:        05-08-2026
-# Version:     3.10
+# Version:     3.11
+# 3.11 — BANK-FIRST export hold. The daytime overflow gate decided to sell on a
+#       FORECAST, and the forecast is not good enough to bear that weight: over the
+#       plugin's own 132 accuracy records the mean absolute error is 7.54 kWh (median
+#       6.65, worst 23.79) and it over-predicts on 82 of 132 days. The engage margin
+#       it was judged against is 1.0 kWh — roughly a seventh of the noise, against a
+#       signal biased the wrong way. So the gate was not measuring a surplus, it was
+#       sampling forecast error and calling the positive half a surplus.
+#       Live on 31-Aug-2026: engaged 08:01 at SOC 56.9% on a claimed 10.4 kWh surplus,
+#       capped the battery to 967W for 5h28m, released at 13:29 with the claim down to
+#       0.0 kWh and SOC only 69.5%. 10.6 kWh sold at 12p that the house then had to buy
+#       back at 25-30p. Four of the five days to 30-Aug exported without ever reaching
+#       90%.
+#       The fix delays the START of export until measured SOC reaches the gate, on days
+#       whose forecast is too small to saturate the DNO export cable. Clipping is the
+#       only thing early export buys, and clipping is a RATE problem: of 11 measured
+#       days whose peak half-hourly surplus stayed at or below the 4 kW cap, ZERO
+#       clipped anything, and the smallest day that clipped anything made 41.22 kWh.
+#       Below the threshold there is therefore nothing to gain by selling early — the
+#       surplus is still there in the afternoon — while the asymmetry is stark: selling
+#       and then missing the SOC target costs 13-18p/kWh, holding back costs nothing.
+#       Deliberately consulted ONLY on the ENGAGE path, so it can delay a start and can
+#       never stand a running export down. That one-sidedness is what keeps the v3.10
+#       stability argument intact: the set of ticks that engage is a strict subset of
+#       today's, so the transition count is bounded above by today's.
+#       Owner's requirement, verbatim (CliveS, 31-Aug-2026): "The most important
+#       requirement is to get the battery to 95% each day and if that means no export
+#       then that is fine."
 # 3.10 — Solar overflow gets HYSTERESIS + a re-engage dwell. The physics gate was a
 #       hard cut at exactly zero, so whenever the day's physics surplus sat on the
 #       boundary the decision flapped: measured 05-Aug-2026, nine transitions in one
@@ -236,6 +263,44 @@ SOLAR_OVERFLOW_TARGET_SOC_PCT = 90.0
 # the day is too weak to give kWh away — revert to the old 100% pacing and keep them.
 SOLAR_OVERFLOW_MIN_END_SOC_PCT = 80.0
 
+# ── Bank-first export hold (v3.11) ──────────────────────────────────────────
+# Export is a RATE problem, not an energy one: PV is only ever clipped in a half
+# hour whose surplus exceeds the DNO cap. Measured over 96 days of half-hourly
+# data (May-Aug 2026): of 11 days whose peak half-hourly surplus stayed at or
+# below 4 kW, ZERO clipped anything — still zero with the start SOC forced to
+# 90%. The smallest day that clipped anything made 41.22 kWh.
+#
+# So below this threshold there is nothing to gain by exporting early, and the
+# asymmetry is stark: exporting and then missing the SOC target costs 13-18p/kWh,
+# while holding export back on a day that cannot clip costs nothing at all — the
+# surplus is still there in the afternoon and still exports.
+#
+# 40.0 kWh, four ways: (a) simulated over 96 measured days it left clipping
+# unchanged while lifting the days reaching 95% from 29 to 55; (b) 41.22 kWh is
+# the empirical clipping floor; (c) the threshold behaves the same under both
+# forecast series on disk, which agree on only 73 of 131 days; (d) 31-Aug-2026,
+# the failure this exists for, carried a morning forecast of 35.6 kWh — a
+# threshold of 35 would not have caught it.
+#
+# THE UNITS ARE RAW MODEL kWh, not bias-corrected. correctedTodayKwh is
+# raw x band_factor and that factor reaches 1.199 around 30 kWh, so feeding the
+# corrected figure to a raw-calibrated threshold would shift the gate by a fifth.
+SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH = 40.0
+
+# The owner's requirement (CliveS, 31-Aug-2026): 95% every day, and no export is
+# an acceptable price. This decides WHEN export may start, never how much: above
+# the gate the existing pacing already sells the full surplus, because
+# headroom_to_target clamps to zero and cap_w floors at MIN_CHARGE_W.
+SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT = 95.0
+
+# Hard clamps on the two prefs that feed the above. 97 rather than 100 because SOC
+# reached exactly 100.0 on only 4 of 122 recorded days, so a gate of 100 would be a
+# near-permanent export ban — a typo must not be able to do that. 80 kWh exceeds
+# the largest day ever recorded here (70.77 kWh, 25-Jun-2026), so the kWh clamp
+# never restricts a legitimate setting.
+SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX = 97.0
+SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX = 80.0
+
 
 # ============================================================
 # Data classes
@@ -337,6 +402,25 @@ class ManagerSnapshot:
     solar_overflow_target_pct:  float = SOLAR_OVERFLOW_TARGET_SOC_PCT
     solar_overflow_min_end_pct: float = SOLAR_OVERFLOW_MIN_END_SOC_PCT
 
+    # ── Bank-first export hold (v3.11) ──────────────────────────────────────
+    # RAW todayKwh, NOT correctedTodayKwh — see SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH.
+    # A whole-DAY total, not a remaining figure, so it does not drift down through
+    # the day. That stability is what stops the classification wandering.
+    raw_today_kwh: float = 0.0
+
+    # True once the day has been classified SMALL from a COMPLETE forecast. A
+    # one-way day latch in the safe direction: a forecast oscillating on the
+    # threshold cannot lift the hold once the day has read small. Owned by
+    # plugin.py's store so the manager stays stateless.
+    bank_first_small_latched: bool = False
+
+    # 0.0 = OFF, and that default is load-bearing: the existing overflow test
+    # harnesses build a ManagerSnapshot without these fields, so a non-zero
+    # default here would silently re-target 25 passing tests. plugin.py stays the
+    # single owner of the live value, exactly as it is for the pacing target.
+    solar_overflow_bank_first_max_kwh: float = 0.0
+    solar_overflow_bank_first_soc:     float = SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT
+
     # Storm warning active — raises the overflow target back to 100% (a storm is the one
     # time a genuinely full battery is worth clipping for). Set by plugin's
     # _apply_storm_override. Note the pacing stays LAZY even at 100%: if the day's own
@@ -397,6 +481,12 @@ class Decision:
     soc_at_dawn_kwh: float = 0.0
     import_kwh:      float = 0.0
     export_kw:       float = 0.0    # kW being exported (solar overflow)
+    # v3.11 — set when the bank-first gate is what refused the overflow branch.
+    # Carried as a FLAG, not as text: the overflow reason string is already close
+    # to the 255-char device-state limit and two tests assert on its literal text.
+    # plugin.py composes the log line and the device state from these.
+    bank_first_holding:  bool  = False
+    bank_first_gate_pct: float = 0.0
     # v3.5 — Plan-object audit trail: (tag, message) tuples appended at every
     # branch evaluate() considers (matched OR skipped).  Plugin logs this on
     # action change to make the WHY visible without re-running with debug on.
@@ -515,30 +605,25 @@ class BatteryManager:
         audit.append(("IMPORT", "skipped — import_needed=False (battery+solar covers tomorrow)"))
 
         # 5. Daytime solar overflow: export surplus PV that would otherwise be clipped
+        # v3.11 — set when the bank-first gate is what refused, so plugin.py can log the
+        # hold and publish it without re-deriving the decision. Note it stays False when
+        # export is disabled entirely: a lockout or storm day must not be attributed to
+        # banking, or the report would credit this feature with somebody else's refusal.
+        _bank_first_holding = False
         if snapshot.export_enabled:
             overflow = self._check_solar_overflow(snapshot, balance)
             if overflow is not None:
                 audit.append(("OVERFLOW", f"matched -> {overflow.reason}"))
                 overflow.audit_trail = audit
                 return overflow
-            # Quote the number the gate actually judged, and say which threshold it
-            # was measured against. The old bare "conditions not met" gave a reader no
-            # way to see the decision sitting on the boundary — diagnosing the
-            # 05-Aug-2026 flapping meant reading the source to find out what "not met"
-            # referred to. Costs one recompute of a subtraction.
-            if not balance.is_daytime:
-                audit.append(("OVERFLOW", "skipped — night (daytime gate)"))
-            else:
-                _surplus   = self._overflow_physics_surplus(snapshot, balance)
-                _threshold = (SOLAR_OVERFLOW_RELEASE_KWH if snapshot.solar_overflow_active
-                              else SOLAR_OVERFLOW_ENGAGE_KWH)
-                audit.append((
-                    "OVERFLOW",
-                    f"skipped — physics surplus {_surplus:+.1f} kWh vs "
-                    f"{_threshold:.1f} kWh {'release' if snapshot.solar_overflow_active else 'engage'} "
-                    f"threshold, 24h surplus {balance.surplus_kwh:.1f} kWh"
-                    + (", re-engage dwell running" if self._overflow_dwell_blocked(snapshot) else "")
-                ))
+            # Name the gate that ACTUALLY refused, and quote the number it judged.
+            # The old block quoted a physics surplus whatever had turned the day down,
+            # so a 24h-surplus refusal read as a physics verdict — see
+            # _overflow_skip_reason for why that matters most in the winter.
+            _tag, _msg = self._overflow_skip_reason(snapshot, balance)
+            audit.append(("OVERFLOW", _msg))
+            if _tag == "bank_first":
+                _bank_first_holding = True
         else:
             audit.append(("OVERFLOW", "skipped — export not enabled"))
 
@@ -558,6 +643,10 @@ class BatteryManager:
                 "RELEASE-OVERFLOW",
                 "matched -> previously-applied overflow cap no longer applicable"
             ))
+            release.bank_first_holding  = _bank_first_holding
+            release.bank_first_gate_pct = (
+                float(snapshot.solar_overflow_bank_first_soc) if _bank_first_holding else 0.0
+            )
             release.audit_trail = audit
             return release
 
@@ -573,6 +662,10 @@ class BatteryManager:
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
         audit.append(("DEFAULT", "matched -> self-consumption (no other branch applied)"))
+        default_decision.bank_first_holding  = _bank_first_holding
+        default_decision.bank_first_gate_pct = (
+            float(snapshot.solar_overflow_bank_first_soc) if _bank_first_holding else 0.0
+        )
         default_decision.audit_trail = audit
         return default_decision
 
@@ -1329,6 +1422,104 @@ class BatteryManager:
         return 0.0 <= elapsed_min < SOLAR_OVERFLOW_MIN_DWELL_MIN
 
     @staticmethod
+    def _overflow_bank_first_blocked(snapshot: ManagerSnapshot) -> bool:
+        """True while daytime export must wait for the battery to reach the gate SOC.
+
+        ONE-SIDED BY CONSTRUCTION: the caller consults this only on the ENGAGE path,
+        so it can delay a start and can never stand a running export down. That is
+        what keeps the v3.10 stability argument intact — the set of ticks that engage
+        is a strict subset of today's, so the transition count cannot rise.
+
+        Fails OPEN on anything unexpected, exactly like the dwell above: a gate that
+        cannot read its inputs must fall back to today's behaviour, never lock export
+        out for the day.
+        """
+        max_kwh = float(snapshot.solar_overflow_bank_first_max_kwh or 0.0)
+        if max_kwh <= 0.0:
+            return False                      # feature off — a provable no-op
+
+        # A storm owns the target (100%) and _apply_storm_override already suppresses
+        # export below the storm release SOC. Exempting makes "no storm regression"
+        # provable rather than argued, and costs nothing: during a storm both policies
+        # want the same thing, which is a full battery.
+        if snapshot.storm_active:
+            return False
+
+        max_kwh = min(max_kwh, SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+        try:
+            raw_today = float(snapshot.raw_today_kwh)
+        except (TypeError, ValueError):
+            return False                      # unreadable forecast -> today's behaviour
+
+        # The latch can only ever say SMALL, never BIG, so it only ever broadens the
+        # block. Set by plugin.py, and only from a COMPLETE forecast.
+        small_day = bool(snapshot.bank_first_small_latched) or (raw_today < max_kwh)
+        if not small_day:
+            return False                      # big day — today's pacing earns its keep
+
+        soc_gate = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+                       max(0.0, float(snapshot.solar_overflow_bank_first_soc)))
+        try:
+            return float(snapshot.current_soc_pct) < soc_gate
+        except (TypeError, ValueError):
+            return False
+
+    def _overflow_skip_reason(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> Tuple[str, str]:
+        """(tag, audit message) naming whichever gate actually refused.
+
+        Walks the gates in the SAME order as _check_solar_overflow. One gate order,
+        two readers — the discipline _overflow_physics_surplus was consolidated to in
+        v3.9, after two copies of one subtraction had silently drifted apart.
+
+        Fixes a mislabel that is live today: the old block quoted a physics surplus
+        whatever had refused, so a day turned down by the 24-hour surplus gate read as
+        though the physics gate had judged it. From October the forecast is below the
+        bank-first threshold on nearly every day, so a wrong attribution here would be
+        the line the owner reads every single day of the season this exists for.
+        """
+        if not balance.is_daytime:
+            return ("night", "skipped — night (daytime gate)")
+
+        if balance.surplus_kwh < MIN_EXPORT_KWH:
+            return ("surplus_24h",
+                    f"skipped — 24h surplus {balance.surplus_kwh:.1f} kWh below the "
+                    f"{MIN_EXPORT_KWH:.1f} kWh minimum: every kWh is worth more kept")
+
+        _surplus   = self._overflow_physics_surplus(snapshot, balance)
+        _threshold = (SOLAR_OVERFLOW_RELEASE_KWH if snapshot.solar_overflow_active
+                      else SOLAR_OVERFLOW_ENGAGE_KWH)
+        if _surplus < _threshold:
+            return ("physics",
+                    f"skipped — physics surplus {_surplus:+.1f} kWh vs "
+                    f"{_threshold:.1f} kWh "
+                    f"{'release' if snapshot.solar_overflow_active else 'engage'} "
+                    f"threshold, 24h surplus {balance.surplus_kwh:.1f} kWh")
+
+        # Everything below here is engage-only — a running export is never stood down
+        # by these, so reaching them at all means solar_overflow_active is False.
+        if self._overflow_dwell_blocked(snapshot):
+            return ("dwell",
+                    f"skipped — re-engage dwell running "
+                    f"({SOLAR_OVERFLOW_MIN_DWELL_MIN:.0f} min since the last release)")
+
+        if self._overflow_bank_first_blocked(snapshot):
+            soc_gate = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+                           max(0.0, float(snapshot.solar_overflow_bank_first_soc)))
+            return ("bank_first",
+                    f"skipped — banking first: SOC {snapshot.current_soc_pct:.1f}% below "
+                    f"{soc_gate:.0f}%, and today's {snapshot.raw_today_kwh:.1f} kWh forecast "
+                    f"cannot fill the {snapshot.max_export_kw:.0f} kW export cap. Physics "
+                    f"surplus {_surplus:+.1f} kWh would otherwise have started an export")
+
+        # Should be unreachable — _check_solar_overflow returned None with every known
+        # gate passing. Say so rather than inventing a reason.
+        return ("unknown",
+                f"skipped — no gate claimed the refusal (physics surplus {_surplus:+.1f} kWh, "
+                f"24h surplus {balance.surplus_kwh:.1f} kWh). This is a bug — please report it")
+
+    @staticmethod
     def _overflow_physics_surplus(
         snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> float:
@@ -1400,6 +1591,10 @@ class BatteryManager:
             if solar_surplus < SOLAR_OVERFLOW_ENGAGE_KWH:
                 return None
             if self._overflow_dwell_blocked(snapshot):
+                return None
+            # v3.11 — bank first. Engage-only by design: this can delay a start and
+            # can never release a running cap. See _overflow_bank_first_blocked.
+            if self._overflow_bank_first_blocked(snapshot):
                 return None
 
         # ── 3. Charge cap calculation ─────────────────────────────────────

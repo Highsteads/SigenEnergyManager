@@ -326,6 +326,18 @@
     <Field id="solarOverflowMinEndSocInfo" type="label">
         <Label>Safety net for the configured pacing target. The daytime overflow gate already stops export as soon as the remaining forecast can no longer fill the battery to 100%, so every spare unit is then kept. This floor prevents a mis-set target below the resilience level you want available for a power cut. Default 80.</Label>
     </Field>
+    <Field id="solarOverflowBankFirstMaxKwh" type="textfield" defaultValue="40">
+        <Label>Bank first below (kWh/day):</Label>
+    </Field>
+    <Field id="solarOverflowBankFirstMaxKwhInfo" type="label">
+        <Label>On any day forecast to make less than this, daytime export waits until the battery reaches the level below. Selling early only ever protects you from clipping, and clipping needs more surplus than your export cable can carry — measured here, no day under about 41 kWh has ever clipped a single unit. So below this figure the surplus is still there in the afternoon and nothing is lost by keeping it, while a unit sold at the export rate and bought back in the evening costs you the difference. Above this figure the old pacing applies unchanged, because those are the days that genuinely would clip. Set to 0 to switch the hold off entirely and return to the previous behaviour. Clearing the box does NOT switch it off — it restores the default of 40.</Label>
+    </Field>
+    <Field id="solarOverflowBankFirstSoc" type="textfield" defaultValue="95">
+        <Label>Bank first until SOC (%):</Label>
+    </Field>
+    <Field id="solarOverflowBankFirstSocInfo" type="label">
+        <Label>The level the battery must reach before daytime export may start on those smaller days. It delays export, it never reduces it — once the battery is here, everything spare is exported exactly as before. Capped at 97 whatever you type, because the battery reaches a true 100% only a handful of days a year and a higher figure would hold export off almost permanently. Default 95.</Label>
+    </Field>
     <Field id="solarOverflowShadowEnabled" type="checkbox" defaultValue="true">
         <Label>Log-only 90% vs 95% daytime-target comparison:</Label>
     </Field>

@@ -30,6 +30,11 @@ from battery_manager import (
     SOLAR_OVERFLOW_ENGAGE_KWH,
     SOLAR_OVERFLOW_RELEASE_KWH,
     SOLAR_OVERFLOW_MIN_DWELL_MIN,
+    SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH,
+    SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
+    SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
+    SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX,
+    MIN_EXPORT_KWH,
 )
 
 
@@ -1866,6 +1871,296 @@ class TestControlPathUsesPerDayBandFactor(unittest.TestCase):
 
         self.assertAlmostEqual(a, b, places=6,
             msg="biasFactor is display-only — changing it must not move the engine")
+class TestSolarOverflowBankFirst(unittest.TestCase):
+    """v3.11: on a day too small to fill the export cable, bank before selling.
+
+    The gate this replaces read a FORECAST and engaged on a 1.0 kWh margin. Over the
+    plugin's own 132 accuracy records that forecast has a mean absolute error of
+    7.54 kWh and over-predicts on 82 of 132 days, so the margin was about a seventh
+    of the noise, biased the wrong way. Live on 31-Aug-2026 it started an export at
+    56.9% SOC on a claimed 10.4 kWh surplus, held the battery at a 967W charge cap
+    for five and a half hours, and released with the claim at 0.0 kWh and the battery
+    at 69.5%.
+
+    The whole design rests on the hold being ENGAGE-ONLY. It may delay a start; it
+    may never stand a running export down. That is what keeps v3.10's stability
+    argument intact, and several tests below exist purely to pin it.
+    """
+
+    CAP = 35.04
+
+    def _snap(self, soc_pct=56.9, active=False, released_at=None, now=None,
+              raw_today=35.6, bank_max=SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH,
+              bank_soc=SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT, latched=False,
+              storm=False, target_pct=SOLAR_OVERFLOW_TARGET_SOC_PCT,
+              export_enabled=True, pv_watts=8500):
+        return ManagerSnapshot(
+            current_soc_pct                   = soc_pct,
+            capacity_kwh                      = self.CAP,
+            export_enabled                    = export_enabled,
+            max_export_kw                     = 4.0,
+            pv_watts                          = pv_watts,
+            house_load_watts                  = 750,
+            solar_overflow_active             = active,
+            solar_overflow_released_at        = released_at,
+            solar_overflow_target_pct         = target_pct,
+            storm_active                      = storm,
+            raw_today_kwh                     = raw_today,
+            bank_first_small_latched          = latched,
+            solar_overflow_bank_first_max_kwh = bank_max,
+            solar_overflow_bank_first_soc     = bank_soc,
+            now                               = now or _now(hour=8),
+        )
+
+    def _bal(self, surplus_kwh, soc_pct=56.9, surplus_24h=36.0):
+        """A balance whose PHYSICS surplus is exactly surplus_kwh.
+
+        Derived from the gate's own definition, exactly as the v3.10 harness does, so
+        a change to the headroom term cannot leave these tests quietly measuring
+        something else.
+        """
+        headroom = (100.0 - soc_pct) / 100.0 * self.CAP
+        home     = 6.6
+        return SufficiencyBalance(
+            battery_kwh                = soc_pct / 100.0 * self.CAP,
+            remaining_solar_kwh        = surplus_kwh + headroom + home,
+            remaining_home_to_dusk_kwh = home,
+            is_daytime                 = True,
+            hours_to_dusk              = 7.0,
+            surplus_kwh                = surplus_24h,
+        )
+
+    def _decide(self, surplus_kwh=10.4, surplus_24h=36.0, **kw):
+        soc = kw.pop("soc_pct", 56.9)
+        snap = self._snap(soc_pct=soc, **kw)
+        return BatteryManager()._check_solar_overflow(
+            snap, self._bal(surplus_kwh, soc_pct=soc, surplus_24h=surplus_24h))
+
+    def _evaluate(self, surplus_kwh=10.4, surplus_24h=36.0, **kw):
+        """Drive evaluate()'s audit path with a stubbed balance, so the audit tests
+        read the same gate order the control path took rather than a re-derivation."""
+        soc  = kw.pop("soc_pct", 56.9)
+        snap = self._snap(soc_pct=soc, **kw)
+        bal  = self._bal(surplus_kwh, soc_pct=soc, surplus_24h=surplus_24h)
+        mgr  = BatteryManager()
+        mgr._calculate_24h_balance = lambda _s: bal
+        return mgr.evaluate(snap)
+
+    @staticmethod
+    def _audit(decision, tag="OVERFLOW"):
+        return " ".join(m for t, m in (decision.audit_trail or []) if t == tag)
+
+    # ── The live failure, pinned ───────────────────────────────────────────
+    def test_the_31_aug_morning_does_not_start_an_export(self):
+        """08:01 on 31-Aug-2026: SOC 56.9%, forecast 35.6 kWh, claimed surplus
+        +10.4 kWh. On v5.78.1 this returned a Decision capping charge at 967W and
+        exporting 1.59 kW. It must now return None."""
+        self.assertIsNone(self._decide(10.4, soc_pct=56.9, raw_today=35.6))
+
+    def test_the_same_morning_on_a_big_day_still_exports(self):
+        """Same numbers, a day the cable can actually be filled — unchanged."""
+        d = self._decide(10.4, soc_pct=56.9, raw_today=55.0)
+        self.assertIsNotNone(d)
+        self.assertGreater(d.export_kw, 0.0)
+
+    # ── The audit must name the gate that actually refused ─────────────────
+    def test_the_audit_names_the_bank_first_hold(self):
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=35.6)
+        self.assertIn("banking first", self._audit(d))
+        self.assertTrue(d.bank_first_holding)
+        self.assertEqual(d.bank_first_gate_pct, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)
+
+    def test_a_dull_day_audit_names_the_physics_gate_not_bank_first(self):
+        """A day turned down because the sun cannot fill the battery must not be
+        reported as banking — from October the forecast is under the threshold on
+        nearly every day, so a wrong attribution here would be the line the owner
+        reads every day of the season this exists for."""
+        d = self._evaluate(-25.0, soc_pct=45.0, raw_today=8.2)
+        audit = self._audit(d)
+        self.assertIn("physics surplus", audit)
+        self.assertNotIn("banking first", audit)
+        self.assertFalse(d.bank_first_holding)
+
+    def test_a_thin_24h_surplus_audit_names_the_24h_gate(self):
+        """Pre-existing mislabel: the old block quoted a physics surplus whatever had
+        refused, so a 24h-surplus refusal read as a physics verdict."""
+        d = self._evaluate(10.4, surplus_24h=MIN_EXPORT_KWH - 0.1, raw_today=35.6)
+        audit = self._audit(d)
+        self.assertIn("24h surplus", audit)
+        self.assertNotIn("physics surplus", audit)
+
+    def test_export_not_enabled_is_not_a_bank_first_hold(self):
+        d = self._evaluate(10.4, soc_pct=50.0, raw_today=20.0, export_enabled=False)
+        self.assertIn("export not enabled", self._audit(d))
+        self.assertFalse(d.bank_first_holding)
+
+    # ── No-op proofs: off, big days, above the gate ────────────────────────
+    def test_the_feature_is_off_by_default_in_the_manager(self):
+        """The 0.0 default is load-bearing — the two existing overflow harnesses
+        build a snapshot without these fields, and a non-zero default here would
+        silently re-target 25 passing tests."""
+        snap = ManagerSnapshot(
+            current_soc_pct  = 56.9,
+            capacity_kwh     = self.CAP,
+            export_enabled   = True,
+            max_export_kw    = 4.0,
+            pv_watts         = 8500,
+            house_load_watts = 750,
+            now              = _now(hour=8),
+        )
+        self.assertEqual(snap.solar_overflow_bank_first_max_kwh, 0.0)
+        self.assertIsNotNone(BatteryManager()._check_solar_overflow(
+            snap, self._bal(10.4, soc_pct=56.9)))
+
+    def test_a_big_day_is_untouched(self):
+        on  = self._decide(10.4, raw_today=55.0, bank_max=40.0)
+        off = self._decide(10.4, raw_today=55.0, bank_max=0.0)
+        self.assertIsNotNone(on)
+        self.assertIsNotNone(off)
+        self.assertEqual(on.export_kw, off.export_kw)
+        self.assertEqual(on.power_watts, off.power_watts)
+
+    def test_above_the_gate_behaviour_is_unchanged(self):
+        on  = self._decide(10.4, soc_pct=96.0, raw_today=30.0, bank_max=40.0)
+        off = self._decide(10.4, soc_pct=96.0, raw_today=30.0, bank_max=0.0)
+        self.assertIsNotNone(on)
+        self.assertEqual(on.export_kw, off.export_kw)
+        self.assertEqual(on.power_watts, off.power_watts)
+
+    def test_a_zero_soc_gate_is_todays_behaviour(self):
+        on  = self._decide(10.4, bank_soc=0.0)
+        off = self._decide(10.4, bank_max=0.0)
+        self.assertIsNotNone(on)
+        self.assertEqual(on.export_kw, off.export_kw)
+
+    def test_storm_is_exempt(self):
+        """A storm owns the target and already suppresses export below its release
+        SOC. Exempting makes non-regression provable rather than argued."""
+        d = self._decide(10.4, soc_pct=56.9, raw_today=30.0, storm=True)
+        self.assertIsNotNone(d)
+        self.assertIn("to 100% target", d.reason)
+        self.assertIn("(storm)", d.reason)
+
+    def test_pacing_target_at_95_does_not_change_behaviour_above_the_gate(self):
+        a = self._decide(10.4, soc_pct=96.0, raw_today=30.0, target_pct=95.0)
+        b = self._decide(10.4, soc_pct=96.0, raw_today=30.0, target_pct=90.0)
+        self.assertIsNotNone(a)
+        self.assertEqual(a.export_kw, b.export_kw)
+        self.assertEqual(a.power_watts, b.power_watts)
+
+    # ── Boundaries and clamps ──────────────────────────────────────────────
+    def test_the_threshold_boundary(self):
+        """40.0 exactly is a BIG day — the prose says "below 40" and the code must
+        agree, or the two drift apart the first time somebody reads one of them."""
+        self.assertIsNone(self._decide(10.4, raw_today=39.9))
+        self.assertIsNotNone(self._decide(10.4, raw_today=40.0))
+        self.assertIsNotNone(self._decide(10.4, raw_today=40.1))
+
+    def test_the_soc_boundary(self):
+        self.assertIsNone(self._decide(10.4, soc_pct=94.9, raw_today=30.0))
+        self.assertIsNotNone(self._decide(10.4, soc_pct=95.0, raw_today=30.0))
+
+    def test_a_soc_gate_above_the_clamp_is_clamped(self):
+        """A typo of 950 must not become a permanent export ban."""
+        for typo in (100.0, 950.0):
+            with self.subTest(bank_soc=typo):
+                self.assertIsNotNone(self._decide(
+                    10.4, soc_pct=SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX + 0.5,
+                    raw_today=30.0, bank_soc=typo))
+
+    def test_an_absurd_threshold_is_clamped(self):
+        """Read from the constant, not a literal: if the clamp moves, this test must
+        move with it rather than quietly testing a number nobody uses any more."""
+        under = SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX - 1.0
+        over  = SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX + 1.0
+        self.assertIsNone(self._decide(10.4, raw_today=under, bank_max=10000.0))
+        self.assertIsNotNone(self._decide(10.4, raw_today=over, bank_max=10000.0))
+
+    def test_an_unreadable_forecast_falls_back_to_todays_behaviour(self):
+        self.assertFalse(BatteryManager._overflow_bank_first_blocked(
+            self._snap(raw_today=None)))
+
+    # ── Engage-only: it may delay a start, never end a run ─────────────────
+    def test_it_only_ever_delays_never_releases(self):
+        d = self._decide(SOLAR_OVERFLOW_RELEASE_KWH + 0.5, soc_pct=40.0,
+                         raw_today=20.0, active=True)
+        self.assertIsNotNone(d, "a running export must not be stood down by the hold")
+
+    def test_a_forecast_crossing_the_threshold_cannot_release(self):
+        for raw in (55.0, 20.0):
+            with self.subTest(raw_today=raw):
+                self.assertIsNotNone(self._decide(
+                    SOLAR_OVERFLOW_RELEASE_KWH + 0.5, soc_pct=40.0,
+                    raw_today=raw, active=True))
+
+    def test_the_small_day_latch_survives_a_high_sample(self):
+        """Once a complete forecast has read the day small, one high sample must not
+        lift the hold. The latch is one-way in the safe direction."""
+        self.assertIsNone(self._decide(10.4, raw_today=45.0, latched=True))
+
+    def test_the_latch_cannot_make_a_big_day_export_early(self):
+        """Sanity on the latch's direction: it can only ever say SMALL."""
+        self.assertIsNotNone(self._decide(10.4, raw_today=45.0, latched=False))
+
+    # ── Composition with the neighbouring gates ────────────────────────────
+    def test_dwell_and_bank_first_compose(self):
+        now = _now(hour=14)
+        blocked = self._decide(10.4, soc_pct=96.0, raw_today=30.0, now=now,
+                               released_at=now - timedelta(minutes=5))
+        self.assertIsNone(blocked, "the dwell still blocks a re-engage")
+        clear = self._decide(10.4, soc_pct=96.0, raw_today=30.0, now=now,
+                             released_at=now - timedelta(
+                                 minutes=SOLAR_OVERFLOW_MIN_DWELL_MIN + 1))
+        self.assertIsNotNone(clear)
+
+    def test_the_dwell_is_named_ahead_of_bank_first(self):
+        """Both gates can block at once. The audit must name the one the control path
+        hit first, or the reader chases the wrong cause."""
+        now = _now(hour=14)
+        d = self._evaluate(10.4, soc_pct=50.0, raw_today=30.0, now=now,
+                           released_at=now - timedelta(minutes=5))
+        self.assertIn("dwell", self._audit(d))
+        self.assertNotIn("banking first", self._audit(d))
+
+    # ── The gate and the audit must never drift apart ──────────────────────
+    def test_the_gate_and_the_audit_agree(self):
+        """Two readers of one gate order is how the v3.9 drift happened. Whenever the
+        control path refuses because of the hold, the audit must say so — and
+        whenever it does not, the audit must not."""
+        mgr = BatteryManager()
+        for soc in (40.0, 56.9, 94.9, 95.0, 99.0):
+            for raw in (8.2, 30.0, 39.9, 40.0, 55.0):
+                for surplus in (-25.0, 10.4):
+                    for s24 in (MIN_EXPORT_KWH - 0.1, 36.0):
+                        with self.subTest(soc=soc, raw=raw, surplus=surplus, s24=s24):
+                            snap = self._snap(soc_pct=soc, raw_today=raw)
+                            bal  = self._bal(surplus, soc_pct=soc, surplus_24h=s24)
+                            tag, _ = mgr._overflow_skip_reason(snap, bal)
+                            blocked_by_bank_first = (
+                                mgr._check_solar_overflow(snap, bal) is None
+                                and mgr._overflow_bank_first_blocked(snap)
+                                and surplus >= SOLAR_OVERFLOW_ENGAGE_KWH
+                                and s24 >= MIN_EXPORT_KWH
+                            )
+                            self.assertEqual(tag == "bank_first", blocked_by_bank_first)
+
+    def test_no_refusal_is_ever_unexplained(self):
+        """The skip reason has an "unknown" branch as a backstop. If it ever fires,
+        the gate order in the audit has drifted from the gate order in the control
+        path — so pin that it does not."""
+        mgr = BatteryManager()
+        for soc in (40.0, 95.0):
+            for raw in (30.0, 55.0):
+                for surplus in (-25.0, 0.5, 10.4):
+                    snap = self._snap(soc_pct=soc, raw_today=raw)
+                    bal  = self._bal(surplus, soc_pct=soc)
+                    if mgr._check_solar_overflow(snap, bal) is None:
+                        tag, _ = mgr._overflow_skip_reason(snap, bal)
+                        self.assertNotEqual(tag, "unknown",
+                                            f"unexplained refusal at soc={soc} "
+                                            f"raw={raw} surplus={surplus}")
+
+
 if __name__ == "__main__":
     print(f"Running {globals().get('PLUGIN_NAME', 'SigenEnergyManager')} battery_manager tests")
     unittest.main(verbosity=2)

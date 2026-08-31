@@ -15,6 +15,7 @@ import sys
 import threading
 import sqlite3
 import tempfile
+import logging
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -3767,6 +3768,252 @@ class TestDawnTargetPct(unittest.TestCase):
         """Whatever the fallback becomes, it must stay above the 1% health
         cutoff and above the 10% figure this rule was written to clear."""
         self.assertGreater(self._plugin({})._dawn_target_pct(), 10)
+
+
+class TestBankFirstMetrics(unittest.TestCase):
+    """v5.79.0: the measurement behind the bank-first export hold.
+
+    None of this touches control — but if it is wrong, the evidence that decides
+    whether the hold is free is wrong, and that is worse than no evidence at all.
+    """
+
+    class _Manager:
+        def __init__(self, shadow_export_kw=None):
+            self._shadow_export_kw = shadow_export_kw
+
+        def _calculate_24h_balance(self, snapshot):
+            return object()
+
+        def _check_solar_overflow(self, snapshot, balance):
+            if self._shadow_export_kw is None:
+                return None
+            return types.SimpleNamespace(export_kw=self._shadow_export_kw)
+
+    class _Snap:
+        def __init__(self, **kw):
+            self.now = kw.get("now") or datetime(2026, 8, 31, 7, 12, tzinfo=timezone.utc)
+            self.raw_today_kwh = kw.get("raw_today_kwh", 35.6)
+            self.solar_overflow_bank_first_max_kwh = kw.get("bank_max", 40.0)
+            self.solar_overflow_bank_first_soc = kw.get("bank_soc", 95.0)
+            self.max_export_kw = kw.get("max_export_kw", 4.0)
+            self.pv_watts = kw.get("pv_watts", 3192)
+            self.house_load_watts = kw.get("house_load_watts", 620)
+
+    def _stub(self, forecast=None, inverter=None, shadow_export_kw=None, store=None):
+        st = plugin.Plugin.__new__(plugin.Plugin)
+        st.store = dict(store or {})
+        st.latest_forecast_data = dict(forecast if forecast is not None
+                                       else {"forecastStatus": "OK", "todayKwh": 35.6})
+        st.latest_inverter_data = dict(inverter or {})
+        st.manager = self._Manager(shadow_export_kw)
+        st.logger = logging.getLogger("bankfirst-test")
+        st.pluginPrefs = {}
+        return st
+
+    @staticmethod
+    def _decision(holding=False, gate=95.0):
+        return types.SimpleNamespace(bank_first_holding=holding, bank_first_gate_pct=gate)
+
+    def _record(self, stub, decision, snap, soc_pct=56.9):
+        plugin.Plugin._record_bank_first_metrics(stub, snap, decision, soc_pct)
+
+    # ── the day latch ──────────────────────────────────────────────────────
+    def test_a_complete_forecast_below_the_threshold_latches_the_day_small(self):
+        st = self._stub()
+        self._record(st, self._decision(), self._Snap())
+        self.assertTrue(st.store["bank_first_small_latched"])
+
+    def test_a_partial_forecast_does_not_latch(self):
+        """Reading low is exactly when you want to keep the units — but a degraded
+        reading must not LOCK the day, or one bad fetch decides the afternoon."""
+        st = self._stub(forecast={"forecastStatus": "Partial 3/4", "todayKwh": 12.0})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=12.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_a_missing_forecast_does_not_latch(self):
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 0.0})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=0.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_a_big_day_does_not_latch(self):
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 55.0})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=55.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_the_latch_clears_on_a_new_local_day(self):
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 55.0},
+                        store={"bank_first_small_latched": True,
+                               "bank_first_latch_date": "2026-08-30"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=55.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    # ── counting the hold ──────────────────────────────────────────────────
+    def test_a_held_minute_is_counted_and_stamped(self):
+        st = self._stub(shadow_export_kw=1.59)
+        self._record(st, self._decision(holding=True), self._Snap())
+        self.assertEqual(st.store["bank_first_blocked_samples"], 1)
+        self.assertEqual(st.store["bank_first_first_block_local"], "08:12")
+        self.assertAlmostEqual(st.store["bank_first_withheld_kwh"], 1.59 / 60.0, places=6)
+
+    def test_the_withheld_figure_comes_from_the_legacy_arm(self):
+        """The counterfactual is the same gate with one scalar changed, so any
+        divergence is the gate under test and nothing else."""
+        st = self._stub(shadow_export_kw=None)
+        self._record(st, self._decision(holding=True), self._Snap())
+        self.assertEqual(st.store["bank_first_blocked_samples"], 1)
+        self.assertEqual(st.store["bank_first_withheld_kwh"], 0.0)
+
+    def test_the_release_is_stamped_once_the_hold_lifts(self):
+        st = self._stub(store={"bank_first_blocked_samples": 300})
+        self._record(st, self._decision(holding=False), self._Snap(), soc_pct=95.1)
+        self.assertEqual(st.store["bank_first_released_local"], "08:12")
+
+    def test_a_day_that_never_held_gets_no_release_stamp(self):
+        st = self._stub()
+        self._record(st, self._decision(holding=False), self._Snap())
+        self.assertFalse(st.store.get("bank_first_released_local"))
+
+    # ── the measured cost ──────────────────────────────────────────────────
+    def test_the_clip_boundary_needs_all_three_conditions(self):
+        """Export pinned at the cap, the battery no longer taking anything, and the
+        battery high enough that it is the battery that stopped taking it. Any one
+        relaxed and a windy evening reads as clipping."""
+        pinned = {"gridPowerWatts": -3950, "batteryPowerWatts": 50, "batterySoc": 99.0}
+        st = self._stub(inverter=pinned)
+        self._record(st, self._decision(), self._Snap(), soc_pct=99.0)
+        self.assertEqual(st.store["bank_first_clip_boundary_min"], 1)
+
+        for relaxed, soc in ((dict(pinned, gridPowerWatts=-2000), 99.0),
+                             (dict(pinned, batteryPowerWatts=1500), 99.0),
+                             (dict(pinned), 96.0)):
+            with self.subTest(inverter=relaxed, soc=soc):
+                st = self._stub(inverter=relaxed)
+                self._record(st, self._decision(), self._Snap(), soc_pct=soc)
+                self.assertEqual(st.store["bank_first_clip_boundary_min"], 0)
+
+    def test_arming_counts_measured_surplus_not_forecast(self):
+        st = self._stub()
+        self._record(st, self._decision(), self._Snap(pv_watts=5000, house_load_watts=600))
+        self.assertEqual(st.store["bank_first_arm_minutes"], 1)
+        self.assertEqual(st.store["bank_first_first_arm_local"], "08:12")
+
+        st = self._stub()
+        self._record(st, self._decision(), self._Snap(pv_watts=3192, house_load_watts=620))
+        self.assertEqual(st.store["bank_first_arm_minutes"], 0)
+
+    def test_the_soc_minute_counters_move_at_their_thresholds(self):
+        st = self._stub()
+        self._record(st, self._decision(), self._Snap(), soc_pct=95.0)
+        self.assertEqual(st.store["bank_first_minutes_soc_ge_95"], 1)
+        self.assertEqual(st.store["bank_first_minutes_soc_ge_99"], 0)
+        self._record(st, self._decision(), self._Snap(), soc_pct=99.0)
+        self.assertEqual(st.store["bank_first_minutes_soc_ge_95"], 2)
+        self.assertEqual(st.store["bank_first_minutes_soc_ge_99"], 1)
+
+    def test_measurement_never_raises_into_the_control_path(self):
+        """Analysis must be invisible to control. A broken input logs at debug and
+        the tick continues."""
+        st = self._stub()
+        st.latest_inverter_data = {"gridPowerWatts": "not-a-number"}
+        try:
+            self._record(st, self._decision(), self._Snap())
+        except Exception as exc:  # pragma: no cover - the point of the test
+            self.fail(f"metrics raised into the control path: {exc!r}")
+
+    # ── the snapshot must carry the RAW forecast ───────────────────────────
+    def test_the_snapshot_reads_todayKwh_not_correctedTodayKwh(self):
+        """The most damaging plausible mistake in this change. correctedTodayKwh is
+        raw x band factor, and that factor reaches ~1.2 around 30 kWh — feeding it to
+        a raw-calibrated 40 kWh threshold would move the gate by a fifth, silently.
+        Read off the source because building a full snapshot needs the whole plugin.
+        """
+        import ast
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(plugin.__file__)), "plugin.py")
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.keyword) and node.arg == "raw_today_kwh":
+                found.append(ast.dump(node.value))
+        self.assertTrue(found, "raw_today_kwh is never populated on the snapshot")
+        for dumped in found:
+            self.assertIn("'todayKwh'", dumped)
+            self.assertNotIn("correctedTodayKwh", dumped)
+
+
+class TestBankFirstLogging(unittest.TestCase):
+    """The hold must announce itself. _log_manager_decision returns early when the
+    action has not changed, and a hold does not change the action — so without its
+    own log pair the whole feature would be silent, and an absence always reads as
+    a fault."""
+
+    def _stub(self, store=None, prefs=None):
+        st = plugin.Plugin.__new__(plugin.Plugin)
+        st.store = dict(store or {})
+        st.logger = logging.getLogger("bankfirst-log-test")
+        st.pluginPrefs = dict(prefs or {})
+        return st
+
+    class _Snap:
+        now = datetime(2026, 8, 31, 7, 12, tzinfo=timezone.utc)
+        raw_today_kwh = 35.6
+        solar_overflow_bank_first_max_kwh = 40.0
+        max_export_kw = 4.0
+
+    @staticmethod
+    def _decision(holding, gate=95.0):
+        return types.SimpleNamespace(bank_first_holding=holding, bank_first_gate_pct=gate)
+
+    def _log(self, stub, holding, soc=56.9):
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first(stub, self._decision(holding), self._Snap(), soc)
+        return [c.args[0] for c in logged.call_args_list]
+
+    def test_the_hold_is_logged_once_per_day(self):
+        st = self._stub()
+        first = self._log(st, holding=True)
+        self.assertEqual(len(first), 1)
+        self.assertIn("Banking first", first[0])
+        self.assertEqual(self._log(st, holding=True), [],
+                         "a second held tick must not log again")
+
+    def test_the_release_is_logged_once(self):
+        st = self._stub()
+        self._log(st, holding=True)
+        st.store["bank_first_blocked_samples"] = 329
+        st.store["bank_first_withheld_kwh"] = 6.21
+        released = self._log(st, holding=False, soc=95.1)
+        self.assertEqual(len(released), 1)
+        self.assertIn("Bank-first satisfied", released[0])
+        self.assertIn("5h29m", released[0])
+        self.assertEqual(self._log(st, holding=False, soc=95.4), [])
+
+    def test_a_day_that_never_held_logs_nothing(self):
+        self.assertEqual(self._log(self._stub(), holding=False), [])
+
+    def test_the_setting_is_announced_and_names_the_kill_switch(self):
+        st = self._stub(prefs={"solarOverflowBankFirstMaxKwh": "40",
+                               "solarOverflowBankFirstSoc": "95"})
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first_setting(st)
+        msg = logged.call_args_list[0].args[0]
+        self.assertIn("ON", msg)
+        self.assertIn("95%", msg)
+        self.assertIn("40.0 kWh", msg)
+        self.assertIn("set the threshold to 0 to disable", msg)
+
+    def test_a_zero_threshold_announces_itself_as_off(self):
+        st = self._stub(prefs={"solarOverflowBankFirstMaxKwh": "0"})
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first_setting(st)
+        self.assertIn("OFF", logged.call_args_list[0].args[0])
+
+    def test_an_absurd_threshold_warns(self):
+        st = self._stub(prefs={"solarOverflowBankFirstMaxKwh": "500"})
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first_setting(st)
+        levels = [c.kwargs.get("level") for c in logged.call_args_list]
+        self.assertIn("WARNING", levels)
 
 
 if __name__ == "__main__":

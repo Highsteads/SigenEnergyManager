@@ -294,6 +294,25 @@
                 <TriggerLabel>Away mode changed</TriggerLabel>
                 <ControlPageLabel>Away Mode</ControlPageLabel>
             </State>
+            <!-- v5.79.0. True while daytime export is being held back so the
+                 battery can reach its target first. currentAction deliberately
+                 stays "Self Consumption" — a hold is not a new action, it is a
+                 reason, and seven dashboard pages key off the existing tokens. -->
+            <State id="bankFirstActive">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Bank-first hold changed</TriggerLabel>
+                <ControlPageLabel>Banking First</ControlPageLabel>
+            </State>
+            <State id="bankFirstTargetSoc">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Bank-first target changed</TriggerLabel>
+                <ControlPageLabel>Bank-First Target %</ControlPageLabel>
+            </State>
+            <State id="bankFirstForecastKwh">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Bank-first day forecast changed</TriggerLabel>
+                <ControlPageLabel>Bank-First Day Forecast kWh</ControlPageLabel>
+            </State>
             <State id="currentAction">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Manager action changed</TriggerLabel>

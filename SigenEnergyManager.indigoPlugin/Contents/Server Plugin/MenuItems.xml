@@ -16,6 +16,11 @@
         <CallbackMethod>menuShowDailyHistory</CallbackMethod>
     </MenuItem>
 
+    <MenuItem id="menuShowBankFirstReport">
+        <Name>Show Bank-First Export Report</Name>
+        <CallbackMethod>menuShowBankFirstReport</CallbackMethod>
+    </MenuItem>
+
     <MenuItem id="menuShowSolarOverflowShadow">
         <Name>Show 90% vs 95% / Agile Shadow Comparison</Name>
         <CallbackMethod>menuShowSolarOverflowShadow</CallbackMethod>
