@@ -242,5 +242,53 @@ class TestCallbackLatency(unittest.TestCase):
                         f"the tick is holding _state_lock across network I/O")
 
 
+# Module level, NOT class attributes: a staticmethod fetched off the class is
+# a plain function, and assigning it INSIDE a class body rebinds it as an
+# instance method, so self would be passed as poll_s.
+_tick_sleep = plugin.Plugin._tick_sleep_seconds
+_accum_h    = plugin.Plugin._accum_interval_h
+
+
+class TestTickPacing(unittest.TestCase):
+    """The loop used to do its work and THEN sleep the whole interval, so the
+    real period was (work + interval). With the Modbus read at ~7 s and the
+    interval at 5 s that made a 12 s cycle out of a setting that said 5, and
+    before the v1.13 read tiering it was 43 s. Both helpers are pure."""
+
+    def test_sleeps_the_remainder_not_the_whole_interval(self):
+        # 5 s interval, tick took 3 s -> 2 s left, not another 5.
+        self.assertAlmostEqual(_tick_sleep(5, 3.0), 2.0)
+
+    def test_a_tick_slower_than_the_interval_does_not_add_more_delay(self):
+        # The real case: the read is ~7 s against a 5 s interval.
+        self.assertAlmostEqual(_tick_sleep(5, 7.0), 0.2)
+        self.assertAlmostEqual(_tick_sleep(5, 60.0), 0.2)
+
+    def test_a_long_interval_is_unaffected(self):
+        """The low-traffic settings must not start waking every fraction of a
+        second — there the work is short, so nearly the whole budget remains."""
+        self.assertAlmostEqual(_tick_sleep(120, 0.05), 10 - 0.05)   # capped at the 10 s base
+        self.assertAlmostEqual(_tick_sleep(30, 0.05), 10 - 0.05)
+
+    def test_never_returns_zero_or_negative(self):
+        for poll, took in ((5, 5), (5, 1e6), (120, 1e6), (5, -1)):
+            self.assertGreater(_tick_sleep(poll, took), 0.0)
+
+    def test_accum_interval_follows_measured_elapsed_time(self):
+        # 12 s between passes is 12 s of energy, whatever the setting says.
+        self.assertAlmostEqual(_accum_h(12.0, 5), 12.0 / 3600.0)
+        self.assertAlmostEqual(_accum_h(43.0, 5), 43.0 / 3600.0)
+
+    def test_accum_interval_is_clamped_after_an_outage(self):
+        """A reconnect after an hour must not dump an hour of power into the
+        day's total in one pass."""
+        self.assertAlmostEqual(_accum_h(3600.0, 5), 60.0 / 3600.0)
+        self.assertAlmostEqual(_accum_h(3600.0, 120), 360.0 / 3600.0)
+
+    def test_accum_interval_never_goes_backwards(self):
+        self.assertEqual(_accum_h(-5.0, 5), 0.0)
+        self.assertEqual(_accum_h(0.0, 5), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

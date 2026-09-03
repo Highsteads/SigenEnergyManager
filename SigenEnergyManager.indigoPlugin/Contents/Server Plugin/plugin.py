@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.86.0)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.87.0)
 # Date:        03-09-2026
-# Version:     5.86.0
+# Version:     5.87.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2475,16 +2475,50 @@ class Plugin(indigo.PluginBase):
                     self.logger.exception(
                         "[Tick] Unhandled error in poll tick — continuing to next tick"
                     )
-                # Sleep the smaller of the 10s base tick and the configured modbus poll
-                # interval, so the advertised 5s "very live" setting is actually honoured
-                # (per-task interval checks inside _tick gate everything else).
-                self.sleep(min(getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL), 10))
+                # Sleep the REMAINDER of the interval, not the interval on TOP of
+                # the work. The tick was doing its work and then sleeping the full
+                # interval, so the real period was always (work + interval) and the
+                # advertised "5 seconds" never happened: measured 43 s before the
+                # v1.13 read tiering and 12 s after, against a 5 s setting.
+                # Per-task interval checks inside _tick gate everything else, so
+                # waking earlier costs nothing but a few float comparisons — and a
+                # long interval is unaffected, because there the work is short and
+                # the sleep is still nearly the whole interval.
+                self.sleep(self._tick_sleep_seconds(
+                    getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL),
+                    time.time() - now))
         except self.StopThread:
             pass
 
     # ================================================================
     # Main Poll Tick
     # ================================================================
+
+    @staticmethod
+    def _tick_sleep_seconds(poll_s, tick_took, base=10.0, floor=0.2):
+        """Seconds to sleep after a tick that took `tick_took` to run.
+
+        The remainder of the interval, so a poll starts every `poll_s` — or as
+        soon as the last one finishes when the read is slower than that, which
+        it is here (the Modbus read is 8 throttled transactions, ~7 s). The
+        floor is belt-and-braces: work can only exceed the budget when it was
+        genuinely slow, so a hot loop is not reachable, but 0.2 s costs nothing
+        and removes the class of bug entirely.
+        """
+        return max(floor, min(poll_s, base) - max(0.0, tick_took))
+
+    @staticmethod
+    def _accum_interval_h(elapsed_s, poll_s):
+        """Hours to attribute to one accounting pass, from MEASURED elapsed time.
+
+        The fallback watt-integrators used the CONFIGURED poll interval, which
+        is not how often a pass actually happens — 43 s of real cycle against a
+        5 s setting meant they under-counted eightfold whenever the inverter's
+        own daily registers were unavailable and the fallback ran. Clamped so a
+        reconnect after a long outage cannot dump one huge slab into a daily
+        total, and floored at zero so a clock step backwards cannot subtract.
+        """
+        return min(max(elapsed_s, 0.0), max(60.0, poll_s * 3.0)) / 3600.0
 
     def _tick(self, now):
         """Called every 10 seconds. Dispatches all timed tasks.
@@ -2781,9 +2815,14 @@ class Plugin(indigo.PluginBase):
 
         If a register read fails the fallback is watt-integration (original method).
         """
-        interval_h = getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL) / 3600.0
-        # ^ fallback: hours per poll, used only when the inverter's direct daily
+        # Fallback: hours per pass, used only when the inverter's direct daily
         # registers are unavailable and we fall through to watt-integration.
+        # MEASURED, not the configured interval — see _accum_interval_h.
+        _poll_s   = getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL)
+        _now_wall = time.time()
+        _last     = self.store.get("last_energy_accum") or _now_wall
+        self.store["last_energy_accum"] = _now_wall
+        interval_h = self._accum_interval_h(_now_wall - _last, _poll_s)
 
         # --- Home daily: read directly from 30092 (resets at midnight) ---
         # The inverter's daily counter may reset at a slightly different
