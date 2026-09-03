@@ -15,6 +15,38 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.82.0 — 03-09-2026
+
+**NO DIRECTION GUARD — v5.81.x would have exported the battery through a Power Up and through a
+free-electricity hour.** Found by finally reading the Octopus dashboard page, which advertises
+"Power Up — use more electricity in these sessions", and then introspecting the schema:
+`SavingSessionsFlowDirection = TURN_DOWN | TURN_UP | WEEKEND_HAPPY_HOUR`, exposed as `eventType`
+on every event. **The query never asked for it.**
+
+The consequences of that omission are both wrong in the same direction — spend battery, earn
+nothing:
+
+* **TURN_UP** wants MORE consumption. Exporting is exactly backwards.
+* **WEEKEND_HAPPY_HOUR** is FREE electricity. Exporting through it wastes the free power AND
+  drains the battery.
+
+**And this is not hypothetical: 12 of the 62 events on this account are already happy hours.**
+The current promotion (to 1 Nov) grants an hour of free power for every two successful
+turn-downs, so the account is actively working towards events of exactly the kind the code would
+have mishandled — and a scheduled happy hour may well arrive flagged as joined.
+
+`get_saving_sessions()` now returns `direction`; the window cache admits **only** TURN_DOWN, and
+an absent or unrecognised value is never treated as one (a direction Octopus adds later must not
+be assumed safe). The alert still fires for the others — knowing a Happy Hour is coming is
+useful — but says what it is and that the battery is not driven for it.
+
+Same class as the Axle import/export guard added in v5.57.0, which shipped without one and would
+have self-driven a full 4 kW export through an IMPORT event. Twice now: **when an external feed
+announces an event, ask which way it runs before acting on it.**
+
+Tonight's session is TURN_DOWN / status UPCOMING / joined, 61 pts/kWh, so it still fires. 5 tests;
+930 -> 935, and removing the guard turns 3 red.
+
 ## v5.81.1 — 03-09-2026
 
 **The announcement dedupe depended on the id's Python TYPE.** `_check_saving_sessions` compared

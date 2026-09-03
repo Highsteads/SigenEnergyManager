@@ -2433,6 +2433,58 @@ class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
         self.assertEqual(len(self._run(["1234"], 5899)), 1)
 
 
+class TestSavingSessionDirectionGuard(unittest.TestCase):
+    """Only a TURN_DOWN is earned by exporting.
+
+    A TURN_UP session wants MORE consumption and a WEEKEND_HAPPY_HOUR is free
+    power you want to USE — exporting the battery into either is backwards, and
+    both arrive in the SAME feed: 12 of the 62 events on this account are happy
+    hours. Introspected the live schema 03-Sep-2026:
+    SavingSessionsFlowDirection = TURN_DOWN | TURN_UP | WEEKEND_HAPPY_HOUR.
+    Same class as the Axle import/export guard (v5.57.0), which shipped without
+    one and would have self-driven a 4 kW export through an IMPORT event.
+    """
+
+    def _windows(self, direction, joined=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_notified": []}
+        p.pluginPrefs = {"savingSessionExport": True}
+        p._send_pushover = lambda *a, **k: None
+        p._save_accumulators = lambda: None
+        start = datetime.now(timezone.utc) + timedelta(hours=2)
+        p.octopus = types.SimpleNamespace(get_saving_sessions=lambda: {
+            "has_joined": True,
+            "events": [{"id": 1, "code": "E", "start_at": start,
+                        "end_at": start + timedelta(hours=1),
+                        "reward_per_kwh_points": 61, "joined": joined,
+                        "direction": direction}],
+        })
+        with patch.object(plugin, "log", lambda *a, **k: None):
+            p._check_saving_sessions()
+        return p.store.get("saving_sessions_windows")
+
+    def test_turn_down_is_cached(self):
+        self.assertEqual(len(self._windows("TURN_DOWN")), 1)
+
+    def test_turn_up_is_never_cached(self):
+        # Power Up wants MORE consumption — exporting would be exactly backwards.
+        self.assertEqual(self._windows("TURN_UP"), [])
+
+    def test_weekend_happy_hour_is_never_cached(self):
+        # Free electricity. Exporting the battery through it wastes the free power
+        # AND drains the battery. These already exist in the live feed.
+        self.assertEqual(self._windows("WEEKEND_HAPPY_HOUR"), [])
+
+    def test_unknown_direction_is_never_cached(self):
+        # A direction Octopus adds later must not be assumed safe to export into.
+        self.assertEqual(self._windows("SOME_NEW_THING"), [])
+        self.assertEqual(self._windows(""), [])
+
+    def test_a_turn_down_not_opted_into_is_still_not_cached(self):
+        # Both gates must hold, not either.
+        self.assertEqual(self._windows("TURN_DOWN", joined=False), [])
+
+
 class TestSavingSessionsCadence(unittest.TestCase):
     """Hourly normally, 10-minutely once a session is imminent.
 

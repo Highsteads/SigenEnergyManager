@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.81.1)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.82.0)
 # Date:        03-09-2026
-# Version:     5.81.1
+# Version:     5.82.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -152,6 +152,7 @@ from sigenergy_modbus import SigenergyModbus
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               GAS_KWH_PER_M3)
+from octopus_api      import SAVING_SESSION_TURN_DOWN
 # The ONE Europe/London implementation. Imported, never re-declared: copies are
 # what put two sites an hour out in the first place, and there is no version of
 # "just this once" that does not end up as copy number six.
@@ -4215,6 +4216,8 @@ class Plugin(indigo.PluginBase):
             # silently. An alert that omits this reads as "you're covered", which
             # is the opposite of the truth, so it leads the message when it matters.
             joined = bool(event.get("joined"))
+            direction = event.get("direction") or "UNKNOWN"
+            turn_down = direction == SAVING_SESSION_TURN_DOWN
             body = (
                 f"Octopus Saving Session: {when}"
                 + (f" ({duration_h:.1f}h)" if duration_h else "")
@@ -4223,13 +4226,18 @@ class Plugin(indigo.PluginBase):
                 + ("" if joined else
                    " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
                    "the battery will not be driven for it.")
+                + ("" if turn_down else
+                   f"  This is a {direction.replace('_', ' ').title()} session, not a "
+                   "turn-down — the battery is NOT driven for it. A Power Up wants you to "
+                   "USE more, and a Happy Hour is free power worth using.")
             )
             self._send_pushover(
                 "Octopus Saving Session announced" if joined
                 else "Octopus Saving Session - opt in to earn",
                 body, priority="0")
             log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
-                f"{points} pts/kWh, opted in: {'YES' if joined else 'NO'}",
+                f"{direction}, {points} pts/kWh, opted in: {'YES' if joined else 'NO'}"
+                + ("" if turn_down else " — battery NOT driven (not a turn-down)"),
                 level="INFO" if joined else "WARNING")
             new_ids.append(event_id)
 
@@ -4253,6 +4261,13 @@ class Plugin(indigo.PluginBase):
             for e in (data.get("events") or [])
             if e.get("joined") and e.get("end_at") and e["end_at"] > now_utc
             and e["start_at"] < horizon
+            # ONLY a turn-down is earned by exporting. A TURN_UP session wants MORE
+            # consumption and a WEEKEND_HAPPY_HOUR is free power you want to USE —
+            # exporting the battery into either is backwards, and both arrive in
+            # THIS SAME feed (12 of 62 events on this account are happy hours). An
+            # absent or unrecognised direction is never treated as a turn-down.
+            # Same class as the Axle import/export guard added in v5.57.0.
+            and e.get("direction") == SAVING_SESSION_TURN_DOWN
         ]
 
         if new_ids:

@@ -73,6 +73,11 @@ FINANCIALS_CACHE_TTL  = 1800   # 30 min - standing/unit rates change at most dai
 FINANCIALS_NEG_CACHE_TTL = 120 # 2 min - debounce failures so /api/status can't hammer Kraken
 FINANCIALS_FAIL_WARN_COUNT = 5    # consecutive failures before one WARNING at default level
 FINANCIALS_STALE_WARN_AGE  = 7200 # 2h - warn once when served financials are older than this
+# Octopus tells you which WAY a session runs, and it is not optional information.
+# SavingSessionsFlowDirection, introspected from the live schema 03-Sep-2026:
+SAVING_SESSION_TURN_DOWN   = "TURN_DOWN"           # use LESS  -> exporting earns
+SAVING_SESSION_TURN_UP     = "TURN_UP"             # use MORE  -> exporting is BACKWARDS
+SAVING_SESSION_HAPPY_HOUR  = "WEEKEND_HAPPY_HOUR"  # FREE power -> exporting wastes it
 SAVING_SESSIONS_CACHE_TTL     = 1800  # 30 min - new events are announced at most a few times/day
 SAVING_SESSIONS_NEG_CACHE_TTL = 300   # 5 min - debounce failures (this is a non-urgent poll)
 
@@ -819,7 +824,8 @@ class OctopusAPI:
                   {"id": str, "code": str,
                    "start_at": datetime (aware, UTC), "end_at": datetime (aware, UTC),
                    "reward_per_kwh_points": int,
-                   "joined": bool},   # per-EVENT opt-in; NOT implied by has_joined
+                   "joined": bool,    # per-EVENT opt-in; NOT implied by has_joined
+                   "direction": str},  # TURN_DOWN | TURN_UP | WEEKEND_HAPPY_HOUR | UNKNOWN
                   ...
               ],  # sorted by start_at ascending
               "fetched_at": float,
@@ -847,7 +853,7 @@ class OctopusAPI:
                 "query ($a: String!) { savingSessions {"
                 "  account(accountNumber: $a) { hasJoinedCampaign"
                 "    joinedEvents { eventId } }"
-                "  events { id code startAt endAt rewardPerKwhInOctoPoints }"
+                "  events { id code startAt endAt eventType rewardPerKwhInOctoPoints }"
                 "}}"
             ),
             "variables": {"a": self.account_id},
@@ -939,6 +945,12 @@ class OctopusAPI:
                 "end_at":                end_at,
                 "reward_per_kwh_points": int(e.get("rewardPerKwhInOctoPoints") or 0),
                 "joined":                str(e.get("id")) in joined_ids,
+                # WHICH WAY the session runs. Only TURN_DOWN is earned by exporting;
+                # TURN_UP wants MORE consumption and WEEKEND_HAPPY_HOUR is free power
+                # you want to USE. Both arrive in this same feed — 12 of the 62 events
+                # on this account are happy hours — so anything that spends battery
+                # MUST gate on this. An absent/unknown value is never TURN_DOWN.
+                "direction":             (e.get("eventType") or "") or "UNKNOWN",
             })
         events.sort(key=lambda ev: ev["start_at"])
 
