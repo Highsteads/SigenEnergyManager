@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.81.1)
 # Date:        03-09-2026
-# Version:     5.81.0
+# Version:     5.81.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -4179,11 +4179,16 @@ class Plugin(indigo.PluginBase):
             return
 
         now_utc  = datetime.now(timezone.utc)
-        notified = set(self.store.get("saving_sessions_notified") or [])
+        # Normalised to str on BOTH sides. GraphQL's ID type is specified to
+        # serialise as a STRING, and this payload happens to return an int — so
+        # comparing the raw value against a persisted set is one API tweak away
+        # from a dedupe that never matches and re-announces every hour. Also
+        # migrates a set persisted as ints by an earlier version.
+        notified = {str(x) for x in (self.store.get("saving_sessions_notified") or [])}
         new_ids  = []
 
         for event in data.get("events") or []:
-            event_id = event.get("id")
+            event_id = str(event.get("id")) if event.get("id") is not None else None
             start_at = event.get("start_at")
             if not event_id or start_at is None or event_id in notified:
                 continue

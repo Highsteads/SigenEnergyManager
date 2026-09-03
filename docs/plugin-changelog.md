@@ -15,6 +15,27 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.81.1 — 03-09-2026
+
+**The announcement dedupe depended on the id's Python TYPE.** `_check_saving_sessions` compared
+the raw `event["id"]` against the persisted `saving_sessions_notified` set. Live that happens to
+work — Octopus returns the id as an int and JSON round-trips it as an int — but **GraphQL's `ID`
+type is SPECIFIED to serialise as a string**, so the day that payload changes, every hourly poll
+stops matching and re-announces the same session. Both sides are now normalised with `str()`,
+which also migrates a set persisted as ints by 5.80.x.
+
+**Found by a probe, not by the suite.** Driving the shipped `_check_saving_sessions` against the
+live API with a store seeded as `["5899"]` sent a Pushover for an event that was already
+announced. The 927-test suite could not have caught it: every fixture used one type
+consistently, so it was asserting the arithmetic of matching rather than the behaviour under
+the type variance the API actually permits. `octopus_api.py` was already normalising with
+`str()` for the `joined` lookup, so the two halves disagreed — the more useful signal, and the
+reason the fix is to make the convention explicit in both places rather than to match whatever
+today's payload happens to be.
+
+3 tests (int-vs-str, str-vs-int migration, and a genuinely-new event still notifying as the
+negative control); 927 -> 930, and reverting the normalisation turns 2 of them red.
+
 ## v5.81.0 — 03-09-2026
 
 Phase 2, at CliveS's request: **drive the battery to export during a Saving Session** — the

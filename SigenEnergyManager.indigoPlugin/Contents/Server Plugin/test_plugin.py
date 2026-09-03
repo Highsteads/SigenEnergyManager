@@ -2393,6 +2393,46 @@ class TestCheckSavingSessions(unittest.TestCase):
         self.assertIn("on top of", body)   # the correction this Phase 1 build exists for
 
 
+class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
+    """Dedupe must not depend on the id's Python type.
+
+    GraphQL's ID type is SPECIFIED to serialise as a string; this payload happens
+    to return an int. A raw comparison against a persisted set therefore works
+    right up until Octopus changes that, at which point every hourly poll
+    re-announces the same session. Found 03-Sep-2026 by seeding the store with a
+    string id in a probe and watching a supposedly-deduped event notify again.
+    """
+
+    def _run(self, stored, event_id):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_notified": stored}
+        p.pluginPrefs = {}
+        sent = []
+        p._send_pushover = lambda t, b, priority="0": sent.append(t)
+        p._save_accumulators = lambda: None
+        start = datetime.now(timezone.utc) + timedelta(hours=3)
+        p.octopus = types.SimpleNamespace(get_saving_sessions=lambda: {
+            "has_joined": True,
+            "events": [{"id": event_id, "code": "E1", "start_at": start,
+                        "end_at": start + timedelta(hours=1),
+                        "reward_per_kwh_points": 61, "joined": True}],
+        })
+        with patch.object(plugin, "log", lambda *a, **k: None):
+            p._check_saving_sessions()
+        return sent
+
+    def test_int_id_against_str_store_is_deduped(self):
+        self.assertEqual(self._run(["5899"], 5899), [])
+
+    def test_str_id_against_int_store_is_deduped(self):
+        # The migration direction: a set persisted by an earlier version as ints.
+        self.assertEqual(self._run([5899], "5899"), [])
+
+    def test_a_genuinely_new_event_still_notifies(self):
+        # The negative control — the guard must not swallow everything.
+        self.assertEqual(len(self._run(["1234"], 5899)), 1)
+
+
 class TestSavingSessionsCadence(unittest.TestCase):
     """Hourly normally, 10-minutely once a session is imminent.
 
