@@ -84,5 +84,38 @@ class TestDialogXml(unittest.TestCase):
                                 f"visibleBindingId {binding!r} names no field in this dialog")
 
 
+class TestCurrentModeTokensMatchDevicesXml(unittest.TestCase):
+    """Every ACTION_MODE_TOKEN value must exist as an <Option value=> on the
+    currentMode List state.
+
+    Indigo derives one BoolTrueFalse sub-state per Option, so a token with no
+    Option writes a value the enum does not know: no sub-state fires and a
+    trigger built on it never runs. Caught live 03-Sep-2026 — v5.81.0 added
+    ACTION_SAVING_SESSION -> "savingSession" and did NOT add the Option, so
+    `currentMode.savingSession` did not exist on the device after a restart.
+    """
+
+    def test_every_token_has_an_option(self):
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "Devices.xml"), encoding="utf-8") as fh:
+            xml = fh.read()
+        block = re.search(r'<State id="currentMode">.*?</ValueType>', xml, re.S)
+        self.assertIsNotNone(block, "currentMode List state not found in Devices.xml")
+        options = set(re.findall(r'<Option value="([^"]+)"', block.group(0)))
+        self.assertTrue(options, "no Options parsed - the regex matched nothing")
+
+        with open(os.path.join(here, "plugin.py"), encoding="utf-8") as fh:
+            plugin_src = fh.read()
+        table = re.search(r'ACTION_MODE_TOKEN\s*=\s*\{(.*?)\}', plugin_src, re.S)
+        self.assertIsNotNone(table, "ACTION_MODE_TOKEN table not found in plugin.py")
+        tokens = set(re.findall(r':\s*"([A-Za-z]+)"', table.group(1)))
+        self.assertTrue(tokens, "no tokens parsed - the regex matched nothing")
+
+        missing = sorted(tokens - options)
+        self.assertEqual(missing, [],
+                         f"currentMode tokens with no <Option> in Devices.xml: {missing}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

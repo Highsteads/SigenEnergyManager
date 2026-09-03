@@ -21,6 +21,8 @@ from battery_manager import (
     ACTION_START_EXPORT,
     ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT,
+    ACTION_SAVING_SESSION,
+    saving_session_exportable_kwh,
     TARIFF_TRACKER,
     TARIFF_GO,
     FLOOD_PREV_TARGET_PCT,
@@ -103,6 +105,8 @@ def _make_snapshot(
     weekend_kwh=30.0,
     bias_factor=1.0,
     bias_factor_today=1.0,
+    saving_session_active=False,
+    saving_session_hours=1.0,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -148,6 +152,8 @@ def _make_snapshot(
         vpp_active             = vpp_active,
         weekday_kwh            = weekday_kwh,
         weekend_kwh            = weekend_kwh,
+        saving_session_active  = saving_session_active,
+        saving_session_hours   = saving_session_hours,
     )
 
 
@@ -2159,6 +2165,89 @@ class TestSolarOverflowBankFirst(unittest.TestCase):
                         self.assertNotEqual(tag, "unknown",
                                             f"unexplained refusal at soc={soc} "
                                             f"raw={raw} surplus={surplus}")
+
+
+class TestSavingSessionExportableKwh(unittest.TestCase):
+    """The arithmetic behind CliveS's rule (03-Sep-2026): run the session burst as
+    long as it does not spend energy Axle needs, and the house still reaches next
+    morning without importing."""
+
+    def _kwh(self, **kw):
+        args = dict(battery_at_dawn_kwh=20.0, reserve_pct=15.0, capacity_kwh=35.04,
+                    planned_vpp_kwh=0.0, export_cap_kw=4.0, window_hours=1.0,
+                    import_needed=False)
+        args.update(kw)
+        return saving_session_exportable_kwh(**args)
+
+    def test_headroom_above_the_reserve_is_exportable(self):
+        # 20 kWh at dawn, 15% of 35.04 = 5.26 kWh reserve -> ~14.7 spare, capped by
+        # the DNO window (4 kW x 1 h = 4 kWh).
+        self.assertEqual(self._kwh(), 4.0)
+
+    def test_capped_by_the_export_window_not_the_battery(self):
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=30.0), 4.0)
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=30.0, window_hours=2.0), 8.0)
+
+    def test_axle_energy_is_held_back(self):
+        # 8 kWh at dawn, 5.26 reserve -> 2.74 spare; 2.0 of it promised to Axle
+        # leaves 0.74, under the minimum, so it stands down entirely.
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=8.0), 2.74)
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=8.0, planned_vpp_kwh=2.0), 0.0)
+
+    def test_import_needed_refuses_outright(self):
+        # The engine's own verdict wins over any amount of apparent headroom.
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=30.0, import_needed=True), 0.0)
+
+    def test_below_the_reserve_exports_nothing(self):
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=4.0), 0.0)
+
+    def test_a_trivial_amount_is_not_worth_a_mode_switch(self):
+        # 5.26 reserve + 1.0 minimum -> 6.0 at dawn leaves 0.74, under the floor.
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=6.0), 0.0)
+
+    def test_unknown_inputs_never_guess(self):
+        self.assertEqual(self._kwh(battery_at_dawn_kwh=None), 0.0)
+        self.assertEqual(self._kwh(capacity_kwh=0), 0.0)
+        self.assertEqual(self._kwh(export_cap_kw="nonsense"), 0.0)
+
+
+class TestSavingSessionOverride(unittest.TestCase):
+    """Placement matters more than the arithmetic: Axle pays ~£1/kWh against
+    ~7.6p/kWh here, so an Axle window must always win."""
+
+    def setUp(self):
+        self.mgr = BatteryManager()
+
+    def test_axle_wins_when_both_are_live(self):
+        snap = _make_snapshot(soc_pct=95.0, export_enabled=True,
+                              vpp_active=True, saving_session_active=True,
+                              now_hour=20)
+        self.assertEqual(self.mgr.evaluate(snap).action, ACTION_VPP_EXPORT)
+
+    def test_session_drives_export_when_axle_is_idle(self):
+        snap = _make_snapshot(soc_pct=95.0, export_enabled=True,
+                              saving_session_active=True, now_hour=20)
+        self.assertEqual(self.mgr.evaluate(snap).action, ACTION_SAVING_SESSION)
+
+    def test_export_disabled_stands_the_session_down(self):
+        # Post-power-cut lockout / storm. Same precedence as the VPP branch.
+        snap = _make_snapshot(soc_pct=95.0, export_enabled=False,
+                              saving_session_active=True, now_hour=20)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("export currently disabled", d.reason)
+
+    def test_a_flat_battery_refuses_and_says_why(self):
+        snap = _make_snapshot(soc_pct=12.0, export_enabled=True,
+                              saving_session_active=True, now_hour=20)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("Saving Session window, but not exporting", d.reason)
+
+    def test_inactive_session_changes_nothing(self):
+        # The negative control: without the flag the branch must be invisible.
+        snap = _make_snapshot(soc_pct=95.0, export_enabled=True, now_hour=20)
+        self.assertNotEqual(self.mgr.evaluate(snap).action, ACTION_SAVING_SESSION)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0)
 # Date:        03-09-2026
-# Version:     5.80.1
+# Version:     5.81.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -129,6 +129,23 @@ try:
     from plugin_utils import install_timestamp_filter
 except ImportError:
     install_timestamp_filter = None
+try:
+    # The correct checkbox-pref reader: Indigo re-serialises a saved checkbox as
+    # the STRING "false", and bare bool("false") is True. NB most of this file
+    # still uses bare bool() on prefs (exportEnabled, axleEnabled, …) — a real
+    # latent trap, but an estate-wide sweep of its own, not this change's job.
+    from plugin_utils import as_bool as _as_bool
+except ImportError:                                     # pragma: no cover
+    def _as_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "yes", "on", "1"):
+                return True
+            if v in ("false", "no", "off", "0", ""):
+                return False
+        return default
 
 # Plugin modules
 from sigenergy_modbus import SigenergyModbus
@@ -147,7 +164,7 @@ from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
-    ACTION_VPP_EXPORT,
+    ACTION_VPP_EXPORT, ACTION_SAVING_SESSION,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
@@ -186,6 +203,7 @@ ACTION_MODE_TOKEN = {
     ACTION_START_EXPORT:     "startExport",
     ACTION_STOP_EXPORT:      "stopExport",
     ACTION_VPP_EXPORT:       "vppExport",     # dedicated enum token (currentMode.vppExport trigger)
+    ACTION_SAVING_SESSION:   "savingSession",
 }
 
 # Minimum inverter readings required per half-hourly slot before we trust the
@@ -232,6 +250,8 @@ STORM_WATCH_INTERVAL = 7200  # 2 hours
 # Octopus announces a new Saving Session at most a few times a day (usually the evening
 # before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
 SAVING_SESSIONS_INTERVAL = 3600  # 1 hour
+SAVING_SESSIONS_SOON_INTERVAL = 600   # 10 min once a session is imminent
+SAVING_SESSIONS_SOON_HOURS    = 2.0   # how far ahead counts as imminent
 
 
 def _away_seed_profile(daily_kwh):
@@ -1054,6 +1074,8 @@ class Plugin(indigo.PluginBase):
         # Saving Sessions — Phase 1 (notify-only, no dispatch changes)
         self.store["last_saving_sessions"]      = 0.0   # time.time() of last poll
         self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
+        self.store["saving_sessions_windows"]   = []    # joined windows, cached for the manager
+        self.store["saving_session_export_active"] = False
 
         # Half-hourly SQLite logging — delta anchors (reset each write)
         self.store["hh_anchor_pv_kwh"]     = None  # cumulative PV at last slot boundary
@@ -2507,8 +2529,12 @@ class Plugin(indigo.PluginBase):
             self._check_storm_watch()
             self.store["last_storm_watch"] = now
 
-        # 10b. Saving Sessions — notify on newly-announced events (every hour)
-        if now - self.store["last_saving_sessions"] >= SAVING_SESSIONS_INTERVAL:
+        # 10b. Saving Sessions — notify on newly-announced events, and refresh the
+        # joined-window cache. Hourly normally; every 10 min once a known session is
+        # within SAVING_SESSIONS_SOON_HOURS, because OPTING IN is a thing the owner
+        # does in the Octopus app minutes before the window and we would otherwise
+        # not see it until after the session had started.
+        if now - self.store["last_saving_sessions"] >= self._saving_sessions_interval():
             self._check_saving_sessions()
             self.store["last_saving_sessions"] = now
 
@@ -3378,9 +3404,15 @@ class Plugin(indigo.PluginBase):
                 weekend_pref = round(live_daily * (1.0 if self.store.get("away_active")
                                                    else 1.30), 1)
 
+        # Octopus Saving Session — a JOINED window live right now, from the cache the
+        # hourly poll leaves behind (never a network call on the manager cycle).
+        _ss_window = self._saving_session_window()
+
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
             capacity_kwh       = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
+            saving_session_active = _ss_window is not None,
+            saving_session_hours  = float((_ss_window or {}).get("hours", 1.0)),
             efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
             dawn_target_pct    = self._dawn_target_pct(),                      # v4.0: retained for VPP/storm
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
@@ -4171,16 +4203,52 @@ class Plugin(indigo.PluginBase):
             when = start_local.strftime("%a %d %b, %H:%M")
             if end_local:
                 when += f"-{end_local.strftime('%H:%M')}"
+            # Being JOINED is the difference between earning and not earning.
+            # MEASURED 03-Sep-2026: campaign membership does NOT enrol you in each
+            # event — this account read hasJoinedCampaign=True while every one of
+            # the 17 sessions since 16-Aug was un-joined, so they were missed
+            # silently. An alert that omits this reads as "you're covered", which
+            # is the opposite of the truth, so it leads the message when it matters.
+            joined = bool(event.get("joined"))
             body = (
                 f"Octopus Saving Session: {when}"
                 + (f" ({duration_h:.1f}h)" if duration_h else "")
                 + f". Extra export above your usual baseline earns {points} Octopoints/kWh "
                 "on top of the normal export rate."
+                + ("" if joined else
+                   " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
+                   "the battery will not be driven for it.")
             )
-            self._send_pushover("Octopus Saving Session announced", body, priority="0")
+            self._send_pushover(
+                "Octopus Saving Session announced" if joined
+                else "Octopus Saving Session - opt in to earn",
+                body, priority="0")
             log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
-                f"{points} pts/kWh")
+                f"{points} pts/kWh, opted in: {'YES' if joined else 'NO'}",
+                level="INFO" if joined else "WARNING")
             new_ids.append(event_id)
+
+        # Cache the JOINED upcoming/live windows for the manager cycle. The manager
+        # runs every 60s and must never do network I/O (one slow call there stalls
+        # every action callback behind it), so the hourly poll leaves it a small
+        # plain-data list and _saving_session_window() reads only that.
+        upcoming = sorted(e["start_at"] for e in (data.get("events") or [])
+                          if e.get("start_at") and e["start_at"] > now_utc)
+        # Deliberately NOT filtered on `joined` — the whole point is to be polling
+        # often enough to notice an opt-in made shortly before the window.
+        self.store["saving_sessions_next_start"] = (
+            upcoming[0].isoformat() if upcoming else "")
+
+        horizon = now_utc + timedelta(days=2)
+        self.store["saving_sessions_windows"] = [
+            {"id": e.get("id"),
+             "start": e["start_at"].isoformat(),
+             "end":   e["end_at"].isoformat(),
+             "points": e.get("reward_per_kwh_points", 0)}
+            for e in (data.get("events") or [])
+            if e.get("joined") and e.get("end_at") and e["end_at"] > now_utc
+            and e["start_at"] < horizon
+        ]
 
         if new_ids:
             notified.update(new_ids)
@@ -4188,6 +4256,52 @@ class Plugin(indigo.PluginBase):
             # announcements, not the account's whole history.
             self.store["saving_sessions_notified"] = list(notified)[-200:]
             self._save_accumulators()   # persist now so a restart can't re-send these
+
+    def _saving_sessions_interval(self):
+        """Poll cadence: hourly, or every 10 min once a session is imminent.
+
+        Mirrors _vpp_poll_interval. The reason it matters is OPT-IN: joining a
+        session is a tap in the Octopus app that the owner may make minutes before
+        the window opens, and the `joined` flag is what gates the export. On the
+        flat hourly cadence an opt-in at 17:45 would not be seen until after an
+        18:00 session had started. Reads only the cached next-start, never the
+        network.
+        """
+        nxt = self.store.get("saving_sessions_next_start")
+        if not nxt:
+            return SAVING_SESSIONS_INTERVAL
+        try:
+            start = datetime.fromisoformat(nxt)
+        except (TypeError, ValueError):
+            return SAVING_SESSIONS_INTERVAL
+        hours = (start - datetime.now(timezone.utc)).total_seconds() / 3600.0
+        if 0 <= hours <= SAVING_SESSIONS_SOON_HOURS:
+            return SAVING_SESSIONS_SOON_INTERVAL
+        return SAVING_SESSIONS_INTERVAL
+
+    def _saving_session_window(self, now_utc=None):
+        """The JOINED Saving Session window live right now, or None.
+
+        Pure read of the cache `_check_saving_sessions` leaves behind — no network,
+        no Octopus call, safe to run on the 60s manager cycle.
+
+        Returns {"id", "start", "end", "points", "hours"} or None. Gated on the
+        `savingSessionExport` pref: this drives the battery, so it is OFF unless
+        the owner turned it on.
+        """
+        if not _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
+            return None
+        now_utc = now_utc or datetime.now(timezone.utc)
+        for w in self.store.get("saving_sessions_windows") or []:
+            try:
+                start = datetime.fromisoformat(w["start"])
+                end   = datetime.fromisoformat(w["end"])
+            except (KeyError, TypeError, ValueError):
+                continue        # malformed row — skip it, never guess a window
+            if start <= now_utc < end:
+                hours = max(0.0, (end - start).total_seconds() / 3600.0)
+                return dict(w, hours=hours)
+        return None
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
@@ -4324,6 +4438,17 @@ class Plugin(indigo.PluginBase):
                 log(f"[Manager] VPP export — {decision.reason}")
             self._drive_vpp_export()
 
+        elif action == ACTION_SAVING_SESSION:
+            # Octopus Saving Session: drive the export exactly the way a VPP window
+            # is driven — same proven path, same live PV vs export-target choice
+            # between banking surplus and discharging. The manager re-decides every
+            # cycle, so if the dawn projection turns against us mid-window the very
+            # next decision drops out of this branch and the export stands down.
+            if not self.store.get("saving_session_export_active"):
+                log(f"[Manager] Saving Session export — {decision.reason}")
+                self.store["saving_session_export_active"] = True
+            self._drive_vpp_export()
+
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
                 log("[Manager] Stopping night export - returning to self-consumption")
@@ -4382,6 +4507,21 @@ class Plugin(indigo.PluginBase):
             # else: cap within deadband — idempotent, no Modbus writes
 
         elif action == ACTION_SELF_CONSUMPTION:
+            # Saving Session stand-down. The window ending is only ONE of the ways to
+            # get here — the manager also drops out of the branch mid-window if the
+            # dawn projection turns against us, and that must stand the export down
+            # just as promptly. Latch on the flag, not on the clock.
+            if self.store.get("saving_session_export_active"):
+                self.store["saving_session_export_active"] = False
+                log("[Manager] Saving Session export ended — returning to self-consumption")
+                if self.modbus and self.modbus.connected:
+                    if not self.modbus.set_self_consumption():
+                        # Confirm, never assume: an unconfirmed hand-back is what left a
+                        # VPP window exporting past its end (v5.64.0). Same lesson here.
+                        log("[Manager] Saving Session hand-back to Self Consumption was "
+                            "NOT confirmed — retrying on the next tick", level="WARNING")
+                        self.store["vpp_handback_pending"] = True
+
             # Determine if inverter is currently in a non-self-consumption mode.
             # Check store flags first; fall back to actual emsWorkMode from inverter data
             # so a restart (which resets all flags to False) can still recover a stuck mode.
@@ -7121,6 +7261,7 @@ class Plugin(indigo.PluginBase):
             ACTION_START_EXPORT:     "Night Export Active",
             ACTION_STOP_EXPORT:      "Export Stopping",
             ACTION_VPP_EXPORT:       "VPP Export Active",
+            ACTION_SAVING_SESSION:   "Saving Session Export",
         }.get(decision.action, decision.action)
 
         # Flood prevention visibility (v4.5)

@@ -195,6 +195,70 @@ ACTION_START_EXPORT     = "start_export"        # used by flood prevention pre-d
 ACTION_STOP_EXPORT      = "stop_export"         # stop active legacy export (v3.x migration)
 ACTION_SOLAR_OVERFLOW   = "solar_overflow"      # daytime: cap charge so PV surplus exports
 ACTION_VPP_EXPORT       = "vpp_export"          # VPP event window: self-drive export (ignore Axle dispatch)
+ACTION_SAVING_SESSION   = "saving_session"      # Octopus Saving Session: export above baseline for Octopoints
+
+# ── Octopus Saving Session export ───────────────────────────────────────────
+# Below the Axle VPP override on purpose, and it is not close: Axle pays about
+# £1/kWh, a Saving Session about 61 Octopoints/kWh = 7.6p/kWh (800 points = £1).
+# Axle is worth ~13x per kWh, so it wins every conflict and it wins the stored
+# energy too — this branch may only spend what Axle has no plan for.
+SAVING_SESSION_MIN_KWH = 1.0     # below this the burst is not worth a mode switch
+
+
+def saving_session_exportable_kwh(battery_at_dawn_kwh: float,
+                                  reserve_pct: float,
+                                  capacity_kwh: float,
+                                  planned_vpp_kwh: float,
+                                  export_cap_kw: float,
+                                  window_hours: float,
+                                  import_needed: bool,
+                                  min_worthwhile_kwh: float = SAVING_SESSION_MIN_KWH) -> float:
+    """kWh that may be exported during a Saving Session window. 0.0 = do not run.
+
+    CliveS's rule, 03-Sep-2026: run the session burst as long as it does not take
+    energy an Axle event needs, and as long as the house still reaches next
+    morning WITHOUT importing.
+
+    Both halves are expressed against the engine's own projection rather than a
+    fresh model:
+
+      * `battery_at_dawn_kwh` is what `_calculate_24h_balance` says the battery
+        holds at next dawn if nothing changes — it already carries the solar
+        still to come and the overnight drain.
+      * `planned_vpp_kwh` is Axle export still scheduled TODAY (snapshot
+        .vpp_today_kwh, future-only and pro-rated since v5.19.4). Subtracting it
+        is what stops this branch spending Axle's energy — the "unless we can do
+        both" half of the rule, priced rather than assumed.
+      * `import_needed` is the engine's OWN verdict that tomorrow cannot be
+        covered without buying. If it is already True, exporting more is exactly
+        the wrong move and the answer is 0.0 whatever the arithmetic says.
+
+    The reserve is a floor we must still be above at dawn, so it is subtracted
+    from the dawn projection, not from the battery now.
+
+    NB `battery_at_dawn_kwh` is CLAMPED at the health floor by its producer, so
+    it cannot go negative to signal a deep shortfall — that is precisely what
+    `import_needed` is for, and why this refuses on the flag rather than trying
+    to read a shortfall out of a clamped number.
+    """
+    if import_needed:
+        return 0.0
+    try:
+        dawn_kwh = float(battery_at_dawn_kwh)
+        cap_kwh  = float(capacity_kwh)
+        reserve  = float(reserve_pct) / 100.0 * cap_kwh
+        vpp      = max(0.0, float(planned_vpp_kwh))
+        window   = max(0.0, float(export_cap_kw)) * max(0.0, float(window_hours))
+    except (TypeError, ValueError):
+        return 0.0          # an unknown input is not a licence to guess
+    if cap_kwh <= 0:
+        return 0.0
+
+    spare = dawn_kwh - reserve - vpp
+    kwh   = min(spare, window)
+    if kwh < max(0.0, float(min_worthwhile_kwh)):
+        return 0.0
+    return round(kwh, 2)
 
 # Minimum percentage cheaper to justify waiting for tomorrow's Tracker rate
 TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper)
@@ -384,6 +448,14 @@ class ManagerSnapshot:
     # Used by flood prevention to inflate refill-day demand.
     vpp_today_kwh:    float = 0.0
     vpp_tomorrow_kwh: float = 0.0
+
+    # Octopus Saving Session: True only while a window the account has actually
+    # JOINED is live and the feature is enabled. plugin.py owns that test — the
+    # manager never talks to Octopus. Being joined is load-bearing: an un-joined
+    # session pays nothing, so exporting into one would drain the battery for
+    # the 12p export rate alone.
+    saving_session_active:   bool  = False
+    saving_session_hours:    float = 1.0    # length of the live window (hours)
 
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
@@ -709,6 +781,52 @@ class BatteryManager:
             return Decision(
                 action = ACTION_VPP_EXPORT,
                 reason = "VPP event active — self-driving export (Axle dispatch ignored)",
+            )
+        if snapshot.saving_session_active:
+            # STRICTLY BELOW the VPP branch above, and the ordering is the whole
+            # design: Axle pays ~£1/kWh against ~7.6p/kWh here, so an overlapping
+            # Axle window has already returned by the time we reach this line and
+            # this branch can never take a paid VPP minute.
+            if not snapshot.export_enabled:
+                return Decision(
+                    action = ACTION_SELF_CONSUMPTION,
+                    reason = "Saving Session window but export currently disabled "
+                             "(power-cut lockout / storm) — standing down",
+                )
+            balance = self._calculate_24h_balance(snapshot)
+            reserve_pct = max(snapshot.dawn_target_pct, snapshot.health_cutoff_pct)
+            kwh = saving_session_exportable_kwh(
+                battery_at_dawn_kwh = balance.battery_at_dawn_kwh,
+                reserve_pct         = reserve_pct,
+                capacity_kwh        = snapshot.capacity_kwh,
+                planned_vpp_kwh     = snapshot.vpp_today_kwh,
+                export_cap_kw       = snapshot.max_export_kw,
+                window_hours        = snapshot.saving_session_hours,
+                import_needed       = balance.import_needed,
+            )
+            if kwh > 0:
+                return Decision(
+                    action = ACTION_SAVING_SESSION,
+                    reason = (f"Octopus Saving Session — exporting up to {kwh:.1f} kWh "
+                              f"above baseline (dawn projection {balance.battery_at_dawn_kwh:.1f} kWh "
+                              f"vs {reserve_pct:.0f}% reserve"
+                              + (f", holding {snapshot.vpp_today_kwh:.1f} kWh for Axle"
+                                 if snapshot.vpp_today_kwh > 0 else "")
+                              + ")"),
+                    soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+                )
+            # Refusing is a real answer and worth saying, because the alternative
+            # is a session that quietly does nothing and looks broken.
+            return Decision(
+                action = ACTION_SELF_CONSUMPTION,
+                reason = ("Saving Session window, but not exporting: "
+                          + ("tomorrow already needs a grid import"
+                             if balance.import_needed else
+                             f"only {balance.battery_at_dawn_kwh:.1f} kWh projected at dawn "
+                             f"against a {reserve_pct:.0f}% reserve"
+                             + (f" plus {snapshot.vpp_today_kwh:.1f} kWh promised to Axle"
+                                if snapshot.vpp_today_kwh > 0 else ""))),
+                soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
             )
         if snapshot.export_active and snapshot.flood_prev_target_soc > 0:
             balance = self._calculate_24h_balance(snapshot)

@@ -818,7 +818,8 @@ class OctopusAPI:
               "events": [
                   {"id": str, "code": str,
                    "start_at": datetime (aware, UTC), "end_at": datetime (aware, UTC),
-                   "reward_per_kwh_points": int},
+                   "reward_per_kwh_points": int,
+                   "joined": bool},   # per-EVENT opt-in; NOT implied by has_joined
                   ...
               ],  # sorted by start_at ascending
               "fetched_at": float,
@@ -916,6 +917,13 @@ class OctopusAPI:
 
         acct       = ss["account"]
         has_joined = bool(acct.get("hasJoinedCampaign"))
+        # Per-EVENT opt-in, and it is NOT implied by campaign membership. Measured
+        # 03-Sep-2026: this account reads hasJoinedCampaign=True with 36 joined events
+        # ending 16-Aug-2026, while ALL 17 events since — the new season — are
+        # un-joined. An un-joined session pays NOTHING, so anything that spends
+        # battery for a session must gate on THIS set, never on has_joined.
+        joined_ids = {str(e.get("eventId")) for e in (acct.get("joinedEvents") or [])
+                      if e.get("eventId") is not None}
 
         events = []
         for e in ss.get("events") or []:
@@ -930,6 +938,7 @@ class OctopusAPI:
                 "start_at":              start_at,
                 "end_at":                end_at,
                 "reward_per_kwh_points": int(e.get("rewardPerKwhInOctoPoints") or 0),
+                "joined":                str(e.get("id")) in joined_ids,
             })
         events.sort(key=lambda ev: ev["start_at"])
 

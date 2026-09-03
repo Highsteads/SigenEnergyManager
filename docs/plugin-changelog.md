@@ -15,6 +15,82 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.81.0 — 03-09-2026
+
+Phase 2, at CliveS's request: **drive the battery to export during a Saving Session** — the
+thing v5.80.0 deliberately did not do. His rule, verbatim: do it "as long as it does not
+interfere with an Axle event the same day unless we can do both and still have enough to get
+through to next morning without importing."
+
+**PER-EVENT OPT-IN IS THE HEADLINE, and it was found by checking rather than assuming.**
+Campaign membership does NOT enrol you in each session. Measured today: this account reads
+`hasJoinedCampaign=True` with **36 joined events ending 16-Aug-2026**, while **all 17 sessions
+since — the entire new season — are un-joined**, including 1 Sept at 68 pts/kWh and 2 Sept at
+56. They were missed in silence. So `get_saving_sessions()` now returns a per-event `joined`
+flag, the alert LEADS with "NOT OPTED IN — join it in the Octopus app, or it pays nothing"
+and logs at WARNING, and **the export branch will not fire for an un-joined session at all**:
+exporting into one earns no Octopoints, so it would drain the battery for the plain 12p export
+rate. Had I taken the earlier "you're already enrolled" reading at face value, the feature
+would have driven the battery for nothing on its first run.
+
+**Axle wins, and it is not close.** Axle pays about £1/kWh; a Saving Session at 61 Octopoints/kWh
+pays 7.6p/kWh (800 points = £1) — roughly **13x**. So the new branch sits STRICTLY BELOW the
+VPP override in `_check_overrides`, which means an overlapping Axle window has already returned
+before this line is reached and the session can never take a paid VPP minute. It also cannot
+spend Axle's *energy*: `snapshot.vpp_today_kwh` (future-only, pro-rated, in place since v5.19.4)
+is subtracted from what may be exported, which is the "unless we can do both" half of the rule
+priced rather than assumed.
+
+**"Still reaches next morning without importing"** is expressed against the engine's own
+projection rather than a second model: new pure `saving_session_exportable_kwh()` takes
+`balance.battery_at_dawn_kwh` (which already carries the solar still to come and the overnight
+drain), subtracts the reserve — `max(dawn_target, health_cutoff)` — subtracts Axle's promised
+kWh, and caps the result at the DNO window (`max_export_kw x window_hours`). It refuses
+outright when `balance.import_needed` is already True, because the engine saying "tomorrow needs
+a grid import" settles the question whatever the arithmetic says. **That flag is load-bearing
+for a specific reason: `battery_at_dawn_kwh` is CLAMPED at the health floor by its producer, so
+it cannot go negative to signal a deep shortfall** — reading a shortfall out of a clamped number
+is exactly the trap, so the refusal keys on the flag instead.
+
+Also: a refusal now SAYS SO in the decision reason ("Saving Session window, but not exporting:
+tomorrow already needs a grid import"), because a session that quietly does nothing is
+indistinguishable from a broken feature — which is precisely what v5.80.0 was. The stand-down
+latches on the flag, not the clock, so the export stops promptly if the dawn projection turns
+against us MID-window, and the hand-back to Self Consumption is CONFIRMED with a retry on the
+`vpp_handback_pending` path (the v5.64.0 lesson: never latch on an unconfirmed write).
+
+**Adaptive poll cadence, and it is what makes tonight work.** Hourly normally, every 10 minutes
+once a known session starts within 2 hours — because opting in is a tap in the Octopus app that
+the owner may make shortly before the window, and the `joined` flag is what gates the export. On
+a flat hourly cadence an opt-in at 17:45 would not have been seen until after an 18:00 session
+had already started. The imminence test reads only a cached next-start (deliberately NOT filtered
+on `joined` — the point is to already be polling often enough to NOTICE the opt-in), so it costs
+no extra network.
+
+**A gap found by restarting and looking rather than by any test:** the new
+`ACTION_SAVING_SESSION -> "savingSession"` token had no matching `<Option>` on the `currentMode`
+List state in Devices.xml, so `currentMode.savingSession` did not exist on the device and a
+trigger built on it would never have fired. Added, plus `TestCurrentModeTokensMatchDevicesXml`
+in test_config_xml.py which walks every token in ACTION_MODE_TOKEN and asserts an Option exists
+(proven to fail by removing the Option again). NB an added Option needs an Indigo CLIENT restart
+before the sub-state appears — the documented client XML caching.
+
+The manager cycle does no network I/O for any of this — the hourly poll leaves the joined
+windows in `store["saving_sessions_windows"]` and `_saving_session_window()` is a pure read of
+that cache.
+
+**Ships OFF** (`savingSessionExport`, default false) — a new behaviour that drives the battery
+must not switch itself on for anyone. Read through `plugin_utils.as_bool`, not bare `bool()`;
+**NB most of plugin.py still reads checkbox prefs with bare `bool()`, where `bool("false")` is
+True — a real latent trap and an estate-wide sweep of its own.**
+
+Tests 903 -> 927. Four sabotages, each asserted to have applied and each restore byte-identical:
+disabling the VPP branch so the session steals the window (4 red), removing the `import_needed`
+refusal (1), no longer holding back Axle's energy (1), ignoring the reserve floor (3). **A fifth
+mutation SURVIVED and was the more useful result** — adding `and not vpp_active` to the session
+branch changed nothing, because that branch already sits below the VPP one, so the mutation was
+meaningless rather than the test weak. Re-run as a genuine precedence break, it went red.
+
 ## v5.80.1 — 03-09-2026
 
 **v5.80.0 SHIPPED SILENTLY DEAD, AND THE WAY IT FAILED IS THE WHOLE ENTRY.**

@@ -2393,6 +2393,88 @@ class TestCheckSavingSessions(unittest.TestCase):
         self.assertIn("on top of", body)   # the correction this Phase 1 build exists for
 
 
+class TestSavingSessionsCadence(unittest.TestCase):
+    """Hourly normally, 10-minutely once a session is imminent.
+
+    Opting in is a tap the owner makes in the Octopus app, often shortly before
+    the window, and the `joined` flag gates the export — so on a flat hourly
+    cadence an opt-in at 17:45 would not be seen until after an 18:00 session
+    had started.
+    """
+
+    def _p(self, next_start):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_next_start": next_start}
+        return p
+
+    def _iso(self, hours):
+        return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+    def test_hourly_when_nothing_is_scheduled(self):
+        self.assertEqual(self._p("")._saving_sessions_interval(),
+                         plugin.SAVING_SESSIONS_INTERVAL)
+
+    def test_hourly_when_the_next_session_is_days_away(self):
+        self.assertEqual(self._p(self._iso(30))._saving_sessions_interval(),
+                         plugin.SAVING_SESSIONS_INTERVAL)
+
+    def test_ten_minutely_when_a_session_is_imminent(self):
+        self.assertEqual(self._p(self._iso(1.5))._saving_sessions_interval(),
+                         plugin.SAVING_SESSIONS_SOON_INTERVAL)
+
+    def test_back_to_hourly_once_the_start_has_passed(self):
+        # A start in the past must not pin it at the fast cadence for ever.
+        self.assertEqual(self._p(self._iso(-3))._saving_sessions_interval(),
+                         plugin.SAVING_SESSIONS_INTERVAL)
+
+    def test_a_malformed_stamp_never_raises(self):
+        self.assertEqual(self._p("not-a-date")._saving_sessions_interval(),
+                         plugin.SAVING_SESSIONS_INTERVAL)
+
+
+class TestSavingSessionWindow(unittest.TestCase):
+    """The manager-cycle read: pure, cache-only, and gated on the pref."""
+
+    def _p(self, windows, enabled=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_windows": windows}
+        p.pluginPrefs = {"savingSessionExport": enabled}
+        return p
+
+    def _win(self, start_h, end_h):
+        now = datetime.now(timezone.utc)
+        return {"id": "1", "points": 61,
+                "start": (now + timedelta(hours=start_h)).isoformat(),
+                "end":   (now + timedelta(hours=end_h)).isoformat()}
+
+    def test_live_window_is_returned_with_its_length(self):
+        w = self._p([self._win(-0.25, 0.75)])._saving_session_window()
+        self.assertIsNotNone(w)
+        self.assertAlmostEqual(w["hours"], 1.0, places=2)
+
+    def test_future_window_is_not_live(self):
+        self.assertIsNone(self._p([self._win(2, 3)])._saving_session_window())
+
+    def test_past_window_is_not_live(self):
+        self.assertIsNone(self._p([self._win(-3, -2)])._saving_session_window())
+
+    def test_pref_off_means_never(self):
+        self.assertIsNone(self._p([self._win(-0.25, 0.75)], enabled=False)
+                          ._saving_session_window())
+
+    def test_pref_string_false_is_off(self):
+        # Indigo re-serialises a saved checkbox as the STRING "false", and bare
+        # bool("false") is True — the trap this pref reads through as_bool to dodge.
+        p = self._p([self._win(-0.25, 0.75)])
+        p.pluginPrefs = {"savingSessionExport": "false"}
+        self.assertIsNone(p._saving_session_window())
+
+    def test_a_malformed_row_is_skipped_not_guessed(self):
+        p = self._p([{"id": "x", "start": "nonsense", "end": "nonsense"},
+                     self._win(-0.25, 0.75)])
+        self.assertIsNotNone(p._saving_session_window())
+
+
 class TestVppEventStr(unittest.TestCase):
     """v5.55.1 — the dashboard's VPP window used to be a hardcoded "".
 

@@ -211,6 +211,19 @@
         <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
     </Field>
 
+    <Field id="separator_savingsessions" type="separator"/>
+    <Field id="label_savingsessions" type="label">
+        <Label>OCTOPUS SAVING SESSIONS</Label>
+    </Field>
+    <Field id="savingSessionExport" type="checkbox" defaultValue="false">
+        <Label>Export the battery during a Saving Session:</Label>
+    </Field>
+    <Field id="label_savingsessions_info" type="label" fontSize="small">
+        <Label>Alerts are always sent when a session is announced. This checkbox is the separate question of whether the battery is driven to export during the window, which is what earns the Octopoints.
+
+Guards, all automatic: it only ever runs for a session you have actually opted into in the Octopus app (an un-joined session pays nothing); an Axle VPP window always wins, and energy Axle has already promised is held back for it; and it will not export at all if that would leave the battery unable to reach next morning without buying from the grid. Storms and the post-power-cut lockout stand it down as usual.</Label>
+    </Field>
+
     <Field id="separator_dashboard" type="separator"/>
     <Field id="label_dashboard" type="label">
         <Label>WEB DASHBOARD (port 8179)</Label>
