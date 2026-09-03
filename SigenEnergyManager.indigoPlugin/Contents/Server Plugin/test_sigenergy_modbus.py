@@ -522,7 +522,10 @@ class TestSignedRegisterDecode(unittest.TestCase):
         self.assertEqual(self.modbus._read_int32(30000), 65536)
 
 
-from sigenergy_modbus import PLANT_BATTERY_SOC, PLANT_ESS_SOH, INV_PV_STRING_BLOCK   # noqa: E402
+from sigenergy_modbus import (   # noqa: E402
+    PLANT_BATTERY_SOC, PLANT_ESS_SOH, INV_PV_STRING_BLOCK, PLANT_PV_POWER,
+    SLOW_CACHE_MAX_AGE_S, SLOW_READS_PER_CYCLE, decode_s32_pair,
+)
 
 
 class TestReadAllPartial(unittest.TestCase):
@@ -547,13 +550,19 @@ class TestReadAllPartial(unittest.TestCase):
                      "_read_uint32", "_read_uint64"):
             setattr(m, name, _rd(100))
 
-        # The v1.8 per-string block primitive: a valid 4-string block unless
-        # its address is in the fail set.
+        # Block primitive. TWO different blocks go through it since v1.13, so
+        # it must answer by ADDRESS — a fake that returned the per-string
+        # block for everything fed the fast tier's 30035 read four words of
+        # string data and quietly produced a 262 kW "PV power".
         def _blk(register, count, slave=None, *a, **k):
             if register in fail:
                 return None
+            if register == PLANT_PV_POWER:
+                # 30035-30038 as two big-endian S32s: PV 5000 W, ESS -1200 W.
+                return [0, 5000, 0xFFFF, 0xFB50]
             return [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
         m._read_block_u16 = _blk
+        m._blk_calls = []
         return m
 
     def test_all_present_returns_dict(self):
@@ -588,17 +597,180 @@ class TestReadAllPartial(unittest.TestCase):
         off — and once latched it is NOT retried even if the register would
         now answer (re-probe is a restart, by design)."""
         m = self._mk(fail_addrs={INV_PV_STRING_BLOCK})
+        # force_full so each cycle actually ATTEMPTS the block. Since v1.13 a
+        # routine cycle reads only SLOW_READS_PER_CYCLE slow registers, so
+        # three read_all()s are no longer three attempts at this one.
         for _ in range(3):
-            self.assertIsNotNone(m.read_all())
+            self.assertIsNotNone(m.read_all(force_full=True))
         self.assertTrue(m._pv_strings_absent)
         calls = []
         def _blk_ok(register, count, slave=None, *a, **k):
             calls.append(register)
+            if register == PLANT_PV_POWER:
+                return [0, 5000, 0xFFFF, 0xFB50]
             return [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
         m._read_block_u16 = _blk_ok
-        data = m.read_all()
+        data = m.read_all(force_full=True)
         self.assertNotIn("pvStrings", data)
-        self.assertEqual(calls, [])              # latched = not even attempted
+        # NB not assertEqual(calls, []) any more: since v1.13 the fast tier
+        # reads 30035-30038 through this same primitive every cycle. The
+        # assertion that matters is that the LATCHED block is not attempted.
+        self.assertNotIn(INV_PV_STRING_BLOCK, calls)
+        self.assertEqual(calls, [PLANT_PV_POWER])
+
+    # --- read tiering (v1.13) -----------------------------------------
+
+    def _counting(self, fail_addrs=()):
+        """A modbus whose every read primitive records the address it hit."""
+        m = self._mk(fail_addrs=fail_addrs)
+        seen = []
+        for name in ("_read_uint16", "_read_int16", "_read_int32",
+                     "_read_uint32", "_read_uint64"):
+            inner = getattr(m, name)
+            def wrap(register, slave=None, _i=inner, *a, **k):
+                seen.append(register)
+                return _i(register, slave=slave)
+            setattr(m, name, wrap)
+        blk = m._read_block_u16
+        def wrap_blk(register, count, slave=None, *a, **k):
+            seen.append(register)
+            return blk(register, count, slave=slave)
+        m._read_block_u16 = wrap_blk
+        m._seen = seen
+        return m
+
+    def test_first_cycle_is_a_full_sweep_then_cycles_get_short(self):
+        """The first snapshot after a connect must carry every key, and every
+        cycle after it must be a fraction of the transactions. This is the
+        whole point: 29 reads at the protocol's 1 s spacing made one poll
+        ~43 s measured live, so the dashboards were ~40 s stale."""
+        m = self._counting()
+        first = m.read_all()
+        n_first = len(m._seen)
+        m._seen.clear()
+        m.read_all()
+        n_next = len(m._seen)
+        self.assertGreater(n_first, 20, "first cycle must prime every register")
+        self.assertLessEqual(n_next, 5 + SLOW_READS_PER_CYCLE)
+        self.assertLess(n_next * 2, n_first, "a routine cycle must be far shorter")
+        # and the first sweep really did deliver the whole contract
+        for key in ("emsWorkMode", "batterySoh", "pvLifetimeKwh", "gridVoltageV",
+                    "batteryTempC", "ratedCapacityKwh", "homeDailyDirectKwh"):
+            self.assertIn(key, first)
+
+    def test_every_critical_key_is_read_fresh_every_cycle(self):
+        """The six CRITICAL_KEYS must never be served from cache — they drive
+        force-charge decisions, and a cached SOC is exactly the phantom the
+        partial-read guard exists to stop."""
+        m = self._counting()
+        m.read_all()
+        m._seen.clear()
+        m.read_all()
+        self.assertIn(PLANT_BATTERY_SOC, m._seen)
+        self.assertIn(PLANT_PV_POWER, m._seen)      # the block covers PV + ESS
+
+    def test_slow_keys_are_served_from_cache_not_dropped(self):
+        """A cycle that did not re-read a slow register still returns its key.
+        read_all()'s dict shape is a contract every consumer relies on."""
+        m = self._mk()
+        m.read_all()
+        for _ in range(3):
+            data = m.read_all()
+            for key in ("emsWorkMode", "batterySoh", "ratedCapacityKwh",
+                        "pvLifetimeKwh", "batteryMinTempC"):
+                self.assertIn(key, data, f"{key} vanished on a routine cycle")
+
+    def test_pv_and_battery_power_come_from_one_block(self):
+        """One transaction, so the two share an instant. homePowerWatts is
+        derived from them and used to absorb the spread between separate
+        reads — down to 0 W on a moving day."""
+        m = self._counting()
+        m.read_all()
+        m._seen.clear()          # count ONE cycle, not the priming one too
+        data = m.read_all()
+        self.assertEqual(data["pvPowerWatts"], 5000)
+        self.assertEqual(data["batteryPowerWatts"], -1200)
+        self.assertEqual(m._seen.count(PLANT_PV_POWER), 1)
+
+    def test_failed_fast_block_costs_both_keys_and_returns_none(self):
+        m = self._mk(fail_addrs={PLANT_PV_POWER})
+        self.assertIsNone(m.read_all())     # both are critical
+        self.assertTrue(m._connected)       # healthy link, transient drop
+
+    def test_a_failed_slow_read_keeps_the_previous_value(self):
+        m = self._mk()
+        first = m.read_all()
+        self.assertEqual(first["batterySoh"], 10.0)
+        # every subsequent read of that register fails
+        inner = m._read_uint16
+        m._read_uint16 = lambda register, slave=None, *a, **k: (
+            None if register == PLANT_ESS_SOH else inner(register, slave=slave))
+        for _ in range(12):
+            data = m.read_all()
+        self.assertEqual(data["batterySoh"], 10.0, "last good value must survive")
+
+    def test_a_slow_value_that_never_comes_back_is_dropped_not_served_forever(self):
+        """A cached value is a real reading that is merely old. One this old is
+        not stale, it is absent — and an absent reading must present as a gap,
+        never as an hour-old number offered as current."""
+        m = self._mk()
+        m.read_all()
+        aged = {k: (v, t - SLOW_CACHE_MAX_AGE_S - 1)
+                for k, (v, t) in m._slow_cache.items()}
+        m._slow_cache = aged
+        inner = m._read_uint16
+        m._read_uint16 = lambda register, slave=None, *a, **k: (
+            None if register == PLANT_ESS_SOH else inner(register, slave=slave))
+        data = m.read_all()
+        self.assertNotIn("batterySoh", data)
+        self.assertIn("batterySoc", data)    # critical data unaffected
+
+    def test_mark_slow_read_due_jumps_the_rotation(self):
+        """After a control write a cached value must not outlive the change
+        that invalidated it.
+
+        Both arms, deliberately. The key is the LAST in the rotation, so it
+        would not come round on the next cycle by itself — an earlier version
+        of this test marked emsWorkMode, which happens to be first in the
+        list and was therefore read either way, and it passed green against a
+        mark_slow_read_due() gutted to `pass`."""
+        specs = self._mk()._slow_read_specs()
+        last_key, _rd, last_reg, _sl, _post = [sp for sp in specs
+                                               if sp[0] != "pvStrings"][-1]
+
+        control = self._counting()
+        control.read_all()
+        control._seen.clear()
+        control.read_all()
+        self.assertNotIn(last_reg, control._seen,
+                         "test is not discriminating — pick a later key")
+
+        m = self._counting()
+        m.read_all()
+        m._seen.clear()
+        m.mark_slow_read_due(last_key)
+        m.read_all()
+        self.assertIn(last_reg, m._seen)
+
+    def test_every_slow_register_comes_round(self):
+        """The rotation must not starve anything — a register that is never
+        re-read would silently freeze at its first value."""
+        m = self._counting()
+        m.read_all()
+        m._seen.clear()
+        for _ in range(40):
+            m.read_all()
+        specs = m._slow_read_specs()
+        for key, _rd, register, _sl, _post in specs:
+            if key == "pvStrings":
+                continue
+            self.assertIn(register, m._seen, f"{key} never came round")
+
+    def test_decode_s32_pair_matches_the_int32_primitive(self):
+        self.assertEqual(decode_s32_pair([0, 5000, 0xFFFF, 0xFB50]), (5000, -1200))
+        self.assertEqual(decode_s32_pair([0, 0, 0, 0]), (0, 0))
+        self.assertIsNone(decode_s32_pair([0, 1, 2]))     # short block
+        self.assertIsNone(decode_s32_pair(None))
 
     def test_majority_errors_marks_disconnected(self):
         m = SigenergyModbus("192.168.1.49")
