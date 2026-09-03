@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.83.0 · Requires Indigo 2025.2 or later
+**Version:** 5.83.1 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -142,6 +142,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.83.1 | 03-Sep-2026 | **You can now see a saving session is armed before it starts.** The plugin knew about tonight's session but said so nowhere — the decision log and the dashboard API both looked exactly the same whether one was booked or not, so the only way to check was to wait and see if the battery moved. Both now show it, including which way the window runs. Nothing about the behaviour changed. 958 tests. |
 | 5.83.0 | 03-Sep-2026 | **The battery can now use your free Happy Hour.** Two successful Power Down sessions earn an hour of free electricity, which you book on the Octopus site — and with the new setting ticked the battery grid-charges flat out for that hour so the free energy goes in the pack instead of going to waste. It only runs for the slot you actually booked (four are offered each Sunday), fills to your usual target rather than 100%, stops early once full, and has three separate ways of stopping so it can't run past the free hour into electricity you pay for. It records what it banked separately, so a Sunday dip in self-sufficiency is explainable rather than mysterious. Worth ~£8-15 before the promotion ends on 1 November, and honestly nothing at all on a bright Sunday when the battery is already full — it will say so rather than pretend. Off by default. 957 tests. |
 | 5.82.0 | 03-Sep-2026 | **Safety fix to yesterday's feature: it didn't ask which way a session runs.** Octopus runs three kinds — turn *down* (use less, which is what exporting earns), **Power Up** (use *more*), and **Weekend Happy Hour** (an hour of free electricity). They all arrive in the same list, and the plugin was treating them alike, so it would have exported the battery through a Power Up and through your free hour — spending the battery to earn nothing, both times. It now only ever exports during a turn-down, and anything it doesn't recognise is left alone. You still get told about the others, with a note that the battery stays out of it. Not theoretical: a dozen happy hours are already in your history. 935 tests. |
 | 5.81.1 | 03-Sep-2026 | Housekeeping on yesterday's feature: the check that stops a session being announced twice was comparing values whose type Octopus does not actually guarantee. It works today and would have started repeating the same alert every hour the day Octopus changed it. Found by driving the real code against the live account rather than by the tests, which had all been written with one type throughout. 930 tests. |

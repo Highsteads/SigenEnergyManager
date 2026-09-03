@@ -15,6 +15,27 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.83.1 — 03-09-2026
+
+**An armed Octopus session was not observable from anywhere.** Found half an hour before a live
+18:00 turn-down, trying to answer "is this actually armed?" and discovering there was no way to:
+the window cache lives only in `store["saving_sessions_windows"]`, is not persisted, and appears
+in neither the decision audit nor the status API. The audit's `[OVERRIDE]` line still read
+"skipped — no VPP active, no running flood export", wording that predates both new overrides, so
+a cached session and no session looked identical. **A feature you cannot check before it runs can
+only ever be verified after it has already failed** — and a restart clears the cache, so this was
+not hypothetical.
+
+Two changes, both read-only:
+- The `[OVERRIDE]` audit line now names `saving_session_active` and `happy_hour_active`.
+- `/api/status` gains `octopus_sessions` (the cached windows with their direction, plus
+  `next_start`) and two flags, `saving_session_export_active` and `happy_hour_import_active`.
+
+Direction is included in the exposed window because it decides which way the window drives, so a
+reader can tell an export window from an import one without inferring it from the battery.
+
+No behaviour change. 958 tests.
+
 ## v5.83.0 — 03-09-2026
 
 **Weekend Happy Hour import — Phase 3.** During a BOOKED Octopus Happy Hour (an hour of free

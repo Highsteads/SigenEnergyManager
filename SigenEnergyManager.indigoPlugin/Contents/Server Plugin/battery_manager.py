@@ -687,7 +687,11 @@ class BatteryManager:
             audit.append(("OVERRIDE", f"matched -> {override.reason}"))
             override.audit_trail = audit
             return override
-        audit.append(("OVERRIDE", "skipped — no VPP active, no running flood export"))
+        audit.append(("OVERRIDE", (
+            "skipped — vpp_active=False, no running flood export, "
+            f"saving_session_active={snapshot.saving_session_active}, "
+            f"happy_hour_active={snapshot.happy_hour_active}"
+        )))
 
         # 24h sufficiency calc used by every later branch
         balance = self._calculate_24h_balance(snapshot)

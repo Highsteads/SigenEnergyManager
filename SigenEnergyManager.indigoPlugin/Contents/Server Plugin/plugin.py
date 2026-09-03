@@ -8,7 +8,7 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.83.0)
 # Date:        03-09-2026
-# Version:     5.83.0
+# Version:     5.83.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1872,10 +1872,30 @@ class Plugin(indigo.PluginBase):
                     "export_active":         store.get("export_active",         False),
                     "solar_overflow_active": store.get("solar_overflow_active", False),
                     "import_active":         store.get("import_active",         False),
+                    # Octopus session state. Added 03-Sep-2026 because it was
+                    # NOT observable from anywhere: the window cache lives only
+                    # in memory, so half an hour before a live session there was
+                    # no way to answer "is this armed?" without waiting to see
+                    # whether it fired. A feature you cannot check before it runs
+                    # can only be verified after it has already failed.
+                    "saving_session_export_active":
+                        store.get("saving_session_export_active", False),
+                    "happy_hour_import_active":
+                        store.get("happy_hour_import_active", False),
                     # Live connection state — latest_inverter_data is kept at
                     # last-known-good on failure, so bool(inv) could never go
                     # false again after the first successful poll.
                     "modbus_connected":      bool(self.modbus and self.modbus.connected),
+                },
+                "octopus_sessions": {
+                    # The cached windows, so an armed session is visible BEFORE
+                    # its start rather than inferred afterwards from whether the
+                    # battery moved. Direction is included because it decides
+                    # which way the window drives: TURN_DOWN exports,
+                    # WEEKEND_HAPPY_HOUR imports, and anything else drives
+                    # nothing at all.
+                    "windows":    store.get("saving_sessions_windows") or [],
+                    "next_start": store.get("saving_sessions_next_start"),
                 },
                 "hourly_forecast": hourly,
             }
