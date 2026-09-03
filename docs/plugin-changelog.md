@@ -15,6 +15,46 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.80.0 — 03-09-2026
+
+Octopus Saving Sessions — Phase 1: detect a newly-announced event and Pushover CliveS.
+No dispatch change at all; this is visibility only.
+
+**Why Phase 1 and not more.** Checked the account's actual history via the
+`barnybug/savingsessions` calculator: across the six sessions since the battery went live
+(Mar–Aug 2026), five earned £0.00 and one earned 120 points (15p) — because the battery
+already exports close to its own 10-day baseline most evenings, leaving little "extra" for
+Saving Sessions to reward. Octopoints are genuinely on top of the normal 12p/kWh export
+payment (confirmed against Octopus's own FAQ: "your export tariff won't be affected — only
+additional energy exported during the Session will be paid at the Saving Sessions incentive
+rate"), but that normal export revenue would be earned at the same flat rate whichever half
+hour of the day it went out in — Outgoing isn't time-of-use. So the marginal value of
+actively *timing* dispatch around a session is still only the Octopoints bonus, and on this
+account's numbers so far that's pennies, not pounds. Not worth arbitrating against the Axle
+VPP and bank-first export hold for. Revisit once a winter session or two (historically worth
+far more — the best pre-battery session here paid 416 points/£0.52) shows real numbers.
+
+**octopus_api.py** — new `OctopusAPI.get_saving_sessions()`, mirroring the
+`get_account_financials()` shape (30-min positive cache, 5-min negative-cache debounce,
+serves the last good value through a network blip). Queries `savingSessions { account {
+hasJoinedCampaign joinedEvents { eventId } } events { id code startAt endAt
+rewardPerKwhInOctoPoints } }` against `KRAKEN_GRAPHQL_BACKEND`
+(`api.backend.octopus.energy`) — this query 404s on the main `api.octopus.energy` graphql
+host that every other Kraken call in this module uses; the JWT from the existing
+`_get_kraken_token()` works unchanged against the backend host, so no new auth step was
+needed. Only public reference for this query is the `barnybug/savingsessions` open-source
+calculator (github.com/barnybug/savingsessions) — there is no first-party Octopus API doc
+for it.
+
+**plugin.py** — `_check_saving_sessions()`, hourly tick (`SAVING_SESSIONS_INTERVAL`).
+Compares live events against `store["saving_sessions_notified"]` (persisted in
+accumulators.json, not day-scoped — same treatment as storm state, so a restart between
+the announcement and the session can't re-send the push), sends one Pushover per
+newly-announced future event naming the window and the points/kWh rate, and stays
+completely silent when there is nothing new, the account isn't a Saving Sessions member, or
+the poll fails. 18 new tests (9 in `test_octopus_api.py`, 9 in `test_plugin.py`) — 897 total,
+all green.
+
 ## v5.78.1 — 29-08-2026
 
 CONFIGURE DIALOG WAS DEAD FOR FIVE DAYS.

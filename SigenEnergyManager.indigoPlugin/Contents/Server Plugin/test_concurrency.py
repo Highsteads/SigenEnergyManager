@@ -72,6 +72,7 @@ def _mk_plugin():
         "last_modbus", "last_forecast", "last_manager", "last_octopus",
         "last_profile", "last_cost_settle", "last_vpp", "last_acc_save",
         "last_storm_watch", "last_energy_var", "last_log_check",
+        "last_saving_sessions",
     )}
     p.store.update({
         "vpp_state": "idle", "vpp_event": None, "manager_paused": False,

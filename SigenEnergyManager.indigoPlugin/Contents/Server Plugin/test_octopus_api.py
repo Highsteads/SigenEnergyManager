@@ -590,5 +590,94 @@ class TestIgoRatesAreFetchedWhenActive(unittest.TestCase):
         self.assertEqual(self.fetched.count(octopus_api.TARIFF_GO), 1)
 
 
+# A realistic savingSessions payload: one past joined event, one future joined event.
+_SAVING_SESSIONS = {"data": {"savingSessions": {
+    "account": {
+        "hasJoinedCampaign": True,
+        "joinedEvents": [{"eventId": "1001"}, {"eventId": "1002"}],
+    },
+    "events": [
+        {"id": "1001", "code": "OCT12AUG", "startAt": "2026-08-12T18:00:00+01:00",
+         "endAt": "2026-08-12T18:30:00+01:00", "rewardPerKwhInOctoPoints": 800},
+        {"id": "1002", "code": "OCT01SEP", "startAt": "2026-09-10T18:00:00+01:00",
+         "endAt": "2026-09-10T19:00:00+01:00", "rewardPerKwhInOctoPoints": 600},
+    ],
+}}}
+
+
+class TestSavingSessions(unittest.TestCase):
+    def setUp(self):
+        self.api = _make_api()
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+        octopus_api.requests.post.return_value = _FakeResp(_SAVING_SESSIONS)
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def test_uses_backend_host_not_main_graphql_host(self):
+        # This query 404s on the main api.octopus.energy host — it must go to
+        # api.backend.octopus.energy, not KRAKEN_GRAPHQL.
+        self.api.get_saving_sessions(force=True)
+        called_url = octopus_api.requests.post.call_args[0][0]
+        self.assertEqual(called_url, octopus_api.KRAKEN_GRAPHQL_BACKEND)
+        self.assertNotEqual(called_url, octopus_api.KRAKEN_GRAPHQL)
+
+    def test_has_joined_parsed(self):
+        data = self.api.get_saving_sessions(force=True)
+        self.assertTrue(data["has_joined"])
+
+    def test_events_parsed_and_sorted(self):
+        data = self.api.get_saving_sessions(force=True)
+        self.assertEqual(len(data["events"]), 2)
+        self.assertEqual(data["events"][0]["id"], "1001")   # earlier startAt first
+        self.assertEqual(data["events"][1]["reward_per_kwh_points"], 600)
+
+    def test_timestamps_are_aware_with_offset_preserved(self):
+        data = self.api.get_saving_sessions(force=True)
+        ev = data["events"][0]
+        self.assertIsNotNone(ev["start_at"].tzinfo)
+        self.assertEqual(ev["start_at"].utcoffset().total_seconds(), 3600)  # +01:00 (BST)
+        self.assertEqual(ev["start_at"].hour, 18)   # local wall-clock hour from the string
+
+    def test_cache_hit_second_call(self):
+        self.api.get_saving_sessions(force=True)
+        octopus_api.requests.post.reset_mock()
+        self.api.get_saving_sessions()          # cached — no network
+        octopus_api.requests.post.assert_not_called()
+
+    def test_no_account_configured_returns_none(self):
+        api = octopus_api.OctopusAPI(api_key="", account_id="", mpan="", serial="")
+        self.assertIsNone(api.get_saving_sessions())
+
+    def test_http_failure_serves_none_when_never_fetched(self):
+        octopus_api.requests.post.return_value = _FakeResp({}, ok=False, status=500)
+        self.assertIsNone(self.api.get_saving_sessions(force=True))
+
+    def test_http_failure_serves_stale_cache_after_one_success(self):
+        good = self.api.get_saving_sessions(force=True)
+        octopus_api.requests.post.return_value = _FakeResp({}, ok=False, status=500)
+        stale = self.api.get_saving_sessions(force=True)
+        self.assertEqual(stale, good)   # served the last good value, not None
+
+    def test_malformed_event_skipped_not_fatal(self):
+        payload = {"data": {"savingSessions": {
+            "account": {"hasJoinedCampaign": True, "joinedEvents": []},
+            "events": [
+                {"id": "bad", "code": "X"},   # missing startAt/endAt
+                _SAVING_SESSIONS["data"]["savingSessions"]["events"][0],
+            ],
+        }}}
+        octopus_api.requests.post.return_value = _FakeResp(payload)
+        data = self.api.get_saving_sessions(force=True)
+        self.assertEqual(len(data["events"]), 1)
+        self.assertEqual(data["events"][0]["id"], "1001")
+
+    def test_graphql_errors_with_no_data_serves_none(self):
+        octopus_api.requests.post.return_value = _FakeResp(
+            {"data": None, "errors": [{"message": "boom"}]})
+        self.assertIsNone(self.api.get_saving_sessions(force=True))
+
+
 if __name__ == "__main__":
     unittest.main()

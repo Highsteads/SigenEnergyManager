@@ -58,6 +58,11 @@ except ImportError:
 
 OCTOPUS_API_BASE  = "https://api.octopus.energy/v1"
 KRAKEN_GRAPHQL    = "https://api.octopus.energy/v1/graphql/"
+# Saving Sessions is served ONLY from the backend host — the main KRAKEN_GRAPHQL host 404s
+# it. Confirmed live 03-Sep-2026 (and matches barnybug/savingsessions, the only public
+# reference for this query). The JWT from obtainKrakenToken on the main host works
+# unchanged against this one — no separate auth step needed.
+KRAKEN_GRAPHQL_BACKEND = "https://api.backend.octopus.energy/v1/graphql/"
 REQUEST_TIMEOUT   = 15   # seconds
 
 # Cache TTLs
@@ -68,6 +73,8 @@ FINANCIALS_CACHE_TTL  = 1800   # 30 min - standing/unit rates change at most dai
 FINANCIALS_NEG_CACHE_TTL = 120 # 2 min - debounce failures so /api/status can't hammer Kraken
 FINANCIALS_FAIL_WARN_COUNT = 5    # consecutive failures before one WARNING at default level
 FINANCIALS_STALE_WARN_AGE  = 7200 # 2h - warn once when served financials are older than this
+SAVING_SESSIONS_CACHE_TTL     = 1800  # 30 min - new events are announced at most a few times/day
+SAVING_SESSIONS_NEG_CACHE_TTL = 300   # 5 min - debounce failures (this is a non-urgent poll)
 
 # Gas volume (m3) -> kWh conversion.  Octopus bills gas in kWh but the
 # consumption API returns m3 for metric SMETS meters.  kWh = m3 * VCF * CV / 3.6.
@@ -216,6 +223,9 @@ class OctopusAPI:
         self._financials_neg_at   = 0.0    # last failure (negative-cache debounce)
         self._financials_fail_count   = 0     # consecutive failures (reset on success)
         self._financials_stale_warned = False # 2h-stale WARNING fired (reset on success)
+        self._saving_sessions_cache    = None   # {"has_joined", "events", "fetched_at"}
+        self._saving_sessions_cache_at = 0.0
+        self._saving_sessions_neg_at   = 0.0    # last failure (negative-cache debounce)
         self._rates_neg_at        = {}     # cache_key -> last failed fetch (debounce)
         self._tariff_neg_at       = 0.0    # last failed tariff detection (debounce)
 
@@ -781,6 +791,119 @@ class OctopusAPI:
         self._financials_cache_at = now
         self._financials_fail_count   = 0
         self._financials_stale_warned = False
+        return result
+
+    # ================================================================
+    # Public: Saving Sessions
+    # ================================================================
+
+    def _saving_sessions_failed(self, now):
+        """Stamp the negative-cache window and return the last good value (stale)
+        or None if never successfully fetched. Same shape as _financials_failed —
+        this is a non-urgent poll, so failures stay DEBUG-quiet rather than
+        warning (unlike financials, nothing downstream depends on freshness)."""
+        self._saving_sessions_neg_at = now
+        return self._saving_sessions_cache
+
+    def get_saving_sessions(self, force=False):
+        """Octopus Saving Sessions events for this account (past + any announced future ones).
+
+        Uses KRAKEN_GRAPHQL_BACKEND — this query 404s on the main graphql host. The JWT
+        from _get_kraken_token() (obtained against the main host) works unchanged here.
+
+        Returns:
+            {
+              "has_joined": bool,   # hasJoinedCampaign — the account-level Saving
+                                     # Sessions membership flag, not per-event
+              "events": [
+                  {"id": str, "code": str,
+                   "start_at": datetime (aware, UTC), "end_at": datetime (aware, UTC),
+                   "reward_per_kwh_points": int},
+                  ...
+              ],  # sorted by start_at ascending
+              "fetched_at": float,
+            }
+        or None on failure (no account configured / auth / network — never successfully
+        fetched). Serves the last good value (stale) through a network blip once one
+        successful fetch has happened, same pattern as get_account_financials.
+        """
+        now = time.time()
+        if (not force and self._saving_sessions_cache is not None
+                and now - self._saving_sessions_cache_at < SAVING_SESSIONS_CACHE_TTL):
+            return self._saving_sessions_cache
+        if not force and now - self._saving_sessions_neg_at < SAVING_SESSIONS_NEG_CACHE_TTL:
+            return self._saving_sessions_cache
+        if not self.api_key or not self.account_id:
+            return self._saving_sessions_failed(now)
+        token = self._get_kraken_token()
+        if not token:
+            return self._saving_sessions_failed(now)
+        if not self._record_request():      # Kraken counts against the same API
+            return self._saving_sessions_failed(now)
+
+        query = json.dumps({
+            "query": (
+                "query ($a: String!) { savingSessions {"
+                "  account(accountNumber: $a) { hasJoinedCampaign"
+                "    joinedEvents { eventId } }"
+                "  events { id code startAt endAt rewardPerKwhInOctoPoints }"
+                "}}"
+            ),
+            "variables": {"a": self.account_id},
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL_BACKEND,
+                data=query.encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"JWT {token}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if not response.ok:
+                self.logger.debug(f"Saving Sessions query failed: HTTP {response.status_code}")
+                if response.status_code in (401, 403):
+                    # Dead/expired JWT — purge it so the next attempt re-authenticates
+                    # instead of resending the same token for the rest of its ~55-min life.
+                    self._kraken_token = None
+                return self._saving_sessions_failed(now)
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            self.logger.debug(f"Saving Sessions error: {e}")
+            return self._saving_sessions_failed(now)
+
+        ss = ((payload or {}).get("data") or {}).get("savingSessions") or {}
+        if not ss:
+            errs = (payload or {}).get("errors")
+            if errs:
+                self.logger.debug(f"Saving Sessions GraphQL errors: {errs}")
+                # GraphQL errors + empty payload is auth-shaped — purge the cached
+                # token so the next attempt re-runs obtainKrakenToken.
+                self._kraken_token = None
+            return self._saving_sessions_failed(now)
+
+        acct       = ss.get("account") or {}
+        has_joined = bool(acct.get("hasJoinedCampaign"))
+
+        events = []
+        for e in ss.get("events") or []:
+            try:
+                start_at = datetime.fromisoformat(str(e["startAt"]).replace("Z", "+00:00"))
+                end_at   = datetime.fromisoformat(str(e["endAt"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError, TypeError):
+                continue   # malformed event — skip it rather than fail the whole fetch
+            events.append({
+                "id":                    e.get("id"),
+                "code":                  e.get("code"),
+                "start_at":              start_at,
+                "end_at":                end_at,
+                "reward_per_kwh_points": int(e.get("rewardPerKwhInOctoPoints") or 0),
+            })
+        events.sort(key=lambda ev: ev["start_at"])
+
+        result = {"has_joined": has_joined, "events": events, "fetched_at": now}
+        self._saving_sessions_cache    = result
+        self._saving_sessions_cache_at = now
+        self._saving_sessions_neg_at   = 0.0
         return result
 
     # ================================================================

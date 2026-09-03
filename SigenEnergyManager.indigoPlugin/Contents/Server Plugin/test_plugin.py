@@ -2296,6 +2296,103 @@ class TestApplyStormResultLocName(unittest.TestCase):
         self.assertEqual(stub.sent, [])
 
 
+class TestCheckSavingSessions(unittest.TestCase):
+    """Phase 1 (03-Sep-2026) — notify-only, no dispatch change. One Pushover per
+    newly-announced future event, deduped and persisted so a restart can't re-send."""
+
+    class _Stub:
+        def __init__(self, octopus_data, store=None):
+            self.octopus     = MagicMock()
+            self.octopus.get_saving_sessions.return_value = octopus_data
+            self.store        = store if store is not None else {"saving_sessions_notified": []}
+            self.sent         = []
+            self.saved        = 0
+
+        def _send_pushover(self, title, body, priority="0"):
+            self.sent.append((title, body, priority))
+
+        def _save_accumulators(self):
+            self.saved += 1
+
+    def _check(self, stub):
+        plugin.Plugin._check_saving_sessions(stub)
+
+    def _event(self, event_id, start_at, end_at=None, points=800):
+        return {"id": event_id, "code": f"E{event_id}", "start_at": start_at,
+                "end_at": end_at, "reward_per_kwh_points": points}
+
+    def _future(self, hours=24):
+        return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+    def _past(self, hours=24):
+        return datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    def test_new_future_event_sends_one_pushover(self):
+        stub = self._Stub({"has_joined": True,
+                            "events": [self._event("1", self._future())]})
+        self._check(stub)
+        self.assertEqual(len(stub.sent), 1)
+        self.assertIn("Saving Session", stub.sent[0][0])
+
+    def test_notified_event_id_persisted(self):
+        stub = self._Stub({"has_joined": True,
+                            "events": [self._event("1", self._future())]})
+        self._check(stub)
+        self.assertIn("1", stub.store["saving_sessions_notified"])
+        self.assertEqual(stub.saved, 1)   # persisted immediately, not on the 5-min cadence
+
+    def test_already_notified_event_not_resent(self):
+        stub = self._Stub(
+            {"has_joined": True, "events": [self._event("1", self._future())]},
+            store={"saving_sessions_notified": ["1"]},
+        )
+        self._check(stub)
+        self.assertEqual(stub.sent, [])
+        self.assertEqual(stub.saved, 0)
+
+    def test_past_event_never_notified(self):
+        # Guards both a genuinely-past event and one that started before the
+        # plugin began watching — neither should ever produce a push.
+        stub = self._Stub({"has_joined": True,
+                            "events": [self._event("1", self._past())]})
+        self._check(stub)
+        self.assertEqual(stub.sent, [])
+
+    def test_not_joined_campaign_stays_silent(self):
+        stub = self._Stub({"has_joined": False,
+                            "events": [self._event("1", self._future())]})
+        self._check(stub)
+        self.assertEqual(stub.sent, [])
+
+    def test_none_from_api_is_silent_not_fatal(self):
+        stub = self._Stub(None)
+        self._check(stub)   # must not raise
+        self.assertEqual(stub.sent, [])
+
+    def test_api_exception_is_caught_not_fatal(self):
+        stub = self._Stub({"has_joined": True, "events": []})
+        stub.octopus.get_saving_sessions.side_effect = RuntimeError("boom")
+        self._check(stub)   # must not raise
+        self.assertEqual(stub.sent, [])
+
+    def test_two_new_events_both_sent_one_save(self):
+        stub = self._Stub({"has_joined": True, "events": [
+            self._event("1", self._future(24)),
+            self._event("2", self._future(48)),
+        ]})
+        self._check(stub)
+        self.assertEqual(len(stub.sent), 2)
+        self.assertEqual(stub.saved, 1)   # one persist covers both, not one each
+
+    def test_message_carries_points_and_additive_framing(self):
+        stub = self._Stub({"has_joined": True,
+                            "events": [self._event("1", self._future(), points=120)]})
+        self._check(stub)
+        body = stub.sent[0][1]
+        self.assertIn("120", body)
+        self.assertIn("on top of", body)   # the correction this Phase 1 build exists for
+
+
 class TestVppEventStr(unittest.TestCase):
     """v5.55.1 — the dashboard's VPP window used to be a hardcoded "".
 

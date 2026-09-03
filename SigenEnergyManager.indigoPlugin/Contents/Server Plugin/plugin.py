@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1)
-# Date:        29-08-2026
-# Version:     5.79.0
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0)
+# Date:        03-09-2026
+# Version:     5.80.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -229,6 +229,9 @@ VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 VPP_OVERRUN_GRACE_MINS    = 15
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 STORM_WATCH_INTERVAL = 7200  # 2 hours
+# Octopus announces a new Saving Session at most a few times a day (usually the evening
+# before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
+SAVING_SESSIONS_INTERVAL = 3600  # 1 hour
 
 
 def _away_seed_profile(daily_kwh):
@@ -1047,6 +1050,10 @@ class Plugin(indigo.PluginBase):
         self.store["last_storm_watch"]    = 0.0    # time.time() of last poll
         self.store["last_energy_var"]     = 0.0    # time.time() of last variable write
         self._energy_var_ids: dict        = {}     # cached variable IDs by name
+
+        # Saving Sessions — Phase 1 (notify-only, no dispatch changes)
+        self.store["last_saving_sessions"]      = 0.0   # time.time() of last poll
+        self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
 
         # Half-hourly SQLite logging — delta anchors (reset each write)
         self.store["hh_anchor_pv_kwh"]     = None  # cumulative PV at last slot boundary
@@ -2499,6 +2506,11 @@ class Plugin(indigo.PluginBase):
         if now - self.store["last_storm_watch"] >= STORM_WATCH_INTERVAL:
             self._check_storm_watch()
             self.store["last_storm_watch"] = now
+
+        # 10b. Saving Sessions — notify on newly-announced events (every hour)
+        if now - self.store["last_saving_sessions"] >= SAVING_SESSIONS_INTERVAL:
+            self._check_saving_sessions()
+            self.store["last_saving_sessions"] = now
 
         # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
         if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
@@ -4094,6 +4106,79 @@ class Plugin(indigo.PluginBase):
             )
             self.store["storm_alerted_level"] = "none"
             self._save_accumulators()
+
+    def _check_saving_sessions(self):
+        """Notify on newly-announced Octopus Saving Sessions events.
+
+        Phase 1 — visibility only, no dispatch change. Octopus pays extra export
+        during a session at the Saving Sessions incentive rate ON TOP OF the normal
+        Outgoing export rate (confirmed against the account 03-Sep-2026: a session
+        with 7.99 kWh exported earned both the normal ~96p export payment AND a
+        120-point/15p Octopoints bonus for the 7.27 kWh above baseline). This just
+        surfaces the announcement so CliveS can glance at the battery — it does not
+        try to hold back or time discharge, which would need to arbitrate against
+        the Axle VPP and bank-first export hold (deliberately deferred, see
+        SigenEnergyManager CLAUDE.md).
+
+        Cheap by design: hourly poll, one Pushover per event ever (deduped via
+        saving_sessions_notified, persisted so a restart can't re-send), silent
+        when nothing new. A failed poll is silent too — get_saving_sessions()
+        serves the last good value or None, and this simply tries again next hour.
+        """
+        if not self.octopus:
+            return
+        try:
+            data = self.octopus.get_saving_sessions()
+        except Exception as exc:
+            log(f"[SavingSessions] get_saving_sessions() raised: {exc}", level="WARNING")
+            return
+        if not data:
+            return   # no account configured, or never successfully fetched yet
+        if not data.get("has_joined"):
+            return   # account isn't a Saving Sessions member — nothing to watch for
+
+        now_utc  = datetime.now(timezone.utc)
+        notified = set(self.store.get("saving_sessions_notified") or [])
+        new_ids  = []
+
+        for event in data.get("events") or []:
+            event_id = event.get("id")
+            start_at = event.get("start_at")
+            if not event_id or start_at is None or event_id in notified:
+                continue
+            if start_at <= now_utc:
+                # Already started or in the past — either we've seen it before (and
+                # it's in `notified`) or the plugin only just started watching after
+                # it began. Either way a push now would be pointless or late.
+                continue
+
+            tz          = _london_tz()
+            start_local = start_at.astimezone(tz) if tz else start_at
+            end_at      = event.get("end_at")
+            end_local   = (end_at.astimezone(tz) if (end_at and tz) else end_at)
+            points      = event.get("reward_per_kwh_points", 0)
+            duration_h  = ((end_at - start_at).total_seconds() / 3600.0) if end_at else None
+
+            when = start_local.strftime("%a %d %b, %H:%M")
+            if end_local:
+                when += f"-{end_local.strftime('%H:%M')}"
+            body = (
+                f"Octopus Saving Session: {when}"
+                + (f" ({duration_h:.1f}h)" if duration_h else "")
+                + f". Extra export above your usual baseline earns {points} Octopoints/kWh "
+                "on top of the normal export rate."
+            )
+            self._send_pushover("Octopus Saving Session announced", body, priority="0")
+            log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
+                f"{points} pts/kWh")
+            new_ids.append(event_id)
+
+        if new_ids:
+            notified.update(new_ids)
+            # Cap it — this only needs to remember enough to dedupe recent
+            # announcements, not the account's whole history.
+            self.store["saving_sessions_notified"] = list(notified)[-200:]
+            self._save_accumulators()   # persist now so a restart can't re-send these
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
@@ -9200,6 +9285,9 @@ class Plugin(indigo.PluginBase):
             # so a restart during an active warning doesn't re-send the Pushover.
             "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
             "storm_level":               self.store.get("storm_level", "none"),
+            # Saving Sessions notified-event ids — not day-specific, persisted so a
+            # restart between the announcement and the session can't re-send the push.
+            "saving_sessions_notified":  list(self.store.get("saving_sessions_notified") or [])[-200:],
             # Restart-critical control state. These also live in pluginPrefs,
             # but runtime pref writes only reach .indiPref on a GRACEFUL
             # shutdown — a crash or hard-kill (plausible in exactly the
@@ -9261,6 +9349,8 @@ class Plugin(indigo.PluginBase):
                 self.store["storm_alerted_level"] = data.get("storm_alerted_level")
             if data.get("storm_level"):
                 self.store["storm_level"] = data.get("storm_level")
+            if data.get("saving_sessions_notified"):
+                self.store["saving_sessions_notified"] = list(data["saving_sessions_notified"])[-200:]
             # Restart-critical control state, restored regardless of day.
             # pluginPrefs copies (written by the same paths) are kept as a
             # fallback for installs upgrading from before v5.43 — startup()'s
