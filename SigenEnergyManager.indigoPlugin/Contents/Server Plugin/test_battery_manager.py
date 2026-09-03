@@ -22,7 +22,9 @@ from battery_manager import (
     ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT,
     ACTION_SAVING_SESSION,
+    ACTION_HAPPY_HOUR_IMPORT,
     saving_session_exportable_kwh,
+    happy_hour_import_kwh,
     TARIFF_TRACKER,
     TARIFF_GO,
     FLOOD_PREV_TARGET_PCT,
@@ -107,6 +109,9 @@ def _make_snapshot(
     bias_factor_today=1.0,
     saving_session_active=False,
     saving_session_hours=1.0,
+    happy_hour_active=False,
+    happy_hour_hours=1.0,
+    inverter_max_kw=10.0,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -154,6 +159,9 @@ def _make_snapshot(
         weekend_kwh            = weekend_kwh,
         saving_session_active  = saving_session_active,
         saving_session_hours   = saving_session_hours,
+        happy_hour_active      = happy_hour_active,
+        happy_hour_hours       = happy_hour_hours,
+        inverter_max_kw        = inverter_max_kw,
     )
 
 
@@ -2248,6 +2256,94 @@ class TestSavingSessionOverride(unittest.TestCase):
         # The negative control: without the flag the branch must be invisible.
         snap = _make_snapshot(soc_pct=95.0, export_enabled=True, now_hour=20)
         self.assertNotEqual(self.mgr.evaluate(snap).action, ACTION_SAVING_SESSION)
+
+
+
+class TestHappyHourImportKwh(unittest.TestCase):
+    """Three ceilings: headroom to target, the window, and Octopus's fair-use cap."""
+
+    def _kwh(self, **kw):
+        args = dict(soc_pct=50.0, capacity_kwh=35.04, target_soc_pct=93.0,
+                    charge_kw=10.0, window_hours=1.0)
+        args.update(kw)
+        return happy_hour_import_kwh(**args)
+
+    def test_window_is_the_binding_ceiling_when_the_battery_is_low(self):
+        # 50% -> 93% of 35.04 = 15.07 kWh of headroom, but only 10 kWh fits in an hour.
+        self.assertEqual(self._kwh(), 10.0)
+
+    def test_headroom_binds_when_the_battery_is_nearly_full(self):
+        # 88% -> 93% = 1.75 kWh, well under the 10 kWh the window allows.
+        self.assertEqual(self._kwh(soc_pct=88.0), 1.75)
+
+    def test_at_or_above_target_imports_nothing(self):
+        self.assertEqual(self._kwh(soc_pct=93.0), 0.0)
+        self.assertEqual(self._kwh(soc_pct=97.0), 0.0)
+
+    def test_a_trivial_amount_is_not_worth_the_mode_switch(self):
+        # 92.9% -> 93% is 0.035 kWh.
+        self.assertEqual(self._kwh(soc_pct=92.9), 0.0)
+
+    def test_fair_use_cap_cannot_bind_in_one_hour_but_is_honoured(self):
+        # Unreachable at 10 kW x 1 h, so it must not interfere...
+        self.assertEqual(self._kwh(soc_pct=10.0), 10.0)
+        # ...but a longer window or a bigger inverter must still respect it.
+        self.assertEqual(self._kwh(soc_pct=10.0, window_hours=3.0), 16.0)
+        self.assertEqual(self._kwh(soc_pct=10.0, window_hours=3.0, fair_use_cap_kwh=5.0), 5.0)
+
+    def test_it_fills_to_target_not_to_full(self):
+        # The standing rule is to stop short of 100% to protect the pack; free
+        # electricity is not a reason to override it.
+        at_target = self._kwh(soc_pct=80.0, target_soc_pct=93.0)
+        to_full   = self._kwh(soc_pct=80.0, target_soc_pct=100.0)
+        self.assertLess(at_target, to_full)
+        self.assertEqual(at_target, 4.56)
+
+    def test_unknown_inputs_never_guess(self):
+        self.assertEqual(self._kwh(soc_pct=None), 0.0)
+        self.assertEqual(self._kwh(capacity_kwh=0), 0.0)
+        self.assertEqual(self._kwh(charge_kw="nonsense"), 0.0)
+
+
+class TestHappyHourOverride(unittest.TestCase):
+    def setUp(self):
+        self.mgr = BatteryManager()
+
+    def test_it_imports_when_a_booked_hour_is_live(self):
+        snap = _make_snapshot(soc_pct=55.0, happy_hour_active=True, now_hour=12)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.action, ACTION_HAPPY_HOUR_IMPORT)
+        self.assertEqual(d.power_watts, 10000)
+
+    def test_axle_still_wins(self):
+        snap = _make_snapshot(soc_pct=55.0, happy_hour_active=True,
+                              vpp_active=True, export_enabled=True, now_hour=12)
+        self.assertEqual(self.mgr.evaluate(snap).action, ACTION_VPP_EXPORT)
+
+    def test_both_directions_live_fails_closed(self):
+        # A turn-down (export) and a happy hour (import) cannot both be right.
+        snap = _make_snapshot(soc_pct=55.0, happy_hour_active=True,
+                              saving_session_active=True, export_enabled=True, now_hour=12)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("refusing to guess", d.reason)
+
+    def test_full_battery_declines_and_explains_itself(self):
+        snap = _make_snapshot(soc_pct=95.0, happy_hour_active=True, now_hour=12)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("nothing worth importing", d.reason)
+
+    def test_no_export_gate_applies(self):
+        # Unlike the turn-down branch, this IMPORTS — a power-cut lockout or storm
+        # export suppression is irrelevant to it, and a storm wants a full battery.
+        snap = _make_snapshot(soc_pct=55.0, happy_hour_active=True,
+                              export_enabled=False, now_hour=12)
+        self.assertEqual(self.mgr.evaluate(snap).action, ACTION_HAPPY_HOUR_IMPORT)
+
+    def test_inactive_changes_nothing(self):
+        snap = _make_snapshot(soc_pct=55.0, now_hour=12)
+        self.assertNotEqual(self.mgr.evaluate(snap).action, ACTION_HAPPY_HOUR_IMPORT)
 
 
 if __name__ == "__main__":

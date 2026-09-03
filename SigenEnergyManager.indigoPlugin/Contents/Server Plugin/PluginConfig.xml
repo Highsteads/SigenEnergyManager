@@ -218,6 +218,14 @@
     <Field id="savingSessionExport" type="checkbox" defaultValue="false">
         <Label>Export the battery during a Saving Session:</Label>
     </Field>
+    <Field id="happyHourImport" type="checkbox" defaultValue="false">
+        <Label>Charge the battery during a Weekend Happy Hour:</Label>
+    </Field>
+    <Field id="label_happyhour_info" type="label" fontSize="small">
+        <Label>A Happy Hour is an hour of FREE electricity you book on the Octopus site, earned by two successful Power Down sessions. With this ticked, the battery grid-charges at full inverter power for that hour so the free energy is banked rather than wasted.
+
+It only ever runs for the slot you actually booked (Octopus offers four each Sunday), it fills to your configured target rather than 100%, and it stops early once the battery is full. Slots fall mid-Sunday when solar is often already filling the battery, so on a bright day there may be no room to fill and it will correctly do nothing.</Label>
+    </Field>
     <Field id="label_savingsessions_info" type="label" fontSize="small">
         <Label>Alerts are always sent when a session is announced. This checkbox is the separate question of whether the battery is driven to export during the window, which is what earns the Octopoints.
 

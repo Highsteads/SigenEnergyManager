@@ -298,6 +298,16 @@
                  battery can reach its target first. currentAction deliberately
                  stays "Self Consumption" — a hold is not a new action, it is a
                  reason, and seven dashboard pages key off the existing tokens. -->
+            <State id="happyHourActive">
+                <ValueType boolType="TrueFalse">Boolean</ValueType>
+                <TriggerLabel>Happy Hour import active</TriggerLabel>
+                <ControlPageLabel>Happy Hour import active</ControlPageLabel>
+            </State>
+            <State id="happyHourFreeKwhLast">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Free kWh banked in the last Happy Hour</TriggerLabel>
+                <ControlPageLabel>Happy Hour free kWh</ControlPageLabel>
+            </State>
             <State id="bankFirstActive">
                 <ValueType>Boolean</ValueType>
                 <TriggerLabel>Bank-first hold changed</TriggerLabel>
@@ -336,6 +346,7 @@
                         <Option value="stopExport">Export Stopping</Option>
                         <Option value="vppExport">VPP Export Active</Option>
                         <Option value="savingSession">Saving Session Export</Option>
+                        <Option value="happyHourImport">Happy Hour Import</Option>
                     </List>
                 </ValueType>
                 <TriggerLabel>Battery mode changed</TriggerLabel>

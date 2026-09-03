@@ -2433,6 +2433,62 @@ class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
         self.assertEqual(len(self._run(["1234"], 5899)), 1)
 
 
+class TestHappyHourWindowReader(unittest.TestCase):
+    """The two readers share ONE cache, so the risk is cross-contamination:
+    a turn-down must never be driven as a happy hour, or vice versa."""
+
+    def _p(self, rows, hh=True, ss=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_windows": rows}
+        p.pluginPrefs = {"happyHourImport": hh, "savingSessionExport": ss}
+        return p
+
+    def _row(self, direction, start_h=-0.25, end_h=0.75):
+        now = datetime.now(timezone.utc)
+        return {"id": 1, "points": 0, "direction": direction,
+                "start": (now + timedelta(hours=start_h)).isoformat(),
+                "end":   (now + timedelta(hours=end_h)).isoformat()}
+
+    def test_a_live_happy_hour_is_returned(self):
+        w = self._p([self._row("WEEKEND_HAPPY_HOUR")])._happy_hour_window()
+        self.assertIsNotNone(w)
+        self.assertAlmostEqual(w["hours"], 1.0, places=2)
+
+    def test_a_turn_down_is_NOT_returned_as_a_happy_hour(self):
+        self.assertIsNone(self._p([self._row("TURN_DOWN")])._happy_hour_window())
+
+    def test_a_happy_hour_is_NOT_returned_as_a_turn_down(self):
+        self.assertIsNone(self._p([self._row("WEEKEND_HAPPY_HOUR")])._saving_session_window())
+
+    def test_each_reader_picks_its_own_from_a_mixed_cache(self):
+        rows = [self._row("TURN_DOWN"), self._row("WEEKEND_HAPPY_HOUR")]
+        p = self._p(rows)
+        self.assertEqual(p._happy_hour_window()["direction"], "WEEKEND_HAPPY_HOUR")
+        self.assertEqual(p._saving_session_window()["direction"], "TURN_DOWN")
+
+    def test_each_pref_gates_only_its_own_feature(self):
+        rows = [self._row("TURN_DOWN"), self._row("WEEKEND_HAPPY_HOUR")]
+        p = self._p(rows, hh=False, ss=True)
+        self.assertIsNone(p._happy_hour_window())
+        self.assertIsNotNone(p._saving_session_window())
+        p = self._p(rows, hh=True, ss=False)
+        self.assertIsNotNone(p._happy_hour_window())
+        self.assertIsNone(p._saving_session_window())
+
+    def test_string_false_pref_is_off(self):
+        p = self._p([self._row("WEEKEND_HAPPY_HOUR")])
+        p.pluginPrefs = {"happyHourImport": "false"}
+        self.assertIsNone(p._happy_hour_window())
+
+    def test_a_future_or_past_window_is_not_live(self):
+        self.assertIsNone(self._p([self._row("WEEKEND_HAPPY_HOUR", 2, 3)])._happy_hour_window())
+        self.assertIsNone(self._p([self._row("WEEKEND_HAPPY_HOUR", -3, -2)])._happy_hour_window())
+
+    def test_a_row_with_no_direction_is_never_driven(self):
+        row = self._row("WEEKEND_HAPPY_HOUR"); del row["direction"]
+        self.assertIsNone(self._p([row])._happy_hour_window())
+
+
 class TestSavingSessionDirectionGuard(unittest.TestCase):
     """Only a TURN_DOWN is earned by exporting.
 
@@ -2470,10 +2526,21 @@ class TestSavingSessionDirectionGuard(unittest.TestCase):
         # Power Up wants MORE consumption — exporting would be exactly backwards.
         self.assertEqual(self._windows("TURN_UP"), [])
 
-    def test_weekend_happy_hour_is_never_cached(self):
-        # Free electricity. Exporting the battery through it wastes the free power
-        # AND drains the battery. These already exist in the live feed.
-        self.assertEqual(self._windows("WEEKEND_HAPPY_HOUR"), [])
+    def test_weekend_happy_hour_never_drives_an_export(self):
+        # v5.82.0 asserted a happy hour was never CACHED. v5.83.0 caches it on
+        # purpose so the import feature can find it, and the protection moved to
+        # per-reader filtering. The INTENT is unchanged and is what's asserted
+        # here: a happy hour must never reach the export path. Exporting through
+        # free electricity wastes it and drains the battery.
+        rows = self._windows("WEEKEND_HAPPY_HOUR")
+        self.assertEqual([r["direction"] for r in rows], ["WEEKEND_HAPPY_HOUR"])
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"saving_sessions_windows": rows}
+        p.pluginPrefs = {"savingSessionExport": True}
+        # Cached, but invisible to the export reader — even mid-window.
+        import datetime as _dt
+        mid = _dt.datetime.fromisoformat(rows[0]["start"]) + _dt.timedelta(minutes=5)
+        self.assertIsNone(p._saving_session_window(now_utc=mid))
 
     def test_unknown_direction_is_never_cached(self):
         # A direction Octopus adds later must not be assumed safe to export into.
@@ -2533,11 +2600,18 @@ class TestSavingSessionWindow(unittest.TestCase):
         p.pluginPrefs = {"savingSessionExport": enabled}
         return p
 
-    def _win(self, start_h, end_h):
+    def _win(self, start_h, end_h, direction="TURN_DOWN"):
+        # `direction` became required in v5.83.0 when the happy-hour reader began
+        # sharing this cache. A row without one is NEVER driven (see
+        # test_a_row_with_no_direction_is_never_driven below) — these fixtures
+        # carry it because that is what _check_saving_sessions now writes.
         now = datetime.now(timezone.utc)
-        return {"id": "1", "points": 61,
-                "start": (now + timedelta(hours=start_h)).isoformat(),
-                "end":   (now + timedelta(hours=end_h)).isoformat()}
+        row = {"id": "1", "points": 61,
+               "start": (now + timedelta(hours=start_h)).isoformat(),
+               "end":   (now + timedelta(hours=end_h)).isoformat()}
+        if direction is not None:
+            row["direction"] = direction
+        return row
 
     def test_live_window_is_returned_with_its_length(self):
         w = self._p([self._win(-0.25, 0.75)])._saving_session_window()
@@ -2560,6 +2634,13 @@ class TestSavingSessionWindow(unittest.TestCase):
         p = self._p([self._win(-0.25, 0.75)])
         p.pluginPrefs = {"savingSessionExport": "false"}
         self.assertIsNone(p._saving_session_window())
+
+    def test_a_row_with_no_direction_is_never_driven(self):
+        # Fail closed, symmetric with the happy-hour reader: an untagged row is
+        # not evidence of a turn-down, and driving the battery off one would be
+        # guessing.
+        self.assertIsNone(self._p([self._win(-0.25, 0.75, direction=None)])
+                          ._saving_session_window())
 
     def test_a_malformed_row_is_skipped_not_guessed(self):
         p = self._p([{"id": "x", "start": "nonsense", "end": "nonsense"},

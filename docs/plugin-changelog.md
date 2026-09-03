@@ -15,6 +15,66 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.83.0 — 03-09-2026
+
+**Weekend Happy Hour import — Phase 3.** During a BOOKED Octopus Happy Hour (an hour of free
+electricity, earned by two successful turn-downs), grid-charge the battery at full inverter power
+so the free energy is banked instead of wasted. Specced first in
+`docs/happy-hour-import-spec.md` and signed off before a line was written; CliveS chose passive
+fill, count-and-tag, full charge rate.
+
+**Booked is the whole point.** Octopus offers FOUR 1-hour slots each Sunday (11:00-14:00 BST) and
+only the reserved one comes back `joined` — measured 03-Sep-2026: Sun 16 Aug 12:00Z was booked,
+its three siblings were not. The cache admits joined events only, so the unbooked siblings can
+never drive anything.
+
+**It fills to the configured target, not to 100%** (`solarOverflowTargetSoc`, 93 live). Free
+electricity is not a reason to override a rule that exists to protect the pack — and following
+the pref means changing that one setting moves both features. NB the standing note says 95 while
+the live pref is 93; that discrepancy is the existing open item, not a decision taken here.
+
+**No export gate, deliberately.** Unlike the turn-down branch this IMPORTS, so a post-power-cut
+lockout or storm export-suppression is irrelevant, and a storm actively WANTS a full battery.
+The asymmetry is commented at both sites because it is exactly the kind of thing a later tidy-up
+"harmonises" into a bug.
+
+**A turn-down and a happy hour together FAILS CLOSED** — they cannot both be right and guessing
+which way to drive the battery is worse than doing nothing. They should never co-occur (weekday
+evenings vs Sunday middays), so if they do, something upstream is wrong and quietly picking one
+would hide it.
+
+**Termination is bounded three ways** — window end, target SOC, and `_check_happy_hour_overrun`,
+an independent backstop sharing no dependency with the primary path (the v5.62.0 lesson: one
+path ending a window is one path too few). Importing past a free hour means BUYING at 25p, so
+the exposure is real money. Hand-back is CONFIRMED with the `vpp_handback_pending` retry.
+
+**Free kWh is measured from ONE anchor** — the cumulative import counter captured at entry and
+persisted immediately, so a restart mid-window can neither double-count nor lose it. Surfaced as
+`happyHourFreeKwhLast`, tagged rather than blended into ordinary import: the headline
+self-sufficiency figure stays honest and matches the meter, and the Sunday dip is explainable.
+
+**One shared window cache, two readers.** `_window_of_direction` is the single implementation, so
+freshness and malformed-row handling cannot diverge; `_saving_session_window` and
+`_happy_hour_window` each filter to the direction they drive. A row with NO direction is driven
+by neither — fail closed both ways.
+
+Reuses `force_charge` (mode 0x03 + charge limit + hardware charge-cutoff backstop), the same
+proven path `ACTION_START_IMPORT` uses, so a crash mid-window cannot leave it charging unbounded.
+New `inverter_max_kw` on the snapshot — the charge decision needs the CHARGE rate, and
+`max_export_kw` is the DNO EXPORT cap (4 kW here), a different number.
+
+**Honest value: ~£8-15 across the rest of the promotion, which ends 1 November.** Slots land at
+peak solar, so a bright September Sunday leaves no headroom and it will correctly do nothing;
+October is where the money is. Scoped small on purpose. Pre-drain to manufacture headroom was
+considered and DEFERRED — revisit after one October hour shows whether it earns the extra cycle.
+
+Ships OFF (`happyHourImport`). Tests 935 -> 957; five sabotages each proven red (5/1/1/5/6), each
+asserted to have applied and each restore byte-identical. **Two existing tests were updated
+rather than deleted**: the v5.82.0 "happy hour is never cached" assertion now asserts the
+unchanged INTENT (never reaches the export path) since the mechanism moved to per-reader
+filtering, and the turn-down window fixtures gained the `direction` they now carry — plus a new
+symmetric test that an untagged row drives neither.
+
 ## v5.82.0 — 03-09-2026
 
 **NO DIRECTION GUARD — v5.81.x would have exported the battery through a Power Up and through a

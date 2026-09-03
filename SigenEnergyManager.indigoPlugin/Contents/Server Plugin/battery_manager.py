@@ -196,6 +196,7 @@ ACTION_STOP_EXPORT      = "stop_export"         # stop active legacy export (v3.
 ACTION_SOLAR_OVERFLOW   = "solar_overflow"      # daytime: cap charge so PV surplus exports
 ACTION_VPP_EXPORT       = "vpp_export"          # VPP event window: self-drive export (ignore Axle dispatch)
 ACTION_SAVING_SESSION   = "saving_session"      # Octopus Saving Session: export above baseline for Octopoints
+ACTION_HAPPY_HOUR_IMPORT = "happy_hour_import"  # Octopus Weekend Happy Hour: bank FREE grid electricity
 
 # ── Octopus Saving Session export ───────────────────────────────────────────
 # Below the Axle VPP override on purpose, and it is not close: Axle pays about
@@ -203,6 +204,61 @@ ACTION_SAVING_SESSION   = "saving_session"      # Octopus Saving Session: export
 # Axle is worth ~13x per kWh, so it wins every conflict and it wins the stored
 # energy too — this branch may only spend what Axle has no plan for.
 SAVING_SESSION_MIN_KWH = 1.0     # below this the burst is not worth a mode switch
+
+
+# ── Octopus Weekend Happy Hour import ───────────────────────────────────────
+# The mirror image of the turn-down branch: an hour of FREE electricity, so the
+# right move is to IMPORT as hard as the inverter allows and bank it.
+#
+# Octopus offers four 1-hour slots each Sunday (11:00-14:00 BST, measured
+# 03-Sep-2026) and only the one the owner BOOKED carries joined=True. That is
+# peak solar, so headroom — not the charge rate and not the fair-use cap — is
+# almost always the binding constraint.
+HAPPY_HOUR_FAIR_USE_KWH = 16.0    # Octopus's stated fair-usage limit per free hour
+HAPPY_HOUR_MIN_KWH      = 0.5     # below this the mode switch is not worth making
+
+
+def happy_hour_import_kwh(soc_pct: float,
+                          capacity_kwh: float,
+                          target_soc_pct: float,
+                          charge_kw: float,
+                          window_hours: float,
+                          fair_use_cap_kwh: float = HAPPY_HOUR_FAIR_USE_KWH,
+                          min_worthwhile_kwh: float = HAPPY_HOUR_MIN_KWH) -> float:
+    """kWh worth importing during a booked Happy Hour. 0.0 = do not run.
+
+    Three ceilings, whichever bites first:
+      * HEADROOM to the configured target SOC — deliberately the target, NOT 100%.
+        CliveS's standing rule is to stop short of full to protect the pack, and
+        free electricity is not a reason to override a rule that exists for the
+        battery's sake. It follows whatever `solarOverflowTargetSoc` is set to
+        (93 live at the time of writing), so changing that moves this too.
+      * The WINDOW — charge_kw x window_hours. At ~10 kW over one hour this is
+        ~10 kWh.
+      * Octopus's FAIR-USE cap. At one hour and 10 kW it cannot bind; honoured
+        anyway so a future 2-hour slot or a bigger inverter cannot walk past it.
+
+    Returns 0.0 rather than a token amount when there is nothing worth having —
+    on a sunny Sunday the battery is usually already at target, and that is a
+    legitimate "nothing to do", not a fault.
+    """
+    try:
+        soc      = float(soc_pct)
+        cap_kwh  = float(capacity_kwh)
+        target   = float(target_soc_pct)
+        rate_kw  = max(0.0, float(charge_kw))
+        hours    = max(0.0, float(window_hours))
+        fair_cap = max(0.0, float(fair_use_cap_kwh))
+    except (TypeError, ValueError):
+        return 0.0          # an unknown input is not a licence to guess
+    if cap_kwh <= 0:
+        return 0.0
+
+    headroom = (target - soc) / 100.0 * cap_kwh
+    kwh = min(headroom, rate_kw * hours, fair_cap)
+    if kwh < max(0.0, float(min_worthwhile_kwh)):
+        return 0.0
+    return round(kwh, 2)
 
 
 def saving_session_exportable_kwh(battery_at_dawn_kwh: float,
@@ -395,6 +451,10 @@ class ManagerSnapshot:
     health_cutoff_pct:  float = 1.0      # hardware discharge floor
     export_enabled:     bool  = False    # export MPAN active
     max_export_kw:      float = 4.0      # DNO export cap (kW)
+    inverter_max_kw:    float = 10.0     # inverter charge/discharge ceiling (kW).
+                                         # Added v5.83.0: the Happy Hour import decision
+                                         # needs the CHARGE rate, and max_export_kw is the
+                                         # DNO EXPORT cap (4 kW here) — a different number.
     export_rate_p:      float = 12.0     # live export unit rate (p/kWh), for advisory revenue
 
     # Daily consumption estimates (24h sufficiency model)
@@ -455,7 +515,12 @@ class ManagerSnapshot:
     # session pays nothing, so exporting into one would drain the battery for
     # the 12p export rate alone.
     saving_session_active:   bool  = False
-    saving_session_hours:    float = 1.0    # length of the live window (hours)
+    saving_session_hours:    float = 1.0
+
+    # Octopus Weekend Happy Hour: True only while a BOOKED (joined) free-electricity
+    # window is live and the feature is enabled. plugin.py owns that test.
+    happy_hour_active:       bool  = False
+    happy_hour_hours:        float = 1.0    # length of the live window (hours)
 
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
@@ -781,6 +846,49 @@ class BatteryManager:
             return Decision(
                 action = ACTION_VPP_EXPORT,
                 reason = "VPP event active — self-driving export (Axle dispatch ignored)",
+            )
+        if snapshot.saving_session_active and snapshot.happy_hour_active:
+            # A turn-down (export) and a happy hour (import) cannot both be right,
+            # and guessing which way to push the battery is the one thing worse
+            # than doing nothing. FAIL CLOSED and say so — these should never
+            # co-occur (weekday evenings vs Sunday middays), so if they do,
+            # something upstream is wrong and quietly picking one would hide it.
+            return Decision(
+                action = ACTION_SELF_CONSUMPTION,
+                reason = "Saving Session AND Happy Hour both live — refusing to guess "
+                         "which way to drive the battery; standing down",
+            )
+        if snapshot.happy_hour_active:
+            # FREE electricity: import as hard as the inverter allows, up to the
+            # configured target SOC. Note there is deliberately NO export_enabled
+            # gate here, unlike the turn-down branch above — this IMPORTS, so a
+            # post-power-cut lockout or storm suppression is irrelevant to it, and
+            # a storm actively WANTS a full battery. Do not "harmonise" the two.
+            kwh = happy_hour_import_kwh(
+                soc_pct        = snapshot.current_soc_pct,
+                capacity_kwh   = snapshot.capacity_kwh,
+                target_soc_pct = snapshot.solar_overflow_target_pct,
+                charge_kw      = snapshot.inverter_max_kw,
+                window_hours   = snapshot.happy_hour_hours,
+            )
+            if kwh > 0:
+                return Decision(
+                    action          = ACTION_HAPPY_HOUR_IMPORT,
+                    reason          = (f"Octopus Happy Hour — free electricity, importing up to "
+                                       f"{kwh:.1f} kWh to fill headroom "
+                                       f"({snapshot.current_soc_pct:.0f}% -> "
+                                       f"{snapshot.solar_overflow_target_pct:.0f}% target)"),
+                    target_soc_pct  = snapshot.solar_overflow_target_pct,
+                    power_watts     = int(max(0.0, snapshot.inverter_max_kw) * 1000),
+                )
+            # Already at target is the COMMON case on a sunny Sunday and is not a
+            # fault — but say it, so a free hour that banked nothing is explained
+            # rather than looking like the feature failing to fire.
+            return Decision(
+                action = ACTION_SELF_CONSUMPTION,
+                reason = (f"Happy Hour window, but nothing worth importing: battery at "
+                          f"{snapshot.current_soc_pct:.0f}% against a "
+                          f"{snapshot.solar_overflow_target_pct:.0f}% target"),
             )
         if snapshot.saving_session_active:
             # STRICTLY BELOW the VPP branch above, and the ordering is the whole

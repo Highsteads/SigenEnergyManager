@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.82.0)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.83.0)
 # Date:        03-09-2026
-# Version:     5.82.0
+# Version:     5.83.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -152,7 +152,7 @@ from sigenergy_modbus import SigenergyModbus
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               GAS_KWH_PER_M3)
-from octopus_api      import SAVING_SESSION_TURN_DOWN
+from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
 # The ONE Europe/London implementation. Imported, never re-declared: copies are
 # what put two sites an hour out in the first place, and there is no version of
 # "just this once" that does not end up as copy number six.
@@ -165,7 +165,7 @@ from battery_manager  import (
     BatteryManager, ManagerSnapshot, TariffData,
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
-    ACTION_VPP_EXPORT, ACTION_SAVING_SESSION,
+    ACTION_VPP_EXPORT, ACTION_SAVING_SESSION, ACTION_HAPPY_HOUR_IMPORT,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
@@ -205,6 +205,7 @@ ACTION_MODE_TOKEN = {
     ACTION_STOP_EXPORT:      "stopExport",
     ACTION_VPP_EXPORT:       "vppExport",     # dedicated enum token (currentMode.vppExport trigger)
     ACTION_SAVING_SESSION:   "savingSession",
+    ACTION_HAPPY_HOUR_IMPORT: "happyHourImport",
 }
 
 # Minimum inverter readings required per half-hourly slot before we trust the
@@ -1077,6 +1078,9 @@ class Plugin(indigo.PluginBase):
         self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
         self.store["saving_sessions_windows"]   = []    # joined windows, cached for the manager
         self.store["saving_session_export_active"] = False
+        self.store["happy_hour_import_active"]  = False
+        self.store["happy_hour_anchor_kwh"]     = None   # grid-import counter at window entry
+        self.store["happy_hour_free_kwh"]       = 0.0    # free kWh banked in the last window
 
         # Half-hourly SQLite logging — delta anchors (reset each write)
         self.store["hh_anchor_pv_kwh"]     = None  # cumulative PV at last slot boundary
@@ -2548,6 +2552,9 @@ class Plugin(indigo.PluginBase):
         # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64)
         self._retry_vpp_handback()
 
+        # 13. Happy Hour overrun backstop — independent of the primary end path
+        self._check_happy_hour_overrun()
+
     def _retry_vpp_handback(self):
         """Re-assert Self Consumption after a VPP hand-back that was never confirmed.
 
@@ -3408,17 +3415,21 @@ class Plugin(indigo.PluginBase):
         # Octopus Saving Session — a JOINED window live right now, from the cache the
         # hourly poll leaves behind (never a network call on the manager cycle).
         _ss_window = self._saving_session_window()
+        _hh_window = self._happy_hour_window()
 
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
             capacity_kwh       = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
             saving_session_active = _ss_window is not None,
             saving_session_hours  = float((_ss_window or {}).get("hours", 1.0)),
+            happy_hour_active     = _hh_window is not None,
+            happy_hour_hours      = float((_hh_window or {}).get("hours", 1.0)),
             efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
             dawn_target_pct    = self._dawn_target_pct(),                      # v4.0: retained for VPP/storm
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
+            inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
             export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), DEFAULT_EXPORT_RATE_P),
             weekday_kwh        = weekday_pref,
             weekend_kwh        = weekend_pref,
@@ -4257,7 +4268,8 @@ class Plugin(indigo.PluginBase):
             {"id": e.get("id"),
              "start": e["start_at"].isoformat(),
              "end":   e["end_at"].isoformat(),
-             "points": e.get("reward_per_kwh_points", 0)}
+             "points": e.get("reward_per_kwh_points", 0),
+             "direction": e.get("direction")}
             for e in (data.get("events") or [])
             if e.get("joined") and e.get("end_at") and e["end_at"] > now_utc
             and e["start_at"] < horizon
@@ -4267,7 +4279,10 @@ class Plugin(indigo.PluginBase):
             # THIS SAME feed (12 of 62 events on this account are happy hours). An
             # absent or unrecognised direction is never treated as a turn-down.
             # Same class as the Axle import/export guard added in v5.57.0.
-            and e.get("direction") == SAVING_SESSION_TURN_DOWN
+            # Both drivable directions are cached WITH their direction; each reader
+            # filters to the one it drives. One cache means the freshness logic
+            # cannot diverge between the two features.
+            and e.get("direction") in (SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR)
         ]
 
         if new_ids:
@@ -4299,6 +4314,99 @@ class Plugin(indigo.PluginBase):
             return SAVING_SESSIONS_SOON_INTERVAL
         return SAVING_SESSIONS_INTERVAL
 
+    def _end_happy_hour_import(self, why):
+        """Stop a Happy Hour import and record what it banked.
+
+        Latches on the FLAG, not the clock, so this is equally the path for the
+        window ending, the battery reaching target, and the overrun backstop.
+        The hand-back is CONFIRMED — an unconfirmed write is what left a VPP
+        window exporting past its end (v5.64.0) — and an unconfirmed one here
+        would leave the house BUYING electricity after the free hour, which is
+        the more expensive direction to get wrong.
+        """
+        anchor = self.store.get("happy_hour_anchor_kwh")
+        banked = None
+        if anchor is not None:
+            banked = max(0.0, float(self.store.get("grid_import_daily_kwh", 0.0)) - float(anchor))
+            self.store["happy_hour_free_kwh"] = round(banked, 2)
+        self.store["happy_hour_import_active"] = False
+        self.store["happy_hour_anchor_kwh"]    = None
+        self.store["import_active"]            = False
+        self.store["import_target_soc"]        = 0.0
+
+        if self.modbus and self.modbus.connected:
+            if not self.modbus.set_self_consumption():
+                log("[Manager] Happy Hour hand-back to Self Consumption was NOT "
+                    "confirmed — retrying on the next tick", level="WARNING")
+                self.store["vpp_handback_pending"] = True
+            self._restore_import_cutoff()
+        else:
+            log("[Manager] Happy Hour ended with the inverter unreachable — the "
+                "hand-back will be re-asserted when it returns", level="WARNING")
+            self.store["vpp_handback_pending"] = True
+
+        banked_str = f"{banked:.2f} kWh banked free" if banked is not None else "amount unknown"
+        log(f"[Manager] Happy Hour import ended ({why}) — {banked_str}")
+        self._save_accumulators()
+
+    def _check_happy_hour_overrun(self):
+        """Second, independent guard on an over-running Happy Hour import.
+
+        Mirrors _check_vpp_overrun (v5.62.0), and for the same reason: the
+        primary end path is one path, and one path ending a window is one path
+        too few. Sharing no dependency with it — no Octopus call, no prefs, just
+        the stored window end — is the whole point. Importing past a free hour
+        means BUYING at 25p, so the exposure here is real money.
+        """
+        if not self.store.get("happy_hour_import_active"):
+            return
+        try:
+            w = self._happy_hour_window()
+            if w is not None:
+                return                      # still inside the booked window
+            # No live window but the flag is set: either it ended and the primary
+            # path missed it, or the pref was switched off mid-window. Either way,
+            # stop importing.
+            log("[Manager] Happy Hour import still running with no live window — "
+                "force-ending it", level="WARNING")
+            self._end_happy_hour_import("overrun backstop: no live window")
+        except Exception as exc:                                # noqa: BLE001
+            log(f"[Manager] Happy Hour overrun check failed: {exc}", level="WARNING")
+
+    def _window_of_direction(self, direction, pref, now_utc=None):
+        """The live cached window of one direction, or None. Pure cache read.
+
+        Shared by both features so the freshness and malformed-row handling can
+        only ever be written once. `pref` is the checkbox that gates driving the
+        battery for that direction — read via as_bool, because Indigo stores a
+        saved checkbox as the STRING "false" and bare bool() calls that True.
+        """
+        if not _as_bool(self.pluginPrefs.get(pref), False):
+            return None
+        now_utc = now_utc or datetime.now(timezone.utc)
+        for w in self.store.get("saving_sessions_windows") or []:
+            if w.get("direction") != direction:
+                continue
+            try:
+                start = datetime.fromisoformat(w["start"])
+                end   = datetime.fromisoformat(w["end"])
+            except (KeyError, TypeError, ValueError):
+                continue        # malformed row — skip it, never guess a window
+            if start <= now_utc < end:
+                hours = max(0.0, (end - start).total_seconds() / 3600.0)
+                return dict(w, hours=hours)
+        return None
+
+    def _happy_hour_window(self, now_utc=None):
+        """A BOOKED Octopus Weekend Happy Hour live right now, or None.
+
+        Booked is the whole point: Octopus offers four 1-hour slots each Sunday
+        and only the one the owner reserved comes back joined — the cache admits
+        joined events only, so the three unbooked siblings never reach here.
+        """
+        return self._window_of_direction(
+            SAVING_SESSION_HAPPY_HOUR, "happyHourImport", now_utc)
+
     def _saving_session_window(self, now_utc=None):
         """The JOINED Saving Session window live right now, or None.
 
@@ -4309,19 +4417,8 @@ class Plugin(indigo.PluginBase):
         `savingSessionExport` pref: this drives the battery, so it is OFF unless
         the owner turned it on.
         """
-        if not _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
-            return None
-        now_utc = now_utc or datetime.now(timezone.utc)
-        for w in self.store.get("saving_sessions_windows") or []:
-            try:
-                start = datetime.fromisoformat(w["start"])
-                end   = datetime.fromisoformat(w["end"])
-            except (KeyError, TypeError, ValueError):
-                continue        # malformed row — skip it, never guess a window
-            if start <= now_utc < end:
-                hours = max(0.0, (end - start).total_seconds() / 3600.0)
-                return dict(w, hours=hours)
-        return None
+        return self._window_of_direction(
+            SAVING_SESSION_TURN_DOWN, "savingSessionExport", now_utc)
 
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
@@ -4469,6 +4566,34 @@ class Plugin(indigo.PluginBase):
                 self.store["saving_session_export_active"] = True
             self._drive_vpp_export()
 
+        elif action == ACTION_HAPPY_HOUR_IMPORT:
+            # FREE electricity for one booked hour: grid-charge at inverter max.
+            # Reuses force_charge (mode 0x03 + charge limit + the hardware charge
+            # cutoff backstop) — the same proven path ACTION_START_IMPORT drives,
+            # so a crash mid-window cannot leave it charging unbounded.
+            if not self.store.get("happy_hour_import_active"):
+                power_w = min(int(decision.power_watts or 10000),
+                              int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
+                target  = decision.target_soc_pct or 93.0
+                cutoff  = min(float(target) + 3.0, 100.0)
+                if self.modbus and self.modbus.connected and \
+                        self.modbus.force_charge(power_w, cutoff_soc=cutoff):
+                    # Anchor the free-kWh measurement on the cumulative import
+                    # counter, captured ONCE at entry. A delta from one anchor is
+                    # the only way a restart mid-window cannot double-count.
+                    self.store["happy_hour_import_active"] = True
+                    self.store["happy_hour_anchor_kwh"] = self.store.get(
+                        "grid_import_daily_kwh", 0.0)
+                    self.store["import_active"] = True
+                    self.store["import_target_soc"] = float(target)
+                    self._set_import_cutoff(cutoff)
+                    self._save_accumulators()   # persist the anchor immediately
+                    log(f"[Manager] Happy Hour import — {decision.reason}")
+                else:
+                    log("[Manager] Happy Hour import could not be started "
+                        "(inverter unreachable or the charge command was refused)",
+                        level="WARNING")
+
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
                 log("[Manager] Stopping night export - returning to self-consumption")
@@ -4531,6 +4656,9 @@ class Plugin(indigo.PluginBase):
             # get here — the manager also drops out of the branch mid-window if the
             # dawn projection turns against us, and that must stand the export down
             # just as promptly. Latch on the flag, not on the clock.
+            if self.store.get("happy_hour_import_active"):
+                self._end_happy_hour_import("window ended or battery reached target")
+
             if self.store.get("saving_session_export_active"):
                 self.store["saving_session_export_active"] = False
                 log("[Manager] Saving Session export ended — returning to self-consumption")
@@ -7282,6 +7410,7 @@ class Plugin(indigo.PluginBase):
             ACTION_STOP_EXPORT:      "Export Stopping",
             ACTION_VPP_EXPORT:       "VPP Export Active",
             ACTION_SAVING_SESSION:   "Saving Session Export",
+            ACTION_HAPPY_HOUR_IMPORT: "Happy Hour Import",
         }.get(decision.action, decision.action)
 
         # Flood prevention visibility (v4.5)
@@ -7374,6 +7503,12 @@ class Plugin(indigo.PluginBase):
         # v5.78.0. Same first-tick guard as currentMode above — a state added in
         # this version is not registered until stateListOrDisplayStateIdChanged
         # has run, and writing it early logs a red line for nothing.
+        if "happyHourActive" in dev.states:
+            states.append({"key": "happyHourActive",
+                           "value": str(bool(self.store.get("happy_hour_import_active")))})
+        if "happyHourFreeKwhLast" in dev.states:
+            states.append({"key": "happyHourFreeKwhLast",
+                           "value": round(float(self.store.get("happy_hour_free_kwh", 0.0) or 0.0), 2)})
         if "awayMode" in dev.states:
             states.append({"key": "awayMode",
                            "value": str(bool(self.store.get("away_active")))})
@@ -9458,6 +9593,11 @@ class Plugin(indigo.PluginBase):
             # Saving Sessions notified-event ids — not day-specific, persisted so a
             # restart between the announcement and the session can't re-send the push.
             "saving_sessions_notified":  list(self.store.get("saving_sessions_notified") or [])[-200:],
+            # Happy Hour: the anchor is the ONLY way the free-kWh figure survives a
+            # restart mid-window without double-counting, so it is persisted on entry.
+            "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
+            "happy_hour_anchor_kwh":     self.store.get("happy_hour_anchor_kwh"),
+            "happy_hour_free_kwh":       self.store.get("happy_hour_free_kwh", 0.0),
             # Restart-critical control state. These also live in pluginPrefs,
             # but runtime pref writes only reach .indiPref on a GRACEFUL
             # shutdown — a crash or hard-kill (plausible in exactly the
@@ -9521,6 +9661,13 @@ class Plugin(indigo.PluginBase):
                 self.store["storm_level"] = data.get("storm_level")
             if data.get("saving_sessions_notified"):
                 self.store["saving_sessions_notified"] = list(data["saving_sessions_notified"])[-200:]
+            # Restore a Happy Hour that was mid-window when we stopped. The overrun
+            # backstop then ends it on the first tick if the window has since closed.
+            if data.get("happy_hour_import_active"):
+                self.store["happy_hour_import_active"] = True
+                self.store["happy_hour_anchor_kwh"] = data.get("happy_hour_anchor_kwh")
+            if data.get("happy_hour_free_kwh") is not None:
+                self.store["happy_hour_free_kwh"] = data.get("happy_hour_free_kwh", 0.0)
             # Restart-critical control state, restored regardless of day.
             # pluginPrefs copies (written by the same paths) are kept as a
             # fallback for installs upgrading from before v5.43 — startup()'s
