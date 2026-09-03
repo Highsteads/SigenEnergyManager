@@ -4368,5 +4368,72 @@ class TestBankFirstLogging(unittest.TestCase):
         self.assertIn("WARNING", levels)
 
 
+class TestHappyHourAlertBody(unittest.TestCase):
+    """What the alert SAYS, given what the reader can actually do about it.
+
+    Written after 03-Sep-2026, when four pushes went out telling CliveS to "opt in
+    to earn" on four Happy Hour slots his token balance could not pay for. The
+    advice was impossible to act on, so the four interruptions bought nothing. The
+    rule these tests hold down: never instruct someone to do what they cannot do,
+    and never report an UNKNOWN balance as if it were a known zero.
+    """
+
+    def _p(self, tokens, need=2, import_on=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"happy_hour_tokens": tokens}
+        p.pluginPrefs = {"happyHourTokensRequired": need,
+                         "happyHourImport": import_on}
+        return p
+
+    def _ev(self, joined=False, capacity="AVAILABLE"):
+        return {"joined": joined, "capacity": capacity,
+                "direction": "WEEKEND_HAPPY_HOUR"}
+
+    def test_too_few_tokens_says_so_and_does_not_tell_him_to_book(self):
+        body = self._p(1)._happy_hour_alert_body("Sun 06 Sep, 11:00-12:00", 1.0, self._ev())
+        self.assertIn("1 of the 2 tokens", body)
+        self.assertNotIn("book it on the octopus site", body.lower())
+
+    def test_enough_tokens_does_tell_him_to_book(self):
+        body = self._p(2)._happy_hour_alert_body("Sun 06 Sep, 11:00-12:00", 1.0, self._ev())
+        self.assertIn("book it", body.lower())
+        self.assertNotIn("cannot be booked", body)
+
+    def test_an_unknown_balance_is_never_reported_as_zero(self):
+        """None means NOT REPORTED. Saying "you have 0 tokens" would be a claim the
+        API never made, and it is the exact shape of the absent-state bug."""
+        body = self._p(None)._happy_hour_alert_body("Sun", 1.0, self._ev())
+        self.assertNotIn("0 of the", body)
+        self.assertNotIn("0 tokens", body)
+        self.assertIn("if you have the tokens", body)
+
+    def test_a_full_slot_is_not_offered_however_many_tokens_are_held(self):
+        body = self._p(99)._happy_hour_alert_body("Sun", 1.0, self._ev(capacity="FULL"))
+        self.assertIn("full", body.lower())
+        self.assertNotIn("book it", body.lower())
+
+    def test_an_already_booked_slot_says_the_battery_will_charge(self):
+        body = self._p(0)._happy_hour_alert_body("Sun", 1.0, self._ev(joined=True))
+        self.assertIn("BOOKED", body)
+        self.assertIn("grid-charge", body)
+
+    def test_a_booked_slot_with_the_feature_OFF_says_it_will_not_charge(self):
+        """The worst silent outcome: booked, free power waiting, and the plugin
+        sitting it out because a checkbox is unticked. Say so at booking time."""
+        body = self._p(0, import_on=False)._happy_hour_alert_body("Sun", 1.0, self._ev(joined=True))
+        self.assertIn("BOOKED", body)
+        self.assertIn("switched off", body)
+
+    def test_zero_required_stops_the_token_wording_entirely(self):
+        body = self._p(0, need=0)._happy_hour_alert_body("Sun", 1.0, self._ev())
+        self.assertNotIn("tokens needed", body)
+
+    def test_a_junk_required_pref_falls_back_rather_than_raising(self):
+        p = self._p(1, need="")
+        self.assertEqual(p._happy_hour_tokens_required(), 2)
+        p.pluginPrefs["happyHourTokensRequired"] = "not a number"
+        self.assertEqual(p._happy_hour_tokens_required(), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

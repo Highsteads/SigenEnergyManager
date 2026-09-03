@@ -303,7 +303,12 @@
                 <TriggerLabel>Happy Hour import active</TriggerLabel>
                 <ControlPageLabel>Happy Hour import active</ControlPageLabel>
             </State>
-            <State id="happyHourFreeKwhLast">
+            <State id="happyHourTokens">
+            <ValueType>Integer</ValueType>
+            <TriggerLabel>Happy Hour Tokens</TriggerLabel>
+            <ControlPageLabel>Happy Hour Tokens</ControlPageLabel>
+        </State>
+        <State id="happyHourFreeKwhLast">
                 <ValueType>Number</ValueType>
                 <TriggerLabel>Free kWh banked in the last Happy Hour</TriggerLabel>
                 <ControlPageLabel>Happy Hour free kWh</ControlPageLabel>

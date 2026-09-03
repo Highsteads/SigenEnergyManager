@@ -820,10 +820,13 @@ class OctopusAPI:
             {
               "has_joined": bool,   # hasJoinedCampaign — the account-level Saving
                                      # Sessions membership flag, not per-event
+              "token_balance": int|None,  # Weekend Happy Hour tokens, reported
+                                     # verbatim. None = not reported, NOT zero.
               "events": [
                   {"id": str, "code": str,
                    "start_at": datetime (aware, UTC), "end_at": datetime (aware, UTC),
                    "reward_per_kwh_points": int,
+                   "capacity": str|None,  # capacityStatus, e.g. "AVAILABLE"
                    "joined": bool,    # per-EVENT opt-in; NOT implied by has_joined
                    "direction": str},  # TURN_DOWN | TURN_UP | WEEKEND_HAPPY_HOUR | UNKNOWN
                   ...
@@ -851,9 +854,10 @@ class OctopusAPI:
         query = json.dumps({
             "query": (
                 "query ($a: String!) { savingSessions {"
-                "  account(accountNumber: $a) { hasJoinedCampaign"
+                "  account(accountNumber: $a) { hasJoinedCampaign tokenBalance"
                 "    joinedEvents { eventId } }"
-                "  events { id code startAt endAt eventType rewardPerKwhInOctoPoints }"
+                "  events { id code startAt endAt eventType capacityStatus"
+                "           rewardPerKwhInOctoPoints }"
                 "}}"
             ),
             "variables": {"a": self.account_id},
@@ -923,6 +927,17 @@ class OctopusAPI:
 
         acct       = ss["account"]
         has_joined = bool(acct.get("hasJoinedCampaign"))
+        # Weekend Happy Hour tokens. Reported VERBATIM and never derived: the
+        # accrual rule cannot be reconstructed from the account history — measured
+        # 03-Sep-2026, 24 successful turn-downs and one booking leave a balance of
+        # 1, which fits no simple "N per success, M per booking" arithmetic, and the
+        # scheme itself only began on 16-Aug-2026. So this is the API's own number
+        # or nothing; None means "not reported", which is NOT the same as zero.
+        raw_tokens = acct.get("tokenBalance")
+        try:
+            token_balance = int(raw_tokens) if raw_tokens is not None else None
+        except (TypeError, ValueError):
+            token_balance = None
         # Per-EVENT opt-in, and it is NOT implied by campaign membership. Measured
         # 03-Sep-2026: this account reads hasJoinedCampaign=True with 36 joined events
         # ending 16-Aug-2026, while ALL 17 events since — the new season — are
@@ -951,10 +966,16 @@ class OctopusAPI:
                 # on this account are happy hours — so anything that spends battery
                 # MUST gate on this. An absent/unknown value is never TURN_DOWN.
                 "direction":             (e.get("eventType") or "") or "UNKNOWN",
+                # Whether the slot can still be booked at all. Octopus offers four
+                # Happy Hour slots per Sunday and they fill; telling someone to book
+                # a full one is worse than saying nothing. Absent -> None, meaning
+                # unknown rather than available.
+                "capacity":              e.get("capacityStatus") or None,
             })
         events.sort(key=lambda ev: ev["start_at"])
 
-        result = {"has_joined": has_joined, "events": events, "fetched_at": now}
+        result = {"has_joined": has_joined, "events": events, "fetched_at": now,
+                  "token_balance": token_balance}
         self._saving_sessions_cache    = result
         self._saving_sessions_cache_at = now
         self._saving_sessions_neg_at   = 0.0

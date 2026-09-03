@@ -8,7 +8,7 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.84.0)
 # Date:        03-09-2026
-# Version:     5.84.0
+# Version:     5.85.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1077,6 +1077,10 @@ class Plugin(indigo.PluginBase):
         self.store["last_saving_sessions"]      = 0.0   # time.time() of last poll
         self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
         self.store["saving_sessions_windows"]   = []    # joined windows, cached for the manager
+        # Happy Hour token balance, reported verbatim by the API. None means NOT
+        # REPORTED, which is deliberately distinct from 0 — a missing balance must
+        # never be shown as "you have none".
+        self.store["happy_hour_tokens"]         = None
         self.store["saving_session_export_active"] = False
         self.store["happy_hour_import_active"]  = False
         self.store["happy_hour_anchor_kwh"]     = None   # grid-import counter at window entry
@@ -2409,6 +2413,14 @@ class Plugin(indigo.PluginBase):
                 # as the default, and the first evaluate tick (<=5s) writes
                 # the real mode — so nothing is lost.
                 {"key": "currentReason", "value": "Starting up"},
+                # -1 = NOT REPORTED. Seeded here rather than left to the first
+                # tick because a freshly created Integer state materialises as
+                # 0, and 0 is a REAL balance meaning "you have no tokens" — a
+                # claim the API has not made yet at this point in startup. The
+                # gap is only seconds, but it is seconds of the state asserting
+                # something false, which is the whole failure mode this -1
+                # convention exists to prevent.
+                {"key": "happyHourTokens", "value": -1},
                 {"key": "dawnViable",    "value": ""},
                 {"key": "socAtDawn",     "value": ""},
                 {"key": "lastUpdate",    "value": "Initialising..."},
@@ -4171,6 +4183,68 @@ class Plugin(indigo.PluginBase):
             self.store["storm_alerted_level"] = "none"
             self._save_accumulators()
 
+    def _happy_hour_alert_body(self, when, duration_h, event):
+        """What to say about a Weekend Happy Hour, given what the reader can do about it.
+
+        A Happy Hour is an hour of FREE electricity, earned by successful turn-downs and
+        then BOOKED on the Octopus site — Octopus offers four slots per Sunday and only
+        the one actually booked comes back joined. Three facts decide the message, and
+        all three come from the API rather than from us:
+
+          token_balance   how many tokens the account holds (reported VERBATIM — the
+                          accrual rule is not derivable, see octopus_api)
+          capacity        whether the slot can still be booked at all
+          joined          whether THIS slot is the one already booked
+
+        The rule this exists to enforce: never tell someone to act on something they
+        cannot act on. On 03-Sep-2026 four pushes went out saying "opt in to earn" for
+        four slots against a balance that could not pay for one — advice that cost the
+        reader four interruptions and bought nothing.
+        """
+        tokens   = self.store.get("happy_hour_tokens")
+        need     = self._happy_hour_tokens_required()
+        capacity = event.get("capacity")
+        joined   = bool(event.get("joined"))
+
+        body = (f"Octopus Weekend Happy Hour: {when}"
+                + (f" ({duration_h:.1f}h)" if duration_h else "")
+                + " — free electricity for the hour.")
+
+        if joined:
+            enabled = _as_bool(self.pluginPrefs.get("happyHourImport"), False)
+            return body + ("  BOOKED. The battery will grid-charge through it."
+                           if enabled else
+                           "  BOOKED — but Happy Hour import is switched off, so the "
+                           "battery will not charge for it. Tick it in the plugin config.")
+
+        if capacity and capacity != "AVAILABLE":
+            return body + f"  This slot is {capacity.replace('_', ' ').lower()}."
+
+        # Not booked, and bookable as far as capacity goes — so the only question left
+        # is whether the account can pay for it. An UNKNOWN balance must not be reported
+        # as zero, so it says nothing about tokens rather than guessing.
+        if tokens is None:
+            return body + "  Book it on the Octopus site if you have the tokens."
+        if need and tokens < need:
+            return (body + f"  You have {tokens} of the {need} tokens needed, so it "
+                    "cannot be booked yet — each successful Power Down earns towards it.")
+        return (body + f"  You have {tokens} tokens — book it on the Octopus site and "
+                "the battery will charge itself free for that hour.")
+
+    def _happy_hour_tokens_required(self):
+        """How many tokens booking a Happy Hour costs.
+
+        NOT available from the API and NOT derivable from the account history — measured
+        03-Sep-2026, 24 successful turn-downs and one booking leave a balance of 1, which
+        fits no simple arithmetic. So this is Octopus's published figure, held as a pref
+        so a change on their side is one field to edit rather than a release. 0 disables
+        the "not enough tokens" wording entirely.
+        """
+        try:
+            return max(0, int(self.pluginPrefs.get("happyHourTokensRequired", 2)))
+        except (TypeError, ValueError):
+            return 2
+
     def _check_saving_sessions(self):
         """Notify on newly-announced Octopus Saving Sessions events.
 
@@ -4198,6 +4272,10 @@ class Plugin(indigo.PluginBase):
             return
         if not data:
             return   # fetch failed (get_saving_sessions has already warned) or no account
+        # Carry the balance forward on every successful fetch. Written before the
+        # has_joined early-return below, because the token count is just as true for an
+        # account that has not joined the campaign.
+        self.store["happy_hour_tokens"] = data.get("token_balance")
         if not data.get("has_joined"):
             # A REAL answer now, not the "couldn't tell" case — that returns None above and
             # warns from the API layer. Say it once per plugin start: an account that has
@@ -4249,23 +4327,34 @@ class Plugin(indigo.PluginBase):
             joined = bool(event.get("joined"))
             direction = event.get("direction") or "UNKNOWN"
             turn_down = direction == SAVING_SESSION_TURN_DOWN
-            body = (
-                f"Octopus Saving Session: {when}"
-                + (f" ({duration_h:.1f}h)" if duration_h else "")
-                + f". Extra export above your usual baseline earns {points} Octopoints/kWh "
-                "on top of the normal export rate."
-                + ("" if joined else
-                   " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
-                   "the battery will not be driven for it.")
-                + ("" if turn_down else
-                   f"  This is a {direction.replace('_', ' ').title()} session, not a "
-                   "turn-down — the battery is NOT driven for it. A Power Up wants you to "
-                   "USE more, and a Happy Hour is free power worth using.")
-            )
-            self._send_pushover(
-                "Octopus Saving Session announced" if joined
-                else "Octopus Saving Session - opt in to earn",
-                body, priority="0")
+            happy_hour = direction == SAVING_SESSION_HAPPY_HOUR
+
+            if happy_hour:
+                # A Happy Hour is BOOKED, not opted into, and booking costs tokens.
+                # Telling someone to "opt in to earn" on a slot they cannot book is
+                # noise — it happened on 03-Sep-2026, four pushes for four slots
+                # against a balance that could not pay for one. So the message says
+                # what the reader can actually DO, and nothing else.
+                body = self._happy_hour_alert_body(when, duration_h, event)
+                title = ("Octopus Happy Hour booked" if joined
+                         else "Octopus Happy Hour available")
+            else:
+                body = (
+                    f"Octopus Saving Session: {when}"
+                    + (f" ({duration_h:.1f}h)" if duration_h else "")
+                    + f". Extra export above your usual baseline earns {points} "
+                    "Octopoints/kWh on top of the normal export rate."
+                    + ("" if joined else
+                       " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
+                       "the battery will not be driven for it.")
+                    + ("" if turn_down else
+                       f"  This is a {direction.replace('_', ' ').title()} session, not a "
+                       "turn-down — the battery is NOT driven for it. A Power Up wants you "
+                       "to USE more.")
+                )
+                title = ("Octopus Saving Session announced" if joined
+                         else "Octopus Saving Session - opt in to earn")
+            self._send_pushover(title, body, priority="0")
             log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
                 f"{direction}, {points} pts/kWh, opted in: {'YES' if joined else 'NO'}"
                 + ("" if turn_down else " — battery NOT driven (not a turn-down)"),
@@ -7529,6 +7618,13 @@ class Plugin(indigo.PluginBase):
         if "happyHourFreeKwhLast" in dev.states:
             states.append({"key": "happyHourFreeKwhLast",
                            "value": round(float(self.store.get("happy_hour_free_kwh", 0.0) or 0.0), 2)})
+        # -1 stands for "not reported yet", because an Integer state cannot hold
+        # None and 0 is a real balance that means something quite different. The
+        # distinction matters: 0 tokens is "earn some", unknown is "ask Octopus".
+        if "happyHourTokens" in dev.states:
+            _tok = self.store.get("happy_hour_tokens")
+            states.append({"key": "happyHourTokens",
+                           "value": int(_tok) if _tok is not None else -1})
         if "awayMode" in dev.states:
             states.append({"key": "awayMode",
                            "value": str(bool(self.store.get("away_active")))})

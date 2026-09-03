@@ -15,6 +15,44 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.85.0 — 03-09-2026
+
+**The Happy Hour alert told CliveS to do something he could not do.** Four pushes went out on
+03-Sep-2026 saying "opt in to earn" for four Sunday slots — and a Weekend Happy Hour is not
+opted into, it is BOOKED, and booking costs tokens his balance could not pay for. Four
+interruptions, no possible action. **Advice that cannot be acted on is worse than silence,
+because the reader spends attention working out that there was nothing to do.**
+
+The schema had the answer all along and the query never asked: `tokenBalance` on the account,
+`capacityStatus` on each event. Both are now fetched, and the Happy Hour message is built from
+what the reader can actually do — booked (and whether the battery will charge for it), slot
+full, not enough tokens, or ready to book.
+
+**The token balance is reported VERBATIM and never derived.** The accrual rule cannot be
+reconstructed: measured against this account, 24 successful turn-downs and one booking leave a
+balance of 1, which fits no simple "N earned per success, M spent per booking" arithmetic, and
+the scheme itself only began on 16-Aug-2026. So the plugin repeats the API's own number or says
+nothing. **`None` means NOT REPORTED and is deliberately distinct from 0** — "you have no
+tokens" is a claim, and one the API never made. The device state uses `-1` for unknown, because
+an Integer state cannot hold None and 0 is a real balance meaning something quite different.
+
+**What a booking COSTS is a pref, not a constant.** It is absent from the API and underivable,
+so `happyHourTokensRequired` (default 2, Octopus's published figure) holds it: if they change
+it, that is one field to edit rather than a release. Set 0 and the alerts stop mentioning
+tokens at all.
+
+Also closes the worst silent outcome available here: a slot BOOKED, free power waiting, and the
+plugin sitting it out because `happyHourImport` is unticked. The booking alert now says so, at
+the moment it can still be fixed.
+
+963 -> 971 tests; four sabotages each proven red (unknown-balance-as-zero, nag-without-tokens,
+offer-a-full-slot, silent-when-switched-off), each asserted to have applied and each restore
+byte-identical. NB the repo's own `TestNoTestsStrandedBelowMain` caught the new class being
+appended below `__main__`, where it would never have run — a gate earning its keep.
+
+NB v5.84.0 shipped a README row but no entry here, so the chain skips it; that one is the other
+session's to backfill.
+
 ## v5.83.1 — 03-09-2026
 
 **An armed Octopus session was not observable from anywhere.** Found half an hour before a live

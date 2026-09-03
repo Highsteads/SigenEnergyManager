@@ -221,6 +221,10 @@
     <Field id="happyHourImport" type="checkbox" defaultValue="false">
         <Label>Charge the battery during a Weekend Happy Hour:</Label>
     </Field>
+    <Field id="happyHourTokensRequired" type="textfield" defaultValue="2">
+        <Label>Tokens needed to book a Happy Hour:</Label>
+        <Description>What Octopus charges for one booking. It is not exposed by their API and cannot be worked out from your history, so it lives here — if they change it, change this rather than waiting for a plugin release. Set 0 to stop the alerts mentioning tokens at all.</Description>
+    </Field>
     <Field id="label_happyhour_info" type="label" fontSize="small">
         <Label>A Happy Hour is an hour of FREE electricity you book on the Octopus site, earned by two successful Power Down sessions. With this ticked, the battery grid-charges at full inverter power for that hour so the free energy is banked rather than wasted.
 
