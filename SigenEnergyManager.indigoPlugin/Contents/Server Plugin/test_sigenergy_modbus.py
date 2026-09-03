@@ -869,6 +869,51 @@ class TestDecodePvStrings(unittest.TestCase):
         self.assertEqual(decode_pv_strings([4]), [])
         self.assertEqual(decode_pv_strings([0, 0, 1, 2]), [])   # count 0
 
+    # --- signed V/I (v5.86.0) ------------------------------------------
+    # The happy-path fixture above was taken in full sun, where every word is
+    # positive and the sign can never show. These are the dusk shapes.
+
+    # Reconstructed exactly from the four simultaneous live states at
+    # 2026-09-03 18:40:25, while South (PV3) sat at its zero-crossing:
+    # V 218.5/327.6/327.8/219.2, I 0.11/0.11/655.34/0.03. The decode is a
+    # pure divide, so multiplying back is lossless.
+    DUSK_BLOCK = [4, 4, 2185, 11, 3276, 11, 3278, 65534, 2192, 3]
+
+    def test_dusk_negative_current_is_signed_not_655_amps(self):
+        out = decode_pv_strings(self.DUSK_BLOCK)
+        self.assertEqual(len(out), 4)
+        south = out[2]
+        # 65534 is -2 as S16 -> -0.02 A, NOT 655.34 A.
+        self.assertEqual(south["a"], -0.02)
+        self.assertEqual(south["v"], 327.8)
+        # The bug this pins: V*I unsigned put 214,853 W on a 4.275 kWp string.
+        self.assertEqual(south["w"], 0)
+
+    def test_dusk_block_leaves_the_healthy_strings_alone(self):
+        out = decode_pv_strings(self.DUSK_BLOCK)
+        self.assertEqual([s["a"] for s in out], [0.11, 0.11, -0.02, 0.03])
+        self.assertEqual([s["w"] for s in out], [24, 36, 0, 7])
+
+    def test_no_string_may_exceed_its_physical_limits(self):
+        # Every observed wrap sat in 65532..65535; walk the whole run plus a
+        # deeper negative, and assert none of them can reach the dashboard.
+        for raw in (65532, 65533, 65534, 65535, 65000):
+            with self.subTest(raw=raw):
+                out = decode_pv_strings([1, 1, 3278, raw, 0, 0, 0, 0, 0, 0])
+                self.assertTrue(all(s["w"] < 20000 for s in out),
+                                f"raw {raw} produced {out}")
+
+    def test_implausible_pair_discards_the_whole_block(self):
+        # A misaligned block has no trustworthy members — [], never a
+        # partial list that reads as a real measurement.
+        self.assertEqual(decode_pv_strings([4, 4, 30000, 5000, 3081, 624,
+                                            3146, 651, 2044, 615]), [])
+
+    def test_watts_are_never_negative(self):
+        out = decode_pv_strings([1, 1, 3278, 65436, 0, 0, 0, 0, 0, 0])  # -1.00 A
+        self.assertEqual(out[0]["a"], -1.0)
+        self.assertGreaterEqual(out[0]["w"], 0)
+
 
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
