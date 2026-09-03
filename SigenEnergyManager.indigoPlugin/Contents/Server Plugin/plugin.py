@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1)
 # Date:        03-09-2026
-# Version:     5.80.0
+# Version:     5.80.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -4133,9 +4133,18 @@ class Plugin(indigo.PluginBase):
             log(f"[SavingSessions] get_saving_sessions() raised: {exc}", level="WARNING")
             return
         if not data:
-            return   # no account configured, or never successfully fetched yet
+            return   # fetch failed (get_saving_sessions has already warned) or no account
         if not data.get("has_joined"):
-            return   # account isn't a Saving Sessions member — nothing to watch for
+            # A REAL answer now, not the "couldn't tell" case — that returns None above and
+            # warns from the API layer. Say it once per plugin start: an account that has
+            # not joined the campaign earns nothing from a session, and silence about that
+            # is indistinguishable from the feature being broken (which it was, in v5.80.0).
+            if not self.store.get("saving_sessions_unjoined_logged"):
+                self.store["saving_sessions_unjoined_logged"] = True
+                log("[SavingSessions] This Octopus account has not joined the Saving "
+                    "Sessions campaign, so no session alerts will fire. Join it in the "
+                    "Octopus app under Octoplus if you want them.")
+            return
 
         now_utc  = datetime.now(timezone.utc)
         notified = set(self.store.get("saving_sessions_notified") or [])

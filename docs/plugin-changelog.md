@@ -15,6 +15,51 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.80.1 — 03-09-2026
+
+**v5.80.0 SHIPPED SILENTLY DEAD, AND THE WAY IT FAILED IS THE WHOLE ENTRY.**
+
+`get_saving_sessions()` sent `Authorization: JWT <token>`, copying the convention every other
+Kraken call in `octopus_api.py` uses. **The backend host does not take that form.** Measured
+against the live API today, all three variants:
+
+| header | result |
+|---|---|
+| `<token>` (raw) | account resolves — `hasJoinedCampaign=True`, 36 joined events |
+| `Bearer <token>` | account resolves |
+| `JWT <token>` (what shipped) | `account: null`, `errors[].extensions.errorCode = OE-0102` |
+| main host + raw token | HTTP 400 — the two hosts are mirror images |
+
+**The failure shape is what made it dangerous.** `events` is PUBLIC and resolved fine, so the
+reply was HTTP 200 with a complete 61-event list and only the `account` sub-field errored to
+null. `acct = ss.get("account") or {}` then read that as `hasJoinedCampaign = False`, and
+`_check_saving_sessions` returns early on exactly that — so the feature would have stayed
+silent for ever, with no log line, on a reply that looked entirely healthy. It was released
+and reported as working on the strength of a clean plugin start, which is
+[[feedback_verify_the_dispatched_path]] in its purest form: the plugin starting proves the
+plugin starts.
+
+**I noticed the discrepancy while reading barnybug's client** (he sends the raw token) and
+consciously kept the JWT form "for consistency with this codebase". That was the wrong call:
+consistency is a property of one host, and this is a different host. The comment at the call
+site now says so, with the error code, so nobody harmonises it back.
+
+**Second fix, and the one that matters more: an errored account block is UNKNOWN, never
+"not joined".** `get_saving_sessions` now inspects `errors[].path` and returns a FAILURE
+(None) with a WARNING naming the error code when the account leg errored or came back null —
+so a future auth change surfaces in the log within the hour instead of quietly disabling the
+feature. A GENUINE `hasJoinedCampaign: False` still comes through as a real answer, and
+`_check_saving_sessions` now logs that once per start rather than returning in silence:
+"this account has not joined the campaign, so no session alerts will fire". An absence and a
+negative are different facts — [[feedback_absent_state_is_never_a_match]], hit again, this
+time in an auth reply rather than a device state.
+
+Live-verified after the restart, through the SHIPPED file: account block resolves,
+`hasJoinedCampaign=True`, 36 joined events, signed-up meter point 1591059073620. Tests
+897 → 903, and both fixes mutation-tested — reverting the header turns the suite red (1
+failure), reverting the guard turns it red (3) — each sabotage asserted to have applied and
+each restore verified byte-identical, with `__pycache__` cleared before every run.
+
 ## v5.80.0 — 03-09-2026
 
 Octopus Saving Sessions — Phase 1: detect a newly-announced event and Pushover CliveS.

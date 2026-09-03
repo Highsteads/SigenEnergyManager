@@ -856,7 +856,20 @@ class OctopusAPI:
                 KRAKEN_GRAPHQL_BACKEND,
                 data=query.encode(),
                 headers={"Content-Type": "application/json",
-                         "Authorization": f"JWT {token}"},
+                         # RAW token, NOT the "JWT <token>" form every other call in this
+                         # module uses — the two hosts take DIFFERENT auth conventions, and
+                         # getting it wrong here fails in the worst possible way. MEASURED
+                         # 03-Sep-2026 against the live API: raw and "Bearer <token>" both
+                         # resolve the account block; "JWT <token>" returns
+                         #   errors[].extensions.errorCode = OE-0102 ("'Authorization'
+                         #   header is invalid") on path ["savingSessions","account"]
+                         # while STILL returning HTTP 200 with the full events list,
+                         # because `events` is public and only `account` needs auth. So a
+                         # wrong header looks like a healthy reply from an account that has
+                         # simply never joined. The main host is the mirror image: it 400s
+                         # a raw token and wants the JWT prefix. Do not "make these
+                         # consistent".
+                         "Authorization": token},
                 timeout=REQUEST_TIMEOUT,
             )
             if not response.ok:
@@ -872,8 +885,8 @@ class OctopusAPI:
             return self._saving_sessions_failed(now)
 
         ss = ((payload or {}).get("data") or {}).get("savingSessions") or {}
+        errs = (payload or {}).get("errors") or []
         if not ss:
-            errs = (payload or {}).get("errors")
             if errs:
                 self.logger.debug(f"Saving Sessions GraphQL errors: {errs}")
                 # GraphQL errors + empty payload is auth-shaped — purge the cached
@@ -881,7 +894,27 @@ class OctopusAPI:
                 self._kraken_token = None
             return self._saving_sessions_failed(now)
 
-        acct       = ss.get("account") or {}
+        # A PARTIAL failure is the dangerous shape here, and it is the one that shipped in
+        # v5.80.0: `events` is public so it resolves, while `account` errors to null. Read
+        # naively that is "a healthy reply from someone who never joined" — which makes the
+        # whole feature go permanently silent with nothing logged. An account block that is
+        # absent BECAUSE OF AN ERROR is UNKNOWN, never a membership answer.
+        acct_errored = any("account" in (e.get("path") or []) for e in errs)
+        if acct_errored or ss.get("account") is None:
+            if acct_errored:
+                codes = sorted({(e.get("extensions") or {}).get("errorCode", "?") for e in errs})
+                self.logger.warning(
+                    f"[Octopus] Saving Sessions: the account block came back as an error "
+                    f"({', '.join(codes)}) — cannot tell whether this account has joined the "
+                    f"campaign, so no session alerts will fire until this clears.")
+                self._kraken_token = None   # auth-shaped; force a fresh token next attempt
+            else:
+                self.logger.warning(
+                    "[Octopus] Saving Sessions: no account block returned — cannot tell "
+                    "whether this account has joined the campaign.")
+            return self._saving_sessions_failed(now)
+
+        acct       = ss["account"]
         has_joined = bool(acct.get("hasJoinedCampaign"))
 
         events = []

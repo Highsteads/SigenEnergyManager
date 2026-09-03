@@ -678,6 +678,79 @@ class TestSavingSessions(unittest.TestCase):
             {"data": None, "errors": [{"message": "boom"}]})
         self.assertIsNone(self.api.get_saving_sessions(force=True))
 
+    def test_sends_the_raw_token_not_the_jwt_prefix(self):
+        # MEASURED 03-Sep-2026: the backend host accepts a raw token (and "Bearer <token>")
+        # and REJECTS "JWT <token>" with OE-0102, while the main host is the mirror image.
+        # v5.80.0 shipped the JWT form and the feature was silently dead.
+        self.api.get_saving_sessions(force=True)
+        hdrs = octopus_api.requests.post.call_args[1]["headers"]
+        self.assertEqual(hdrs["Authorization"], "tok")
+        self.assertNotIn("JWT", hdrs["Authorization"])
+
+
+class TestSavingSessionsPartialFailure(unittest.TestCase):
+    """The shape that shipped broken in v5.80.0.
+
+    `events` is public and resolves; `account` needs auth and errors to null. HTTP is 200
+    and the events list is complete, so a naive read sees "a healthy reply from an account
+    that never joined" — and the caller then goes silent for ever. An account block that is
+    absent because of an ERROR is UNKNOWN, never a membership answer.
+    """
+
+    def setUp(self):
+        self.api = _make_api()
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def _payload(self, account, errors=None):
+        p = {"data": {"savingSessions": {
+            "account": account,
+            "events": _SAVING_SESSIONS["data"]["savingSessions"]["events"],
+        }}}
+        if errors:
+            p["errors"] = errors
+        return p
+
+    def test_errored_account_block_is_not_read_as_not_joined(self):
+        octopus_api.requests.post.return_value = _FakeResp(self._payload(
+            None,
+            [{"message": "'Authorization' header is invalid.",
+              "path": ["savingSessions", "account"],
+              "extensions": {"errorCode": "OE-0102"}}]))
+        # Must be a FAILURE (None), never a payload claiming has_joined False.
+        self.assertIsNone(self.api.get_saving_sessions(force=True))
+
+    def test_errored_account_purges_the_token_so_the_next_try_reauthenticates(self):
+        self.api._kraken_token = "stale"
+        octopus_api.requests.post.return_value = _FakeResp(self._payload(
+            None, [{"path": ["savingSessions", "account"],
+                    "extensions": {"errorCode": "OE-0102"}}]))
+        self.api.get_saving_sessions(force=True)
+        self.assertIsNone(self.api._kraken_token)
+
+    def test_null_account_without_errors_is_also_unknown_not_false(self):
+        octopus_api.requests.post.return_value = _FakeResp(self._payload(None))
+        self.assertIsNone(self.api.get_saving_sessions(force=True))
+
+    def test_a_genuine_not_joined_answer_still_comes_through(self):
+        # The real negative must survive — this is the case the guard must NOT swallow.
+        octopus_api.requests.post.return_value = _FakeResp(self._payload(
+            {"hasJoinedCampaign": False, "joinedEvents": []}))
+        data = self.api.get_saving_sessions(force=True)
+        self.assertIsNotNone(data)
+        self.assertFalse(data["has_joined"])
+
+    def test_an_error_on_an_unrelated_path_does_not_bin_a_good_account_block(self):
+        octopus_api.requests.post.return_value = _FakeResp(self._payload(
+            {"hasJoinedCampaign": True, "joinedEvents": [{"eventId": "1001"}]},
+            [{"path": ["savingSessions", "somethingElse"], "extensions": {"errorCode": "X"}}]))
+        data = self.api.get_saving_sessions(force=True)
+        self.assertIsNotNone(data)
+        self.assertTrue(data["has_joined"])
+
 
 if __name__ == "__main__":
     unittest.main()
