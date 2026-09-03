@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.85.0 · Requires Indigo 2025.2 or later
+**Version:** 5.85.1 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -142,6 +142,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.85.1 | 03-Sep-2026 | **The token count is now quoted as Octopus's, not stated as fact.** Their API reported one token while their own app showed none, so the plugin no longer treats that number as a decision. It tells you what the API says and points you at the app, which is what actually decides whether you can book. It will never tell you a slot cannot be booked — being wrongly talked out of a free hour is a good deal worse than being nudged about one you had already claimed. 972 tests. |
 | 5.85.0 | 03-Sep-2026 | **Happy Hour alerts now tell you something you can act on.** They used to say "opt in to earn" for every slot, but a Happy Hour is booked rather than opted into and booking costs tokens — so the alerts were asking for something that could not be done. The plugin now reads your token balance and whether the slot still has room, and says which it is: booked, full, not enough tokens yet, or ready to book. If a slot is booked and the charging option is switched off it tells you that too, while there is still time to turn it on. It never guesses your balance — if Octopus does not report one, it says nothing rather than claiming you have none. 971 tests. |
 | 5.84.0 | 03-Sep-2026 | **A 4.275 kW string reporting 215 kW.** The inverter sends each string's current as a signed number and the plugin read it as an unsigned one. In full sun that makes no difference, which is why it survived the live probe it was built from and every test written off that probe. But as a string falls to nothing at dawn and dusk its current dips a hundredth of an amp below zero, and read the wrong way round a hundredth below zero is 655 amps — so the South array reported 215 kW and a day's total of 220 kWh. It had done this on 21 days since the per-string readings shipped on 13 August, briefly each dawn and dusk, and this evening it stuck there for half an hour. Current and voltage are now read signed, a string's power can no longer go below zero, and a reading outside what a PV string can physically do throws away the whole block rather than trusting the rest of it — a misread block has no trustworthy members. The dashboard's own history is cleaned up separately in Dashboards 3.2.0, because nothing rewrites what is already logged. 963 tests, each of three deliberate breakages caught. |
 | 5.83.1 | 03-Sep-2026 | **You can now see a saving session is armed before it starts.** The plugin knew about tonight's session but said so nowhere — the decision log and the dashboard API both looked exactly the same whether one was booked or not, so the only way to check was to wait and see if the battery moved. Both now show it, including which way the window runs. Nothing about the behaviour changed. 958 tests. |

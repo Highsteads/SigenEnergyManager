@@ -4389,10 +4389,26 @@ class TestHappyHourAlertBody(unittest.TestCase):
         return {"joined": joined, "capacity": capacity,
                 "direction": "WEEKEND_HAPPY_HOUR"}
 
-    def test_too_few_tokens_says_so_and_does_not_tell_him_to_book(self):
+    def test_a_low_balance_is_reported_but_never_becomes_a_refusal(self):
+        """The balance is INFORMATION, not a verdict.
+
+        Measured 03-Sep-2026: the API reported tokenBalance=1 while the Octopus app
+        showed 0. A documented field can disagree with the vendor's own UI, and the
+        UI decides what the account may do. So a low count must never produce
+        "you cannot book this" — a wrong refusal talks the owner out of a free hour
+        he was entitled to, which is far worse than a redundant nudge.
+        """
         body = self._p(1)._happy_hour_alert_body("Sun 06 Sep, 11:00-12:00", 1.0, self._ev())
         self.assertIn("1 of the 2 tokens", body)
-        self.assertNotIn("book it on the octopus site", body.lower())
+        self.assertNotIn("cannot be booked", body.lower())
+        self.assertIn("check the app", body.lower())
+
+    def test_the_number_is_attributed_to_octopus_not_asserted_as_fact(self):
+        """It disagreed with the app once, so it is never stated in our own voice."""
+        for tokens in (1, 2):
+            body = self._p(tokens)._happy_hour_alert_body("Sun", 1.0, self._ev())
+            self.assertIn("Octopus's API reports", body)
+            self.assertNotIn(f"You have {tokens}", body)
 
     def test_enough_tokens_does_tell_him_to_book(self):
         body = self._p(2)._happy_hour_alert_body("Sun 06 Sep, 11:00-12:00", 1.0, self._ev())
@@ -4406,6 +4422,7 @@ class TestHappyHourAlertBody(unittest.TestCase):
         self.assertNotIn("0 of the", body)
         self.assertNotIn("0 tokens", body)
         self.assertIn("if you have the tokens", body)
+        self.assertNotIn("cannot be booked", body.lower())
 
     def test_a_full_slot_is_not_offered_however_many_tokens_are_held(self):
         body = self._p(99)._happy_hour_alert_body("Sun", 1.0, self._ev(capacity="FULL"))

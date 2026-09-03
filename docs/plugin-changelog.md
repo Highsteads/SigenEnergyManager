@@ -15,6 +15,33 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.85.1 — 03-09-2026
+
+**`tokenBalance` said 1; the Octopus app showed CliveS 0.** Reported within the hour of v5.85.0
+shipping. The schema is unambiguous — *"The account's Weekend Happy Hours token balance (zero if
+it has none)"* — and it still disagreed with Octopus's own UI.
+
+**Which is right is not the point.** The app decides what the account may actually do; the API
+field is a number. v5.85.0 turned that number into a VERDICT — *"so it cannot be booked yet"* —
+which is a prediction about what Octopus will allow, made from a field measured to contradict
+them. **A wrong refusal talks the owner out of a free hour he was entitled to, which is a far
+worse failure than a redundant nudge**, so the asymmetry decides the design: report, never refuse.
+
+The count is now ATTRIBUTED rather than asserted — "Octopus's API reports 1 of the 2 tokens a
+booking needs — check the app, which is the authority, and book it there if it lets you" — and no
+path can produce "cannot be booked". Two tests hold that down: one asserting the refusal wording
+never appears on a low balance, one asserting the number is never stated in our own voice
+("You have N"). Proven by reinstating the v5.85.0 wording, which turns both red.
+
+**The general lesson, and it is not Octopus-specific: a documented API field can disagree with
+the vendor's own UI, and the UI is authoritative for what the user can do.** A field description
+tells you what a value is MEANT to be, not that it matches what the user sees. Anything derived
+from a vendor field and shown to a user should be attributed to that vendor, so a disagreement
+reads as a disagreement rather than as the plugin being wrong — or worse, as the plugin quietly
+overruling the thing the user is looking at.
+
+971 -> 972 tests. No behaviour change beyond wording; nothing about how the battery is driven.
+
 ## v5.85.0 — 03-09-2026
 
 **The Happy Hour alert told CliveS to do something he could not do.** Four pushes went out on

@@ -8,7 +8,7 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.84.0)
 # Date:        03-09-2026
-# Version:     5.85.0
+# Version:     5.85.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -4220,16 +4220,24 @@ class Plugin(indigo.PluginBase):
         if capacity and capacity != "AVAILABLE":
             return body + f"  This slot is {capacity.replace('_', ' ').lower()}."
 
-        # Not booked, and bookable as far as capacity goes — so the only question left
-        # is whether the account can pay for it. An UNKNOWN balance must not be reported
-        # as zero, so it says nothing about tokens rather than guessing.
+        # Not booked, and bookable as far as capacity goes. What is left is the token
+        # count — and this is REPORTED, never used as a verdict.
+        #
+        # MEASURED 03-Sep-2026: the API said tokenBalance=1 while the Octopus app showed
+        # CliveS 0, and the schema describes the field plainly as "the account's Weekend
+        # Happy Hours token balance". A documented field can still disagree with the
+        # vendor's own UI, and it is the UI that decides what the account may actually
+        # do. So the plugin ATTRIBUTES the number rather than asserting it, and never
+        # says "you cannot book this" — a wrong refusal would talk him out of a free
+        # hour he was entitled to, which is a far worse failure than a redundant nudge.
         if tokens is None:
-            return body + "  Book it on the Octopus site if you have the tokens."
+            return body + "  Book it in the Octopus app if you have the tokens."
         if need and tokens < need:
-            return (body + f"  You have {tokens} of the {need} tokens needed, so it "
-                    "cannot be booked yet — each successful Power Down earns towards it.")
-        return (body + f"  You have {tokens} tokens — book it on the Octopus site and "
-                "the battery will charge itself free for that hour.")
+            return (body + f"  Octopus's API reports {tokens} of the {need} tokens a "
+                    "booking needs — check the app, which is the authority, and book it "
+                    "there if it lets you. Each successful Power Down earns towards one.")
+        return (body + f"  Octopus's API reports {tokens} tokens — book it in the app "
+                "and the battery will charge itself free for that hour.")
 
     def _happy_hour_tokens_required(self):
         """How many tokens booking a Happy Hour costs.
