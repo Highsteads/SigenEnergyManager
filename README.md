@@ -2,6 +2,8 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
+**Version:** 5.83.0 · Requires Indigo 2025.2 or later
+
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
 home-consumption profile, and picks the inverter mode that keeps the most kWh

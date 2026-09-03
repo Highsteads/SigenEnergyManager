@@ -84,6 +84,25 @@ class TestVersionConsistency(unittest.TestCase):
             f"README changelog leads with {rows[0]} but the bundle ships "
             f"{self.plist['PluginVersion']}")
 
+    def test_the_readme_version_header_matches_the_bundle(self):
+        """The header line nothing else watches.
+
+        estate-check reads it, and a reader reads it before anything else on the
+        page — but no other check compared it to the bundle, so it could sit
+        releases behind with the changelog table perfectly correct. That is how
+        ClaudeBridge advertised 2.17.1 while shipping 2.23.0. Added 03-Sep-2026
+        after the header itself was added and found to be unwatched: a header no
+        test reads is drift waiting to happen.
+        """
+        found = re.search(r"^\*\*Version:\*\*\s*(\d+(?:\.\d+)+)",
+                          self.readme, re.MULTILINE)
+        self.assertIsNotNone(
+            found, "README.md has no '**Version:** X.Y.Z' header line")
+        self.assertEqual(
+            found.group(1), str(self.plist["PluginVersion"]),
+            f"README header says {found.group(1)} but the bundle ships "
+            f"{self.plist['PluginVersion']}")
+
     def test_the_plugin_py_header_matches_the_bundle(self):
         path = os.path.join(HERE, "plugin.py")
         with open(path, encoding="utf-8") as fh:
