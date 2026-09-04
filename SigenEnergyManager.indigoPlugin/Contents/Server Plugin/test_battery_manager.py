@@ -2233,8 +2233,16 @@ class TestSavingSessionOverride(unittest.TestCase):
         self.assertEqual(self.mgr.evaluate(snap).action, ACTION_VPP_EXPORT)
 
     def test_session_drives_export_when_axle_is_idle(self):
+        # weekend_kwh is pinned to the weekday figure ON PURPOSE. _make_snapshot
+        # builds `now` from the REAL date, and evaluate() picks tomorrow's need
+        # by tomorrow's weekday — so with the 22/30 defaults this test asserted
+        # the session branch Mon-Thu and the sufficiency refusal Fri-Sat, and it
+        # was red two days in seven from 03-Sep-2026 until anyone ran it on a
+        # Friday. The subject here is the branch, not the sufficiency guard,
+        # which test_a_flat_battery_refuses_and_says_why already covers.
         snap = _make_snapshot(soc_pct=95.0, export_enabled=True,
-                              saving_session_active=True, now_hour=20)
+                              saving_session_active=True, now_hour=20,
+                              weekday_kwh=22.0, weekend_kwh=22.0)
         self.assertEqual(self.mgr.evaluate(snap).action, ACTION_SAVING_SESSION)
 
     def test_export_disabled_stands_the_session_down(self):

@@ -339,11 +339,18 @@ Guards, all automatic: it only ever runs for a session you have actually opted i
     <Field id="powerCutLockoutMinSocPctInfo" type="label">
         <Label>Export also resumes during the lockout when the day's remaining solar comfortably refills the battery to the floor above on its own — on a bright summer morning, holding export off banks nothing the sun wasn't going to deliver anyway, and only risks driving the battery to 100% and clipping everything above your export cap. This setting is the safety line: however good the forecast looks, that early release never applies below this percentage, because a nearly-empty battery is not a resilience reserve. On a winter night, with no solar to come, the SOC floor above governs on its own. Default 50.</Label>
     </Field>
+    <Field id="separator_solarexport" type="separator"/>
+    <Field id="label_solarexport" type="label">
+        <Label>DAYTIME SOLAR EXPORT</Label>
+    </Field>
+    <Field id="label_solarexport_info" type="label">
+        <Label>Two separate decisions here, and it is easy to take one for the other. The two "hold export" settings decide WHEN daytime export starts. The charge target decides how the solar splits between battery and grid once export is already running — it never starts or stops one.</Label>
+    </Field>
     <Field id="solarOverflowTargetSoc" type="textfield" defaultValue="90">
         <Label>Daytime charge target (%):</Label>
     </Field>
     <Field id="solarOverflowTargetSocInfo" type="label">
-        <Label>On a sunny day the battery charge is paced to reach this level by dusk, and everything spare is exported. This is a target, not a limit — once export is running at your DNO cap, surplus solar has nowhere else to go and keeps charging the battery past it, so most bright days still finish near full. Aiming at 100% is counter-productive: the pacing is taken out of export before the cap is applied, so a high target spends the morning giving away exportable units to buy charge, and still meets the afternoon peak with less room to absorb it. Default 90.</Label>
+        <Label>This sets how the solar SPLITS once export is already running — it does not decide when export starts, so if nothing is exporting, this is not the setting to change. On a sunny day the plugin paces the battery charge to reach this level by dusk and sends everything spare to the grid. It is a target, not a limit — once export is running at your DNO cap, surplus solar has nowhere else to go and keeps charging the battery past it, so most bright days still finish near full. Aiming at 100% is counter-productive: the pacing is taken out of export before the cap is applied, so a high target spends the morning giving away exportable units to buy charge, and still meets the afternoon peak with less room to absorb it. Default 90.</Label>
     </Field>
     <Field id="solarOverflowMinEndSoc" type="textfield" defaultValue="80">
         <Label>Daytime charge target floor (%):</Label>
@@ -352,16 +359,16 @@ Guards, all automatic: it only ever runs for a session you have actually opted i
         <Label>Safety net for the configured pacing target. The daytime overflow gate already stops export as soon as the remaining forecast can no longer fill the battery to 100%, so every spare unit is then kept. This floor prevents a mis-set target below the resilience level you want available for a power cut. Default 80.</Label>
     </Field>
     <Field id="solarOverflowBankFirstMaxKwh" type="textfield" defaultValue="40">
-        <Label>Bank first below (kWh/day):</Label>
+        <Label>Hold export on days forecast below (kWh):</Label>
     </Field>
     <Field id="solarOverflowBankFirstMaxKwhInfo" type="label">
         <Label>On any day forecast to make less than this, daytime export waits until the battery reaches the level below. Selling early only ever protects you from clipping, and clipping needs more surplus than your export cable can carry — measured here, no day under about 41 kWh has ever clipped a single unit. So below this figure the surplus is still there in the afternoon and nothing is lost by keeping it, while a unit sold at the export rate and bought back in the evening costs you the difference. Above this figure the old pacing applies unchanged, because those are the days that genuinely would clip. Set to 0 to switch the hold off entirely and return to the previous behaviour. Clearing the box does NOT switch it off — it restores the default of 40.</Label>
     </Field>
     <Field id="solarOverflowBankFirstSoc" type="textfield" defaultValue="95">
-        <Label>Bank first until SOC (%):</Label>
+        <Label>Hold export until SOC reaches (%):</Label>
     </Field>
     <Field id="solarOverflowBankFirstSocInfo" type="label">
-        <Label>The level the battery must reach before daytime export may start on those smaller days. It delays export, it never reduces it — once the battery is here, everything spare is exported exactly as before. Capped at 97 whatever you type, because the battery reaches a true 100% only a handful of days a year and a higher figure would hold export off almost permanently. Default 95.</Label>
+        <Label>This is the setting that decides when daytime export starts. On those smaller days the battery must reach this level before any export begins. It delays export, it never reduces it — once the battery is here, everything spare is exported exactly as before. Capped at 97 whatever you type, because the battery reaches a true 100% only a handful of days a year and a higher figure would hold export off almost permanently. Default 95.</Label>
     </Field>
     <Field id="solarOverflowShadowEnabled" type="checkbox" defaultValue="true">
         <Label>Log-only 90% vs 95% daytime-target comparison:</Label>
