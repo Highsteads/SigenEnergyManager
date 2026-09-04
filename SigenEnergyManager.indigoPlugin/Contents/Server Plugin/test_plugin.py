@@ -4154,8 +4154,11 @@ class TestBankFirstMetrics(unittest.TestCase):
     def _stub(self, forecast=None, inverter=None, shadow_export_kw=None, store=None):
         st = plugin.Plugin.__new__(plugin.Plugin)
         st.store = dict(store or {})
+        # forecastDate matches _Snap's default `now` (2026-08-31 local). Without
+        # it the latch must refuse to arm — see the two tests below.
         st.latest_forecast_data = dict(forecast if forecast is not None
-                                       else {"forecastStatus": "OK", "todayKwh": 35.6})
+                                       else {"forecastStatus": "OK", "todayKwh": 35.6,
+                                             "forecastDate": "2026-08-31"})
         st.latest_inverter_data = dict(inverter or {})
         st.manager = self._Manager(shadow_export_kw)
         st.logger = logging.getLogger("bankfirst-test")
@@ -4174,6 +4177,30 @@ class TestBankFirstMetrics(unittest.TestCase):
         st = self._stub()
         self._record(st, self._decision(), self._Snap())
         self.assertTrue(st.store["bank_first_small_latched"])
+
+    def test_a_forecast_for_yesterday_does_not_latch_today(self):
+        """The live fault of 04-Sep-2026.
+
+        Between local midnight and the first fetch of the new day,
+        latest_forecast_data still holds YESTERDAY's totals while today_str has
+        already rolled. The latch armed from the previous day's 31.0 kWh and, being
+        one-way, could never be cleared by the 45.3 kWh forecast that arrived an hour
+        later — so a day well above the 40 kWh exemption was held for 4h18m and
+        7.2 kWh of export was withheld. The log line even said "45.3 kWh is below the
+        40.0 kWh cap-saturation threshold" and nobody read it closely enough.
+        """
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 31.0,
+                                  "forecastDate": "2026-08-30"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=31.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_a_forecast_with_no_date_does_not_latch(self):
+        """A dict with no forecastDate cannot say which day it describes, and an
+        unknown day must not classify one. Belt and braces for an older cache file
+        restored from disk by a version that predates the stamp."""
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 31.0})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=31.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
 
     def test_a_partial_forecast_does_not_latch(self):
         """Reading low is exactly when you want to keep the units — but a degraded

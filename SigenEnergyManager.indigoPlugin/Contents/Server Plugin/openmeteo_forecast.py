@@ -600,6 +600,11 @@ class OpenMeteoForecast:
         nxt_key = (now_hour_naive + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
 
         return {
+            # The local day these totals are FOR. Between local midnight and the
+            # first fetch of the new day, latest_forecast_data still describes
+            # YESTERDAY, and a reader with no date on it cannot tell. _fetch_array
+            # already carries a day-shift guard for the same hazard.
+            "forecastDate":         self._now_local().strftime("%Y-%m-%d"),
             "todayKwh":             round(today_total, 1),
             "tomorrowKwh":          round(tomorrow_total, 1),
             "remainingTodayKwh":    round(remaining_today_kwh, 1),
@@ -846,6 +851,7 @@ class OpenMeteoForecast:
         """Return a zeroed forecast dict when no data is available."""
         self.logger.warning(f"[OpenMeteo] Empty forecast: {reason}")
         return {
+            "forecastDate":         "",   # unknown: must not classify a day
             "todayKwh":             0.0,
             "tomorrowKwh":          0.0,
             "correctedTodayKwh":    0.0,

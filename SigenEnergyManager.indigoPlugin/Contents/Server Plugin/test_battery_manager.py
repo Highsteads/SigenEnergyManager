@@ -1984,6 +1984,27 @@ class TestSolarOverflowBankFirst(unittest.TestCase):
         self.assertTrue(d.bank_first_holding)
         self.assertEqual(d.bank_first_gate_pct, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)
 
+    def test_an_absent_forecast_does_not_read_as_a_small_day(self):
+        """0.0 kWh means "no forecast", never "a tiny day".
+
+        The gate's docstring promises it fails OPEN on anything unexpected, and the
+        arithmetic quietly broke that promise: 0.0 < 40.0 is True, so a forecast that
+        never arrived classified the day small and held export off on the strength of
+        a reading nobody had. Same family as feedback_absent_state_is_never_a_match.
+        """
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=0.0)
+        self.assertIsNotNone(d)
+        self.assertGreater(d.export_kw, 0.0)
+        self.assertFalse(d.bank_first_holding)
+        self.assertNotIn("banking first", self._audit(d))
+
+    def test_a_latched_day_still_holds_when_the_forecast_goes_dark(self):
+        """The control arm for the test above: once the day IS classified small from
+        a real forecast, losing the feed later must not release the hold. The latch
+        is one-way on purpose, and the fail-open path must not undo it."""
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=0.0, latched=True)
+        self.assertTrue(d.bank_first_holding)
+
     def test_a_dull_day_audit_names_the_physics_gate_not_bank_first(self):
         """A day turned down because the sun cannot fill the battery must not be
         reported as banking — from October the forecast is under the threshold on

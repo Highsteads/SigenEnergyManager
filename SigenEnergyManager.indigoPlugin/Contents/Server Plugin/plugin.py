@@ -6,9 +6,9 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.87.1)
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0)
 # Date:        04-09-2026
-# Version:     5.87.1
+# Version:     5.88.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3101,7 +3101,16 @@ class Plugin(indigo.PluginBase):
                           SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
             status  = str(self.latest_forecast_data.get("forecastStatus", ""))
             raw_kwh = float(snapshot.raw_today_kwh or 0.0)
+            # The forecast must be FOR today. Between local midnight and the first
+            # fetch of the new day, latest_forecast_data still holds YESTERDAY's
+            # totals while today_str has already rolled — so the latch armed from
+            # the previous day's number and, being one-way, could never be cleared
+            # by the real forecast arriving an hour later. Live on 04-Sep-2026: a
+            # 45.3 kWh day was held for 4h18m off a 31.0 kWh predecessor, and the
+            # log line said "45.3 kWh is below the 40.0 kWh threshold".
+            fc_date = str(self.latest_forecast_data.get("forecastDate", ""))
             if (max_kwh > 0.0 and status.upper().startswith("OK")
+                    and fc_date == today_str
                     and raw_kwh > 0.0 and raw_kwh < max_kwh):
                 store["bank_first_small_latched"] = True
 

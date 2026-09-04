@@ -1681,8 +1681,15 @@ class BatteryManager:
         except (TypeError, ValueError):
             return False                      # unreadable forecast -> today's behaviour
 
+        # A missing or zero forecast is UNKNOWN, never small. Without this the
+        # comparison reads 0.0 < 40.0 as "small day" and holds export off on the
+        # strength of a reading that never arrived — the fail-OPEN promise in the
+        # docstring above, which the arithmetic quietly broke.
+        if raw_today <= 0.0 and not snapshot.bank_first_small_latched:
+            return False
+
         # The latch can only ever say SMALL, never BIG, so it only ever broadens the
-        # block. Set by plugin.py, and only from a COMPLETE forecast.
+        # block. Set by plugin.py, and only from a COMPLETE forecast FOR TODAY.
         small_day = bool(snapshot.bank_first_small_latched) or (raw_today < max_kwh)
         if not small_day:
             return False                      # big day — today's pacing earns its keep

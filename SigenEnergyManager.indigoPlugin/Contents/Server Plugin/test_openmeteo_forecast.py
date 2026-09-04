@@ -12,8 +12,10 @@
 #       TestBiasFactorNotApplied as TestBiasFactorApplied for v1.3 of the
 #       module under test.
 
+import io
 import os
 import sys
+import openmeteo_forecast
 import tempfile
 import unittest
 from datetime import datetime
@@ -525,5 +527,37 @@ class TestNowLocalIsAware(unittest.TestCase):
     def test_now_local_is_timezone_aware(self):
         fc = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
         self.assertIsNotNone(fc._now_local().tzinfo)
+class TestForecastCarriesItsOwnDate(unittest.TestCase):
+    """Every forecast dict must say which local day its totals are FOR.
+
+    The bank-first latch refuses to classify a day from a forecast whose date is not
+    today, which is what stops it arming from yesterday's number in the window
+    between local midnight and the first fetch of the new day. If this key ever stops
+    being emitted the latch can never arm and the export hold silently switches
+    itself off — a feature dying quietly, with nothing in the log.
+    """
+
+    def test_the_empty_forecast_carries_the_key_as_unknown(self):
+        f = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+        d = f._empty_forecast("test")
+        self.assertIn("forecastDate", d)
+        self.assertEqual(d["forecastDate"], "")   # unknown must never match a date
+
+    def test_every_forecast_shaped_return_carries_forecastDate(self):
+        """The success dict needs a live fetch to build, so pin it at the source.
+
+        Any `return {` block in the module carrying "todayKwh" is a forecast dict and
+        must carry "forecastDate" beside it.
+        """
+        src = io.open(openmeteo_forecast.__file__, encoding="utf-8").read()
+        blocks = [b.split("}")[0] for b in src.split("return {")[1:]]
+        blocks = [b for b in blocks if '"todayKwh"' in b]
+        self.assertGreaterEqual(len(blocks), 2, "no forecast-shaped returns found — "
+                                                "this test would pass vacuously")
+        for b in blocks:
+            self.assertIn('"forecastDate"', b,
+                          "a forecast dict without forecastDate disables the latch")
+
+
 if __name__ == "__main__":
     unittest.main()
