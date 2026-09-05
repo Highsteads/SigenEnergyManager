@@ -45,6 +45,7 @@ from sigenergy_modbus import (
     HOLD_REMOTE_EMS_ENABLE,
     HOLD_REMOTE_EMS_MODE,
     decode_pv_strings,
+    PLANT_PV_TOTAL_KWH, PLANT_LOAD_TOTAL_KWH, PLANT_ESS_CHARGE_TOTAL_KWH, PLANT_TOTAL_IMPORT_KWH, NO_CACHE_KEYS, ENERGY_BLOCK_KEYS, decode_energy_block_a, decode_energy_block_c, decode_u64_words,
 )
 
 
@@ -560,6 +561,15 @@ class TestReadAllPartial(unittest.TestCase):
             if register == PLANT_PV_POWER:
                 # 30035-30038 as two big-endian S32s: PV 5000 W, ESS -1200 W.
                 return [0, 5000, 0xFFFF, 0xFB50]
+            # v1.14 energy blocks, values from the 05-Sep-2026 live probe.
+            if register == PLANT_PV_TOTAL_KWH:            # pv 7630.06, daily load 12.05
+                return [0, 0, 0x000B, 0xA47E, 0, 1205]
+            if register == PLANT_LOAD_TOTAL_KWH:          # load lifetime 4014.90
+                return [0, 0, 0x0006, 0x2052]
+            if register == PLANT_ESS_CHARGE_TOTAL_KWH:    # chg 2471.58, dis 2396.45
+                return [0, 0, 3, 0xC576, 0, 0, 3, 0xA81D]
+            if register == PLANT_TOTAL_IMPORT_KWH:        # imp 57.11, exp 3597.06
+                return [0, 0, 0, 5711, 0, 0, 5, 0x7D1A]
             return [4, 4, 2101, 633, 3081, 624, 3146, 651, 2044, 615]
         m._read_block_u16 = _blk
         m._blk_calls = []
@@ -616,7 +626,13 @@ class TestReadAllPartial(unittest.TestCase):
         # reads 30035-30038 through this same primitive every cycle. The
         # assertion that matters is that the LATCHED block is not attempted.
         self.assertNotIn(INV_PV_STRING_BLOCK, calls)
-        self.assertEqual(calls, [PLANT_PV_POWER])
+        # v1.14: the four plant energy blocks go through the same primitive on a
+        # full sweep, so the fast block is no longer the ONLY caller — but it is
+        # still the first, and the latched string block still never appears.
+        self.assertEqual(calls[0], PLANT_PV_POWER)
+        self.assertEqual(set(calls) - {PLANT_PV_POWER},
+                         {PLANT_PV_TOTAL_KWH, PLANT_LOAD_TOTAL_KWH,
+                          PLANT_ESS_CHARGE_TOTAL_KWH, PLANT_TOTAL_IMPORT_KWH})
 
     # --- read tiering (v1.13) -----------------------------------------
 
@@ -737,6 +753,8 @@ class TestReadAllPartial(unittest.TestCase):
         specs = self._mk()._slow_read_specs()
         last_key, _rd, last_reg, _sl, _post = [sp for sp in specs
                                                if sp[0] != "pvStrings"][-1]
+        if isinstance(last_reg, tuple):          # v1.14 block spec: (address, count)
+            last_reg = last_reg[0]
 
         control = self._counting()
         control.read_all()
@@ -764,6 +782,8 @@ class TestReadAllPartial(unittest.TestCase):
         for key, _rd, register, _sl, _post in specs:
             if key == "pvStrings":
                 continue
+            if isinstance(register, tuple):      # v1.14 block spec: (address, count)
+                register = register[0]
             self.assertIn(register, m._seen, f"{key} never came round")
 
     def test_decode_s32_pair_matches_the_int32_primitive(self):
@@ -1085,6 +1105,114 @@ class TestDecodePvStrings(unittest.TestCase):
         out = decode_pv_strings([1, 1, 3278, 65436, 0, 0, 0, 0, 0, 0])  # -1.00 A
         self.assertEqual(out[0]["a"], -1.0)
         self.assertGreaterEqual(out[0]["w"], 0)
+
+
+
+class TestLifetimeEnergyBlocks(unittest.TestCase):
+    """v1.14 — the four plant energy blocks, the no-cache rule for reset-type
+    registers, and the fresh-read stamp daily_energy.py anchors on."""
+
+    def _mk(self, fail_addrs=()):
+        return TestReadAllPartial._mk(self, fail_addrs=fail_addrs)
+
+    def test_first_sweep_delivers_all_seven_energy_keys_by_address(self):
+        data = self._mk().read_all()
+        self.assertEqual(data["pvLifetimeKwh"], 7630.06)
+        self.assertEqual(data["homeDailyDirectKwh"], 12.05)
+        self.assertEqual(data["homeLifetimeKwh"], 4014.9)
+        self.assertEqual(data["batteryChargeLifetimeKwh"], 2471.58)
+        self.assertEqual(data["batteryDischargeLifetimeKwh"], 2396.45)
+        self.assertEqual(data["gridImportLifetimeKwh"], 57.11)
+        self.assertEqual(data["gridExportLifetimeKwh"], 3597.06)
+        self.assertIn("_energyReadAt", data)
+
+    def test_reset_type_keys_are_never_served_from_cache(self):
+        """A daily counter ten minutes old that spans midnight is from a
+        different day — the fault that froze homeDailyKwh on 4/5-Sep-2026.
+        Lifetime keys are still served from cache like any slow key."""
+        m = self._mk()
+        m.read_all()                               # full sweep: everything present
+        # Rotation now reads SLOW_READS_PER_CYCLE specs per cycle; walk enough
+        # cycles that at least one skips block A, and check the rule held on it.
+        saw_absent = False
+        for _ in range(12):
+            data = m.read_all()
+            self.assertIn("pvLifetimeKwh", data)   # cached, always present
+            if "homeDailyDirectKwh" not in data:
+                saw_absent = True
+                self.assertNotIn("_energyReadAt", data) if "homeLifetimeKwh" not in m._slow_cache else None
+        self.assertTrue(saw_absent, "block A was read every cycle — the test proves nothing")
+        for key in NO_CACHE_KEYS:
+            self.assertNotIn(key, m._slow_cache)
+
+    def test_energy_read_at_only_on_a_cycle_that_read_a_block(self):
+        m = self._mk()
+        m.read_all()
+        stamped = unstamped = 0
+        for _ in range(12):
+            data = m.read_all()
+            if "_energyReadAt" in data:
+                stamped += 1
+            else:
+                unstamped += 1
+        self.assertGreater(stamped, 0)
+        self.assertGreater(unstamped, 0, "every cycle stamped — cache-served cycles must not")
+
+    def test_mark_energy_due_reads_all_four_blocks_next_cycle(self):
+        m = TestReadAllPartial._counting(self)
+        m.read_all()
+        m._seen.clear()
+        m.mark_slow_read_due(*ENERGY_BLOCK_KEYS)
+        data = m.read_all()
+        for addr in (PLANT_PV_TOTAL_KWH, PLANT_LOAD_TOTAL_KWH,
+                     PLANT_ESS_CHARGE_TOTAL_KWH, PLANT_TOTAL_IMPORT_KWH):
+            self.assertIn(addr, m._seen)
+        self.assertIn("_energyReadAt", data)
+        self.assertIn("homeDailyDirectKwh", data)
+
+    def test_load_lifetime_block_absent_latches_and_the_rest_survive(self):
+        m = self._mk(fail_addrs={PLANT_LOAD_TOTAL_KWH})
+        for _ in range(3):
+            data = m.read_all(force_full=True)
+            self.assertIsNotNone(data)
+        self.assertIn("_energyB", m._energy_block_absent)
+        self.assertNotIn("homeLifetimeKwh", data)
+        self.assertIn("pvLifetimeKwh", data)
+        self.assertIn("batteryChargeLifetimeKwh", data)
+        seen = []
+        m._read_block_u16 = (lambda register, count, slave=None, *a, **k:
+                             seen.append(register) or [0, 5000, 0xFFFF, 0xFB50])
+        m.read_all(force_full=True)
+        self.assertNotIn(PLANT_LOAD_TOTAL_KWH, seen)
+
+    def test_battery_lifetime_block_absent_latches_after_three_misses(self):
+        m = self._mk(fail_addrs={PLANT_ESS_CHARGE_TOTAL_KWH})
+        for _ in range(3):
+            m.read_all(force_full=True)
+        self.assertIn("_energyC", m._energy_block_absent)
+        self.assertNotIn("_energyB", m._energy_block_absent)
+
+    def test_a_single_miss_does_not_latch(self):
+        m = self._mk(fail_addrs={PLANT_LOAD_TOTAL_KWH})
+        m.read_all(force_full=True)
+        self.assertNotIn("_energyB", m._energy_block_absent)
+
+    def test_routine_cycle_stays_short_with_the_blocks(self):
+        m = TestReadAllPartial._counting(self)
+        m.read_all()
+        m._seen.clear()
+        m.read_all()
+        self.assertLessEqual(len(m._seen), 5 + SLOW_READS_PER_CYCLE)
+
+    def test_decoders_reject_short_or_sentinel_blocks(self):
+        self.assertIsNone(decode_energy_block_a([0, 0, 0, 1]))
+        self.assertIsNone(decode_energy_block_c([0, 0, 0, 1, 0, 0]))
+        self.assertIsNone(decode_energy_block_a([0xFFFF] * 6))      # sentinel-sized U64
+        self.assertEqual(decode_u64_words([0, 0, 0x000B, 0xA47E]), 763006)
+        self.assertIsNone(decode_u64_words(None))
+        self.assertEqual(decode_energy_block_c([0, 0, 3, 0xC576, 0, 0, 3, 0xA81D]),
+                         {"batteryChargeLifetimeKwh": 2471.58,
+                          "batteryDischargeLifetimeKwh": 2396.45})
 
 
 if __name__ == "__main__":

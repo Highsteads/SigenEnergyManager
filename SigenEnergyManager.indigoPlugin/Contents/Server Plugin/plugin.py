@@ -6,9 +6,10 @@
 #              Core philosophy: never import from grid unless battery cannot
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
-#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0)
-# Date:        04-09-2026
-# Version:     5.88.0
+#              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
+#              Claude Fable 5.1 (5.89.0)
+# Date:        05-09-2026 14:10
+# Version:     5.89.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -148,7 +149,12 @@ except ImportError:                                     # pragma: no cover
         return default
 
 # Plugin modules
-from sigenergy_modbus import SigenergyModbus
+from sigenergy_modbus import SigenergyModbus, ENERGY_BLOCK_KEYS
+# v5.89.0: the daily figures derive from lifetime counters anchored at local
+# midnight. See docs/daily-energy-revamp.md for why the accumulate-and-reset
+# model went (it froze homeDailyKwh on yesterday's total for two days).
+from daily_energy import (DailyEnergy, readings_from_data, recovery_from_data,
+                          local_midnight_epoch, KEYS as ENERGY_KEYS)
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               GAS_KWH_PER_M3)
@@ -248,6 +254,14 @@ VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 # exporting a quarter of an hour late is a fault, not a late poll.
 VPP_OVERRUN_GRACE_MINS    = 15
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
+# v5.89.0 — the energy tripwire. The identity residual and the derived-vs-device
+# house gap each warn once per day above max(absolute, fraction * throughput).
+ENERGY_BALANCE_ABS_KWH    = 0.5
+ENERGY_BALANCE_FRACTION   = 0.03
+ENERGY_HOUSE_FRACTION     = 0.05
+# How long the midnight task waits for a post-midnight lifetime read to replace
+# the provisional anchor before recording the day anyway.
+MIDNIGHT_ANCHOR_WAIT_S    = 600
 STORM_WATCH_INTERVAL = 7200  # 2 hours
 # Octopus announces a new Saving Session at most a few times a day (usually the evening
 # before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
@@ -1048,6 +1062,17 @@ class Plugin(indigo.PluginBase):
         self.store["pv_lifetime_start_kwh"]     = None
         self.store["import_lifetime_start_kwh"] = None
         self.store["export_lifetime_start_kwh"] = None
+        # v5.89.0: the six daily figures are DERIVED (daily_energy.py). The store
+        # keys above and below are a read-only PROJECTION of that object, refreshed
+        # on every Modbus observe and kept so its sixty-odd consumers need no change.
+        # Nothing may write to them except _project_daily_energy.
+        self.store["battery_charge_daily_kwh"]    = 0.0
+        self.store["battery_discharge_daily_kwh"] = 0.0
+        self.store["energy_balance_kwh"]          = 0.0
+        self.store["energy_day_partial"]          = False
+        self.store["energy_reconcile_warned"]     = ""
+        self.store["energy_yesterday_projection"] = None
+        self.daily_energy = DailyEnergy()
 
         # VPP state machine
         self.store["vpp_state"]            = VPP_IDLE
@@ -1829,6 +1854,11 @@ class Plugin(indigo.PluginBase):
                     "peak_soc":   round(store.get("peak_soc",            0.0), 1),
                     "min_soc":    round(store.get("min_soc",           100.0), 1),
                     "self_suff":  self_suff,
+                    # v5.89.0
+                    "battery_charge_kwh":    round(store.get("battery_charge_daily_kwh", 0.0), 2),
+                    "battery_discharge_kwh": round(store.get("battery_discharge_daily_kwh", 0.0), 2),
+                    "balance_kwh":           round(store.get("energy_balance_kwh", 0.0), 2),
+                    "partial":               bool(store.get("energy_day_partial", False)),
                 },
                 "vpp": {
                     "state":     store.get("vpp_state",  "idle"),
@@ -2793,7 +2823,7 @@ class Plugin(indigo.PluginBase):
         self.store["grid_status_prev"] = new_grid_status
 
         # Update daily energy accumulators
-        self._accumulate_daily_energy(data)
+        self._observe_energy_counters(data)
 
         # Accumulate home load into persistent half-hourly profile
         self._refresh_away_state()
@@ -2802,101 +2832,186 @@ class Plugin(indigo.PluginBase):
         # Update device states
         self._update_inverter_device(data)
 
-    def _accumulate_daily_energy(self, data):
-        """Compute daily energy totals from Modbus registers where available.
+    def _observe_energy_counters(self, data):
+        """Feed this cycle's lifetime counters to DailyEnergy and project the day's
+        figures into the store.
 
-        Home consumption: register 30092 resets at midnight on the inverter —
-        read directly; always accurate regardless of when the plugin started.
-
-        PV / grid import / grid export: only lifetime totals exist in the protocol
-        (30088, 30216, 30220).  We snapshot the lifetime value at midnight (or at
-        first read after plugin startup) and compute daily = current - snapshot.
-        This is accurate for any full day even if the plugin restarts mid-day.
-
-        If a register read fails the fallback is watt-integration (original method).
+        v5.89.0 replaced the accumulate-and-reset model. Each daily figure is
+        `latest - anchor` on a plant LIFETIME counter (pv 30088, load 30094,
+        ESS charge/discharge 30200/30204, grid import/export 30216/30220),
+        anchored at Europe/London midnight. The inverter's own daily counters
+        (30092, 30566, 30572) are read but never trusted as the figure: they run
+        on the inverter's clock and are served only on the cycle they were read.
+        They RECOVER a missing anchor (anchor = lifetime - device_daily) and
+        cross-check the derived house figure. Design: docs/daily-energy-revamp.md.
         """
-        # Fallback: hours per pass, used only when the inverter's direct daily
-        # registers are unavailable and we fall through to watt-integration.
-        # MEASURED, not the configured interval — see _accum_interval_h.
-        _poll_s   = getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL)
-        _now_wall = time.time()
-        _last     = self.store.get("last_energy_accum") or _now_wall
-        self.store["last_energy_accum"] = _now_wall
-        interval_h = self._accum_interval_h(_now_wall - _last, _poll_s)
+        de = getattr(self, "daily_energy", None)
+        if de is None:
+            return
+        today    = _local_today_str()
+        readings = readings_from_data(data)
+        recovery = recovery_from_data(data)
+        fresh    = data.get("_energyReadAt") is not None
+        read_at  = float(data.get("_energyReadAt") or data.get("_read_at") or time.time())
+        try:
+            soc = float(data.get("batterySoc"))
+        except (TypeError, ValueError):
+            soc = None
+        if de.today_date is not None and today != de.today_date:
+            # Local midnight has passed since the last observe. Keep the day just
+            # ended as the projection stood (the fallback for any key the anchors
+            # cannot settle), and force a fresh read of every lifetime block on the
+            # next cycle so the new day's anchor is a post-midnight boundary reading
+            # rather than a cached one — the cache is what froze 4/5-Sep-2026.
+            self.store["energy_yesterday_projection"] = self._energy_projection_snapshot(de.today_date)
+            mb = getattr(self, "modbus", None)
+            if mb is not None:
+                try:
+                    mb.mark_slow_read_due(*ENERGY_BLOCK_KEYS)
+                except Exception as exc:
+                    self.logger.debug(f"[Energy] could not mark the energy blocks due: {exc}")
+        de.observe(readings, read_at, today, soc_pct=soc, recovery=recovery, fresh=fresh)
+        if de.last_backwards:
+            log(f"[Energy] Lifetime counter went BACKWARDS for {', '.join(de.last_backwards)} "
+                f"— the plant re-based it; re-anchored from here, so today's figure for it "
+                f"restarts at zero", level="WARNING")
+        self._project_daily_energy(data)
+        self._reconcile_daily_energy(data, today)
+        self._track_energy_extremes(data)
 
-        # --- Home daily: read directly from 30092 (resets at midnight) ---
-        # The inverter's daily counter may reset at a slightly different
-        # moment than _check_midnight (its clock could be UTC, BST, or
-        # vendor-default), creating a window where a poll captures the
-        # post-reset 0 while our store still represents yesterday — and
-        # _write_daily_history then snapshots 0 as yesterday's home_kwh.
-        # Confirmed bug on 12-May-2026: every prior day in daily_history.json
-        # had home_kwh ~= 0 despite real consumption ~15-20 kWh/day.
-        #
-        # Defence: a sudden DROP in the inverter's daily counter (while our
-        # store has accumulated > 2 kWh) is treated as the inverter's reset
-        # and ignored.  _check_midnight runs in the same _tick and will reset
-        # our store value cleanly when the local date rolls over.
-        home_direct = data.get("homeDailyDirectKwh")
-        if home_direct is not None:
-            current = self.store.get("home_daily_kwh", 0.0)
-            if (home_direct + 1.0) < current and current > 2.0:
-                self.logger.debug(
-                    f"[Energy] Suspected inverter daily reset detected — "
-                    f"home_direct={home_direct:.2f} < store={current:.2f}. "
-                    f"Holding store value until _check_midnight runs."
-                )
-                # Hold value; _check_midnight will reset cleanly on date change
-            else:
-                self.store["home_daily_kwh"] = home_direct
-        else:
-            self.store["home_daily_kwh"] += (
-                max(0, data.get("homePowerWatts", 0)) * interval_h / 1000.0
-            )
+    def _project_daily_energy(self, data=None):
+        """Write DailyEnergy's figures into the legacy store keys (read-only projection)."""
+        de = getattr(self, "daily_energy", None)
+        if de is None:
+            return
+        t = de.today()
+        v = t["values"]
+        data = data or {}
+        # House: its own lifetime counter; failing that (a firmware without
+        # 30094) the identity, which the other five counters give exactly — the
+        # plant computes its house figure the same way.
+        home = v["home"]
+        if home is None and None not in (v["pv"], v["gridImport"], v["gridExport"],
+                                         v["batteryCharge"], v["batteryDischarge"]):
+            home = round(max(0.0, v["pv"] + v["gridImport"] + v["batteryDischarge"]
+                                  - v["gridExport"] - v["batteryCharge"]), 2)
+        # Battery flow: lifetime-anchored; failing that (no 30200/30204) the
+        # inverter's own daily counters, and only from a cycle that read them.
+        chg = v["batteryCharge"]
+        dis = v["batteryDischarge"]
+        if chg is None and data.get("batteryDailyChargeKwh") is not None:
+            chg = float(data["batteryDailyChargeKwh"])
+        if dis is None and data.get("batteryDailyDischargeKwh") is not None:
+            dis = float(data["batteryDailyDischargeKwh"])
+        for store_key, value in (
+            ("pv_daily_kwh",                v["pv"]),
+            ("grid_import_daily_kwh",       v["gridImport"]),
+            ("grid_export_daily_kwh",       v["gridExport"]),
+            ("home_daily_kwh",              home),
+            ("battery_charge_daily_kwh",    chg),
+            ("battery_discharge_daily_kwh", dis),
+        ):
+            if value is not None:                 # absent keeps the last projection
+                self.store[store_key] = float(value)
+        self.store["energy_day_partial"] = bool(t["partial"])
+        residual = de.residual()
+        if residual is not None:
+            self.store["energy_balance_kwh"] = residual
 
-        # --- PV daily: delta from lifetime total (30088) ---
-        pv_lifetime = data.get("pvLifetimeKwh")
-        if pv_lifetime is not None:
-            if self.store["pv_lifetime_start_kwh"] is None:
-                self.store["pv_lifetime_start_kwh"] = pv_lifetime
-                self.logger.info(
-                    f"[Energy] PV lifetime anchor: {pv_lifetime:.2f} kWh "
-                    f"(daily PV starts from this point)"
-                )
-            self.store["pv_daily_kwh"] = max(
-                0.0, pv_lifetime - self.store["pv_lifetime_start_kwh"]
-            )
-        else:
-            self.store["pv_daily_kwh"] += (
-                max(0, data.get("pvPowerWatts", 0)) * interval_h / 1000.0
-            )
+    def _energy_projection_snapshot(self, date_str=None):
+        """The projection as a plain dict, stamped with the day it describes."""
+        de = getattr(self, "daily_energy", None)
+        t  = de.today() if de is not None else {"sources": {}, "partial": False}
+        return {
+            "date":             date_str or self.store.get("today_date"),
+            "pv":               float(self.store.get("pv_daily_kwh", 0.0) or 0.0),
+            "gridImport":       float(self.store.get("grid_import_daily_kwh", 0.0) or 0.0),
+            "gridExport":       float(self.store.get("grid_export_daily_kwh", 0.0) or 0.0),
+            "home":             float(self.store.get("home_daily_kwh", 0.0) or 0.0),
+            "batteryCharge":    float(self.store.get("battery_charge_daily_kwh", 0.0) or 0.0),
+            "batteryDischarge": float(self.store.get("battery_discharge_daily_kwh", 0.0) or 0.0),
+            "balance":          float(self.store.get("energy_balance_kwh", 0.0) or 0.0),
+            "partial":          bool(self.store.get("energy_day_partial", False)),
+            "sources":          dict(t.get("sources") or {}),
+        }
 
-        # --- Grid import daily: delta from lifetime total (30216) ---
-        imp_lifetime = data.get("gridImportLifetimeKwh")
-        if imp_lifetime is not None:
-            if self.store["import_lifetime_start_kwh"] is None:
-                self.store["import_lifetime_start_kwh"] = imp_lifetime
-            self.store["grid_import_daily_kwh"] = max(
-                0.0, imp_lifetime - self.store["import_lifetime_start_kwh"]
-            )
-        else:
-            self.store["grid_import_daily_kwh"] += (
-                max(0, data.get("gridPowerWatts", 0)) * interval_h / 1000.0
-            )
+    def _energy_day_totals(self, date_str):
+        """The six figures for `date_str`, for the daily record.
 
-        # --- Grid export daily: delta from lifetime total (30220) ---
-        exp_lifetime = data.get("gridExportLifetimeKwh")
-        if exp_lifetime is not None:
-            if self.store["export_lifetime_start_kwh"] is None:
-                self.store["export_lifetime_start_kwh"] = exp_lifetime
-            self.store["grid_export_daily_kwh"] = max(
-                0.0, exp_lifetime - self.store["export_lifetime_start_kwh"]
-            )
-        else:
-            self.store["grid_export_daily_kwh"] += (
-                max(0, -data.get("gridPowerWatts", 0)) * interval_h / 1000.0
-            )
+        A COMPLETED day is anchor[next day] - anchor[day] — two boundary readings,
+        exact by construction, immune to the order the midnight tasks ran in.
+        Any key the anchors cannot settle falls back to the projection as it
+        stood when that day ended, which is what v5.88 recorded for every key.
+        """
+        snap = self.store.get("energy_yesterday_projection")
+        base = (dict(snap) if isinstance(snap, dict) and snap.get("date") == date_str
+                else self._energy_projection_snapshot(date_str))
+        de = getattr(self, "daily_energy", None)
+        c  = de.completed(date_str) if de is not None else None
+        if c is None:
+            return base
+        v = c["values"]
+        for key in ENERGY_KEYS:
+            if v[key] is not None:
+                base[key] = v[key]
+        if v["home"] is None and None not in (v["pv"], v["gridImport"], v["gridExport"],
+                                              v["batteryCharge"], v["batteryDischarge"]):
+            base["home"] = round(max(0.0, v["pv"] + v["gridImport"] + v["batteryDischarge"]
+                                          - v["gridExport"] - v["batteryCharge"]), 2)
+        base["sources"] = dict(c["sources"])
+        base["partial"] = bool(c["partial"])
+        if None not in (v["pv"], v["gridImport"], v["gridExport"], v["batteryCharge"],
+                        v["batteryDischarge"]) and base.get("home") is not None:
+            base["balance"] = round(v["pv"] + v["gridImport"] + v["batteryDischarge"]
+                                    - v["gridExport"] - v["batteryCharge"] - base["home"], 2)
+        return base
 
+    def _reconcile_daily_energy(self, data, today):
+        """The tripwire: the identity must close and the derived house figure must
+        agree with the inverter's own daily counter. Each check warns once per day
+        and re-arms when it clears — the 4-Sep-2026 fault (a 10.5 kWh
+        disagreement) sat unnoticed for two days because nothing looked.
+        """
+        de = getattr(self, "daily_energy", None)
+        if de is None:
+            return
+        warned = str(self.store.get("energy_reconcile_warned") or "")
+        flags  = set(w for w in warned.split(",") if w.startswith(today + ":"))
+        v = de.today()["values"]
+        checks = []
+        residual = de.residual()
+        if residual is not None:
+            through = v["pv"] + v["gridImport"] + v["batteryDischarge"]
+            checks.append((
+                "balance",
+                abs(residual) > max(ENERGY_BALANCE_ABS_KWH, ENERGY_BALANCE_FRACTION * through),
+                f"energy balance off by {residual:+.2f} kWh so far today (pv {v['pv']:.2f} "
+                f"+ import {v['gridImport']:.2f} + discharge {v['batteryDischarge']:.2f} "
+                f"- export {v['gridExport']:.2f} - charge {v['batteryCharge']:.2f} - house "
+                f"{v['home']:.2f}) — a midnight anchor is wrong; the figures come right "
+                f"again at the next midnight"))
+        device_home = (data or {}).get("homeDailyDirectKwh")
+        derived     = self.store.get("home_daily_kwh")
+        if device_home is not None and derived is not None and v["home"] is not None:
+            gap = float(derived) - float(device_home)
+            checks.append((
+                "house",
+                abs(gap) > max(ENERGY_BALANCE_ABS_KWH, ENERGY_HOUSE_FRACTION * float(device_home)),
+                f"derived house use {float(derived):.2f} kWh disagrees with the inverter's "
+                f"own daily counter {float(device_home):.2f} kWh by {gap:+.2f} kWh — the "
+                f"house anchor is wrong"))
+        for name, bad, message in checks:
+            flag = f"{today}:{name}"
+            if bad and flag not in flags:
+                log(f"[Energy] {message}", level="WARNING")
+                flags.add(flag)
+            elif not bad and flag in flags:
+                log(f"[Energy] {name} check back within bounds")
+                flags.discard(flag)
+        self.store["energy_reconcile_warned"] = ",".join(sorted(flags))
+
+    def _track_energy_extremes(self, data):
+        """Peak/low SOC and peak PV for the day — unchanged from v5.88, split out."""
         # --- SOC peak/low tracking ---
         soc = data.get("batterySoc", 0.0)
         if soc > self.store["peak_soc"]:
@@ -6860,6 +6975,16 @@ class Plugin(indigo.PluginBase):
         if today == self.store["today_date"]:
             return  # Not yet midnight
 
+        # v5.89.0: give the first post-midnight lifetime read a few minutes to
+        # replace the provisional anchor, so the record written below is the
+        # difference of two true boundary readings. Bounded — a Modbus outage
+        # at midnight must not hold the day's record hostage.
+        de = getattr(self, "daily_energy", None)
+        if de is not None and de.today_date == today and de.today().get("provisional"):
+            midnight = local_midnight_epoch(today)
+            if midnight is not None and 0.0 <= time.time() - midnight < MIDNIGHT_ANCHOR_WAIT_S:
+                return
+
         # New day
         yesterday = self.store["today_date"]
         log(f"Midnight: recording daily history for {yesterday}")
@@ -6934,20 +7059,39 @@ class Plugin(indigo.PluginBase):
             log(f"[VPP] Window spans midnight — export anchor re-based "
                 f"({max(0.0, _pre_total - _old_start):.2f} kWh banked before the rollover)")
 
-        # Reset accumulators
-        self.store["pv_daily_kwh"]              = 0.0
-        self.store["grid_import_daily_kwh"]     = 0.0
-        self.store["grid_export_daily_kwh"]     = 0.0
-        self.store["home_daily_kwh"]            = 0.0
+        # New day. v5.89.0: the daily figures derive from lifetime counters anchored
+        # at this boundary (daily_energy.py) — nothing is zeroed by hand. The
+        # projection is refreshed from the object, which already rolled over on
+        # the first observe of the new day (or does so here if Modbus was out).
         self.store["peak_soc"]                  = 0.0
         self.store["min_soc"]                   = 100.0
         self.store["peak_pv_w"]                 = 0
         self.store["peak_pv_time"]              = ""
         self.store["today_date"]                = today
-        # Clear lifetime anchors — next poll will re-snapshot at the new day's baseline
+        self.store["energy_reconcile_warned"]   = ""
+        # Legacy anchors (pre-5.89 accumulators file) — cleared so a downgrade
+        # cannot read yesterday's boundary as today's.
         self.store["pv_lifetime_start_kwh"]     = None
         self.store["import_lifetime_start_kwh"] = None
         self.store["export_lifetime_start_kwh"] = None
+        if de is not None:
+            if de.today_date != today:
+                if self.store.get("energy_yesterday_projection") is None:
+                    self.store["energy_yesterday_projection"] = self._energy_projection_snapshot(yesterday)
+                de.rollover(today)
+                mb = getattr(self, "modbus", None)
+                if mb is not None:
+                    try:
+                        mb.mark_slow_read_due(*ENERGY_BLOCK_KEYS)
+                    except Exception as exc:
+                        self.logger.debug(f"[Energy] could not mark the energy blocks due: {exc}")
+            self._project_daily_energy()
+        else:
+            for _k in ("pv_daily_kwh", "grid_import_daily_kwh", "grid_export_daily_kwh",
+                       "home_daily_kwh", "battery_charge_daily_kwh", "battery_discharge_daily_kwh",
+                       "energy_balance_kwh"):
+                self.store[_k] = 0.0
+            self.store["energy_day_partial"] = False
 
         self._save_accumulators()
 
@@ -7071,20 +7215,22 @@ class Plugin(indigo.PluginBase):
                             max(0.0, _as_float(self.pluginPrefs.get("solarOverflowBankFirstSoc"),
                                                SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)))
 
+        totals = self._energy_day_totals(date_str)
         record = {
             "date":                 date_str,
             "month":                date_str[:7],
-            "pv_kwh":               round(self.store["pv_daily_kwh"], 2),
+            "pv_kwh":               round(totals["pv"], 2),
             "pv_forecast_kwh":      round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
-            "grid_import_kwh":      round(self.store["grid_import_daily_kwh"], 2),
-            "grid_export_kwh":      round(self.store["grid_export_daily_kwh"], 2),
-            "home_kwh":             round(self.store["home_daily_kwh"], 2),
-            "battery_charge_kwh":   round(
-                self.latest_inverter_data.get("batteryDailyChargeKwh", 0.0), 2
-            ),
-            "battery_discharge_kwh": round(
-                self.latest_inverter_data.get("batteryDailyDischargeKwh", 0.0), 2
-            ),
+            "grid_import_kwh":      round(totals["gridImport"], 2),
+            "grid_export_kwh":      round(totals["gridExport"], 2),
+            "home_kwh":             round(totals["home"], 2),
+            "battery_charge_kwh":   round(totals["batteryCharge"], 2),
+            "battery_discharge_kwh": round(totals["batteryDischarge"], 2),
+            # v5.89.0 audit fields: the identity residual, whether any figure was
+            # anchored late (a boundary the plugin missed), and how each was anchored.
+            "energy_balance_kwh":   round(float(totals.get("balance", 0.0)), 2),
+            "energy_partial":       bool(totals.get("partial", False)),
+            "energy_sources":       dict(totals.get("sources") or {}),
             "peak_soc":   round(self.store["peak_soc"], 1),
             "min_soc":    round(self.store["min_soc"], 1),
             "tariff":     self.latest_rates_data.get("tariff_info", {}).get("tariff_key", "?"),
@@ -7480,12 +7626,16 @@ class Plugin(indigo.PluginBase):
             _num_state("batteryCellVoltage",       _as_float(data.get("batteryCellVoltage"), 0.0),    3),
             _num_state("batteryMaxTempC",          _as_float(data.get("batteryMaxTempC"), 0.0),       1),
             _num_state("batteryMinTempC",          _as_float(data.get("batteryMinTempC"), 0.0),       1),
-            _num_state("batteryDailyChargeKwh",    _as_float(data.get("batteryDailyChargeKwh"), 0.0), 2),
-            _num_state("batteryDailyDischargeKwh", _as_float(data.get("batteryDailyDischargeKwh"), 0.0), 2),
+            # v5.89.0: from the projection, never from data — the inverter's daily
+            # registers are present only on the cycle they were read, and a 0.0
+            # written on the other cycles would chart as a real reading.
+            _num_state("batteryDailyChargeKwh",    self.store.get("battery_charge_daily_kwh", 0.0),    2),
+            _num_state("batteryDailyDischargeKwh", self.store.get("battery_discharge_daily_kwh", 0.0), 2),
             _num_state("pvDailyKwh",               self.store["pv_daily_kwh"],          2),
             _num_state("gridDailyImportKwh",       self.store["grid_import_daily_kwh"], 2),
             _num_state("gridDailyExportKwh",       self.store["grid_export_daily_kwh"], 2),
             _num_state("homeDailyKwh",             self.store["home_daily_kwh"],        2),
+            _num_state("energyBalanceKwh",         self.store.get("energy_balance_kwh", 0.0), 2),
             {"key": "modbusConnected",          "value": "True"},
             {"key": "lastUpdate",               "value": data.get("lastUpdate", "")},
         ]
@@ -7798,15 +7948,18 @@ class Plugin(indigo.PluginBase):
                     battery_net_kwh  REAL,
                     tracker_price_p  REAL,
                     agile_price_p    REAL,
-                    manager_action   TEXT
+                    manager_action   TEXT,
+                    battery_charge_kwh    REAL,
+                    battery_discharge_kwh REAL
                 )
             """)
             # Existing installations have the older table. SQLite only gained
             # ADD COLUMN support suitable for this small migration long ago;
             # inspect first so startup remains idempotent.
             columns = {row[1] for row in con.execute("PRAGMA table_info(halfhourly)")}
-            if "agile_price_p" not in columns:
-                con.execute("ALTER TABLE halfhourly ADD COLUMN agile_price_p REAL")
+            for _col in ("agile_price_p", "battery_charge_kwh", "battery_discharge_kwh"):
+                if _col not in columns:
+                    con.execute(f"ALTER TABLE halfhourly ADD COLUMN {_col} REAL")
             con.commit()
             log(f"[Timeseries] DB ready: {db_path}")
         except sqlite3.Error as exc:
@@ -7839,36 +7992,42 @@ class Plugin(indigo.PluginBase):
         slot_start_dt = now_dt - timedelta(seconds=ENERGY_VAR_INTERVAL)
         slot_start = slot_start_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-        cur_pv     = round(self.store.get("pv_daily_kwh",          0.0), 4)
-        cur_import = round(self.store.get("grid_import_daily_kwh", 0.0), 4)
-        cur_export = round(self.store.get("grid_export_daily_kwh", 0.0), 4)
-        cur_home   = round(self.store.get("home_daily_kwh",        0.0), 4)
-
+        # v5.89.0: deltas of the LIFETIME counters between two writes. The old
+        # form subtracted the daily store and clamped at zero, which threw away
+        # the pre-midnight part of the slot spanning midnight every night —
+        # winter_import_forecast.py had already noticed "44-47 of 48 slots".
+        de   = getattr(self, "daily_energy", None)
+        snap = de.lifetime_snapshot() if de is not None else {}
         inv_data  = self.latest_inverter_data or {}
         cur_soc   = float(inv_data.get("batterySoc", 0.0))
         cap_kwh   = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), "35.04")
+        need = ("pv", "gridImport", "gridExport", "home")
+        if any(k not in snap for k in need):
+            return                                   # no complete reading yet — next slot
+        anchor     = self.store.get("hh_anchor_lifetime")
+        anchor_soc = self.store.get("hh_anchor_soc_pct")
 
-        anchor_pv     = self.store.get("hh_anchor_pv_kwh")
-        anchor_import = self.store.get("hh_anchor_import_kwh")
-        anchor_export = self.store.get("hh_anchor_export_kwh")
-        anchor_home   = self.store.get("hh_anchor_home_kwh")
-        anchor_soc    = self.store.get("hh_anchor_soc_pct")
-
-        # Seed anchors on first call — skip writing this slot (unknown period)
-        if anchor_pv is None:
-            self.store["hh_anchor_pv_kwh"]     = cur_pv
-            self.store["hh_anchor_import_kwh"] = cur_import
-            self.store["hh_anchor_export_kwh"] = cur_export
-            self.store["hh_anchor_home_kwh"]   = cur_home
-            self.store["hh_anchor_soc_pct"]    = cur_soc
+        # Seed anchors on first call (or an upgrade from the pre-5.89 daily-store
+        # anchors) — skip writing this slot, its period is unknown.
+        if not isinstance(anchor, dict) or any(k not in anchor for k in need):
+            self.store["hh_anchor_lifetime"] = dict(snap)
+            self.store["hh_anchor_soc_pct"]  = cur_soc
             return
 
-        # Guard against midnight reset making deltas negative
-        delta_pv     = max(0.0, round(cur_pv     - anchor_pv,     4))
-        delta_import = max(0.0, round(cur_import - anchor_import,  4))
-        delta_export = max(0.0, round(cur_export - anchor_export,  4))
-        delta_home   = max(0.0, round(cur_home   - anchor_home,    4))
-        battery_net  = round((cur_soc - (anchor_soc or cur_soc)) * cap_kwh / 100.0, 4)
+        def _delta(key):
+            if key not in snap or key not in anchor:
+                return None
+            # max() guards a meter reset only; lifetime counters never go down.
+            return round(max(0.0, snap[key] - anchor[key]), 4)
+
+        delta_pv     = _delta("pv")
+        delta_import = _delta("gridImport")
+        delta_export = _delta("gridExport")
+        delta_home   = _delta("home")
+        delta_charge = _delta("batteryCharge")
+        delta_dischg = _delta("batteryDischarge")
+        battery_net  = round((cur_soc - (anchor_soc if anchor_soc is not None else cur_soc))
+                             * cap_kwh / 100.0, 4)
 
         # Tracker price from tariff monitor device state
         tracker_p = None
@@ -7906,12 +8065,14 @@ class Plugin(indigo.PluginBase):
                    (slot_start, slot_end,
                     grid_import_kwh, grid_export_kwh, pv_kwh, home_kwh,
                     battery_soc_start_pct, battery_soc_end_pct, battery_net_kwh,
-                    tracker_price_p, agile_price_p, manager_action)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    tracker_price_p, agile_price_p, manager_action,
+                    battery_charge_kwh, battery_discharge_kwh)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (slot_start, slot_end,
                  delta_import, delta_export, delta_pv, delta_home,
                  anchor_soc, cur_soc, battery_net,
-                 tracker_p, agile_p, action)
+                 tracker_p, agile_p, action,
+                 delta_charge, delta_dischg)
             )
             con.commit()
         except sqlite3.Error as exc:
@@ -7924,11 +8085,8 @@ class Plugin(indigo.PluginBase):
                     pass
 
         # Advance anchors
-        self.store["hh_anchor_pv_kwh"]     = cur_pv
-        self.store["hh_anchor_import_kwh"] = cur_import
-        self.store["hh_anchor_export_kwh"] = cur_export
-        self.store["hh_anchor_home_kwh"]   = cur_home
-        self.store["hh_anchor_soc_pct"]    = cur_soc
+        self.store["hh_anchor_lifetime"] = dict(snap)
+        self.store["hh_anchor_soc_pct"]  = cur_soc
 
     def _write_energy_summary_variables(self):
         """
@@ -9736,6 +9894,17 @@ class Plugin(indigo.PluginBase):
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
             "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
+            "battery_charge_daily_kwh":    self.store.get("battery_charge_daily_kwh", 0.0),
+            "battery_discharge_daily_kwh": self.store.get("battery_discharge_daily_kwh", 0.0),
+            "energy_balance_kwh":          self.store.get("energy_balance_kwh", 0.0),
+            "energy_day_partial":          bool(self.store.get("energy_day_partial", False)),
+            "energy_reconcile_warned":     self.store.get("energy_reconcile_warned", ""),
+            "energy_yesterday_projection": self.store.get("energy_yesterday_projection"),
+            # v5.89.0: the lifetime anchors the daily figures derive from. Carries
+            # its own dates, so it is restored whatever day the plugin starts on.
+            "daily_energy":                (self.daily_energy.to_dict()
+                                            if getattr(self, "daily_energy", None) is not None
+                                            else None),
             # Log-only 90% vs 95% daytime pacing counterfactual. Persist it so a
             # restart cannot turn a partial day into an apparently clean day.
             "shadow_95_export_foregone_kwh": self.store.get("shadow_95_export_foregone_kwh", 0.0),
@@ -9902,6 +10071,13 @@ class Plugin(indigo.PluginBase):
                 # 4h lockout survives a non-graceful stop. It self-expires.
                 self.pluginPrefs["powerRestoredTime"]  = _prt
                 self.store["power_cut_lockout_active"] = True
+            # v5.89.0: the anchor object, restored regardless of day — it carries
+            # its own dates and prunes what is stale itself.
+            _de = data.get("daily_energy")
+            if isinstance(_de, dict):
+                self.daily_energy = DailyEnergy.from_dict(_de)
+            if isinstance(data.get("energy_yesterday_projection"), dict):
+                self.store["energy_yesterday_projection"] = data["energy_yesterday_projection"]
             today = _local_today_str()   # Europe/London, matches the save/midnight basis
             if data.get("today_date") == today:
                 # Same day — restore accumulators and lifetime anchors
@@ -9920,6 +10096,22 @@ class Plugin(indigo.PluginBase):
                 self.store["export_lifetime_start_kwh"] = data.get("export_lifetime_start_kwh")
                 self.store["shadow_95_export_foregone_kwh"] = data.get("shadow_95_export_foregone_kwh", 0.0)
                 self.store["shadow_95_samples"]             = data.get("shadow_95_samples", 0)
+                for _ek in ("battery_charge_daily_kwh", "battery_discharge_daily_kwh",
+                            "energy_balance_kwh", "energy_day_partial", "energy_reconcile_warned"):
+                    if _ek in data:
+                        self.store[_ek] = data[_ek]
+                # v5.89.0 upgrade path: a pre-5.89 file has no daily_energy block, but
+                # its lifetime anchors ARE today's midnight boundary for three keys.
+                # The other three recover from the inverter's own daily counters on
+                # the first read (daily_energy.observe, recovery=).
+                if not isinstance(_de, dict) and getattr(self, "daily_energy", None) is not None:
+                    _seeded = self.daily_energy.migrate_legacy(
+                        today, data.get("pv_lifetime_start_kwh"),
+                        data.get("import_lifetime_start_kwh"), data.get("export_lifetime_start_kwh"))
+                    if _seeded:
+                        log(f"[Energy] Midnight anchors for {', '.join(_seeded)} carried over from "
+                            f"the pre-5.89 accumulators; house and battery flow recover from the "
+                            f"inverter's own daily counters on the first read")
                 for _bf_key, _bf_default in (
                     ("bank_first_small_latched",     False),
                     ("bank_first_latch_date",        ""),

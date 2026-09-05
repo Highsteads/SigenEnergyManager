@@ -15,6 +15,81 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.89.0 — 05-09-2026
+
+**Daily energy figures derived from lifetime counters anchored at local midnight.** Design note:
+`docs/daily-energy-revamp.md`. Modules: `daily_energy.py` (new, pure), `sigenergy_modbus.py` v1.14,
+`plugin.py`.
+
+**The fault.** `homeDailyKwh` froze on 18.6 kWh from 4-Sep to 5-Sep, `daily_history.json` 4-Sep is
+a copy of 3-Sep (and carries `battery_charge_kwh: 0.0`), and every `halfhourly.home_kwh` since 4-Sep
+00:00 is 0. Mechanism, from the plugin log: `_check_midnight` zeroed `home_daily_kwh`; the next poll
+merged a CACHED `homeDailyDirectKwh` (v1.13 read tiering, `SLOW_CACHE_MAX_AGE_S` = 600) and wrote
+yesterday's total into the fresh store; the inverter rolled its own counter to 0.01 moments later;
+the reset guard read 18.60 -> 0.01 as suspicious and held the value for the day (4,019 times on
+5-Sep). The guard's comment predicted the window and defended the wrong direction.
+
+**Why the class kept recurring.** Three definitions of "today" — Europe/London midnight, the
+inverter's day (30092, 30566, 30572), and whenever the next poll landed (the lifetime re-anchor) —
+and the totals kept as MUTABLE running state, so a wrong figure could never be recomputed.
+
+**The model.** `DailyEnergy` keeps `anchors[date][key]` (a lifetime counter at local midnight) and
+`latest[key]`; `today()[key] = latest - anchor`, `completed(day) = anchor[next] - anchor[day]`.
+Six keys, all plant-level U64 lifetime counters: pv 30088, load 30094, ESS charge 30200, ESS
+discharge 30204, grid import 30216, grid export 30220. Probed read-only 05-Sep-2026 against the
+TypQxQ V2.9 definitions (validated on the four addresses already in use): 30094 moved +0.020 kWh in
+90 s at ~900 W, 30200 +0.010 kWh while charging, 30204 stayed flat. The counters update on a coarse
+tick (a 90 s delta under-read PV by ~30%), so they are for daily/half-hourly deltas only. Register
+30000 holds local wall-clock as an epoch with tz 30002 = 0, within 1 s of the Mac — the inverter's
+midnight IS ours, and nothing depends on that any more.
+
+- **Rollover:** `rollover(date)` takes a PROVISIONAL anchor from the last pre-midnight reading; the
+  first fresh read within 600 s after midnight replaces it (`PROVISIONAL_UPGRADE_WINDOW_S`). A
+  later first read keeps the provisional one if it was within 900 s of midnight
+  (`PROVISIONAL_MAX_AGE_S`), else anchors late and flags the day partial.
+- **Recovery:** a key with no anchor takes `lifetime - device_daily` from the inverter's own daily
+  counter read THIS cycle (`RECOVERY_DATA_KEYS`), so a mid-day start recovers house/battery exactly.
+- **Never cache a discontinuity:** `NO_CACHE_KEYS` (30092, 30566, 30572) are present in `read_all()`'s
+  dict only on the cycle they were read. `data["_energyReadAt"]` stamps a cycle that read a lifetime
+  block fresh; `observe(fresh=False)` changes nothing.
+- **Blocks:** four plant block reads (30088+6, 30094+4, 30200+8, 30216+8) replace four single reads —
+  same transaction count, three new values. B and C carry absent-latches (three misses on a healthy
+  link); the fallbacks are the identity for house and the device daily counters for battery flow.
+- **Projection:** `_observe_energy_counters` feeds the object and PROJECTS the figures into the
+  legacy store keys (`pv_daily_kwh` etc., plus `battery_charge_daily_kwh`,
+  `battery_discharge_daily_kwh`, `energy_balance_kwh`, `energy_day_partial`). The sixty-odd
+  consumers of those keys are untouched; nothing else may write them.
+- **Midnight:** the first observe of a new day snapshots the projection
+  (`energy_yesterday_projection`) and marks the energy blocks due; `_check_midnight_impl` waits up
+  to `MIDNIGHT_ANCHOR_WAIT_S` = 600 s for the post-midnight read to replace the provisional anchor,
+  then records yesterday from `completed()` — exact, and immune to the order the tasks ran in (the
+  old code would have written the new day's zeros, since observe runs before midnight in `_tick`).
+  Record gains `energy_balance_kwh`, `energy_partial`, `energy_sources`.
+- **Half-hourly:** deltas of the lifetime snapshot (`hh_anchor_lifetime`), so a slot spanning
+  midnight keeps its energy; new columns `battery_charge_kwh`, `battery_discharge_kwh` (ALTER-if-
+  missing). The old daily-store anchors are ignored and reseeded (one skipped slot).
+- **Tripwire:** `_reconcile_daily_energy` warns once per day, re-armed on clearing, when
+  `|pv + import + discharge - export - charge - house| > max(0.5, 3% of throughput)` or when the
+  derived house figure differs from 30092 by more than `max(0.5, 5%)`. New inverter state
+  `energyBalanceKwh`.
+- **Persistence:** `accumulators.json` gains `daily_energy` (restored whatever day the plugin starts
+  on) and `energy_yesterday_projection`. A pre-5.89 file on the same day seeds pv/import/export
+  anchors from `*_lifetime_start_kwh` (`migrate_legacy`); house and battery recover on the first read.
+- **Device states:** battery daily charge/discharge and the new balance come from the projection —
+  never `data.get(..., 0.0)`, which would chart a fabricated 0.0 on the cycles the register was not
+  read.
+
+**Untouched:** the decision engine, the bank-first hold, VPP, storm, flood prevention. The export
+feedback loop that reads these figures is v5.90.0.
+
+**Tests:** `test_daily_energy.py` (28), `test_plugin_daily_energy.py` (19), `test_sigenergy_modbus.py`
++9. 1032 -> 1051. Fifteen mutations, each killed, `__pycache__` cleared per run, anchors asserted
+unique, files restored byte-identically.
+
+**Still to do (Stage 2, no version):** mend `daily_history.json` 4-Sep (home 20.58 -> 18.60, battery
+0.0 -> 18.48/10.25), `halfhourly.home_kwh` for 4-Sep and 5-Sep from the SQL Logger identity, and
+`daily_summary` 4-Sep — `scripts/mend_daily_energy_2026_09.py`.
+
 ## v5.85.1 — 03-09-2026
 
 **`tokenBalance` said 1; the Octopus app showed CliveS 0.** Reported within the hour of v5.85.0

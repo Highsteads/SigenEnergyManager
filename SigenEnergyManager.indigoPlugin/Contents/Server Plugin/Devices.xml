@@ -126,6 +126,16 @@
                 <TriggerLabel>Daily home changed</TriggerLabel>
                 <ControlPageLabel>Home Daily (kWh)</ControlPageLabel>
             </State>
+            <!-- v5.89.0. The energy identity residual for today: PV + import +
+                 battery discharge - export - battery charge - home, every term
+                 from the plant's LIFETIME counters anchored at local midnight.
+                 Near zero when every anchor is right; a drift is the tripwire
+                 for a wrong anchor. See docs/daily-energy-revamp.md. -->
+            <State id="energyBalanceKwh">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Energy balance changed</TriggerLabel>
+                <ControlPageLabel>Energy Balance Today (kWh)</ControlPageLabel>
+            </State>
             <!-- Per-PV-string readings (v5.67.0) — live V/A/W per string from
                  the inverter's 31025 block. Numeric so the SQL Logger charts
                  each string's day. Written only for strings the inverter
