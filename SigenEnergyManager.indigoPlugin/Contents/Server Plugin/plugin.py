@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2)
-# Date:        05-09-2026 16:20
-# Version:     5.90.2
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0)
+# Date:        05-09-2026 22:10
+# Version:     5.91.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -301,6 +301,43 @@ def _away_seed_profile(daily_kwh):
     if not (0.0 < total <= 100.0):
         total = AWAY_DAILY_KWH_DEFAULT
     return [round(total / 48.0, 4)] * 48
+
+
+PUSHOVER_BODY_CAP = 1024
+
+
+def _fit_pushover_body(essential, optional, tail, cap=PUSHOVER_BODY_CAP):
+    """Join three groups of lines into a Pushover body that fits the 1024 cap.
+
+    Pushover's free tier truncates SILENTLY above 1024 characters, so a body
+    that grows past it loses its end mid-sentence with nothing to say so. The
+    VPP summary walked into exactly that when its headline was rewritten into
+    plain English (v5.91.0): 1062 characters, and the casualty would have been
+    the last line of the Ask Claude prompt.
+
+    Three groups, because they are not equally worth keeping:
+      essential  the money -- what was sold, and what it is worth.
+      optional   diagnostics, every one of which is in the JSONL anyway.
+      tail       the Ask Claude block, which is what makes the file actionable.
+    Only OPTIONAL lines are shed, from the bottom up, and the message SAYS how
+    many went rather than going quietly shorter. Shedding to nothing and still
+    not fitting is possible in principle, so the result is truncated as a last
+    resort with an explicit marker -- never a silent cut.
+    """
+    def build(keep, dropped):
+        lines = list(essential) + list(optional[:keep])
+        if dropped:
+            lines.append(f"({dropped} more detail line"
+                         f"{'' if dropped == 1 else 's'} left out to fit.)")
+        return "\n".join(lines + list(tail))
+
+    n = len(optional)
+    for keep in range(n, -1, -1):
+        body = build(keep, n - keep)
+        if len(body) <= cap:
+            return body
+    body = build(0, n)
+    return body[:cap - 12].rstrip() + "\n[truncated]"
 
 
 def _as_float(value, fallback):
@@ -1212,7 +1249,7 @@ class Plugin(indigo.PluginBase):
         self.store["bank_first_peak_surplus_kw"]    = 0.0
 
         # Set when a VPP hand-back write was not confirmed, so the 10s tick
-        # re-asserts the safe baseline instead of waiting for the ~15-min manager
+        # re-asserts the safe baseline instead of waiting for the 60s manager
         # cycle (see _retry_vpp_handback). Deliberately NOT persisted: a restart
         # runs the stuck-mode recovery, which returns the inverter to
         # self-consumption anyway, so a stale True would be noise.
@@ -2700,7 +2737,7 @@ class Plugin(indigo.PluginBase):
     def _retry_vpp_handback(self):
         """Re-assert Self Consumption after a VPP hand-back that was never confirmed.
 
-        Bounds the exposure at one 10s tick instead of the ~15-minute manager
+        Bounds the exposure at one 10s tick instead of the 60s manager
         cycle. Deliberately small and self-terminating:
 
           * it only ever writes the SAFE baseline (0x02, no limits), which is what
@@ -5329,7 +5366,14 @@ class Plugin(indigo.PluginBase):
         These registers persist on the inverter across mode changes. A previous
         force_discharge() or force_charge() call can leave a stale limit that
         caps battery output in self-consumption mode. This runs every manager
-        evaluation cycle (~15 min) as a self-healing guard.
+        evaluation cycle as a self-healing guard.
+
+        THE CADENCE IS 60 SECONDS, not the "~15 min" this docstring claimed until
+        v5.91.0. MANAGER_EVAL_INTERVAL has been 60 since the manager was split
+        from the Modbus poll, and a live count over the 05-Sep-2026 VPP window
+        found 55 runs in the hour. The stale figure was not harmless: it was the
+        stated basis for sizing a failed hand-back at "~1.25 kWh" in
+        _end_vpp_export, a figure 15x too large.
 
         Expected values:
           - export_active: discharge limit = inverter max (night_export uses export limit register,
@@ -5383,90 +5427,9 @@ class Plugin(indigo.PluginBase):
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
         elif _vpp_state == VPP_ACTIVE and self.store.get("export_active"):
-            # During the self-driven window the export mode is written once at
-            # VPP_ACTIVE entry and the manager's ACTION_VPP_EXPORT guard does not
-            # re-write it. Maintain the chosen mode (0x05 daytime / 0x06 dark)
-            # here so a transient drift self-heals. Mode register, PLUS the bank
-            # sub-mode's own charge cap (see below) — and nothing else. A stray
-            # write of any OTHER limit once caused a brief 2 kW grid import
-            # (10-Apr-2026), which is why the general limit block below still
-            # skips the whole window.
-            expected_mode = self.store.get("vpp_export_mode", 0x06)
-            actual_mode   = self.modbus.read_ems_mode()
-            if actual_mode is not None and actual_mode != expected_mode:
-                log(
-                    f"[Verify] VPP export mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
-                    f"expected={mode_names.get(expected_mode, expected_mode)} — re-asserting",
-                    level="WARNING",
-                )
-                self.modbus.set_remote_ems_mode(expected_mode)
-
-            # ONE exception to "mode register only": the bank sub-mode's charge
-            # cap. In bank (0x02) the cap IS the export mechanism — it is what
-            # stops the inverter soaking the PV surplus into the battery instead
-            # of sending it to the grid. If it drifted up to inverter max the
-            # export would fall to ~0 and NOTHING above would notice, because the
-            # mode register would still read a correct 0x02. _drive_vpp_export
-            # only rewrites the cap when the surplus moves by >300 W, so a drift
-            # could stand for the rest of the window — a silently unpaid event.
-            #
-            # This does not reopen the 10-Apr-2026 incident: that was the
-            # solar-overflow cap being written back over a VPP window. Here the
-            # expected value is the VPP driver's own cap, and the check only runs
-            # while bank is the live sub-mode. The 0x05/0x06 limits stay untouched
-            # (they are static for the window, and the snapshots record them).
-            if self.store.get("vpp_export_submode") == "bank":
-                expected_cap_w = self.store.get("vpp_bank_charge_cap_w", -1)
-                if expected_cap_w is not None and expected_cap_w >= 0:
-                    actual_cap_w = self.modbus.read_charge_limit()
-                    if actual_cap_w is not None and abs(actual_cap_w - expected_cap_w) > 300:
-                        log(
-                            f"[Verify] VPP bank charge-cap drift: inverter={actual_cap_w}W "
-                            f"expected={expected_cap_w}W — re-asserting (export would "
-                            f"otherwise be banked instead of sold)",
-                            level="WARNING",
-                        )
-                        self.modbus.set_charge_limit(expected_cap_w, quiet=True)
-
-            # And the DISCHARGE sub-mode's own registers (v5.57.0). Same argument
-            # as the bank cap, in the other sub-mode:
-            #   - daytime_export pins charge=0, because in 0x05 an OPEN charge
-            #     limit lets high PV charge the battery INSTEAD of exporting —
-            #     the v5.29.0 missed-dispatch failure. A failed or externally
-            #     reverted write resurrects it with the mode register reading a
-            #     perfectly correct 0x05, so nothing above notices. Dark windows
-            #     never pin charge (PV is zero, the register is irrelevant), so
-            #     only the daytime latch asserts it.
-            #   - both discharge modes wrote discharge=inv_max, and the
-            #     docstring above has promised "export_active: discharge limit
-            #     = inverter max" since v5.16 while this branch skipped the
-            #     whole window. A stale lower cap (a failed night_export write,
-            #     or anything external) throttles the paid export for the
-            #     remaining window with nothing to heal it.
-            # Neither write can cause a grid import — a charge cap of 0 blocks
-            # charging, and the discharge limit is the register the drive
-            # itself wrote — so the 10-Apr-2026 rule is not reopened.
-            elif self.store.get("vpp_export_submode") == "discharge":
-                actual_dis_w = self.modbus.read_discharge_limit()
-                if actual_dis_w is not None and abs(actual_dis_w - inv_max_w) > 200:
-                    log(
-                        f"[Verify] VPP discharge-limit drift: inverter={actual_dis_w}W "
-                        f"expected={inv_max_w}W — re-asserting (a low cap throttles "
-                        f"the paid export)",
-                        level="WARNING",
-                    )
-                    self.modbus.set_discharge_limit(inv_max_w)
-                if self.store.get("vpp_is_daytime"):
-                    actual_chg_w = self.modbus.read_charge_limit()
-                    if actual_chg_w is not None and actual_chg_w > 300:
-                        log(
-                            f"[Verify] VPP daytime-discharge charge cap drift: "
-                            f"inverter={actual_chg_w}W expected=0W — re-asserting "
-                            f"(open charge limit in 0x05 banks PV instead of "
-                            f"exporting it — the v5.29.0 failure)",
-                            level="WARNING",
-                        )
-                        self.modbus.set_charge_limit(0, quiet=True)
+            # v5.91.0: extracted so _log_vpp_snapshot can run the SAME checks
+            # on the registers it has already read, instead of only filing them.
+            self._verify_vpp_export_registers()
 
         # --- Discharge limit and charge limit ---
         # Skip during VPP_PRE_CHARGING and VPP_ACTIVE: the self-driven export owns
@@ -5528,6 +5491,135 @@ class Plugin(indigo.PluginBase):
                 )
                 self.modbus.set_charge_cutoff(expected_charge_cutoff)
 
+    def _verify_vpp_export_registers(self, ems_mode=None, charge_w=None,
+                                     discharge_w=None):
+        """Check the self-driven export's registers, and re-assert any that drifted.
+
+        Called from TWO places, deliberately, and they interleave (measured
+        05-Sep-2026 over a live window: verify then snapshot 39-48s later, then
+        verify ~20s after that, so the mode is actually checked every 20-45s
+        rather than every 60):
+          - _verify_ems_registers(), on the 60s manager cycle, reading fresh.
+          - _log_vpp_snapshot(), on the 60s VPP cycle, passing the three
+            registers it has JUST read for the JSONL record.
+
+        The second caller is why the arguments exist. That snapshot read the
+        mode, the charge limit and the discharge limit every minute of every
+        window and did nothing with them but write them to a file — so a drift
+        landing in a snapshot sat there, recorded and unacted on, until verify's
+        next pass. Passing them in closes that gap for FREE: no extra Modbus
+        transaction, and at the 1000ms throttle every avoided read is worth
+        having during a window.
+
+        Any argument left None is read here, so the no-argument call behaves
+        exactly as the inlined block did before v5.91.0.
+
+        ONE set of rules, in one place. Previously the expectations lived only
+        inside _verify_ems_registers and the snapshot had no opinion at all;
+        two copies would have been free to disagree about which registers may
+        be written mid-window, and that question has an expensive wrong answer
+        (see the 10-Apr-2026 note below).
+        """
+        if not self.modbus or not self.modbus.connected:
+            return
+        # The state guard lives HERE rather than at the call sites. It used to be
+        # the elif condition in _verify_ems_registers; now that a second caller
+        # exists, a check that RE-ASSERTS an export mode must be unable to fire
+        # outside a live export window whoever calls it.
+        if self.store.get("vpp_state", VPP_IDLE) != VPP_ACTIVE:
+            return
+        if not self.store.get("export_active"):
+            return
+
+        inv_max_w  = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+        mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First",
+                      0x05: "Discharge PV First", 0x06: "Discharge ESS First"}
+
+        # During the self-driven window the export mode is written once at
+        # VPP_ACTIVE entry and the manager's ACTION_VPP_EXPORT guard does not
+        # re-write it. Maintain the chosen mode (0x05 daytime / 0x06 dark)
+        # here so a transient drift self-heals. Mode register, PLUS the bank
+        # sub-mode's own charge cap (see below) — and nothing else. A stray
+        # write of any OTHER limit once caused a brief 2 kW grid import
+        # (10-Apr-2026), which is why the general limit block in
+        # _verify_ems_registers still skips the whole window.
+        expected_mode = self.store.get("vpp_export_mode", 0x06)
+        actual_mode   = ems_mode if ems_mode is not None else self.modbus.read_ems_mode()
+        if actual_mode is not None and actual_mode != expected_mode:
+            log(
+                f"[Verify] VPP export mode drift: inverter={mode_names.get(actual_mode, actual_mode)} "
+                f"expected={mode_names.get(expected_mode, expected_mode)} — re-asserting",
+                level="WARNING",
+            )
+            self.modbus.set_remote_ems_mode(expected_mode)
+
+        # ONE exception to "mode register only": the bank sub-mode's charge
+        # cap. In bank (0x02) the cap IS the export mechanism — it is what
+        # stops the inverter soaking the PV surplus into the battery instead
+        # of sending it to the grid. If it drifted up to inverter max the
+        # export would fall to ~0 and NOTHING above would notice, because the
+        # mode register would still read a correct 0x02. _drive_vpp_export
+        # only rewrites the cap when the surplus moves by >300 W, so a drift
+        # could stand for the rest of the window — a silently unpaid event.
+        #
+        # This does not reopen the 10-Apr-2026 incident: that was the
+        # solar-overflow cap being written back over a VPP window. Here the
+        # expected value is the VPP driver's own cap, and the check only runs
+        # while bank is the live sub-mode. The 0x05/0x06 limits stay untouched
+        # (they are static for the window, and the snapshots record them).
+        if self.store.get("vpp_export_submode") == "bank":
+            expected_cap_w = self.store.get("vpp_bank_charge_cap_w", -1)
+            if expected_cap_w is not None and expected_cap_w >= 0:
+                actual_cap_w = charge_w if charge_w is not None else self.modbus.read_charge_limit()
+                if actual_cap_w is not None and abs(actual_cap_w - expected_cap_w) > 300:
+                    log(
+                        f"[Verify] VPP bank charge-cap drift: inverter={actual_cap_w}W "
+                        f"expected={expected_cap_w}W — re-asserting (export would "
+                        f"otherwise be banked instead of sold)",
+                        level="WARNING",
+                    )
+                    self.modbus.set_charge_limit(expected_cap_w, quiet=True)
+
+        # And the DISCHARGE sub-mode's own registers (v5.57.0). Same argument
+        # as the bank cap, in the other sub-mode:
+        #   - daytime_export pins charge=0, because in 0x05 an OPEN charge
+        #     limit lets high PV charge the battery INSTEAD of exporting —
+        #     the v5.29.0 missed-dispatch failure. A failed or externally
+        #     reverted write resurrects it with the mode register reading a
+        #     perfectly correct 0x05, so nothing above notices. Dark windows
+        #     never pin charge (PV is zero, the register is irrelevant), so
+        #     only the daytime latch asserts it.
+        #   - both discharge modes wrote discharge=inv_max, and the
+        #     docstring above has promised "export_active: discharge limit
+        #     = inverter max" since v5.16 while this branch skipped the
+        #     whole window. A stale lower cap (a failed night_export write,
+        #     or anything external) throttles the paid export for the
+        #     remaining window with nothing to heal it.
+        # Neither write can cause a grid import — a charge cap of 0 blocks
+        # charging, and the discharge limit is the register the drive
+        # itself wrote — so the 10-Apr-2026 rule is not reopened.
+        elif self.store.get("vpp_export_submode") == "discharge":
+            actual_dis_w = discharge_w if discharge_w is not None else self.modbus.read_discharge_limit()
+            if actual_dis_w is not None and abs(actual_dis_w - inv_max_w) > 200:
+                log(
+                    f"[Verify] VPP discharge-limit drift: inverter={actual_dis_w}W "
+                    f"expected={inv_max_w}W — re-asserting (a low cap throttles "
+                    f"the paid export)",
+                    level="WARNING",
+                )
+                self.modbus.set_discharge_limit(inv_max_w)
+            if self.store.get("vpp_is_daytime"):
+                actual_chg_w = charge_w if charge_w is not None else self.modbus.read_charge_limit()
+                if actual_chg_w is not None and actual_chg_w > 300:
+                    log(
+                        f"[Verify] VPP daytime-discharge charge cap drift: "
+                        f"inverter={actual_chg_w}W expected=0W — re-asserting "
+                        f"(open charge limit in 0x05 banks PV instead of "
+                        f"exporting it — the v5.29.0 failure)",
+                        level="WARNING",
+                    )
+                    self.modbus.set_charge_limit(0, quiet=True)
+
     def _check_scheduled_import(self):
         # v5.45.0: commands hardware from store state — runs under the lock.
         with self._state_lock:
@@ -5556,7 +5648,7 @@ class Plugin(indigo.PluginBase):
         # v5.71.1: the same door, for a VPP window. This runs from the TICK, so it
         # fires on the clock alone — while the manager's own override (which returns
         # ACTION_VPP_EXPORT and would retract the schedule) only re-evaluates on the
-        # ~15-minute cycle, and that retraction is skipped once an import is running.
+        # 60-second cycle, and that retraction is skipped once an import is running.
         # A schedule armed for a time inside a window therefore fired mid-export:
         # Charge Grid First at up to inverterMaxKw, buying at the import rate through
         # the very hour we are being paid a premium to sell, with _verify_ems_registers
@@ -6340,6 +6432,7 @@ class Plugin(indigo.PluginBase):
             return
         self.store["vpp_last_snapshot_at"] = now_ts
 
+        ems_mode = chg_lim = dis_lim = None
         try:
             inv = self.latest_inverter_data or {}
             ems_mode = self.modbus.read_ems_mode()        if self.modbus and self.modbus.connected else None
@@ -6382,6 +6475,21 @@ class Plugin(indigo.PluginBase):
                 fh.write(_json.dumps(record) + "\n")
         except Exception:
             pass   # snapshot is best-effort, never raise during active event
+
+        # v5.91.0: ACT on the three registers just read, do not merely file them.
+        # Until now this method read the mode, the charge limit and the discharge
+        # limit every minute of every window and did nothing but write them to
+        # JSONL — so a drift arriving between manager cycles sat in the file,
+        # recorded and uncorrected, until verify's next pass. Reusing the values
+        # costs no extra Modbus transaction, and the two callers interleave
+        # (measured 05-Sep-2026: 20-45s apart), so the effective check rate
+        # roughly doubles for free.
+        # Separate try: a fault in the check must not cost us the snapshot that
+        # was the whole point of the read, and vice versa.
+        try:
+            self._verify_vpp_export_registers(ems_mode, chg_lim, dis_lim)
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Snapshot-side register check skipped: {exc}")
 
     def _summarise_vpp_event(self, event):
         """Parse the per-event JSONL file we just closed, compute summary
@@ -6617,20 +6725,63 @@ class Plugin(indigo.PluginBase):
         # so those questions had a false premise baked in and sent the reader
         # looking for behaviour that was never going to be in the file.
         window_str = "daytime" if daytime else "dark"
-        title = f"VPP window done — {export_kwh:.2f} kWh exported"
-        body_lines = [
-            f"Export:   {export_kwh:.2f} kWh",
-            f"PV:       {pv_kwh:.2f} kWh ({pv_status}; peak {max_pv_w} W, min {min_pv_w} W)",
-            f"Battery:  peak discharge {max_bat_dis_w} W",
-            f"Grid:     peak export {peak_grid_export_w} W",
-            f"EMS:      {ems_modes_str}",
-            f"Window:   {window_str}   Driver: {driver_str}",
-        ]
+        # THE HEADLINE IS THE PAID HOUR, NOT THE WHOLE RUN (v5.91.0).
+        # export_kwh is the counter delta across everything we drove, and the
+        # driver deliberately runs two minutes either side of the window, so it
+        # overstates what Axle settles by ~0.23 kWh on a textbook event. It was
+        # the title, the first body line AND the event-log one-liner, so all
+        # three read about 6% high while window_kwh -- the figure that is
+        # actually comparable, computed a few lines above and already stored in
+        # the ledger -- appeared nowhere the reader would see it.
+        # Axle's own settlements settle the argument: over the seven events they
+        # have settled, window_kwh is 0.17 kWh from their number and export_kwh
+        # is 0.82 kWh from it (measured 05-Sep-2026).
+        rate_per_kwh = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
+        outside_kwh  = (export_kwh - window_kwh) if window_kwh is not None else None
+
+        if window_kwh is not None:
+            title = f"VPP window done - {window_kwh:.2f} kWh sold"
+            essential = [
+                f"Sold inside the paid hour: {window_kwh:.2f} kWh, worth about "
+                f"GBP {window_kwh * rate_per_kwh:.2f} at {rate_per_kwh * 100:.0f}p a unit.",
+            ]
+            # Only worth a sentence when there is something to explain. Below a
+            # tenth of a unit the tails are rounding, and saying so every time
+            # would train the reader to skip the line that matters when a window
+            # genuinely over-runs.
+            if outside_kwh is not None and outside_kwh >= 0.1:
+                essential.append(
+                    f"We sent out {export_kwh:.2f} kWh altogether. The extra "
+                    f"{outside_kwh:.2f} kWh went either side of the window, so it "
+                    f"earns the ordinary export rate rather than the event rate."
+                )
+        else:
+            # Never present the run total as though it were the settled figure.
+            title = f"VPP window done - {export_kwh:.2f} kWh exported"
+            essential = [
+                f"We sent out {export_kwh:.2f} kWh while driving the export. The "
+                f"paid-hour figure could not be measured this time, so treat that "
+                f"as the whole run and not as what Axle will settle.",
+            ]
+
+        # A window that something else was driving is not a detail -- it is the
+        # headline. Essential, so it can never be one of the lines shed to fit.
         if external_seen:
-            body_lines.append("WARNING:  external control detected mid-window")
-        body_lines += [
+            essential.append("WARNING: something outside the plugin moved the "
+                             "inverter mode during the window.")
+
+        # Diagnostics. Every one of these is in the JSONL as well, which is what
+        # makes them the right lines to drop when the body will not fit.
+        optional = [
+            f"Solar: {pv_kwh:.2f} kWh ({pv_status}), peaking at {max_pv_w} W.",
+            f"The battery peaked at {max_bat_dis_w} W going out and the grid at "
+            f"{peak_grid_export_w} W.",
+            f"Inverter mode through the {window_str} window: {ems_modes_str} "
+            f"(driven by {driver_str}).",
+        ]
+        tail = [
             "",
-            "── Ask Claude ──",
+            "-- Ask Claude --",
             "Read the latest VPP JSONL file at",
             f"  {path}",
             "This was a SELF-DRIVEN export (we hold Remote EMS over Modbus and",
@@ -6642,7 +6793,7 @@ class Plugin(indigo.PluginBase):
             "  4. Any recommended changes to _drive_vpp_export /",
             "     _verify_ems_registers.",
         ]
-        body = "\n".join(body_lines)
+        body = _fit_pushover_body(essential, optional, tail)
         try:
             self._send_pushover(title, body, priority="0")
         except Exception as exc:
@@ -6651,7 +6802,11 @@ class Plugin(indigo.PluginBase):
         # Also log the headline to the Indigo Event Log so the user has a
         # single grep-able line for each event.  No JSONL spam, just the
         # one-liner.
-        log(f"[VPP] Summary: {export_kwh:.2f} kWh exported, "
+        _paid_str = (f"{window_kwh:.2f} kWh sold in the paid hour "
+                     f"({export_kwh:.2f} kWh over the whole run)"
+                     if window_kwh is not None
+                     else f"{export_kwh:.2f} kWh exported (paid hour not measured)")
+        log(f"[VPP] Summary: {_paid_str}, "
             f"PV {pv_kwh:.2f} kWh ({pv_status}), "
             f"peak grid export {peak_grid_export_w} W, "
             f"{window_str} window, driver {driver_str}, "
@@ -6982,8 +7137,10 @@ class Plugin(indigo.PluginBase):
         # already dead — and until v5.64 that answer was thrown away, so the state
         # machine went IDLE claiming the export had stopped while the inverter was
         # still sitting in 0x05/0x06 selling the battery. The only backstop was
-        # _verify_ems_registers, which runs on the ~15-MINUTE manager cycle, so a
-        # failed hand-back drained up to ~1.25 kWh to the grid outside the paid
+        # _verify_ems_registers, which runs on the 60-SECOND manager cycle (this
+        # comment said "~15 MINUTE" until v5.91.0 — MANAGER_EVAL_INTERVAL is 60,
+        # and 55 runs were counted in the 05-Sep-2026 window), so a
+        # failed hand-back drained up to ~0.08 kWh to the grid outside the paid
         # window — unpaid, silent (one generic Modbus ERROR line, nothing
         # VPP-tagged), and straight against the self-sufficiency KPI.
         released = False

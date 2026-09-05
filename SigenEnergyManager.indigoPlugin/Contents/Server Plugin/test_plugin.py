@@ -4479,5 +4479,380 @@ class TestHappyHourAlertBody(unittest.TestCase):
         self.assertEqual(p._happy_hour_tokens_required(), 2)
 
 
+class TestFitPushoverBody(unittest.TestCase):
+    """_fit_pushover_body: Pushover truncates silently above 1024 characters, so
+    a body that outgrows the cap loses its end mid-sentence with nothing to say
+    so. The VPP summary walked into exactly that the day its headline was
+    rewritten into plain English — 1062 characters, and the casualty would have
+    been the last line of the Ask Claude prompt."""
+
+    TAIL = ["", "-- Ask Claude --", "read the file"]
+
+    def test_a_short_body_is_left_exactly_alone(self):
+        body = plugin._fit_pushover_body(["money"], ["detail"], self.TAIL)
+        self.assertEqual(body, "money\ndetail\n\n-- Ask Claude --\nread the file")
+        self.assertNotIn("left out", body)
+
+    def test_an_oversized_body_sheds_optional_lines_from_the_bottom(self):
+        essential = ["E" * 200]
+        optional  = ["first " + "a" * 300, "second " + "b" * 300, "third " + "c" * 300]
+        body = plugin._fit_pushover_body(essential, optional, self.TAIL)
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        self.assertIn("first", body)        # bottom-up, so the first survives longest
+        self.assertNotIn("third", body)
+
+    def test_shedding_says_so_rather_than_going_quietly_shorter(self):
+        body = plugin._fit_pushover_body(["E" * 900], ["x" * 300, "y" * 300], self.TAIL)
+        self.assertIn("2 more detail lines left out to fit.", body)
+
+    def test_the_note_is_singular_for_one_line(self):
+        body = plugin._fit_pushover_body(["E" * 900], ["x" * 300], self.TAIL)
+        self.assertIn("1 more detail line left out to fit.", body)
+        self.assertNotIn("lines left out", body)
+
+    def test_the_money_and_the_prompt_always_survive(self):
+        essential = ["PAID 4.00 kWh"]
+        optional  = ["z" * 400 for _ in range(6)]
+        body = plugin._fit_pushover_body(essential, optional, self.TAIL)
+        self.assertIn("PAID 4.00 kWh", body)
+        self.assertIn("-- Ask Claude --", body)
+        self.assertTrue(body.endswith("read the file"))
+
+    def test_a_last_resort_cut_is_marked_never_silent(self):
+        """Essential + tail alone over the cap cannot be shed any further. It
+        still must not be handed to Pushover to cut invisibly."""
+        body = plugin._fit_pushover_body(["E" * 2000], [], self.TAIL)
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        self.assertIn("[truncated]", body)
+
+    def test_no_optional_lines_at_all_is_fine(self):
+        body = plugin._fit_pushover_body(["money"], [], self.TAIL)
+        self.assertNotIn("left out", body)
+        self.assertIn("money", body)
+
+
+class TestVppExportRegisterCheck(unittest.TestCase):
+    """_verify_vpp_export_registers — the one check both callers run.
+
+    Extracted in v5.91.0 so _log_vpp_snapshot can act on the three registers it
+    already reads every minute instead of only filing them to JSONL."""
+
+    def _p(self, mode=0x06, submode="discharge", daytime=False,
+           state=None, export_active=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.modbus      = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        p.store = {
+            "vpp_state":             plugin.VPP_ACTIVE if state is None else state,
+            "export_active":         export_active,
+            "vpp_export_mode":       mode,
+            "vpp_export_submode":    submode,
+            "vpp_bank_charge_cap_w": -1,
+            "vpp_is_daytime":        daytime,
+        }
+        p.modbus.connected                         = True
+        p.modbus.read_ems_mode.return_value        = mode
+        p.modbus.read_charge_limit.return_value    = 0
+        p.modbus.read_discharge_limit.return_value = 10000
+        return p
+
+    def test_supplied_values_cost_no_modbus_reads(self):
+        """The entire point of the extraction. At the enforced 1000ms throttle
+        every avoided read is a second of the poll budget back."""
+        p = self._p()
+        p._verify_vpp_export_registers(0x06, 0, 10000)
+        p.modbus.read_ems_mode.assert_not_called()
+        p.modbus.read_charge_limit.assert_not_called()
+        p.modbus.read_discharge_limit.assert_not_called()
+
+    def test_values_not_supplied_are_read(self):
+        p = self._p()
+        p._verify_vpp_export_registers()
+        p.modbus.read_ems_mode.assert_called_once()
+        p.modbus.read_discharge_limit.assert_called_once()
+
+    def test_drift_is_caught_from_supplied_values_too(self):
+        """A check that only worked on its own reads would leave the snapshot
+        path decorative — which is exactly what it was before."""
+        p = self._p(mode=0x06)
+        p._verify_vpp_export_registers(0x02, 0, 10000)   # inverter drifted to 0x02
+        p.modbus.set_remote_ems_mode.assert_called_once_with(0x06)
+
+    def test_a_matching_mode_is_left_alone(self):
+        p = self._p(mode=0x06)
+        p._verify_vpp_export_registers(0x06, 0, 10000)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_a_throttled_discharge_limit_is_reasserted(self):
+        p = self._p()
+        p._verify_vpp_export_registers(0x06, 0, 4000)
+        p.modbus.set_discharge_limit.assert_called_once_with(10000)
+
+    def test_it_refuses_outside_an_active_window(self):
+        """The guard used to be the elif condition in _verify_ems_registers. Now
+        that a second caller exists, a routine that RE-ASSERTS an export mode
+        must be unable to fire outside a window whoever calls it."""
+        p = self._p(state=plugin.VPP_IDLE)
+        p._verify_vpp_export_registers(0x02, 10000, 10000)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+        p.modbus.set_discharge_limit.assert_not_called()
+
+    def test_it_refuses_when_the_export_is_not_active(self):
+        p = self._p(export_active=False)
+        p._verify_vpp_export_registers(0x02, 10000, 10000)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_a_dead_socket_is_a_no_op(self):
+        p = self._p()
+        p.modbus.connected = False
+        p._verify_vpp_export_registers(0x02, 10000, 4000)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+
+class TestSnapshotActsOnWhatItReads(unittest.TestCase):
+    """The WIRING, not the formatter. Before v5.91.0 the snapshot read the mode,
+    the charge limit and the discharge limit every minute of every window and
+    did nothing with them but write them to a file, so a drift arriving between
+    manager cycles sat there recorded and uncorrected."""
+
+    def _p(self, tmpdir):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.modbus      = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        p.store = {
+            "vpp_state":             plugin.VPP_ACTIVE,
+            "export_active":         True,
+            "vpp_export_mode":       0x06,
+            "vpp_export_submode":    "discharge",
+            "vpp_bank_charge_cap_w": -1,
+            "vpp_is_daytime":        False,
+            "vpp_last_snapshot_at":  0,
+        }
+        p.latest_inverter_data = {"batterySoc": 90.0, "pvPowerWatts": 0,
+                                  "batteryPowerWatts": -5000, "homePowerWatts": 1000,
+                                  "gridPowerWatts": -4000, "emsWorkMode": "Remote EMS",
+                                  "gridStatus": "On-grid", "batteryTempC": 19.0,
+                                  "batteryCellVoltage": 3.29,
+                                  "plantRunningState": "Running"}
+        p.modbus.connected                         = True
+        p.modbus.read_ems_mode.return_value        = 0x02      # drifted
+        p.modbus.read_charge_limit.return_value    = 0
+        p.modbus.read_discharge_limit.return_value = 10000
+        p._vpp_event_log_path = MagicMock(
+            return_value=os.path.join(tmpdir, "snap.jsonl"))
+        return p
+
+    def _event(self):
+        return {"start_time": datetime.now(timezone.utc) - timedelta(minutes=5)}
+
+    def test_a_drift_seen_by_the_snapshot_is_acted_on(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._p(td)
+            p._log_vpp_snapshot(self._event())
+            p.modbus.set_remote_ems_mode.assert_called_once_with(0x06)
+
+    def test_the_check_reuses_the_snapshot_reads_and_adds_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._p(td)
+            p._log_vpp_snapshot(self._event())
+            # Exactly one read of each: the snapshot's own. The check must not
+            # go back to the bus for values it was handed.
+            self.assertEqual(p.modbus.read_ems_mode.call_count, 1)
+            self.assertEqual(p.modbus.read_charge_limit.call_count, 1)
+            self.assertEqual(p.modbus.read_discharge_limit.call_count, 1)
+
+    def test_a_failing_check_does_not_cost_us_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._p(td)
+            p._verify_vpp_export_registers = MagicMock(side_effect=RuntimeError("boom"))
+            p._log_vpp_snapshot(self._event())
+            with open(os.path.join(td, "snap.jsonl"), encoding="utf-8") as fh:
+                self.assertIn("snapshot", fh.read())
+
+    def test_a_failing_snapshot_write_does_not_skip_the_check(self):
+        """The two are independent on purpose — the register check is the half
+        that can still save a paid window."""
+        with tempfile.TemporaryDirectory() as td:
+            p = self._p(td)
+            p._vpp_event_log_path = MagicMock(side_effect=OSError("no path"))
+            p._log_vpp_snapshot(self._event())
+            p.modbus.set_remote_ems_mode.assert_called_once_with(0x06)
+
+
+class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
+    """The message CliveS actually reads. It led with export_kwh — the counter
+    delta across the whole driven run, tails included — while window_kwh, the
+    only figure comparable with what Axle settles, was computed a few lines
+    above, stored in the ledger, and shown nowhere.
+
+    Tonight's window: 4.24 kWh over the run, 4.00 kWh inside the paid hour."""
+
+    START = datetime(2026, 9, 5, 18, 30, tzinfo=timezone.utc)
+    END   = datetime(2026, 9, 5, 19, 30, tzinfo=timezone.utc)
+
+    def _write_log(self, path, export_kwh=4.24, n=61, grid_w=-4000):
+        import json
+        recs = []
+        for i in range(n):
+            recs.append({"type": "snapshot",
+                         "logged_at": (self.START + timedelta(seconds=60 * i)).isoformat(),
+                         "event_elapsed_secs": 60.0 * i,
+                         "soc_pct": 97.0 - i * 0.25, "pv_w": 0,
+                         "battery_w": -5150, "home_w": 1150, "grid_w": grid_w,
+                         "ems_work_mode": "Remote EMS", "ems_mode_register": 6,
+                         "ems_mode_name": "Discharge ESS First", "driver": "self",
+                         "charge_limit_w": 10000, "discharge_limit_w": 10000,
+                         "grid_status": "On-grid", "battery_temp_c": 19.5,
+                         "battery_cell_v": 3.29, "plant_state": "Running"})
+        recs.append({"type": "event_ended",
+                     "logged_at": self.END.isoformat(), "export_kwh": export_kwh})
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+
+    def _run(self, tmpdir, export_kwh=4.24, n=61):
+        path = os.path.join(tmpdir, "ev.jsonl")
+        self._write_log(path, export_kwh=export_kwh, n=n)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"axleVppRatePerKwh": "1.00", "inverterMaxKw": "10.0"}
+        p.store       = {"vpp_is_daytime": False}
+        p._vpp_event_log_path      = MagicMock(return_value=path)
+        p._record_vpp_ledger_event = MagicMock()
+        p._send_pushover           = MagicMock()
+        p._update_vpp_device       = MagicMock()
+        p._summarise_vpp_event({"start_time": self.START, "end_time": self.END,
+                                "duration_hrs": 1.0})
+        p._send_pushover.assert_called_once()
+        title, body = p._send_pushover.call_args.args[0], p._send_pushover.call_args.args[1]
+        return p, title, body
+
+    def test_the_title_leads_with_the_paid_hour(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, title, _ = self._run(td)
+            self.assertIn("4.00", title)
+            self.assertNotIn("4.24", title)
+
+    def test_the_body_opens_with_the_paid_hour_and_its_worth(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            first = body.splitlines()[0]
+            self.assertIn("4.00 kWh", first)
+            self.assertIn("GBP 4.00", first)
+
+    def test_the_run_total_is_still_there_and_explained(self):
+        """Not hidden — a reader who knows the tails exist must still be able to
+        see them, and be told why they are worth less."""
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            self.assertIn("4.24 kWh", body)
+            self.assertIn("0.24 kWh", body)
+            self.assertIn("ordinary export rate", body)
+
+    def test_a_number_never_appears_without_what_it_means(self):
+        """The standing notification rule. Every figure in the prose half has to
+        arrive beside the thing that makes it good or bad news."""
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            prose = body.split("-- Ask Claude --")[0]
+            for token in ("paid hour", "worth about", "either side of the window"):
+                self.assertIn(token, prose)
+
+    def test_the_body_is_pure_ascii(self):
+        """Pushover, and the estate's standing no-Unicode rule. The title carried
+        an em-dash and the separator was box-drawing until v5.91.0."""
+        with tempfile.TemporaryDirectory() as td:
+            _, title, body = self._run(td)
+            for s, name in ((title, "title"), (body, "body")):
+                bad = [c for c in s if ord(c) > 127]
+                self.assertEqual(bad, [], f"non-ASCII in {name}: {bad!r}")
+
+    def test_the_body_fits_pushovers_cap(self):
+        """1062 characters on the first draft of the plain-English rewrite, and
+        Pushover would have cut the last line of the prompt without a word."""
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+
+    def test_the_prose_half_is_sentences_not_a_value_dump(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            prose = body.split("-- Ask Claude --")[0]
+            self.assertNotIn("|", prose)
+            self.assertNotIn("=", prose)
+            for line in [l for l in prose.splitlines() if l.strip()]:
+                self.assertTrue(line.rstrip().endswith("."),
+                                f"not a sentence: {line!r}")
+
+    def test_the_ask_claude_prompt_survives_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td)
+            self.assertIn("-- Ask Claude --", body)
+            self.assertIn("_verify_ems_registers", body)
+
+    def test_the_ledger_is_given_both_figures(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, _, _ = self._run(td)
+            kwargs = p._record_vpp_ledger_event.call_args.kwargs
+            self.assertAlmostEqual(kwargs["window_kwh"], 4.0, places=2)
+            self.assertAlmostEqual(
+                p._record_vpp_ledger_event.call_args.args[1], 4.24, places=2)
+
+    def test_no_snapshots_means_the_run_total_is_not_passed_off_as_settled(self):
+        """A window whose snapshots we lost must say so rather than quoting the
+        run total as though Axle would pay it."""
+        with tempfile.TemporaryDirectory() as td:
+            _, title, body = self._run(td, n=0)
+            self.assertIn("4.24", title)
+            self.assertIn("could not be measured", body)
+            self.assertIn("not as what Axle will settle", body)
+
+    def _long_path_dir(self, td):
+        """The real event-log path is ~170 characters. A temp dir is ~50, and
+        that difference is the whole margin: the first plain-English draft came
+        out at 1062 characters IN PRODUCTION while a short-path fixture sat
+        comfortably inside the cap and saw nothing wrong. A fixture only ever
+        tests the regime it was built in."""
+        deep = os.path.join(td, "Library", "Application Support",
+                            "Perceptive Automation", "Indigo 2025.2",
+                            "Preferences", "Plugins",
+                            "com.clives.indigoplugin.sigenergy-energy-manager",
+                            "vpp_events")
+        os.makedirs(deep, exist_ok=True)
+        return deep
+
+    def test_a_real_length_path_still_fits_the_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(self._long_path_dir(td), "2026-09-05_1830.jsonl")
+            self._write_log(path)
+            p = plugin.Plugin.__new__(plugin.Plugin)
+            p.logger, p.pluginPrefs = MagicMock(), {"axleVppRatePerKwh": "1.00"}
+            p.store = {"vpp_is_daytime": False}
+            p._vpp_event_log_path      = MagicMock(return_value=path)
+            p._record_vpp_ledger_event = MagicMock()
+            p._send_pushover           = MagicMock()
+            p._update_vpp_device       = MagicMock()
+            p._summarise_vpp_event({"start_time": self.START, "end_time": self.END,
+                                    "duration_hrs": 1.0})
+            body = p._send_pushover.call_args.args[1]
+            self.assertGreater(len(body), 900, "fixture no longer near the cap")
+            self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+            # It only fits because a diagnostic line was shed, and it says so.
+            self.assertIn("left out to fit.", body)
+            # And what was shed is never the money or the prompt.
+            self.assertIn("Sold inside the paid hour", body)
+            self.assertIn("_verify_ems_registers", body)
+
+    def test_a_trivial_tail_is_not_worth_a_sentence(self):
+        """Below a tenth of a unit the tails are rounding. Saying it every time
+        trains the reader to skip the line that matters when a window genuinely
+        over-runs."""
+        with tempfile.TemporaryDirectory() as td:
+            _, _, body = self._run(td, export_kwh=4.02)
+            self.assertNotIn("either side of the window", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

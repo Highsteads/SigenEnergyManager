@@ -560,5 +560,68 @@ class TestBalanceCanFallBehindItsRows(unittest.TestCase):
         self.assertIsNone(s["balance_behind_gbp"])
 
 
+class TestEstimateIsPricedOffThePaidHour(unittest.TestCase):
+    """estimate_gbp must price the PAID hour, not the whole driven run.
+
+    The driver deliberately runs two minutes either side of the window, so
+    export_kwh is ~0.23 kWh larger than what Axle settles on a textbook event.
+    Pricing off it made every row read about 6% high: measured 05-Sep-2026 over
+    the eight local rows, GBP 40.77 recorded against GBP 35.99 on the settled
+    basis. Axle's own settlements decide the argument — across the seven events
+    they had settled, window_kwh sat 0.17 kWh from their figure and export_kwh
+    sat 0.82 kWh from it."""
+
+    W = ("2026-09-05T18:30:00+00:00", "2026-09-05T19:30:00+00:00")
+
+    def _row(self, export_kwh, window_kwh, rate=1.0):
+        led = VL.empty_ledger()
+        VL.record_local_event(led, self.W[0], self.W[1], export_kwh, rate,
+                              window_kwh=window_kwh)
+        return led["local"][0]
+
+    def test_the_money_comes_from_the_window_figure(self):
+        row = self._row(4.24, 4.000)
+        self.assertEqual(row["estimate_gbp"], 4.00)
+        self.assertEqual(row["estimate_basis"], "window")
+
+    def test_the_run_total_is_still_recorded_alongside(self):
+        """Both figures are kept — dropping the run total is what made 11-Aug
+        look like a 3.2 kWh shortfall when the paid hour was textbook."""
+        row = self._row(4.24, 4.000)
+        self.assertEqual(row["export_kwh"], 4.24)
+        self.assertEqual(row["window_kwh"], 4.0)
+
+    def test_an_unmeasured_window_falls_back_to_the_run_total(self):
+        """Older rows carry no window figure. They fall back to what they always
+        were — never to a zero, which would read as an hour that sold nothing."""
+        row = self._row(4.24, None)
+        self.assertEqual(row["estimate_gbp"], 4.24)
+        self.assertEqual(row["estimate_basis"], "run")
+
+    def test_the_basis_is_always_stated(self):
+        """A number that cannot be misread. The old row gave no way to tell
+        which of the two figures the money had been priced off."""
+        for win in (4.0, None):
+            self.assertIn(self._row(4.24, win)["estimate_basis"], ("window", "run"))
+
+    def test_a_non_unit_rate_is_applied_to_the_window_figure(self):
+        row = self._row(4.24, 4.000, rate=0.50)
+        self.assertEqual(row["estimate_gbp"], 2.00)
+
+    def test_an_overrun_is_priced_on_the_paid_hour_only(self):
+        """The 11-Aug window ran three quarters of an hour late. The paid hour
+        was still 4 kWh, and that is what Axle settled — pricing the run total
+        would have claimed GBP 7.05 for a GBP 4.00 event."""
+        row = self._row(7.05, 3.998)
+        self.assertEqual(row["estimate_gbp"], 4.00)
+
+    def test_junk_window_value_falls_back_rather_than_raising(self):
+        led = VL.empty_ledger()
+        VL.record_local_event(led, self.W[0], self.W[1], 4.24, 1.0,
+                              window_kwh="not a number")
+        self.assertEqual(led["local"][0]["estimate_gbp"], 4.24)
+        self.assertEqual(led["local"][0]["estimate_basis"], "run")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

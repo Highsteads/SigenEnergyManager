@@ -15,6 +15,105 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.91.0 — 05-09-2026
+
+**The VPP summary headlined the figure Axle does not pay on, and the per-minute snapshot
+threw away evidence it had already paid for.** Found by reading back the 05-Sep-2026
+18:30 UTC window, which was itself textbook: 4.000 kWh integrated inside the hour against a
+4 kW cap, 55 in-window samples with a mean of 3,999.6 W and a standard deviation of 19 W,
+mode 0x06 held on all 58 snapshots, and no external interference.
+
+### 1. `estimate_gbp`, the Pushover title and the event-log line all priced the whole run
+
+`export_kwh` is the counter delta across everything we drove. The driver deliberately runs
+T-2min to end+2min (v5.28), so on a textbook event it is ~0.23 kWh larger than the settled
+figure. `window_kwh` — integrated strictly inside the paid hour — has been computed and
+stored in the ledger since v5.63.0 with a comment saying it is *"the only one comparable
+with what Axle settled"*, and then every headline used the other one.
+
+**Axle's own settlements decide it.** Over the seven events they have settled, measured
+05-Sep-2026 from `vpp_ledger.json`:
+
+| | mean abs error vs Axle |
+|---|---|
+| `window_kwh` | **0.17 kWh** |
+| `export_kwh` | 0.82 kWh |
+
+The ledger's eight local rows read **GBP 40.77** where the settled basis gives **GBP 35.99**
+— 13.3% high overall, ~25p an event routinely, and GBP 3.05 of it from the single 11-Aug
+over-run (7.05 kWh recorded for a hour whose cap allows 4).
+
+Changed:
+- `vpp_ledger.record_local_event` prices `estimate_gbp` off `window_kwh`, falling back to
+  `export_kwh` only when the window figure was never measured, and records which it used in
+  a new `estimate_basis` field.
+- `_summarise_vpp_event` leads the title, the body and the event-log one-liner with the paid
+  hour, keeps the run total as an explained secondary sentence, and says plainly when the
+  window figure could not be measured rather than passing the run total off as settled.
+
+**Scope, stated because it is easy to overstate:** `estimate_gbp` on a local row is written
+and never read by any code, and `summarise()` has always used `window_kwh` with a `run_kwh`
+fallback for its `our_kwh` column. So no money figure on the dashboard was ever wrong — the
+lifetime and month-to-date totals come from Axle's settled pence. What was wrong is what a
+human reads: the notification, the log line, and a stored estimate that misled the very
+analysis that found this.
+
+### 2. `_verify_vpp_export_registers` — the snapshot now acts on what it already read
+
+`_log_vpp_snapshot` reads the mode register, the charge limit and the discharge limit every
+minute of every window and, until now, only wrote them to JSONL. So a drift landing between
+manager cycles was *recorded* and not *acted on*.
+
+The VPP branch of `_verify_ems_registers` is extracted into
+`_verify_vpp_export_registers(ems_mode=None, charge_w=None, discharge_w=None)`. Any argument
+left None is read as before; the snapshot passes the three it holds. One set of rules, one
+place — which matters here, because the question "which registers may be written mid-window"
+has an expensive wrong answer (10-Apr-2026, a stray limit write causing a 2 kW grid import),
+and two copies would have been free to diverge on it.
+
+The state guard moved INSIDE the method. It used to be the `elif` condition; with a second
+caller, a routine that re-asserts an export mode must be unable to fire outside a live window
+whoever calls it.
+
+**Measured cadence, which changed the design.** The first plan was to cache the reads and
+drop the duplication. The log says the two callers do not overlap — over the live window,
+verify, then the snapshot 39-48 s later, then verify ~20 s after that — so the mode is really
+checked every 20-45 s, and a cache would have made the effective rate variable and *worse*.
+Read counts over the hour (110 `read_ems_mode`, 110 `read_discharge_limit`, 55
+`read_charge_limit`) confirm 55 runs of each caller. So the reads stay and the evidence is now
+used: no extra Modbus traffic, roughly double the acting check rate in-window.
+
+### 3. `_fit_pushover_body`, and four stale cadence comments
+
+Rewriting the headline into plain English took the body to **1062 characters**. Pushover's
+free tier truncates silently above 1024, and the casualty would have been the last line of
+the Ask Claude prompt. `_fit_pushover_body(essential, optional, tail)` sheds *diagnostic*
+lines from the bottom — every one of which is in the JSONL anyway — announces how many went,
+and marks a last-resort truncation rather than letting one happen invisibly. The money lines,
+the external-control warning and the prompt are never shed. The title's em-dash and the
+`── Ask Claude ──` separator became ASCII, per the standing no-Unicode rule for notifications.
+
+Four comments claimed the manager cycle runs every ~15 minutes. `MANAGER_EVAL_INTERVAL` is
+**60**, and 55 runs were counted in the hour. Corrected in `_verify_ems_registers`'s
+docstring, `_end_vpp_export` (which had used the wrong figure to size a failed hand-back at
+"~1.25 kWh" — nearer 0.08 on the real cadence), the store-init comment and
+`_retry_vpp_handback`. `VPP_OVERRUN_GRACE_MINS`' comment was checked and left alone: it is
+about the 15-minute grace constant and already says the poll is 60 s.
+
+### Tests
+
+1080 -> 1118. Ten mutations, each written from the consequence ("the headline shows the run
+total again", "the snapshot throws its reads away again", "the state guard is gone"), all ten
+proven to turn the suite red, with `__pycache__` cleared before every run and each restore
+asserted byte-identical.
+
+One mutation SURVIVED the first pass and it was the fixture's fault, not the code's: the
+end-to-end test used a temp path ~50 characters long where the real event-log path is ~170,
+so the un-fitted body still fitted and nothing noticed `_fit_pushover_body` being removed.
+A test now builds the real directory depth. *A fixture only tests the regime it was built in.*
+
+---
+
 ## v5.90.2 — 05-09-2026
 
 **`openmeteo_forecast.py` v1.8 — the optimiser file path is injectable; an empty forecast is

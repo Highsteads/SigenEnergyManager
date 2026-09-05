@@ -346,6 +346,10 @@ def record_local_event(ledger, start_time, end_time, export_kwh,
     rather than the event rate. Keeping both is what makes that visible;
     keeping only the first is what made 11-Aug look like a 3.2 kWh shortfall
     when the paid hour was in fact textbook.
+
+    estimate_gbp is priced off window_kwh from v5.91.0, falling back to
+    export_kwh only when the window figure was never measured. estimate_basis
+    records which of the two it used.
     """
     key_start = _iso(start_time)
     key_end   = _iso(end_time)
@@ -366,6 +370,17 @@ def record_local_event(ledger, start_time, end_time, export_kwh,
     except (TypeError, ValueError):
         win = None
 
+    # Price the PAID hour, not the whole driven run. The driver deliberately
+    # runs two minutes either side of the window, so export_kwh is ~0.23 kWh
+    # larger than the settled figure on a textbook event — and estimate_gbp was
+    # built from it, so every row read ~6% high (measured 05-Sep-2026 over the
+    # eight local rows: GBP 40.77 recorded against GBP 35.99 on the settled
+    # basis). Axle's own settlements decide which figure is right: across the
+    # seven events they have settled, window_kwh sits 0.17 kWh from their
+    # number and export_kwh sits 0.82 kWh from it.
+    # Fall back to the run total only when the window figure was never measured
+    # — older rows, or an event whose snapshots we lost. Never to zero.
+    basis_kwh = win if win is not None else kwh
     row = {
         "start_time":   key_start,
         "end_time":     key_end,
@@ -374,7 +389,10 @@ def record_local_event(ledger, start_time, end_time, export_kwh,
         # do not have must not read as an hour that exported nothing.
         "window_kwh":   win,
         "rate_per_kwh": rate,
-        "estimate_gbp": round(kwh * rate, 2),
+        "estimate_gbp": round(basis_kwh * rate, 2),
+        # Say which figure the money was priced off, so the row cannot be
+        # misread the way the old one was.
+        "estimate_basis": "window" if win is not None else "run",
         "driver":       driver or "",
         "log_path":     log_path or "",
     }
