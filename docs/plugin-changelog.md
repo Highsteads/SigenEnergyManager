@@ -15,6 +15,28 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.90.2 — 05-09-2026
+
+**`openmeteo_forecast.py` v1.8 — the optimiser file path is injectable; an empty forecast is
+never published.** `OPTIMISER_FORECAST_FILE` was a hardcoded absolute path into the live Python
+Scripts folder, and `test_complete_fetch_is_ok_and_cached` mocks every array to return `[]` and
+calls `fetch_forecast(force=True)`, which reaches `_write_optimiser_file` — so every
+`scripts/run_tests.py` run on the Indigo Mac wrote the LIVE `openmeteo_forecast.json` with zero
+slots (fingerprint: `bias_bands` centres present with every factor 1.0, no `Wrote optimiser file`
+line in the plugin log). It stayed wrong until the next fetch (<= 30 min), and the evening/overnight
+planner run in that window would have read "0 kWh of solar". Caught rendering the 20:00 message
+against live data at 13:34 — the file had been zeroed by the 13:32 suite run.
+
+- `OpenMeteoForecast(..., optimiser_file=None)`; `_write_optimiser_file` writes `self.optimiser_file`.
+- The writer returns with a WARNING when `hourly_out` is empty.
+- `test_openmeteo_forecast.py` re-points the module constant to a temp path for the whole module
+  AND passes `optimiser_file=` on every construction; `TestOptimiserFileIsolation` (4) pins both,
+  including that the constant no longer contains "Perceptive Automation" under test.
+- `openmeteo_battery_optimiser.py` v3.18 (Python Scripts, same session): a plan-day total of 0 is
+  UNKNOWN — on an EVENING run it falls back to the plugin's `tomorrowSolarKwh`, and with no hourly
+  set the shape-dependent power-cut line says the forecast was not to hand.
+- General rule recorded in the global CLAUDE.md: check the live files' mtimes around a suite run.
+
 ## v5.90.1 — 05-09-2026
 
 **`_write_site_config` publishes the manager's own weekday/weekend figures.** v5.90.0 wrote

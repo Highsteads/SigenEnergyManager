@@ -7,8 +7,15 @@
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
 # Author:      CliveS & Claude Opus 4.8
-# Date:        04-06-2026
-# Version:     1.7 (remainingTodayKwh bias-corrected + current hour pro-rated)
+# Date:        05-09-2026 14:00
+# Version:     1.8 (the optimiser file path is injectable and an EMPTY forecast never
+#              overwrites it. The path was a hardcoded absolute constant, so the plugin's
+#              own test suite, run on the Indigo Mac, clobbered the LIVE
+#              Python Scripts/openmeteo_forecast.json with zero slots on every run —
+#              the 20:00 optimiser message would have read "0 kWh of solar" for up to
+#              30 minutes after each suite run. Tests now pass a tmp path; the writer
+#              refuses an empty hourly set whoever calls it.)
+#              prior 1.7 (remainingTodayKwh bias-corrected + current hour pro-rated)
 # 1.7 — remainingTodayKwh was summed straight off the RAW hourly p50 buckets while
 #       the headline forecast it sits beside (correctedTodayKwh) is bias-corrected,
 #       so the two figures were on different scales — 19-Jul-2026 the Energy page
@@ -184,7 +191,8 @@ class OpenMeteoForecast:
     so the battery optimiser script receives up-to-date Open-Meteo data.
     """
 
-    def __init__(self, data_dir, logger=None, latitude=None, longitude=None, arrays=None):
+    def __init__(self, data_dir, logger=None, latitude=None, longitude=None, arrays=None,
+                 optimiser_file=None):
         """Initialise the Open-Meteo forecast client.
 
         Args:
@@ -200,7 +208,12 @@ class OpenMeteoForecast:
                        falls back to the module ARRAYS for back-compat — a
                        future plugin release will expose per-array config in
                        PluginConfig.xml.
+            optimiser_file: where the optimiser's openmeteo_forecast.json goes.
+                       None = OPTIMISER_FORECAST_FILE (the live Python Scripts
+                       folder). Tests MUST pass a temp path — v1.8, after the
+                       suite clobbered the live file with zero slots.
         """
+        self.optimiser_file = optimiser_file or OPTIMISER_FORECAST_FILE
         if latitude is None or longitude is None:
             raise ValueError(
                 "OpenMeteoForecast requires explicit latitude and longitude; "
@@ -1075,6 +1088,14 @@ class OpenMeteoForecast:
             today_kwh    = raw_today_kwh    * factor_today
             tomorrow_kwh = raw_tomorrow_kwh * factor_tomorrow
 
+            # v1.8: never overwrite a good file with nothing. An empty hourly set is
+            # not a forecast of zero sun, it is a forecast that has not arrived —
+            # and the script reading this file plans the night on it.
+            if not hourly_out:
+                self.logger.warning(
+                    "[OpenMeteo] No hourly buckets to publish — optimiser file left as it was")
+                return
+
             cached_time = self._cached_time or time.time()
             cache_age   = round((time.time() - cached_time) / 3600.0, 2)
 
@@ -1097,7 +1118,7 @@ class OpenMeteoForecast:
 
             # Atomic write — an external scheduled script reads this file, so a
             # concurrent read (or crash mid-write) must never see truncated JSON.
-            self._atomic_write_json(OPTIMISER_FORECAST_FILE, forecast_doc, indent=2)
+            self._atomic_write_json(self.optimiser_file, forecast_doc, indent=2)
 
             self.logger.debug(
                 f"[OpenMeteo] Wrote optimiser file: {len(hourly_out)} slots, "

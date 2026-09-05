@@ -31,6 +31,21 @@ from openmeteo_forecast import (
 )
 
 
+# v1.8 — the module constant is the LIVE optimiser file. Re-point it for the whole
+# test module so no construction, present or future, can write the production file.
+# (05-09-2026: the suite had been clobbering it with zero slots on every run.)
+import openmeteo_forecast as _omf_module
+_omf_module.OPTIMISER_FORECAST_FILE = os.path.join(tempfile.mkdtemp(prefix="omf_live_"),
+                                                   "openmeteo_forecast.json")
+
+
+def _isolated_forecast(latitude=51.5, longitude=-0.12):
+    """A forecast object whose every file, the optimiser one included, is in a temp dir."""
+    d = tempfile.mkdtemp()
+    return OpenMeteoForecast(d, latitude=latitude, longitude=longitude,
+                             optimiser_file=os.path.join(d, "openmeteo_forecast.json"))
+
+
 def _rec(date, fc, actual, month=None):
     factor = round(actual / fc, 4) if fc else 1.0
     return {
@@ -92,7 +107,8 @@ class TestComputeCorrectionFactor(unittest.TestCase):
     def setUp(self):
         # Need a writable data_dir for the class but we don't trigger any disk I/O.
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
 
     def tearDown(self):
         import shutil
@@ -177,7 +193,8 @@ class TestComputeCorrectionBands(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
 
     def tearDown(self):
         import shutil
@@ -244,7 +261,8 @@ class TestApplyBandCorrection(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
         # Hand-crafted bands so interpolation behaviour is unambiguous
         self.f._correction_bands = [
             (17.5, 1.00),
@@ -287,7 +305,8 @@ class TestBiasFactorApplied(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
 
     def tearDown(self):
         import shutil
@@ -340,7 +359,8 @@ class TestRemainingToday(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="openmeteo_test_")
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
 
     def tearDown(self):
         import shutil
@@ -446,7 +466,8 @@ class TestPartialFetch(unittest.TestCase):
         self._prev_req = omf.REQUESTS_AVAILABLE
         omf.REQUESTS_AVAILABLE = True   # _fetch_array is mocked, so no real HTTP
         self._tmp = tempfile.mkdtemp()
-        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                 optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
 
     def tearDown(self):
         self._omf.REQUESTS_AVAILABLE = self._prev_req
@@ -500,7 +521,7 @@ class TestLocalKeyToUtc(unittest.TestCase):
     an hour wrong for the four months of GMT."""
 
     def _fc(self):
-        return OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+        return _isolated_forecast()
 
     def test_summer_key_is_one_hour_behind(self):
         self.assertEqual(self._fc()._local_key_to_utc("2026-08-05 12:00:00"),
@@ -525,7 +546,7 @@ class TestNowLocalIsAware(unittest.TestCase):
     Every caller uses it to decide which forecast slot is 'now'."""
 
     def test_now_local_is_timezone_aware(self):
-        fc = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+        fc = _isolated_forecast()
         self.assertIsNotNone(fc._now_local().tzinfo)
 class TestForecastCarriesItsOwnDate(unittest.TestCase):
     """Every forecast dict must say which local day its totals are FOR.
@@ -538,7 +559,7 @@ class TestForecastCarriesItsOwnDate(unittest.TestCase):
     """
 
     def test_the_empty_forecast_carries_the_key_as_unknown(self):
-        f = OpenMeteoForecast(tempfile.mkdtemp(), latitude=51.5, longitude=-0.12)
+        f = _isolated_forecast()
         d = f._empty_forecast("test")
         self.assertIn("forecastDate", d)
         self.assertEqual(d["forecastDate"], "")   # unknown must never match a date
@@ -557,6 +578,49 @@ class TestForecastCarriesItsOwnDate(unittest.TestCase):
         for b in blocks:
             self.assertIn('"forecastDate"', b,
                           "a forecast dict without forecastDate disables the latch")
+
+
+
+class TestOptimiserFileIsolation(unittest.TestCase):
+    """v1.8: the optimiser file path is injectable and an empty forecast never
+    overwrites it. Before this the suite wrote the LIVE file with zero slots."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self._tmp, "openmeteo_forecast.json")
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                   optimiser_file=self.path)
+
+    def test_the_default_path_is_the_module_constant(self):
+        import openmeteo_forecast as omf
+        f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246)
+        self.assertEqual(f.optimiser_file, omf.OPTIMISER_FORECAST_FILE)
+        self.assertEqual(self.f.optimiser_file, self.path)
+
+    def test_an_empty_forecast_leaves_the_file_alone(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write('{"tomorrow_kwh": 33.3, "hourly": {"x": 1}}')
+        self.f._write_optimiser_file({"_hourly_p50_today": {}, "_hourly_p50_tomorrow": {}})
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertIn('"tomorrow_kwh": 33.3', fh.read())
+
+    def test_a_real_forecast_writes_to_the_injected_path(self):
+        today = _today_local_str() if "_today_local_str" in globals() else None
+        from datetime import datetime as _dt
+        d = self.f._now_local().strftime("%Y-%m-%d")
+        combined = {"_hourly_p50_today": {f"{d} 12:00:00": 4000},
+                    "_hourly_p50_tomorrow": {}}
+        self.f._write_optimiser_file(combined)
+        self.assertTrue(os.path.exists(self.path))
+        import json
+        doc = json.load(open(self.path, encoding="utf-8"))
+        self.assertEqual(len(doc["hourly"]), 1)
+        self.assertGreater(doc["today_kwh"], 0.0)
+
+    def test_the_suite_cannot_reach_the_live_file(self):
+        import openmeteo_forecast as omf
+        self.assertNotIn("Perceptive Automation", omf.OPTIMISER_FORECAST_FILE,
+                         "the module constant must be re-pointed for the whole test module")
 
 
 if __name__ == "__main__":
