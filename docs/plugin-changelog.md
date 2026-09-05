@@ -15,6 +15,17 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.90.1 — 05-09-2026
+
+**`_write_site_config` publishes the manager's own weekday/weekend figures.** v5.90.0 wrote
+`daily_kwh_weekday = sum(profile)` and `daily_kwh_weekend = sum(profile) * uplift` (and the hourly
+profiles likewise), while `_build_manager_snapshot` splits the blended profile through
+`_need_scales()` so the week still averages it. The optimiser's evening message reads the file for
+its "against ~N kWh of house use" line and the plugin's flood preview for its "~N kWh typical use"
+line, so the two figures in one message disagreed by 0.9 kWh (24.4 vs 23.5 on 05-Sep). Both now
+use `_need_scales`. Test: `test_profile_is_split_with_the_same_scales_the_manager_uses`. Found by
+auditing the 20:00 message's sources before it went out.
+
 ## v5.90.0 — 05-09-2026
 
 **Export feedback — the day's own evidence enters the decision.** Stage 3 of

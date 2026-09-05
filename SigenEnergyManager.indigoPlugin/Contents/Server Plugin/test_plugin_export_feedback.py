@@ -251,5 +251,35 @@ class TestWeekendUplift(_Tmp):
         self.assertEqual(plugin._need_scales("garbage"), (1.0, 1.0))
 
 
+
+class TestSiteConfigPublishesTheManagersFigures(_Tmp):
+    """v5.90.1: sigen_site_config.json must carry the SAME weekday/weekend need the
+    manager uses, or the optimiser's evening message quotes a figure 0.9 kWh off
+    the plugin's own in the same sentence (05-Sep-2026)."""
+
+    def test_profile_is_split_with_the_same_scales_the_manager_uses(self):
+        p = _mk(self.tmp)
+        p.pluginVersion = "test"
+        p.latest_rates_data = {}
+        p._dawn_target_pct = lambda: 15.0
+        p.store["consumption_profile"] = [0.5] * 48                  # 24 kWh blended
+        p.store["weekend_uplift"] = 1.1
+        p.store["weekend_uplift_date"] = D1
+        written = {}
+        with patch.object(plugin, "_local_today_str", return_value=D1), \
+             patch.object(plugin, "_atomic_write_json", lambda path, data: written.update(path=path, data=data)):
+            p._write_site_config()
+        cons = written["data"]["consumption"]
+        wd, we = plugin._need_scales(1.1)
+        self.assertAlmostEqual(cons["daily_kwh_weekday"], round(24.0 * wd, 2), places=2)
+        self.assertAlmostEqual(cons["daily_kwh_weekend"], round(24.0 * we, 2), places=2)
+        self.assertEqual(cons["weekend_multiplier"], 1.1)
+        self.assertAlmostEqual(sum(cons["hourly_kwh"]["weekday"].values()), 24.0 * wd, places=1)
+        self.assertAlmostEqual(sum(cons["hourly_kwh"]["weekend"].values()), 24.0 * we, places=1)
+        # the week still averages the profile the figures came from
+        self.assertAlmostEqual((5 * cons["daily_kwh_weekday"] + 2 * cons["daily_kwh_weekend"]) / 7.0,
+                               24.0, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

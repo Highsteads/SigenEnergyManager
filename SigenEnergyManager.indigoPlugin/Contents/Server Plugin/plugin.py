@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.0)
-# Date:        05-09-2026 15:40
-# Version:     5.90.0
+#              Claude Fable 5.1 (5.89.0-5.90.1)
+# Date:        05-09-2026 16:05
+# Version:     5.90.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1440,19 +1440,24 @@ class Plugin(indigo.PluginBase):
         consumption_block = None
         if len(profile_48) == 48:
             # Aggregate half-hourly slots into hourly: hour H = slot 2H + slot 2H+1
-            hourly_wd = {
-                str(h): round(profile_48[2 * h] + profile_48[2 * h + 1], 4)
-                for h in range(24)
-            }
-            daily_wd = round(sum(profile_48), 2)
-            # v5.90.0: the same MEASURED uplift _build_manager_snapshot uses (was 1.30)
+            # v5.90.1: publish the SAME figures the manager uses. The profile sum is a
+            # blend over all days; _need_scales() splits it into weekday and weekend
+            # so the week still averages the profile. v5.90.0 published the raw sum
+            # as the weekday and sum x uplift as the weekend, so the optimiser's
+            # need figure sat 0.9 kWh above the plugin's own in the same message.
             _uplift = (self._measured_weekend_uplift()
                        if hasattr(self, "store") else WEEKEND_UPLIFT_DEFAULT)
-            hourly_we = {
-                str(h): round(float(hourly_wd[str(h)]) * _uplift, 4)
+            _wd_scale, _we_scale = _need_scales(_uplift)
+            hourly_wd = {
+                str(h): round((profile_48[2 * h] + profile_48[2 * h + 1]) * _wd_scale, 4)
                 for h in range(24)
             }
-            daily_we = round(daily_wd * _uplift, 2)
+            hourly_we = {
+                str(h): round((profile_48[2 * h] + profile_48[2 * h + 1]) * _we_scale, 4)
+                for h in range(24)
+            }
+            daily_wd = round(sum(profile_48) * _wd_scale, 2)
+            daily_we = round(sum(profile_48) * _we_scale, 2)
             consumption_block = {
                 "source":           "sigen_inverter_48slot",
                 "daily_kwh_weekday": daily_wd,
