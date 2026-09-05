@@ -605,8 +605,6 @@ class TestOptimiserFileIsolation(unittest.TestCase):
             self.assertIn('"tomorrow_kwh": 33.3', fh.read())
 
     def test_a_real_forecast_writes_to_the_injected_path(self):
-        today = _today_local_str() if "_today_local_str" in globals() else None
-        from datetime import datetime as _dt
         d = self.f._now_local().strftime("%Y-%m-%d")
         combined = {"_hourly_p50_today": {f"{d} 12:00:00": 4000},
                     "_hourly_p50_tomorrow": {}}
