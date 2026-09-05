@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.92.1)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.93.0)
 # Date:        05-09-2026 23:05
-# Version:     5.92.1
+# Version:     5.93.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -186,6 +186,7 @@ from economics     import Economics
 from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
                            DASHBOARD_BIND_LOOPBACK)
 import vpp_ledger as _vpp_ledger
+import axle_email as _axle_email
 
 # ============================================================
 # Constants
@@ -6247,6 +6248,116 @@ class Plugin(indigo.PluginBase):
         # log contradicting the screen.
         self._check_ledger_freshness()
         return added
+
+
+    def _window_for_event_date(self, event_date):
+        """(start_iso, end_iso) for the VPP window this plugin drove on a date.
+
+        The settlement email never states the event's clock times in text - in
+        the specimen they are drawn inside the chart image, where no parser can
+        reach them. It does not matter: we DROVE the window, so we hold it to the
+        second in our own ledger rows. The email brings the money, this brings
+        the window.
+
+        Matches on the LOCAL calendar date, because that is the date the email
+        names ("Sun 16th August"), while the rows are stored in UTC - a summer
+        evening event at 19:00 UTC is the 16th in both, but a late one is not.
+        """
+        try:
+            rows = (_vpp_ledger.load_ledger(self._vpp_ledger_path()).get("local") or [])
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Window lookup failed: {exc}")
+            return None
+        for row in rows:
+            start = row.get("start_time")
+            end   = row.get("end_time")
+            if not start or not end:
+                continue
+            try:
+                local = _to_london(datetime.fromisoformat(str(start)))
+            except (TypeError, ValueError):
+                continue
+            if local.date() == event_date:
+                return (str(start), str(end))
+        return None
+
+    def _ingest_settlement_email(self, sender, subject, body, received_at):
+        """Parse one Axle settlement email into the ledger. Returns a note.
+
+        Every outcome is logged. A settlement that quietly fails to land is the
+        exact failure the ledger-staleness guard exists to end, so "we could not
+        use this message" must never be silent either.
+        """
+        result = _axle_email.parse_settlement_email(
+            sender, subject, body, received_at,
+            window_lookup=self._window_for_event_date)
+        payload, note = result.get("payload"), result.get("note") or ""
+
+        if payload is None:
+            if note and "not an Axle settlement email" not in note:
+                # A genuine Axle mail we could not use is worth a warning; an
+                # unrelated message that merely tripped the trigger is not.
+                log(f"[VPP] Settlement email not imported - {note}", "WARNING")
+            else:
+                self.logger.debug(f"[VPP] Settlement email ignored - {note}")
+            return note
+
+        try:
+            added = self._merge_axle_payload(payload)
+        except Exception as exc:
+            log(f"[VPP] Settlement email could not be filed: {exc}", "ERROR")
+            return str(exc)
+
+        tx = payload["transactions"][0]
+        # _local_time takes a datetime; the row carries an ISO string.
+        try:
+            when = _local_time(datetime.fromisoformat(tx["start_time"]), "%d/%m %H:%M")
+        except (TypeError, ValueError):
+            when = str(tx["start_time"])[:16]
+        log(f"[VPP] Settlement email imported - Axle settled "
+            f"{abs(tx['flex_kwh']):.2f} kWh at {when} for GBP "
+            f"{tx['credit_pence'] / 100:.2f}"
+            + ("." if added else ", which we already held."))
+        return ""
+
+    def actionIngestAxleSettlementEmail(self, action, dev=None):
+        """Action: read the newest message off an Email+ IMAP device and file it.
+
+        The message is read from the device's OWN states rather than passed in
+        through action props. Cross-plugin prop serialisation drops keys (the
+        Email+ sendEmail bug, 09-Apr-2026), and a settlement figure arriving
+        blank would be filed as a real one.
+        """
+        props = getattr(action, "props", {}) or {}
+        try:
+            dev_id = int(props.get("emailDeviceId") or 0)
+        except (TypeError, ValueError):
+            dev_id = 0
+        if not dev_id or dev_id not in indigo.devices:
+            log("[VPP] Import Axle Settlement Email: no Email+ device chosen. Open the "
+                "action and pick the IMAP device carrying the message.", "ERROR")
+            return
+
+        email_dev = indigo.devices[dev_id]
+        if not email_dev.enabled:
+            log(f"[VPP] Import Axle Settlement Email: '{email_dev.name}' has its "
+                f"communication disabled, so its states are frozen at whatever they "
+                f"held when it was switched off. Enable it first.", "ERROR")
+            return
+
+        st = email_dev.states
+        received = datetime.now(timezone.utc)
+        raw_date = st.get("messageDate") or ""
+        for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(str(raw_date).strip()[:31], fmt)
+                received = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                break
+            except (ValueError, TypeError):
+                continue
+
+        self._ingest_settlement_email(st.get("messageFrom", ""), st.get("messageSubject", ""),
+                                      st.get("messageText", ""), received)
 
     def _poll_vpp(self):
         """Poll Axle API and advance VPP state machine."""

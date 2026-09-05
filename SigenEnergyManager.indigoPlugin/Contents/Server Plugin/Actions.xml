@@ -64,4 +64,18 @@
         <CallbackMethod>actionRefreshOctopus</CallbackMethod>
     </Action>
 
+    <Action id="ingestAxleSettlementEmail">
+        <Name>Import Axle Settlement Email</Name>
+        <CallbackMethod>actionIngestAxleSettlementEmail</CallbackMethod>
+        <ConfigUI>
+            <Field id="label_email" type="label">
+                <Label>Fire this from an Email+ trigger on Axle's "Recent grid event - results are in!" message. It reads the message straight off the Email+ IMAP device, works out which event it settles, and files the figures in the earnings ledger.</Label>
+            </Field>
+            <Field id="emailDeviceId" type="menu">
+                <Label>Email+ IMAP device carrying the message:</Label>
+                <List class="indigo.devices" filter="com.indigodomo.email.imapAccount"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+
 </Actions>

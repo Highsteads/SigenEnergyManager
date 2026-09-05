@@ -18,7 +18,7 @@ import tempfile
 import logging
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 # ---- Mock the Indigo runtime + pymodbus so plugin.py imports standalone ----
@@ -5114,6 +5114,132 @@ class TestMergeAxlePayloadSeam(unittest.TestCase):
             p.store["vpp_ledger_stale"] = "the last import was 17 days ago"
             p._merge_axle_payload(self.PAYLOAD)
             self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+
+class TestSettlementEmailWiring(unittest.TestCase):
+    """The WIRING, not the parser. test_axle_email covers the parse; this covers
+    the plugin path a real trigger walks — which is where a feature that parses
+    perfectly can still file nothing."""
+
+    SENDER  = "Axle Energy <noreply@axle.energy>"
+    SUBJECT = "Recent grid event - results are in!"
+    BODY    = ("Hey, We've crunched the numbers - you exported 3.87 kWh during the grid "
+               "event on Sun 16th August. Earned GBP 3.87. 3.87 kWh @ GBP 1.00/kWh")
+    AT      = datetime(2026, 8, 19, 16, 32, tzinfo=timezone.utc)
+
+    def _p(self, tmpdir, local_rows=None):
+        import json as _j
+        path = os.path.join(tmpdir, "vpp_ledger.json")
+        rows = local_rows if local_rows is not None else [{
+            "start_time": "2026-08-16T19:00:00+00:00",
+            "end_time":   "2026-08-16T20:00:00+00:00",
+            "export_kwh": 4.32, "window_kwh": 3.997, "rate_per_kwh": 1.0,
+            "estimate_gbp": 4.0, "driver": "self"}]
+        with open(path, "w", encoding="utf-8") as fh:
+            _j.dump({"schema": 1, "axle": {}, "local": rows}, fh)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"axleEnabled": True, "ledgerStaleDays": "7"}
+        p.store       = {"vpp_ledger_stale": "", "vpp_ledger_logged": 0.0}
+        p._vpp_ledger_path  = MagicMock(return_value=path)
+        p._vpp_ledger_cache = None
+        p._update_vpp_device = MagicMock()
+        return p, path
+
+    def test_the_window_comes_from_our_own_ledger_row(self):
+        """The email never states the clock times in text — they are inside the
+        chart image. We drove the window, so we hold it."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            self.assertEqual(p._window_for_event_date(date(2026, 8, 16)),
+                             ("2026-08-16T19:00:00+00:00", "2026-08-16T20:00:00+00:00"))
+
+    def test_the_window_is_matched_on_the_local_date_the_email_names(self):
+        """Rows are stored UTC; the email says "Sun 16th August", which is local.
+        A 23:30 BST event is the 16th locally and the 16th at 22:30 UTC, but the
+        principle is the date the reader sees."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            self.assertIsNone(p._window_for_event_date(date(2026, 8, 15)))
+
+    def test_an_email_is_parsed_and_filed(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, path = self._p(td)
+            note = p._ingest_settlement_email(self.SENDER, self.SUBJECT, self.BODY, self.AT)
+            self.assertEqual(note, "")
+            import json as _j
+            with open(path, encoding="utf-8") as fh:
+                tx = _j.load(fh)["axle"]["transactions"]
+            self.assertEqual(len(tx), 1)
+            self.assertEqual(tx[0]["credit_pence"], 387)
+            self.assertEqual(tx[0]["transaction_id"], "email-2026-08-16T19:00")
+
+    def test_re_filing_the_same_email_is_harmless(self):
+        """Axle can resend, and a trigger can double-fire. The merge is keyed on
+        the window, so the second import must not double-count the event."""
+        with tempfile.TemporaryDirectory() as td:
+            p, path = self._p(td)
+            p._ingest_settlement_email(self.SENDER, self.SUBJECT, self.BODY, self.AT)
+            p._ingest_settlement_email(self.SENDER, self.SUBJECT, self.BODY, self.AT)
+            import json as _j
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(len(_j.load(fh)["axle"]["transactions"]), 1)
+
+    def test_filing_an_email_clears_the_staleness_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            p.store["vpp_ledger_stale"] = "the last import was 17 days ago"
+            p._ingest_settlement_email(self.SENDER, self.SUBJECT, self.BODY, self.AT)
+            self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+    def test_an_unusable_axle_email_warns_rather_than_vanishing(self):
+        """A settlement that quietly fails to land is the exact failure the
+        staleness guard exists to end."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td, local_rows=[])       # we drove no window that day
+            with patch.object(plugin, "log") as lg:
+                note = p._ingest_settlement_email(self.SENDER, self.SUBJECT, self.BODY, self.AT)
+            self.assertIn("no record of driving a window", note)
+            self.assertTrue(any(c.args[1] == "WARNING" for c in lg.call_args_list if len(c.args) > 1))
+
+    def test_an_unrelated_message_is_ignored_quietly(self):
+        """The Email+ trigger matches on a string, so other mail will reach this.
+        An unrelated message is not a fault and must not log as one."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            with patch.object(plugin, "log") as lg:
+                p._ingest_settlement_email("someone@example.com", "Lunch?", "hello", self.AT)
+            lg.assert_not_called()
+
+    def test_a_disabled_email_device_is_refused_not_read(self):
+        """A disabled device's states are FROZEN at whatever they held when it
+        was switched off, and every read still succeeds — so reading one would
+        re-file a months-old message as though it had just arrived."""
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p._ingest_settlement_email = MagicMock()
+        email_dev = MagicMock()
+        email_dev.enabled = False
+        email_dev.name = "Email+ IMAP Server"
+        action = MagicMock()
+        action.props = {"emailDeviceId": "1568150849"}
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "log") as lg:
+            ind.devices = {1568150849: email_dev}
+            p.actionIngestAxleSettlementEmail(action)
+        p._ingest_settlement_email.assert_not_called()
+        self.assertTrue(any(c.args[1] == "ERROR" for c in lg.call_args_list if len(c.args) > 1))
+
+    def test_no_device_chosen_is_an_error_not_a_crash(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p._ingest_settlement_email = MagicMock()
+        action = MagicMock()
+        action.props = {}
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "log") as lg:
+            ind.devices = {}
+            p.actionIngestAxleSettlementEmail(action)
+        p._ingest_settlement_email.assert_not_called()
+        lg.assert_called_once()
 
 
 if __name__ == "__main__":

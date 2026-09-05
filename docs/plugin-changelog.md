@@ -15,6 +15,79 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.93.0 — 05-09-2026
+
+**The settlement email files itself.** Built against a REAL specimen — the 16-Aug-2026 mail,
+supplied 05-Sep-2026 — rather than an imagined format, which is the only reason the awkward
+parts were visible at all.
+
+### Why the email and not the API
+
+Recorded in v5.92.0 and restated because it is the whole justification: Axle's `/rewards/*`
+endpoints all need an ORGANISATIONAL token (a consumer token 403s, ha-axle-vpp #19), and the
+account page cannot be fetched because sign-in is magic-link only, so there is no credential a
+program can hold. The email carries both figures and arrives DAYS earlier. It was always the
+live channel — the ledger's newest Axle row has always been a hand-typed `email-…` one.
+
+### The awkward part, and why it turned out not to matter
+
+**The email never writes the event's clock times as text.** In the specimen "Event 20:00 →
+21:00" is drawn inside the chart IMAGE. No text parser reaches it, and the ledger's dedupe is
+window-keyed, so without a window a row cannot be filed at all.
+
+It does not need to be parsed. **We drove that window**, so we hold it to the second in our own
+local ledger rows. `_window_for_event_date()` looks it up by the LOCAL calendar date the email
+names ("Sun 16th August") against rows stored in UTC. So the email supplies the money and the
+plugin supplies the timing — steadier than OCR, and impossible to get subtly wrong.
+
+### The body is untrusted input
+
+Anything that can be emailed to you can be emailed by anyone, and a parsed figure lands in an
+earnings record. So: the sender domain and the subject are both checked (either alone is
+guessable); both figures are range-bounded; and the kWh is cross-checked against the money via
+the rate line, on the grounds that a template which has moved is one we can no longer read
+safely — better to refuse than to bank a misreading. Re-filing is harmless by construction,
+since `import_axle_payload` is window-keyed.
+
+The year is inferred from the message's own timestamp, with a rollback: a settlement arrives
+days after its event, so a parsed date in the future belongs to the previous year — the 31st of
+December settled on the 2nd of January. Without it, one event a year is filed twelve months out.
+
+### Wiring
+
+`actionIngestAxleSettlementEmail` reads the Email+ IMAP device's OWN states
+(`messageFrom`/`messageSubject`/`messageText`/`messageDate`, names read from Email+'s
+Devices.xml rather than guessed) instead of taking them as action props — cross-plugin prop
+serialisation drops keys (the Email+ `sendEmail` bug, 09-Apr-2026), and a settlement figure
+arriving blank would be filed as a real one. It REFUSES a disabled device: a disabled device's
+states are frozen at whatever they held when it was switched off and every read still succeeds,
+so reading one would re-file a months-old message as though it had just arrived.
+
+The action carries a ConfigUI, deliberately — an action step with none stores no props and is
+"not completely configured" for ever at run time, with no dialog left to fix it.
+
+**Still needs a human:** Axle send to `axle_vpp@strudwick.co.uk` while the Email+ IMAP device is
+`indigo@highsteads.co.uk` and disabled, so the mailbox is a decision rather than a code change;
+and the trigger itself must be made in the client, because `indigo.trigger` has no `create`.
+
+### Verification
+
+The shipped module was run in the plugin's own context against the real specimen and the real
+ledger. It reproduced the row CliveS typed by hand **field for field** — same id, same window,
+same −3.87 kWh, same 387p.
+
+1143 -> 1173 tests. Thirteen mutations, all killed. **Two survived the first pass and both were
+fixture gaps the specimen itself created:**
+- The money bound could not be killed, because the kWh/money cross-check caught every case the
+  test could express. It needed a rate high enough to keep the two figures consistent while the
+  money stayed absurd.
+- Pence rounding could not be killed, because **3.87 × 100 is exactly 387.0** in binary floating
+  point. 137 money values under GBP 20 are not — 1.15 × 100 is 114.99999999999999 — so a short
+  event would have been banked a penny light, silently and for ever. The specimen's own figure
+  was the one that could not show it.
+
+---
+
 ## v5.92.0 — 05-09-2026
 
 **The earnings ledger had stopped being fed 17.2 days earlier and nothing on the system said
