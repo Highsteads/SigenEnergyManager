@@ -37,7 +37,13 @@
 # both figures are range-bounded. A duplicate is harmless by construction -
 # import_axle_payload is keyed on the window and re-importing is a no-op.
 
+import email
+import email.policy
+import email.utils
+import glob
+import os
 import re
+import time
 from datetime import timedelta
 
 # Bounds on what a single domestic flex event can plausibly settle. The site's
@@ -241,3 +247,80 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
         }]},
         "note": "",
     }
+
+
+# ======================================================================
+# Reading them straight out of the local Mail store
+# ======================================================================
+#
+# There is no IMAP account to log into and no forwarding rule to set up: Apple
+# Mail has already downloaded these messages under the user's own account, and
+# an Indigo plugin host can read them (verified 05-Sep-2026 from a live host —
+# ~/Library/Mail is behind Full Disk Access and the host has it).
+#
+# So the "fetch" is a file read. No credential passes through the plugin, which
+# is the whole reason to prefer this over any mailbox login.
+#
+# .emlx is a byte count, a newline, the RFC822 message, then an Apple plist.
+# Splitting at the first newline and parsing the rest as a message is all it takes.
+
+MAIL_ROOT_GLOB = "~/Library/Mail/V*"
+SCAN_WINDOW_DAYS = 45          # a settlement lands ~3 days after its event
+_PREFILTER = (b"noreply@axle.energy", b"results are in")
+
+
+def mail_roots(root_glob=MAIL_ROOT_GLOB):
+    """Every local Mail store directory. The V-number changes with macOS, so it
+    is globbed rather than pinned — a version bump must not silently stop this."""
+    return sorted(glob.glob(os.path.expanduser(root_glob)))
+
+
+def iter_settlement_messages(root_glob=MAIL_ROOT_GLOB, since_days=SCAN_WINDOW_DAYS, now=None):
+    """Yield (sender, subject, body, received_at) for each settlement mail found.
+
+    Two cheap filters before anything is parsed, because the store here holds
+    16,000 messages and this runs on the plugin's only thread: an mtime window,
+    then a 4 KB prefilter on the raw bytes. A full walk measured 1.64 s.
+
+    Never raises. An unreadable store, a malformed message, a permission change
+    — each is skipped, because a mail scan must not be able to take the plugin
+    down with it.
+    """
+    cutoff = (now or time.time()) - since_days * 86400
+    for root in mail_roots(root_glob):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if not name.endswith(".emlx"):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        continue
+                    with open(path, "rb") as fh:
+                        head = fh.read(4096)
+                        if not all(tok in head for tok in _PREFILTER):
+                            continue
+                        raw = head + fh.read()
+                except (OSError, ValueError):
+                    continue
+                try:
+                    nl = raw.index(b"\n")
+                    msg = email.message_from_bytes(raw[nl + 1:], policy=email.policy.default)
+                except Exception:
+                    continue
+                body = ""
+                try:
+                    parts = msg.walk() if msg.is_multipart() else [msg]
+                    for part in parts:
+                        if part.get_content_type() in ("text/html", "text/plain"):
+                            try:
+                                body += part.get_content()
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+                try:
+                    received = email.utils.parsedate_to_datetime(msg.get("Date"))
+                except Exception:
+                    received = None
+                yield (str(msg.get("From") or ""), str(msg.get("Subject") or ""), body, received)

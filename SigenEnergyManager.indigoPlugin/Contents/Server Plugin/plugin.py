@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.94.0)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.95.0)
 # Date:        05-09-2026 23:05
-# Version:     5.94.0
+# Version:     5.95.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -260,6 +260,10 @@ VPP_OVERRUN_GRACE_MINS    = 15
 # the end of the following month, so a fast check would only re-log the same
 # staleness. The check itself is local file work — no network, no Modbus.
 VPP_LEDGER_CHECK_INTERVAL = 21600  # 6 hours
+# How often to look in the local Mail store for new Axle settlement mail. Same
+# reasoning as the ledger check: a settlement lands days after its event, so
+# hours is ample, and the walk costs ~1.6 s of the plugin's only thread.
+AXLE_MAIL_SCAN_INTERVAL   = 21600  # 6 hours
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 # v5.89.0 — the energy tripwire. The identity residual and the derived-vs-device
 # house gap each warn once per day above max(absolute, fraction * throughput).
@@ -1266,6 +1270,8 @@ class Plugin(indigo.PluginBase):
         # a whole interval — a stale ledger discovered six hours late is six
         # hours of the silence this exists to end.
         self.store["last_ledger_check"]  = 0.0
+        self.store["last_mail_scan"]     = 0.0
+        self.store["mail_scan_problem"]  = ""
         self.store["vpp_ledger_stale"]   = ""
         self.store["vpp_ledger_logged"]  = 0.0
 
@@ -2744,6 +2750,16 @@ class Plugin(indigo.PluginBase):
 
         # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64)
         self._retry_vpp_handback()
+
+        # 12a. Axle settlement mail (v5.95.0). Runs BEFORE the freshness check
+        # below, so an import found here clears the staleness warning on the same
+        # pass rather than leaving the log contradicting itself for six hours.
+        if now - self.store.get("last_mail_scan", 0.0) >= AXLE_MAIL_SCAN_INTERVAL:
+            try:
+                self._scan_axle_mail()
+            except Exception as exc:
+                log(f"[VPP] Axle mail scan failed: {exc}", "WARNING")
+            self.store["last_mail_scan"] = now
 
         # 12b. Earnings-ledger freshness (v5.92.0). Local file work only.
         if now - self.store.get("last_ledger_check", 0.0) >= VPP_LEDGER_CHECK_INTERVAL:
@@ -6249,6 +6265,70 @@ class Plugin(indigo.PluginBase):
         self._check_ledger_freshness()
         return added
 
+
+    def _scan_axle_mail(self):
+        """Import any Axle settlement mail sitting in the local Mail store.
+
+        OFF BY DEFAULT, and it must stay that way. This plugin is published, and
+        reading someone's personal mail store is not a thing to start doing
+        because they upgraded. The pref says plainly what it reads.
+
+        There is no mailbox login here and no credential anywhere: Apple Mail has
+        already downloaded the messages under the user's own account, and the
+        plugin host can read them. That is the whole reason to prefer this over
+        an IMAP account — nothing to store, nothing to rotate, nothing to leak.
+
+        Re-importing is free: the merge is keyed on the event window, so the same
+        message parsed a hundred times still yields one row. That is deliberate,
+        because it means no bookkeeping of what has already been seen can drift.
+        """
+        if not _as_bool(self.pluginPrefs.get("axleScanMail"), False):
+            return
+        if not _as_bool(self.pluginPrefs.get("axleEnabled"), False):
+            return
+
+        roots = _axle_email.mail_roots()
+        if not roots:
+            self._note_mail_scan_problem(
+                "no Apple Mail store found on this Mac, so there is nothing to read")
+            return
+
+        seen = imported = refused = 0
+        for sender, subject, body, received in _axle_email.iter_settlement_messages():
+            seen += 1
+            note = self._ingest_settlement_email(sender, subject, body, received)
+            if note:
+                refused += 1
+            else:
+                imported += 1
+
+        if seen == 0:
+            self._note_mail_scan_problem(
+                "no Axle settlement emails found in the Mail store - check Mail is "
+                "still downloading them, and that this Mac holds the account they go to")
+        else:
+            self._note_mail_scan_problem("")
+            self.logger.debug(f"[VPP] Mail scan: {seen} settlement message(s), "
+                              f"{imported} usable, {refused} not.")
+
+    def _note_mail_scan_problem(self, problem):
+        """Report a mail scan that is finding nothing, once and then hourly.
+
+        A scan that silently returns nothing is indistinguishable from a quiet
+        month of no events - the same trap the events feed and the ledger have
+        each been caught by, so it gets the same treatment.
+        """
+        prev = self.store.get("mail_scan_problem") or ""
+        self.store["mail_scan_problem"] = problem or ""
+        if problem:
+            now = time.time()
+            if problem != prev or now - self.store.get("mail_scan_logged", 0.0) >= 3600.0:
+                self.store["mail_scan_logged"] = now
+                log(f"[VPP] Axle mail scan found nothing - {problem}.", "WARNING")
+        else:
+            if prev:
+                log("[VPP] Axle mail scan is finding settlement emails again.")
+            self.store["mail_scan_logged"] = 0.0
 
     def _window_for_event_date(self, event_date):
         """(start_iso, end_iso) for the VPP window this plugin drove on a date.

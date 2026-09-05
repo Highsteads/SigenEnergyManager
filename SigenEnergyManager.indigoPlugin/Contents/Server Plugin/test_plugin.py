@@ -13,6 +13,7 @@
 import os
 import sys
 import threading
+import time
 import sqlite3
 import tempfile
 import logging
@@ -5259,6 +5260,149 @@ class TestSettlementEmailWiring(unittest.TestCase):
             p.actionIngestAxleSettlementEmail(action)
         p._ingest_settlement_email.assert_not_called()
         lg.assert_called_once()
+
+
+class TestAxleMailScan(unittest.TestCase):
+    """Reading the settlement mail out of Apple Mail's own files.
+
+    No mailbox login, no credential, no forwarding rule — Mail has already
+    downloaded the messages under the user's account and the plugin host can
+    read them. Verified on a live host 05-Sep-2026."""
+
+    RAW = (b"123\n"
+           b"From: Axle Energy <noreply@axle.energy>\n"
+           b"Subject: Recent grid event - results are in!\n"
+           b"Date: Wed, 19 Aug 2026 16:32:00 +0000\n"
+           b"Content-Type: text/plain; charset=utf-8\n\n"
+           b"you exported 3.87 kWh during the grid event on Sun 16th August. "
+           b"You earned GBP 3.87. 3.87 kWh @ GBP 1.00/kWh\n")
+
+    def _store(self, td, raw=None, name="msg.emlx"):
+        d = os.path.join(td, "V10", "INBOX.mbox", "Data", "0", "Messages")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "wb") as fh:
+            fh.write(raw if raw is not None else self.RAW)
+        return os.path.join(td, "V*")
+
+    def test_it_finds_and_reads_a_settlement_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            g = self._store(td)
+            msgs = list(plugin._axle_email.iter_settlement_messages(root_glob=g))
+            self.assertEqual(len(msgs), 1)
+            sender, subject, body, received = msgs[0]
+            self.assertIn("noreply@axle.energy", sender)
+            self.assertIn("results are in", subject)
+            self.assertIn("3.87 kWh", body)
+            self.assertEqual(received.year, 2026)
+
+    def test_unrelated_mail_is_never_opened(self):
+        """The prefilter is on the raw bytes, so someone else's mail is skipped
+        without ever being parsed."""
+        with tempfile.TemporaryDirectory() as td:
+            g = self._store(td, raw=b"9\nFrom: mum@example.com\nSubject: Lunch?\n\nhello\n")
+            self.assertEqual(list(plugin._axle_email.iter_settlement_messages(root_glob=g)), [])
+
+    def test_other_axle_mail_is_skipped(self):
+        """Axle send four other kinds of message; only the settlement one counts."""
+        with tempfile.TemporaryDirectory() as td:
+            raw = self.RAW.replace(b"Recent grid event - results are in!", b"Upcoming Grid Event")
+            g = self._store(td, raw=raw)
+            self.assertEqual(list(plugin._axle_email.iter_settlement_messages(root_glob=g)), [])
+
+    def test_a_message_older_than_the_window_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            g = self._store(td)
+            future = time.time() + 999 * 86400        # push the cutoff past the file
+            self.assertEqual(
+                list(plugin._axle_email.iter_settlement_messages(root_glob=g, now=future)), [])
+
+    def test_a_corrupt_message_does_not_stop_the_scan(self):
+        """One unreadable file must not cost the others. A scan that dies on the
+        first bad message would silently import nothing.
+
+        The broken fixture must carry the Axle markers, or the byte prefilter
+        rejects it long before the parser is reached and the test proves nothing
+        - which is exactly what an earlier version of it did, and a mutation
+        making the parse fatal survived because of it. Markers present, no
+        newline, so the .emlx split raises."""
+        with tempfile.TemporaryDirectory() as td:
+            g = self._store(td)
+            self._store(td, raw=b"noreply@axle.energy results are in \xff\xfe", name="broken.emlx")
+            self.assertEqual(len(list(plugin._axle_email.iter_settlement_messages(root_glob=g))), 1)
+
+    def test_a_missing_mail_store_is_not_an_exception(self):
+        self.assertEqual(
+            list(plugin._axle_email.iter_settlement_messages(root_glob="/nonexistent/V*")), [])
+
+    def test_the_mail_root_glob_is_not_pinned_to_a_version(self):
+        """~/Library/Mail/V10 becomes V11 at some macOS release. A pinned path
+        would stop finding anything, silently."""
+        self.assertIn("V*", plugin._axle_email.MAIL_ROOT_GLOB)
+
+
+class TestAxleMailScanIsOptIn(unittest.TestCase):
+    """Reading someone's personal mail store is not a thing to start doing
+    because they upgraded. This plugin is published."""
+
+    def _p(self, scan=True, axle=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"axleScanMail": scan, "axleEnabled": axle}
+        p.store       = {"mail_scan_problem": "", "mail_scan_logged": 0.0}
+        p._ingest_settlement_email = MagicMock(return_value="")
+        return p
+
+    def test_it_does_nothing_when_the_pref_is_off(self):
+        p = self._p(scan=False)
+        with patch.object(plugin._axle_email, "iter_settlement_messages") as it:
+            p._scan_axle_mail()
+        it.assert_not_called()
+
+    def test_it_does_nothing_when_axle_itself_is_off(self):
+        p = self._p(axle=False)
+        with patch.object(plugin._axle_email, "iter_settlement_messages") as it:
+            p._scan_axle_mail()
+        it.assert_not_called()
+
+    def test_the_default_is_off(self):
+        """Read from PluginConfig.xml, not from a constant in the test — the
+        default that matters is the one a new user actually gets."""
+        import xml.etree.ElementTree as ET
+        here = os.path.dirname(os.path.abspath(plugin.__file__))
+        root = ET.parse(os.path.join(here, "PluginConfig.xml")).getroot()
+        fields = [f for f in root.iter("Field") if f.get("id") == "axleScanMail"]
+        self.assertEqual(len(fields), 1)
+        self.assertEqual((fields[0].get("defaultValue") or "").lower(), "false")
+
+    def test_finding_no_messages_is_reported_not_swallowed(self):
+        """A scan that silently returns nothing looks exactly like a quiet month
+        of no events - the trap both other Axle feeds have been caught by."""
+        p = self._p()
+        with patch.object(plugin._axle_email, "iter_settlement_messages", return_value=iter([])), \
+             patch.object(plugin._axle_email, "mail_roots", return_value=["/somewhere"]), \
+             patch.object(plugin, "log") as lg:
+            p._scan_axle_mail()
+        self.assertIn("no Axle settlement emails found", p.store["mail_scan_problem"])
+        self.assertTrue(any(c.args[1] == "WARNING" for c in lg.call_args_list if len(c.args) > 1))
+
+    def test_a_missing_mail_store_is_reported_distinctly(self):
+        p = self._p()
+        with patch.object(plugin._axle_email, "mail_roots", return_value=[]), \
+             patch.object(plugin, "log") as lg:
+            p._scan_axle_mail()
+        self.assertIn("no Apple Mail store", p.store["mail_scan_problem"])
+        lg.assert_called_once()
+
+    def test_recovery_is_announced(self):
+        p = self._p()
+        p.store["mail_scan_problem"] = "no Axle settlement emails found"
+        with patch.object(plugin._axle_email, "mail_roots", return_value=["/x"]), \
+             patch.object(plugin._axle_email, "iter_settlement_messages",
+                          return_value=iter([("a", "b", "c", None)])), \
+             patch.object(plugin, "log") as lg:
+            p._scan_axle_mail()
+        self.assertEqual(p.store["mail_scan_problem"], "")
+        self.assertTrue(any("finding settlement emails again" in c.args[0] for c in lg.call_args_list))
 
 
 if __name__ == "__main__":

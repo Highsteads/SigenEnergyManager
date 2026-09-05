@@ -211,6 +211,11 @@
         <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
     </Field>
 
+    <Field id="axleScanMail" type="checkbox" defaultValue="false" visibleBindingId="axleEnabled" visibleBindingValue="true">
+        <Label>Read Axle's settlement emails from Apple Mail on this Mac:</Label>
+        <Description>Axle email what each event paid, a few days after it runs. With this on, the plugin reads those emails straight out of Apple Mail's own files and files the figures in the earnings ledger by itself. It only ever opens messages from noreply@axle.energy with Axle's settlement subject, it never signs in to anything, and no password is stored. Leave it off if you would rather type the figures in yourself.</Description>
+    </Field>
+
     <Field id="ledgerStaleDays" type="textfield" defaultValue="7" visibleBindingId="axleEnabled" visibleBindingValue="true">
         <Label>Warn when the Axle earnings figures have not been imported for this many days (0 turns the warning off). Axle settle a few days behind an event, so 7 catches a feed that has genuinely stopped without complaining about a quiet week:</Label>
     </Field>
