@@ -383,6 +383,43 @@ SOLAR_OVERFLOW_TARGET_SOC_PCT = 90.0
 # the day is too weak to give kWh away — revert to the old 100% pacing and keep them.
 SOLAR_OVERFLOW_MIN_END_SOC_PCT = 80.0
 
+# v5.90.0 — intraday PV tracking and the measured-need model (Stage 3 of
+# docs/daily-energy-revamp.md). The manager already evaluated every 60 s; the
+# problem was that nothing MEASURED about today entered the decision.
+PV_TRACKING_MIN_FORECAST_KWH = 2.0    # below this much elapsed forecast the ratio is noise
+PV_TRACKING_FULL_WEIGHT_KWH  = 8.0    # elapsed forecast at which the ratio carries full weight
+PV_TRACKING_MIN_FACTOR       = 0.6    # a dark morning cannot write off the afternoon
+PV_TRACKING_MAX_FACTOR       = 1.3    # nor can a bright one promise more than the model + 30%
+
+
+def pv_tracking_factor(actual_kwh, forecast_kwh):
+    """(factor, ratio) from today's measured PV against the forecast for the SAME
+    elapsed hours, counted only while the inverter could take all the PV.
+
+    ratio  = actual / forecast
+    factor = 1 + w * (ratio - 1),  w = min(1, forecast / PV_TRACKING_FULL_WEIGHT_KWH)
+    clamped to [PV_TRACKING_MIN_FACTOR, PV_TRACKING_MAX_FACTOR].
+
+    The damping weight makes an early-morning reading count for little — one
+    cloud over breakfast is not an afternoon — and the clamp bounds how far a
+    single day may move the forecast. Returns (1.0, None) when the elapsed
+    forecast is too small to judge or either input is unusable: no factor is
+    a factor of exactly one, never a guess.
+    """
+    try:
+        actual   = float(actual_kwh)
+        forecast = float(forecast_kwh)
+    except (TypeError, ValueError):
+        return 1.0, None
+    if forecast < PV_TRACKING_MIN_FORECAST_KWH or actual < 0.0:
+        return 1.0, None
+    ratio  = actual / forecast
+    weight = min(1.0, forecast / PV_TRACKING_FULL_WEIGHT_KWH)
+    factor = 1.0 + weight * (ratio - 1.0)
+    factor = max(PV_TRACKING_MIN_FACTOR, min(PV_TRACKING_MAX_FACTOR, factor))
+    return round(factor, 3), round(ratio, 3)
+
+
 # ── Bank-first export hold (v3.11) ──────────────────────────────────────────
 # Export is a RATE problem, not an energy one: PV is only ever clipped in a half
 # hour whose surplus exceeds the DNO cap. Measured over 96 days of half-hourly
@@ -568,6 +605,13 @@ class ManagerSnapshot:
     # 0.0 when inactive; set to the target SOC % when a flood-prevention export is running
     flood_prev_target_soc: float = 0.0
 
+    # v5.90.0 — what has ACTUALLY happened today (from daily_energy via plugin.py).
+    # Neutral defaults reproduce v5.89 behaviour exactly.
+    pv_tracking_factor:  float = 1.0             # applied to remaining solar (damped, clamped)
+    pv_tracking_ratio:   Optional[float] = None  # measured / forecast so far, for display
+    home_today_kwh:      Optional[float] = None  # house use so far today (kWh); None = unknown
+    home_today_partial:  bool = False            # True when the plugin missed part of today
+
 
 @dataclass
 class SufficiencyBalance:
@@ -604,6 +648,10 @@ class SufficiencyBalance:
     dawn_dt:                  Optional[datetime] = None
     hours_to_dawn:            float = 8.0
     expected_overnight_kwh:   float = 0.0    # consumption from now to dawn
+    # v5.90.0
+    pv_tracking_factor:       float = 1.0    # factor applied to remaining_solar_kwh
+    need_today_used_kwh:      Optional[float] = None   # measured house use so far, when measured
+    need_today_measured:      bool  = False  # True when need_24h = used so far + profile remainder
 
 
 @dataclass
@@ -633,6 +681,23 @@ class Decision:
 # ============================================================
 # BatteryManager
 # ============================================================
+
+def _balance_extras(balance):
+    """v5.90.0 suffix for reason/audit lines: the tracking factor when it is
+    doing anything, and the measured need when it was measured. Empty otherwise,
+    so every pre-5.90 line reads exactly as it did."""
+    parts = []
+    try:
+        f = float(getattr(balance, "pv_tracking_factor", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        f = 1.0
+    if abs(f - 1.0) > 0.005:
+        parts.append(f"solar tracking x{f:.2f}")
+    if getattr(balance, "need_today_measured", False):
+        parts.append(f"need today {balance.need_24h_kwh:.1f} kWh "
+                     f"({balance.need_today_used_kwh:.1f} used)")
+    return (" | " + " | ".join(parts)) if parts else ""
+
 
 class BatteryManager:
     """24-hour sufficiency battery decision engine (v4.0).
@@ -700,6 +765,7 @@ class BatteryManager:
             f"surplus {balance.surplus_kwh:.1f} kWh, import_needed={balance.import_needed}, "
             f"daytime={balance.is_daytime}, dawn SOC {balance.battery_at_dawn_kwh:.1f} kWh, "
             f"tomorrow need {balance.tomorrow_need_kwh:.1f} kWh"
+            + _balance_extras(balance)
         ))
 
         # 2. Resilience buffer (flat-rate any-time; TOU only in the cheap window
@@ -798,6 +864,7 @@ class BatteryManager:
                 f"24h sufficient — surplus {balance.surplus_kwh:.1f} kWh | "
                 f"tomorrow: {balance.available_tomorrow_kwh:.1f} kWh avail, "
                 f"need {balance.tomorrow_need_kwh:.1f} kWh"
+                + _balance_extras(balance)
             ),
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
@@ -1142,6 +1209,11 @@ class BatteryManager:
             # scales by biasFactorToday, so this is the codebase's own convention;
             # the engine was the one place not following it.
             remaining_solar_kwh *= snapshot.bias_factor_today
+            # v5.90.0: the day's own evidence. Computed plugin-side from measured
+            # PV against the forecast for the same elapsed hours (unclipped minutes
+            # only), damped and clamped — see pv_tracking_factor(). Neutral (1.0)
+            # until enough of the day has passed to judge.
+            remaining_solar_kwh *= float(snapshot.pv_tracking_factor or 1.0)
 
         # ── 24h surplus (export eligibility) ───────────────────────────────
         # DELIBERATELY CONSERVATIVE (owner decision, 02-07-2026, closing the
@@ -1155,6 +1227,22 @@ class BatteryManager:
         # was considered and declined: it leans on the overnight forecast for
         # tonight's export decision. Pinned by
         # test_surplus_is_conservative_no_tomorrow_solar.
+        # v5.90.0: need today = what the house has ACTUALLY used so far plus the
+        # profile's remainder of the day, scaled to today's day-type figure. The
+        # old form charged the whole day's figure against a part-day supply
+        # whatever had already happened. Falls back to that whenever the
+        # measurement is unknown or partial (a boundary the plugin missed).
+        need_today_used_kwh = None
+        need_today_measured = False
+        _profile = snapshot.consumption_profile or []
+        if (snapshot.home_today_kwh is not None and not snapshot.home_today_partial
+                and len(_profile) == 48 and sum(_profile) > 0.0):
+            _slot = local_now.hour * 2 + (1 if local_now.minute >= 30 else 0)
+            _remaining_fraction = sum(_profile[_slot:48]) / sum(_profile)
+            need_today_used_kwh = max(0.0, float(snapshot.home_today_kwh))
+            need_24h_kwh        = need_today_used_kwh + _remaining_fraction * need_24h_kwh
+            need_today_measured = True
+
         surplus_kwh = current_soc_kwh + remaining_solar_kwh - need_24h_kwh
 
         # ── Home consumption from now to dusk (for solar overflow charge cap) ─
@@ -1214,6 +1302,10 @@ class BatteryManager:
             dawn_dt                  = dawn_dt,
             hours_to_dawn            = round(hours_to_dawn, 1),
             expected_overnight_kwh   = round(overnight_kwh, 2),
+            pv_tracking_factor       = round(float(snapshot.pv_tracking_factor or 1.0), 3),
+            need_today_used_kwh      = (round(need_today_used_kwh, 2)
+                                        if need_today_used_kwh is not None else None),
+            need_today_measured      = need_today_measured,
         )
 
     # ================================================================
@@ -1824,6 +1916,12 @@ class BatteryManager:
             if solar_surplus < SOLAR_OVERFLOW_RELEASE_KWH:
                 # Solar can no longer fill the battery — release, caller handles it
                 return None
+            # v5.90.0 NOTE — a "min-end floor on the actual trajectory" release was
+            # designed for here and found to be dead by construction: the physics
+            # release above fires whenever net solar < headroom to 100%, and while
+            # it does NOT fire, soc + net/capacity >= 100% > any floor. With the
+            # tracking factor now inside remaining_solar_kwh, THIS gate is the
+            # stop-on-actuals. A mutation sweep proved the floor could never speak.
         else:
             if solar_surplus < SOLAR_OVERFLOW_ENGAGE_KWH:
                 return None

@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0)
-# Date:        05-09-2026 14:10
-# Version:     5.89.0
+#              Claude Fable 5.1 (5.89.0-5.90.0)
+# Date:        05-09-2026 15:40
+# Version:     5.90.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -174,6 +174,7 @@ from battery_manager  import (
     ACTION_VPP_EXPORT, ACTION_SAVING_SESSION, ACTION_HAPPY_HOUR_IMPORT,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
+    pv_tracking_factor as _pv_tracking_factor,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
     SOLAR_OVERFLOW_CAP_DEADBAND_W,
     SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
@@ -262,6 +263,18 @@ ENERGY_HOUSE_FRACTION     = 0.05
 # How long the midnight task waits for a post-midnight lifetime read to replace
 # the provisional anchor before recording the day anyway.
 MIDNIGHT_ANCHOR_WAIT_S    = 600
+# v5.90.0 — intraday PV tracking (Stage 3). A minute counts towards the ratio only
+# while the inverter could take all the PV: at the export cap, or on a full
+# battery no longer charging, it is turning PV away and the measured figure
+# under-reads potential.
+PV_TRACKING_EXPORT_CAP_FRACTION = 0.95
+PV_TRACKING_RECORD_ROWS         = 2000   # intraday_pv_tracking.json ring, ~80 days of hours
+# v5.90.0 — the weekend uplift is MEASURED from daily_history.json (was a hard-coded
+# 1.30; measured here 1.10 over 26 weekends). Default until there is enough history.
+WEEKEND_UPLIFT_DEFAULT          = 1.10
+WEEKEND_UPLIFT_WINDOW_DAYS      = 56
+WEEKEND_UPLIFT_MIN_WEEKDAYS     = 10
+WEEKEND_UPLIFT_MIN_WEEKEND_DAYS = 4
 STORM_WATCH_INTERVAL = 7200  # 2 hours
 # Octopus announces a new Saving Session at most a few times a day (usually the evening
 # before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
@@ -319,6 +332,19 @@ def _as_int(value, fallback):
         return int(fallback)
     except (TypeError, ValueError):
         return fallback
+
+
+def _need_scales(uplift):
+    """(weekday_scale, weekend_scale) so that a blended daily profile P gives
+    weekday = P * wd and weekend = P * wd * uplift with the WEEK still averaging P:
+    5*wd + 2*wd*u = 7  ->  wd = 7 / (5 + 2u). v5.90.0."""
+    try:
+        u = float(uplift)
+    except (TypeError, ValueError):
+        u = 1.0
+    u  = max(0.5, min(2.0, u))
+    wd = 7.0 / (5.0 + 2.0 * u)
+    return round(wd, 4), round(wd * u, 4)
 
 
 def _num_state(key, value, dp):
@@ -1073,6 +1099,19 @@ class Plugin(indigo.PluginBase):
         self.store["energy_reconcile_warned"]     = ""
         self.store["energy_yesterday_projection"] = None
         self.daily_energy = DailyEnergy()
+        # v5.90.0: intraday PV tracking + measured need (Stage 3 of the revamp).
+        self.store["pv_track_date"]         = ""
+        self.store["pv_track_actual_kwh"]   = 0.0
+        self.store["pv_track_forecast_kwh"] = 0.0
+        self.store["pv_track_last_epoch"]   = 0.0
+        self.store["pv_track_last_pv_kwh"]  = None
+        self.store["pv_track_clipped_min"]  = 0.0
+        self.store["pv_track_factor"]       = 1.0
+        self.store["pv_track_ratio"]        = None
+        self.store["pv_track_last_hour"]    = None
+        self.store["need_today_kwh"]        = None
+        self.store["weekend_uplift"]        = None
+        self.store["weekend_uplift_date"]   = ""
 
         # VPP state machine
         self.store["vpp_state"]            = VPP_IDLE
@@ -1406,17 +1445,19 @@ class Plugin(indigo.PluginBase):
                 for h in range(24)
             }
             daily_wd = round(sum(profile_48), 2)
-            # Match plugin's _build_manager_snapshot weekend ratio (1.30x)
+            # v5.90.0: the same MEASURED uplift _build_manager_snapshot uses (was 1.30)
+            _uplift = (self._measured_weekend_uplift()
+                       if hasattr(self, "store") else WEEKEND_UPLIFT_DEFAULT)
             hourly_we = {
-                str(h): round(float(hourly_wd[str(h)]) * 1.30, 4)
+                str(h): round(float(hourly_wd[str(h)]) * _uplift, 4)
                 for h in range(24)
             }
-            daily_we = round(daily_wd * 1.30, 2)
+            daily_we = round(daily_wd * _uplift, 2)
             consumption_block = {
                 "source":           "sigen_inverter_48slot",
                 "daily_kwh_weekday": daily_wd,
                 "daily_kwh_weekend": daily_we,
-                "weekend_multiplier": 1.30,
+                "weekend_multiplier": round(_uplift, 3),
                 "hourly_kwh": {
                     "weekday": hourly_wd,
                     "weekend": hourly_we,
@@ -3132,6 +3173,7 @@ class Plugin(indigo.PluginBase):
         vpp_reserved_kwh = self._compute_vpp_reserved_kwh()
 
         # 3. Build snapshot
+        self._update_pv_tracking()          # v5.90.0: the day's own evidence, first
         snapshot = self._build_manager_snapshot(
             soc_pct, export_enabled, vpp_reserved_kwh,
         )
@@ -3142,6 +3184,11 @@ class Plugin(indigo.PluginBase):
 
         # 5. Evaluate
         decision = self.manager.evaluate(snapshot)
+        # v5.90.0: today's need as the balance saw it, for the device state.
+        try:
+            self.store["need_today_kwh"] = self.manager._calculate_24h_balance(snapshot).need_24h_kwh
+        except Exception as exc:
+            self.logger.debug(f"[Manager] need_today_kwh not recorded: {exc}")
         self.latest_decision = decision
         self._record_solar_overflow_shadow(snapshot, decision)
         self._record_bank_first_metrics(snapshot, decision, soc_pct)
@@ -3573,6 +3620,200 @@ class Plugin(indigo.PluginBase):
             return 0.0
         return (overlap_end - overlap_start).total_seconds() / 3600.0
 
+    # ------------------------------------------------------------------
+    # v5.90.0 — intraday PV tracking + measured need (Stage 3 of the revamp,
+    # docs/daily-energy-revamp.md). The manager evaluated every 60 s already;
+    # what was missing was anything MEASURED about today in its inputs.
+    # ------------------------------------------------------------------
+
+    def _pv_unclipped(self, data):
+        """True when the inverter is free to take all the PV — the only time a
+        shortfall against the forecast says anything about the WEATHER.
+
+        At the export cap, or on a full battery that is no longer charging, the
+        inverter is turning PV away and the measured figure under-reads potential.
+        Learning from those minutes would talk the plugin out of exporting on the
+        very days it most needs to (a low ratio -> less remaining solar -> the
+        physics gate releases -> the battery charges -> it clips again).
+        """
+        data = data or {}
+        try:
+            export_w = max(0.0, -float(data.get("gridPowerWatts", 0) or 0))
+            soc      = float(data.get("batterySoc", 0.0) or 0.0)
+            batt_w   = float(data.get("batteryPowerWatts", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        max_export_w = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0) * 1000.0
+        if max_export_w > 0 and export_w >= PV_TRACKING_EXPORT_CAP_FRACTION * max_export_w:
+            return False
+        if soc >= 99.0 and batt_w <= 100.0:
+            return False
+        return True
+
+    def _forecast_kwh_between(self, t0, t1):
+        """Bias-corrected forecast energy for the interval [t0, t1] (epoch seconds),
+        integrated bucket by bucket from today's hourly p50 in local time.
+
+        Robust to a forecast refresh mid-day: each minute takes whatever bucket
+        is current for it, rather than differencing two cumulative sums that a
+        refresh would move under us.
+        """
+        fc     = self.latest_forecast_data or {}
+        hourly = fc.get("_hourly_p50_today") or {}
+        if not hourly or t1 <= t0:
+            return 0.0
+        try:
+            factor = float(fc.get("biasFactorToday") or fc.get("biasFactor", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            factor = 1.0
+        a = _to_london(datetime.fromtimestamp(float(t0), tz=timezone.utc)).replace(tzinfo=None)
+        b = _to_london(datetime.fromtimestamp(float(t1), tz=timezone.utc)).replace(tzinfo=None)
+        total_wh = 0.0
+        for key, wh in hourly.items():
+            try:
+                start = datetime.strptime(str(key), "%Y-%m-%d %H:%M:%S")
+                wh    = float(wh)
+            except (TypeError, ValueError):
+                continue
+            end     = start + timedelta(hours=1)
+            overlap = (min(b, end) - max(a, start)).total_seconds()
+            if overlap > 0:
+                total_wh += wh * overlap / 3600.0
+        return total_wh / 1000.0 * factor
+
+    def _update_pv_tracking(self):
+        """Advance the two accumulators the tracking factor is made from — measured
+        PV and the forecast for the SAME minutes — counting only minutes when the
+        inverter could take all the PV. Called once per manager evaluate (60 s).
+        Resets at local midnight; persisted so a restart keeps the morning.
+        """
+        today = _local_today_str()
+        if self.store.get("pv_track_date") != today:
+            for key, value in (("pv_track_actual_kwh", 0.0), ("pv_track_forecast_kwh", 0.0),
+                               ("pv_track_clipped_min", 0.0), ("pv_track_last_epoch", 0.0),
+                               ("pv_track_last_pv_kwh", None), ("pv_track_factor", 1.0),
+                               ("pv_track_ratio", None), ("pv_track_last_hour", None)):
+                self.store[key] = value
+            self.store["pv_track_date"] = today
+        now     = time.time()
+        pv_now  = self.store.get("pv_daily_kwh")
+        partial = bool(self.store.get("energy_day_partial", False))
+        de      = getattr(self, "daily_energy", None)
+        if de is not None:
+            try:
+                partial = partial or de.today()["sources"].get("pv") in ("late", "absent")
+            except Exception:
+                pass
+        last_t  = float(self.store.get("pv_track_last_epoch") or 0.0)
+        last_pv = self.store.get("pv_track_last_pv_kwh")
+        if pv_now is not None and last_t > 0.0 and now > last_t and last_pv is not None:
+            d_pv = float(pv_now) - float(last_pv)
+            if d_pv < 0.0:                       # projection re-anchored: count from here
+                d_pv = 0.0
+            d_fc = self._forecast_kwh_between(last_t, now)
+            if self._pv_unclipped(self.latest_inverter_data):
+                self.store["pv_track_actual_kwh"]   = (
+                    float(self.store.get("pv_track_actual_kwh") or 0.0) + d_pv)
+                self.store["pv_track_forecast_kwh"] = (
+                    float(self.store.get("pv_track_forecast_kwh") or 0.0) + d_fc)
+            else:
+                self.store["pv_track_clipped_min"] = (
+                    float(self.store.get("pv_track_clipped_min") or 0.0) + (now - last_t) / 60.0)
+        self.store["pv_track_last_epoch"]  = now
+        self.store["pv_track_last_pv_kwh"] = pv_now
+        if partial:
+            factor, ratio = 1.0, None
+        else:
+            factor, ratio = _pv_tracking_factor(self.store.get("pv_track_actual_kwh", 0.0),
+                                                self.store.get("pv_track_forecast_kwh", 0.0))
+        self.store["pv_track_factor"] = factor
+        self.store["pv_track_ratio"]  = ratio
+        self._record_pv_tracking_hour(today)
+
+    def _record_pv_tracking_hour(self, today):
+        """One line per local hour into intraday_pv_tracking.json — the data the
+        damping constants will be tuned from. Best-effort; never raises."""
+        try:
+            hour = _london_now().hour
+        except Exception:
+            return
+        if self.store.get("pv_track_last_hour") == hour:
+            return
+        self.store["pv_track_last_hour"] = hour
+        try:
+            path = os.path.join(self.data_dir, "intraday_pv_tracking.json")
+            rows = []
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    rows = json.load(fh) or []
+            rows.append({
+                "date":         today,
+                "hour":         hour,
+                "actual_kwh":   round(float(self.store.get("pv_track_actual_kwh") or 0.0), 3),
+                "forecast_kwh": round(float(self.store.get("pv_track_forecast_kwh") or 0.0), 3),
+                "ratio":        self.store.get("pv_track_ratio"),
+                "factor":       self.store.get("pv_track_factor"),
+                "clipped_min":  round(float(self.store.get("pv_track_clipped_min") or 0.0), 1),
+                "pv_today_kwh": self.store.get("pv_daily_kwh"),
+            })
+            _atomic_write_json(path, rows[-PV_TRACKING_RECORD_ROWS:])
+        except Exception as exc:
+            self.logger.debug(f"[Tracking] recorder skipped: {exc}")
+
+    def _measured_weekend_uplift(self):
+        """Weekend / weekday ratio of daily house use, measured from daily_history.json
+        over the last WEEKEND_UPLIFT_WINDOW_DAYS and cached per local day.
+
+        Replaces a hard-coded 1.30 that charged ~28 kWh against every Saturday when
+        the measured weekend mean here was 23.4 kWh (26 weekends to 05-Sep-2026).
+        Falls back to WEEKEND_UPLIFT_DEFAULT with too little history; clamped to
+        [0.9, 1.5]. Days flagged partial (a missed boundary) are left out.
+        """
+        today = _local_today_str()
+        if self.store.get("weekend_uplift_date") == today and self.store.get("weekend_uplift"):
+            return float(self.store["weekend_uplift"])
+        uplift, n_wd, n_we, m_wd, m_we = WEEKEND_UPLIFT_DEFAULT, 0, 0, 0.0, 0.0
+        try:
+            path = os.path.join(self.data_dir, "daily_history.json")
+            with open(path, "r", encoding="utf-8") as fh:
+                records = json.load(fh) or []
+            cutoff = (datetime.strptime(today, "%Y-%m-%d")
+                      - timedelta(days=WEEKEND_UPLIFT_WINDOW_DAYS)).strftime("%Y-%m-%d")
+            wd, we = [], []
+            for r in records:
+                d = str(r.get("date") or "")
+                if d < cutoff or d >= today or r.get("energy_partial"):
+                    continue
+                try:
+                    h = float(r.get("home_kwh") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if h < 2.0:
+                    continue
+                try:
+                    is_weekend = datetime.strptime(d, "%Y-%m-%d").weekday() >= 5
+                except ValueError:
+                    continue
+                (we if is_weekend else wd).append(h)
+            n_wd, n_we = len(wd), len(we)
+            if n_wd >= WEEKEND_UPLIFT_MIN_WEEKDAYS and n_we >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
+                m_wd, m_we = sum(wd) / n_wd, sum(we) / n_we
+                if m_wd > 0.0:
+                    uplift = max(0.9, min(1.5, m_we / m_wd))
+        except Exception as exc:
+            self.logger.debug(f"[Profile] weekend uplift not measured: {exc}")
+        uplift = round(uplift, 3)
+        if self.store.get("weekend_uplift") != uplift:
+            if n_wd and n_we and m_wd:
+                log(f"[Profile] Weekend uplift {uplift:.2f}, measured from {n_wd} weekdays "
+                    f"(mean {m_wd:.1f} kWh) and {n_we} weekend days (mean {m_we:.1f} kWh)")
+            else:
+                log(f"[Profile] Weekend uplift {uplift:.2f} (the default — fewer than "
+                    f"{WEEKEND_UPLIFT_MIN_WEEKEND_DAYS} weekend days of history yet)")
+        self.store["weekend_uplift"]      = uplift
+        self.store["weekend_uplift_date"] = today
+        return uplift
+
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
         """Construct the immutable snapshot passed to manager.evaluate()."""
         prefs = self.pluginPrefs
@@ -3593,19 +3834,19 @@ class Plugin(indigo.PluginBase):
         if live_daily >= 5.0:    # plausibility floor — ignore wildly low partial profiles
             weekday_user_override = abs(weekday_pref - 22.0) > 1.0
             weekend_user_override = abs(weekend_pref - 30.0) > 1.0
+            # v5.90.0: the uplift is MEASURED (was a hard-coded 1.30 — the true
+            # figure here is ~1.10, and 1.30 charged ~28 kWh against every Saturday
+            # when the measured mean was 23.4). The profile sum is a blend over all
+            # days, so weekday and weekend are scaled so the WEEK still averages the
+            # profile: wd = 7P / (5 + 2u), we = wd * u. v5.78.0's rule stands: no
+            # uplift while the house is empty — it models people at home on a
+            # Saturday, and there are none.
+            uplift = 1.0 if self.store.get("away_active") else self._measured_weekend_uplift()
+            wd_scale, we_scale = _need_scales(uplift)
             if not weekday_user_override:
-                weekday_pref = round(live_daily, 1)
+                weekday_pref = round(live_daily * wd_scale, 1)
             if not weekend_user_override:
-                # Weekend tends to be ~30% higher in CliveS' data — preserve
-                # ratio if the user hasn't customised it.
-                #
-                # v5.78.0: NOT while the house is empty. The uplift models people
-                # being at home on a Saturday, and there are none. The 45-day
-                # measurement is flat to within 1.2x trough-to-peak with no weekly
-                # cycle at all, so applying it would invent a 30% Saturday demand
-                # out of nothing and buy for it.
-                weekend_pref = round(live_daily * (1.0 if self.store.get("away_active")
-                                                   else 1.30), 1)
+                weekend_pref = round(live_daily * we_scale, 1)
 
         # Octopus Saving Session — a JOINED window live right now, from the cache the
         # hourly poll leaves behind (never a network call on the manager cycle).
@@ -3673,7 +3914,24 @@ class Plugin(indigo.PluginBase):
             # storm_active is set by _apply_storm_override AFTER the snapshot is built
             # (it already mutates dawn_target_pct/export_enabled there) — see step 4.
             flood_prev_target_soc       = float(self.store.get("flood_prev_target_soc") or 0.0),
+            # v5.90.0 — what has actually happened today (Stage 3). home_today_kwh is
+            # None until the daily-energy object has seen a reading today, so a
+            # fresh start cannot present 0.0 kWh used as a measurement.
+            pv_tracking_factor          = float(self.store.get("pv_track_factor", 1.0) or 1.0),
+            pv_tracking_ratio           = self.store.get("pv_track_ratio"),
+            home_today_kwh              = self._home_today_measured_kwh(),
+            home_today_partial          = bool(self.store.get("energy_day_partial", False)),
         )
+
+    def _home_today_measured_kwh(self):
+        """Today's measured house use, or None when nothing has been observed today."""
+        de = getattr(self, "daily_energy", None)
+        if de is None or de.today_date != _local_today_str() or not de.latest:
+            return None
+        try:
+            return float(self.store.get("home_daily_kwh"))
+        except (TypeError, ValueError):
+            return None
 
     def _apply_seasonal_override(self, snapshot):
         """Raise resilience floor in winter months (Oct–Mar) — longer nights."""
@@ -7801,6 +8059,9 @@ class Plugin(indigo.PluginBase):
             {"key": "rateTomorrow",        "value": str(snapshot.tariff.tomorrow_rate_p or "")},
             {"key": "tomorrowSolarKwh",    "value": round(_tomorrow_solar_kwh, 2)},
             {"key": "tomorrowNeedKwh",     "value": round(_tomorrow_need_kwh, 1)},
+            # v5.90.0
+            {"key": "needTodayKwh",        "value": round(float(self.store.get("need_today_kwh") or 0.0), 1)},
+            {"key": "pvTrackingPct",       "value": int(round(100.0 * float(self.store.get("pv_track_ratio") or 1.0)))},
             {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
         # currentMode is a List-enum registered ASYNCHRONOUSLY after the
@@ -9900,6 +10161,12 @@ class Plugin(indigo.PluginBase):
             "energy_day_partial":          bool(self.store.get("energy_day_partial", False)),
             "energy_reconcile_warned":     self.store.get("energy_reconcile_warned", ""),
             "energy_yesterday_projection": self.store.get("energy_yesterday_projection"),
+            # v5.90.0: the intraday tracking accumulators (the morning survives a restart)
+            "pv_track_date":               self.store.get("pv_track_date", ""),
+            "pv_track_actual_kwh":         self.store.get("pv_track_actual_kwh", 0.0),
+            "pv_track_forecast_kwh":       self.store.get("pv_track_forecast_kwh", 0.0),
+            "pv_track_clipped_min":        self.store.get("pv_track_clipped_min", 0.0),
+            "pv_track_last_hour":          self.store.get("pv_track_last_hour"),
             # v5.89.0: the lifetime anchors the daily figures derive from. Carries
             # its own dates, so it is restored whatever day the plugin starts on.
             "daily_energy":                (self.daily_energy.to_dict()
@@ -10097,7 +10364,9 @@ class Plugin(indigo.PluginBase):
                 self.store["shadow_95_export_foregone_kwh"] = data.get("shadow_95_export_foregone_kwh", 0.0)
                 self.store["shadow_95_samples"]             = data.get("shadow_95_samples", 0)
                 for _ek in ("battery_charge_daily_kwh", "battery_discharge_daily_kwh",
-                            "energy_balance_kwh", "energy_day_partial", "energy_reconcile_warned"):
+                            "energy_balance_kwh", "energy_day_partial", "energy_reconcile_warned",
+                            "pv_track_date", "pv_track_actual_kwh", "pv_track_forecast_kwh",
+                            "pv_track_clipped_min", "pv_track_last_hour"):
                     if _ek in data:
                         self.store[_ek] = data[_ek]
                 # v5.89.0 upgrade path: a pre-5.89 file has no daily_energy block, but

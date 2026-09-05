@@ -467,6 +467,21 @@
                 <TriggerLabel>Tomorrow need changed</TriggerLabel>
                 <ControlPageLabel>Tomorrow Need (kWh)</ControlPageLabel>
             </State>
+            <!-- v5.90.0. Need for the whole of today: measured house use so far
+                 plus the profile's remainder, scaled to the day type. -->
+            <State id="needTodayKwh">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Need today changed</TriggerLabel>
+                <ControlPageLabel>Need Today (kWh)</ControlPageLabel>
+            </State>
+            <!-- v5.90.0. Measured PV so far as a percentage of the forecast for
+                 the same hours, counted only while the inverter could take all
+                 the PV. 100 until enough of the day has passed to judge. -->
+            <State id="pvTrackingPct">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Solar tracking changed</TriggerLabel>
+                <ControlPageLabel>Solar vs Forecast Today (%)</ControlPageLabel>
+            </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last update changed</TriggerLabel>

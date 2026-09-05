@@ -15,6 +15,61 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.90.0 — 05-09-2026
+
+**Export feedback — the day's own evidence enters the decision.** Stage 3 of
+`docs/daily-energy-revamp.md`. Modules: `battery_manager.py`, `plugin.py`, `Devices.xml`.
+
+**The gap.** `_evaluate_manager` ran every 60 s, and every run read `remaining_solar_kwh` (forecast
+buckets x `bias_factor_today`, a band fitted on PREVIOUS days), `need_24h_kwh` (a pref, or the
+profile sum x a hard-coded 1.30 at weekends) and the SOC. Nothing measured about today entered.
+Re-checking could not help: same inputs, same answer. The weekend uplift was measured at 1.10
+(26 weekends since June: weekday mean 21.2, weekend 23.4) against the 1.30 in code, so every
+Saturday charged ~28 kWh of need against the balance.
+
+- **`pv_tracking_factor(actual, forecast)`** (battery_manager, pure): `ratio = actual/forecast`,
+  `factor = 1 + w(ratio - 1)`, `w = min(1, forecast / 8 kWh)`, clamped [0.6, 1.3]; `(1.0, None)` below
+  2 kWh of elapsed forecast. Applied in `_calculate_24h_balance` right after the band factor:
+  `remaining_solar_kwh *= snapshot.pv_tracking_factor`.
+- **Accumulators** (`_update_pv_tracking`, once per evaluate): `pv_track_actual_kwh` += the
+  projection's PV delta since the last evaluate; `pv_track_forecast_kwh` += `_forecast_kwh_between
+  (last, now)` — the forecast integrated bucket-by-bucket over the SAME interval (robust to an
+  hourly refresh: each minute takes whatever bucket is current). Both advance ONLY while
+  `_pv_unclipped()`: export below 95% of `maxExportKw` and not (SOC >= 99 and battery <= 100 W).
+  At the cap, or on a full battery, the inverter turns PV away and a shortfall says nothing about
+  the weather — learning from it would talk the plugin out of exporting on the very days it must
+  (low ratio -> less remaining -> physics gate releases -> battery charges -> clips again). Clipped
+  minutes are counted (`pv_track_clipped_min`). A day whose PV anchor is `late`/`absent` yields a
+  neutral factor. Reset at local midnight; persisted in `accumulators.json` (same-day restore).
+- **Recorder:** one row per local hour to `intraday_pv_tracking.json` (ring of 2000) — the data
+  the damping constants get tuned from.
+- **Measured need** (`_calculate_24h_balance`): when `home_today_kwh` is known and not partial,
+  `need_24h = used_so_far + (profile[slot:48] / sum(profile)) * need_day`. Still the full calendar
+  day against supply to dusk (the deliberate conservatism stands), but the elapsed part is real.
+  `SufficiencyBalance` gains `pv_tracking_factor`, `need_today_used_kwh`, `need_today_measured`.
+- **Weekend uplift** (`_measured_weekend_uplift`): weekend mean / weekday mean over the last 56
+  days of `daily_history.json`, partial days and < 2 kWh days excluded, >= 10 weekdays and >= 4
+  weekend days else `WEEKEND_UPLIFT_DEFAULT` = 1.10, clamped [0.9, 1.5], cached per day, logged on
+  change. `_need_scales(u)`: `wd = 7/(5+2u)`, `we = wd*u`, so the week still averages the profile
+  (the old code set weekday = P and weekend = 1.3P, a week averaging 1.09P). A user pref set away
+  from its default still wins, as before; away mode still means no uplift (v5.78.0).
+  `sigen_site_config.json` publishes the measured multiplier.
+- **Snapshot fields:** `pv_tracking_factor`, `pv_tracking_ratio`, `home_today_kwh` (None until the
+  daily-energy object has seen a reading today — a fresh start cannot present 0.0 used as a
+  measurement), `home_today_partial`. Neutral defaults reproduce v5.89 exactly (pinned).
+- **States:** Battery Manager `needTodayKwh` (Float), `pvTrackingPct` (Integer, ratio x100, 100
+  until judgeable). The `[BALANCE]` audit line and the default reason carry
+  `solar tracking x0.87` and `need today 21.4 kWh (12.4 used)` only when they apply.
+- **Designed and NOT shipped:** a "min-end floor on the actual trajectory" release inside
+  `_check_solar_overflow`. The mutation sweep proved it dead by construction: the physics release
+  fires whenever `net < headroom_to_100`, and while it does not, `soc + net/cap >= 100%`, above any
+  floor. With the tracking factor inside `remaining_solar_kwh`, the physics gate IS the
+  stop-on-actuals (pinned by `test_tracked_shortfall_releases_a_running_export_through_the_physics_gate`).
+
+**Tests:** `test_battery_manager.py` +9, `test_plugin_export_feedback.py` (16, new). 1051 -> 1075.
+Fifteen mutations killed; the sweep's two first-pass survivors were a dead guard (removed) and a
+test whose partial-day fixture carried the same value as a real day (fixed).
+
 ## v5.89.0 — 05-09-2026
 
 **Daily energy figures derived from lifetime counters anchored at local midnight.** Design note:

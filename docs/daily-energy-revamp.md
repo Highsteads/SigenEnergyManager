@@ -160,10 +160,10 @@ and a SOC. Nothing measured about today enters.
    fewer than four weekends of data) — the hard-coded 1.30 charged ~28 kWh against every
    Saturday when the measured mean is 23.4. A pref the user has set away from the default
    still wins, as today.
-3. **Stop-export floor on actuals.** While overflow is active: projected dusk SOC from
-   measured PV so far, tracked remaining solar and the profile must stay above
-   `solar_overflow_min_end_pct`; release below it with a 1-point dead band. Engaging already
-   demands the physics margin.
+3. **Stop-export floor on actuals — designed, built, and DROPPED (05-Sep-2026).** The mutation
+   sweep showed it dead by construction: the physics release fires whenever net solar is below the
+   headroom to 100%, and while it does not, projected dusk SOC is at or above 100%, above any floor.
+   With the tracking factor inside `remaining_solar_kwh`, the physics gate is the stop-on-actuals.
 4. Reason line names the tracking factor and the measured need.
 
 ## Verification (each stage)

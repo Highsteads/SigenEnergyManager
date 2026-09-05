@@ -39,6 +39,9 @@ from battery_manager import (
     SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
     SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX,
     MIN_EXPORT_KWH,
+    pv_tracking_factor,
+    PV_TRACKING_MIN_FACTOR,
+    PV_TRACKING_MAX_FACTOR,
 )
 
 
@@ -112,6 +115,10 @@ def _make_snapshot(
     happy_hour_active=False,
     happy_hour_hours=1.0,
     inverter_max_kw=10.0,
+    pv_tracking_factor=1.0,
+    pv_tracking_ratio=None,
+    home_today_kwh=None,
+    home_today_partial=False,
 ):
     """Build a ManagerSnapshot for testing."""
     tomorrow_str = (datetime.now(timezone.utc).date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -162,6 +169,10 @@ def _make_snapshot(
         happy_hour_active      = happy_hour_active,
         happy_hour_hours       = happy_hour_hours,
         inverter_max_kw        = inverter_max_kw,
+        pv_tracking_factor     = pv_tracking_factor,
+        pv_tracking_ratio      = pv_tracking_ratio,
+        home_today_kwh         = home_today_kwh,
+        home_today_partial     = home_today_partial,
     )
 
 
@@ -2374,6 +2385,106 @@ class TestHappyHourOverride(unittest.TestCase):
         snap = _make_snapshot(soc_pct=55.0, now_hour=12)
         self.assertNotEqual(self.mgr.evaluate(snap).action, ACTION_HAPPY_HOUR_IMPORT)
 
+
+
+class TestExportFeedback(unittest.TestCase):
+    """v5.90.0 — the day's own evidence enters the decision: intraday PV tracking
+    scales remaining solar, the need is measured-so-far plus the profile remainder,
+    and a running export stops when the actual trajectory cannot reach the floor."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    # --- the pure factor ---
+    def test_factor_is_neutral_until_enough_forecast_has_elapsed(self):
+        self.assertEqual(pv_tracking_factor(0.5, 1.9), (1.0, None))
+        self.assertEqual(pv_tracking_factor(None, 5.0), (1.0, None))
+        self.assertEqual(pv_tracking_factor(-1.0, 5.0), (1.0, None))
+
+    def test_factor_is_damped_early_and_full_weight_later(self):
+        # half the forecast arrived; 4 kWh elapsed carries half weight -> 0.75
+        self.assertEqual(pv_tracking_factor(2.0, 4.0), (0.75, 0.5))
+        # at 8 kWh elapsed the ratio carries full weight, then the clamp bites
+        self.assertEqual(pv_tracking_factor(4.0, 8.0), (PV_TRACKING_MIN_FACTOR, 0.5))
+        self.assertEqual(pv_tracking_factor(16.0, 8.0), (PV_TRACKING_MAX_FACTOR, 2.0))
+        self.assertEqual(pv_tracking_factor(8.0, 8.0), (1.0, 1.0))
+
+    # --- the balance applies it ---
+    def test_tracking_factor_scales_remaining_solar_and_surplus(self):
+        kw = dict(soc_pct=50.0, now_hour=12, forecast_p50=_make_sunny_p50(),
+                  dawn_times={_today_str(): _now(hour=6)}, corrected_today_kwh=40.0)
+        base    = self.bm._calculate_24h_balance(_make_snapshot(**kw))
+        tracked = self.bm._calculate_24h_balance(_make_snapshot(pv_tracking_factor=0.8, **kw))
+        self.assertTrue(base.is_daytime)
+        self.assertGreater(base.remaining_solar_kwh, 5.0)
+        self.assertAlmostEqual(tracked.remaining_solar_kwh, base.remaining_solar_kwh * 0.8, places=1)
+        self.assertLess(tracked.surplus_kwh, base.surplus_kwh)
+        self.assertEqual(tracked.pv_tracking_factor, 0.8)
+
+    # --- measured need ---
+    def test_measured_need_is_used_so_far_plus_the_profile_remainder(self):
+        # 14:00 local: 20 of 48 flat slots remain -> need = 12 + 20/48 * 22 = 21.17
+        snap = _make_snapshot(soc_pct=50.0, now_hour=13, home_today_kwh=12.0,
+                              weekday_kwh=22.0, weekend_kwh=22.0)
+        bal  = self.bm._calculate_24h_balance(snap)
+        local_slot = snap.now.astimezone(__import__("zoneinfo").ZoneInfo("Europe/London"))
+        remaining  = (48 - (local_slot.hour * 2 + (1 if local_slot.minute >= 30 else 0))) / 48.0
+        self.assertTrue(bal.need_today_measured)
+        self.assertEqual(bal.need_today_used_kwh, 12.0)
+        self.assertAlmostEqual(bal.need_24h_kwh, round(12.0 + remaining * 22.0, 1), places=1)
+
+    def test_partial_or_unknown_measurement_keeps_the_whole_day_figure(self):
+        for kw in ({"home_today_kwh": None}, {"home_today_kwh": 12.0, "home_today_partial": True}):
+            bal = self.bm._calculate_24h_balance(_make_snapshot(
+                soc_pct=50.0, now_hour=13, weekday_kwh=22.0, weekend_kwh=22.0, **kw))
+            self.assertFalse(bal.need_today_measured)
+            self.assertIsNone(bal.need_today_used_kwh)
+            self.assertEqual(bal.need_24h_kwh, 22.0)
+
+    def test_neutral_defaults_change_nothing(self):
+        """Every pre-5.90 test still holds because the defaults are inert: this
+        pins that a default snapshot reports no tracking and no measured need."""
+        bal = self.bm._calculate_24h_balance(_make_snapshot(soc_pct=50.0, now_hour=20,
+                                                            weekday_kwh=22.0, weekend_kwh=22.0))
+        self.assertEqual(bal.pv_tracking_factor, 1.0)
+        self.assertFalse(bal.need_today_measured)
+        self.assertAlmostEqual(bal.surplus_kwh, 17.52 - 22.0, places=1)
+
+    # --- the reason line names both ---
+    def test_default_reason_carries_the_new_terms_only_when_they_apply(self):
+        # A sufficient evening (battery high, tomorrow well covered) reaches the
+        # DEFAULT branch, whose reason is the line CliveS reads every day.
+        kw = dict(soc_pct=85.0, now_hour=20, corrected_tomorrow_kwh=40.0,
+                  weekday_kwh=22.0, weekend_kwh=22.0)
+        plain = self.bm.evaluate(_make_snapshot(**kw))
+        self.assertTrue(plain.reason.startswith("24h sufficient"), plain.reason)
+        self.assertNotIn("solar tracking", plain.reason)
+        self.assertNotIn("need today", plain.reason)
+        rich = self.bm.evaluate(_make_snapshot(pv_tracking_factor=0.85, home_today_kwh=15.0, **kw))
+        self.assertTrue(rich.reason.startswith("24h sufficient"), rich.reason)
+        self.assertIn("solar tracking x0.85", rich.reason)
+        self.assertIn("need today", rich.reason)
+        self.assertIn("(15.0 used)", rich.reason)
+
+    # --- the physics release IS the stop-on-actuals ---
+    def test_tracked_shortfall_releases_a_running_export_through_the_physics_gate(self):
+        """With the day's evidence inside remaining_solar_kwh, a day that falls short
+        releases through the existing physics gate. (A separate min-end floor was
+        designed and found dead by construction: while the physics gate does not
+        fire, soc + net/capacity >= 100%, above any floor. Pinned here.)"""
+        from battery_manager import SufficiencyBalance
+        snap = _make_snapshot(soc_pct=70.0, now_hour=12, export_enabled=True,
+                              forecast_p50=_make_sunny_p50(), dawn_times={_today_str(): _now(hour=6)})
+        snap.solar_overflow_active = True
+        headroom = (100.0 - 70.0) / 100.0 * CAPACITY_KWH        # 10.5 kWh to 100%
+        # net solar just ABOVE the headroom keeps exporting ...
+        bal = SufficiencyBalance(is_daytime=True, surplus_kwh=20.0, remaining_solar_kwh=headroom + 1.5,
+                                 remaining_home_to_dusk_kwh=1.0, hours_to_dusk=6.0,
+                                 battery_kwh=24.5, battery_at_dawn_kwh=10.0)
+        self.assertIsNotNone(self.bm._check_solar_overflow(snap, bal))
+        # ... and the same day tracked at 0.8 of forecast falls below it and stops.
+        bal.remaining_solar_kwh = (headroom + 1.5) * 0.8
+        self.assertIsNone(self.bm._check_solar_overflow(snap, bal))
 
 if __name__ == "__main__":
     print(f"Running {globals().get('PLUGIN_NAME', 'SigenEnergyManager')} battery_manager tests")
