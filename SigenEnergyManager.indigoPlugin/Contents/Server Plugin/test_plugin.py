@@ -4854,5 +4854,243 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
             self.assertNotIn("either side of the window", body)
 
 
+class TestLedgerFreshness(unittest.TestCase):
+    """The Axle earnings ledger had NO staleness guard at all.
+
+    _record_vpp_api_status exists because a dead events endpoint "looks exactly
+    like a quiet week" — this install polled a revoked token for six weeks in
+    silence. The ledger, which is the other Axle feed, had nothing: axle_age_days
+    was computed on every summary and rendered by nothing, and the only warning
+    sat inside a menu item the user had to fire by hand. On 05-Sep-2026 the Axle
+    side was 17.2 days old and not one thing on this system had said so."""
+
+    def _p(self, age_days=None, axle_on=True, limit="7", load_error=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"axleEnabled": axle_on, "ledgerStaleDays": limit}
+        p.store       = {"vpp_ledger_stale": "", "vpp_ledger_logged": 0.0}
+        summary = {"axle_age_days": age_days}
+        if load_error:
+            summary["load_error"] = load_error
+        p._vpp_ledger_summary = MagicMock(return_value=summary)
+        return p
+
+    def test_a_fresh_ledger_is_silent(self):
+        p = self._p(age_days=2.0)
+        p._check_ledger_freshness()
+        self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+    def test_a_stale_ledger_says_how_old(self):
+        p = self._p(age_days=17.2)
+        p._check_ledger_freshness()
+        self.assertIn("17 days ago", p.store["vpp_ledger_stale"])
+
+    def test_one_day_is_singular(self):
+        p = self._p(age_days=1.0, limit="1")
+        p._check_ledger_freshness()
+        self.assertIn("1 day ago", p.store["vpp_ledger_stale"])
+        self.assertNotIn("1 days", p.store["vpp_ledger_stale"])
+
+    def test_never_imported_is_not_reported_as_fresh(self):
+        """The absent-state fault this estate keeps meeting. An empty ledger has
+        an age of None; treating that as fresh would make a feed that has NEVER
+        delivered read healthier than one a day late."""
+        p = self._p(age_days=None)
+        p._check_ledger_freshness()
+        self.assertIn("ever been imported", p.store["vpp_ledger_stale"])
+
+    def test_an_unreadable_ledger_is_reported_distinctly(self):
+        p = self._p(age_days=None, load_error="ValueError: bad json")
+        p._check_ledger_freshness()
+        self.assertIn("could not be read", p.store["vpp_ledger_stale"])
+
+    def test_a_non_axle_install_is_never_warned(self):
+        """Someone who never joined Axle must not be told to feed a ledger they
+        will never have."""
+        p = self._p(age_days=999.0, axle_on=False)
+        p._check_ledger_freshness()
+        self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+    def test_zero_threshold_turns_the_check_off(self):
+        p = self._p(age_days=999.0, limit="0")
+        p._check_ledger_freshness()
+        self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+    def test_a_junk_threshold_falls_back_rather_than_raising(self):
+        """The house rule: coerce a pref AND guard the coercion. A textfield can
+        hold anything, and a dialog save turns even a number into a string."""
+        p = self._p(age_days=17.2, limit="not a number")
+        p._check_ledger_freshness()
+        self.assertIn("17 days ago", p.store["vpp_ledger_stale"])
+
+    def test_a_string_threshold_is_compared_numerically(self):
+        """A saved textfield arrives as a STRING — comparing it to a float
+        directly is the TypeError this plugin has hit before."""
+        p = self._p(age_days=9.0, limit="7")
+        p._check_ledger_freshness()
+        self.assertNotEqual(p.store["vpp_ledger_stale"], "")
+
+
+class TestLedgerStatusLogging(unittest.TestCase):
+    """Log once, then hourly, and say so when it recovers — the exact contract
+    _record_vpp_api_status already keeps for the events feed."""
+
+    def _p(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.store  = {"vpp_ledger_stale": "", "vpp_ledger_logged": 0.0}
+        return p
+
+    def test_first_occurrence_logs(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("stale")
+            lg.assert_called_once()
+            self.assertEqual(lg.call_args.args[1], "WARNING")
+
+    def test_the_same_problem_does_not_re_log_within_the_hour(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("stale")
+            p._record_vpp_ledger_status("stale")
+            p._record_vpp_ledger_status("stale")
+            self.assertEqual(lg.call_count, 1)
+
+    def test_it_re_logs_after_an_hour(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("stale")
+            p.store["vpp_ledger_logged"] -= 3601
+            p._record_vpp_ledger_status("stale")
+            self.assertEqual(lg.call_count, 2)
+
+    def test_a_changed_problem_logs_immediately(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("stale by 8 days")
+            p._record_vpp_ledger_status("stale by 9 days")
+            self.assertEqual(lg.call_count, 2)
+
+    def test_recovery_is_announced(self):
+        """Silence on recovery leaves the last word on the subject being an
+        error, which reads as still broken."""
+        p = self._p()
+        p._record_vpp_ledger_status("stale")
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("")
+            lg.assert_called_once()
+            self.assertIn("being fed again", lg.call_args.args[0])
+
+    def test_recovery_from_healthy_is_not_announced(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("")
+            lg.assert_not_called()
+
+    def test_the_message_is_plain_english_not_a_value_dump(self):
+        p = self._p()
+        with patch.object(plugin, "log") as lg:
+            p._record_vpp_ledger_status("the last import was 17 days ago")
+            msg = lg.call_args.args[0]
+        self.assertNotIn("|", msg)
+        self.assertNotIn("=", msg)
+        self.assertEqual([c for c in msg if ord(c) > 127], [])
+
+
+class TestMergeAxlePayloadSeam(unittest.TestCase):
+    """The single merge path any automated feed will land on."""
+
+    def _p(self, tmpdir, ledger=None):
+        import json as _j
+        path = os.path.join(tmpdir, "vpp_ledger.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            _j.dump(ledger if ledger is not None else {"schema": 1, "axle": {}, "local": []}, fh)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"axleEnabled": True, "ledgerStaleDays": "7"}
+        p.store       = {"vpp_ledger_stale": "", "vpp_ledger_logged": 0.0}
+        p._vpp_ledger_path = MagicMock(return_value=path)
+        p._vpp_ledger_cache = ("stale-mtime", {"cached": True})
+        return p, path
+
+    PAYLOAD = {"transactions": [{
+        "transaction_id": "tx-1", "transaction_type": "flex event",
+        "start_time": "2026-09-05T18:30:00+00:00",
+        "end_time": "2026-09-05T19:30:00+00:00",
+        "flex_kwh": -3.9, "credit_pence": 390}]}
+
+    def test_a_payload_is_merged_and_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            self.assertEqual(p._merge_axle_payload(self.PAYLOAD), 1)
+
+    def test_the_summary_cache_is_invalidated(self):
+        """Three dashboard pages read that cache, and it is keyed on file mtime
+        — a merge that left it set would serve the pre-merge figures."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            stale = p._vpp_ledger_cache
+            p._merge_axle_payload(self.PAYLOAD)
+            self.assertIsNot(p._vpp_ledger_cache, stale)
+            # And a read now reflects the merge rather than the pre-merge cache.
+            self.assertEqual(p._vpp_ledger_summary()["events_total"], 1)
+
+    def test_re_merging_the_same_payload_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            p._merge_axle_payload(self.PAYLOAD)
+            self.assertEqual(p._merge_axle_payload(self.PAYLOAD), 0)
+
+    def test_it_refuses_a_ledger_that_did_not_parse(self):
+        """save_ledger drops the load_error marker and rewrites the file whole,
+        so merging over an unparseable ledger destroys both the evidence and
+        whatever was still in it."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "vpp_ledger.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{ this is not json")
+            p = plugin.Plugin.__new__(plugin.Plugin)
+            p.logger = MagicMock()
+            p.pluginPrefs = {"axleEnabled": True}
+            p.store = {}
+            p._vpp_ledger_path = MagicMock(return_value=path)
+            p._vpp_ledger_cache = None
+            with self.assertRaises(RuntimeError):
+                p._merge_axle_payload(self.PAYLOAD)
+            # And the damaged file is left exactly as found, for inspection.
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "{ this is not json")
+
+    def test_the_cache_is_dropped_even_when_the_mtime_does_not_move(self):
+        """The explicit invalidation is not redundant with the mtime key.
+
+        _vpp_ledger_summary caches on `cached[0] == mtime`, so on any filesystem
+        whose mtime is coarse (a network share, or anything with one-second
+        granularity) a merge landing inside the same tick as the previous read
+        would serve the PRE-merge figures to the three dashboard pages that poll
+        it. APFS timestamps are fine-grained enough that a natural test can never
+        reach this, which is exactly why it needs pinning rather than assuming —
+        a mutation removing the invalidation survived the first sweep.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            p, path = self._p(td)
+            with patch("os.path.getmtime", return_value=1234.0):
+                before = p._vpp_ledger_summary()          # populates at the frozen mtime
+                self.assertEqual(before["events_total"], 0)
+                p._merge_axle_payload(self.PAYLOAD)
+                after = p._vpp_ledger_summary()
+            self.assertEqual(after["events_total"], 1,
+                             "served a pre-merge summary because the mtime had not moved")
+
+    def test_a_successful_merge_clears_a_standing_staleness_warning(self):
+        """Waiting up to six hours for the next tick would leave the log
+        contradicting the screen."""
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            p.store["vpp_ledger_stale"] = "the last import was 17 days ago"
+            p._merge_axle_payload(self.PAYLOAD)
+            self.assertEqual(p.store["vpp_ledger_stale"], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

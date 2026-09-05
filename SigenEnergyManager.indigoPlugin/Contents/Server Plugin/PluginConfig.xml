@@ -211,6 +211,10 @@
         <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
     </Field>
 
+    <Field id="ledgerStaleDays" type="textfield" defaultValue="7" visibleBindingId="axleEnabled" visibleBindingValue="true">
+        <Label>Warn when the Axle earnings figures have not been imported for this many days (0 turns the warning off). Axle settle a few days behind an event, so 7 catches a feed that has genuinely stopped without complaining about a quiet week:</Label>
+    </Field>
+
     <Field id="separator_savingsessions" type="separator"/>
     <Field id="label_savingsessions" type="label">
         <Label>OCTOPUS SAVING SESSIONS</Label>

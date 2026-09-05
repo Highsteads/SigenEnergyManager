@@ -15,6 +15,95 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.92.0 — 05-09-2026
+
+**The earnings ledger had stopped being fed 17.2 days earlier and nothing on the system said
+so.** Asked to automate the Axle ledger fetch, the research came back saying the fetch itself
+needs Axle's permission — and turned up a fault that needed nobody's.
+
+### The gap
+
+`_record_vpp_api_status` exists because a dead events endpoint "looks exactly like a quiet
+week": this install polled a revoked Axle token for six weeks in complete silence while the VPP
+page read a calm "Standby". The LEDGER — the other Axle feed — had no equivalent at all.
+`axle_age_days` has been computed on every `summarise()` call since the ledger shipped
+(`vpp_ledger.py:590`) and rendered by nothing; `earnings.age_days` reaches `/api/status` and no
+HTML consumes it; the only warning lived inside `menuShowVppEarnings`, at a 14-day threshold,
+fired by hand. Same failure class, same plugin, one feed guarded and one not.
+
+Added, modelled line-for-line on the existing guard:
+- `_record_vpp_ledger_status(problem)` — latch, log on first occurrence and hourly after, and
+  log an explicit recovery. Silence on recovery would leave the last word being an error.
+- `_check_ledger_freshness()` — pure local work off the mtime-cached summary.
+- `VPP_LEDGER_CHECK_INTERVAL = 21600` and a tick stage. Six hours, not minutes: settlement runs
+  days behind and final revenue lands at the end of the following month.
+- `ledgerAgeDays` + `ledgerStatus` device states beside `ledgerUpdated`, because a bare
+  "imported 19/08" reads as calmly as "imported this morning" on a control page.
+- `ledgerStaleDays` pref, default 7, guarded coercion per the house rule.
+
+Three distinctions that are the whole point:
+- **Never imported is NOT fresh.** An empty ledger has an age of `None`, and treating that as
+  healthy would make a feed that has never delivered once read better than one a day late —
+  the absent-state fault this estate keeps meeting.
+- **Unreadable is not merely old**, and is reported separately.
+- **A non-Axle install is never warned** about a ledger it will never have.
+
+### The merge seam
+
+`_merge_axle_payload(payload)` lifted out of `importAxleLedger`. The comment beside the ledger
+has always said Axle's rows "arrive through ONE importer", but the load/merge/save/invalidate
+sequence lived inline in a menu callback, so any automated feed would have had to copy it —
+including the `_vpp_ledger_cache = None` that three dashboard pages depend on.
+
+It now **refuses a ledger carrying `load_error`**. `save_ledger` drops that marker and rewrites
+the file wholesale, so merging over an unparseable ledger destroyed both the evidence and
+whatever was still in it. A test asserts the damaged file is left byte-identical.
+
+### What the research established about the fetch itself
+
+Ten agents across five discovery lanes, three adversarial route assessments and a completeness
+critic. Recorded here so nobody repeats it:
+
+- **The data exists and is documented.** Axle publish an OpenAPI spec (docs.axle.energy) with
+  `/rewards/{site_id}/info`, `/rewards/{site_id}/transactions` and
+  `/entities/site/{site_id}/flex-events`.
+- **The door is shut.** All three require an ORGANISATIONAL bearer token. ha-axle-vpp issue #19
+  records a real HTTP 403 from a consumer token, confirmed by that maintainer. Four independent
+  integrations (ha-axle-vpp, Predbat, the Homey app, SolisAgileManager) all stop at the events
+  endpoint. Asking Axle would need to be for a CONSUMER endpoint where the site is implied by
+  the token — the rewards role alone would still leave no way to resolve a `site_id`, since
+  `/entities/site` is itself organisation-scoped.
+- **The cookie route is dead, and the old comment saying otherwise is withdrawn.**
+  `vpp_ledger.py` used to name "a cookie-authenticated fetch" as a future feed. vpp.axle.energy
+  is React Router v7, not Remix, so there is no `?_data=` route-loader URL; and Axle sign-in is
+  **magic-link only** — no password, so no storable credential and no way to revive a dead
+  session without a human clicking an email.
+- **The settlement email is the live channel.** The completeness critic caught the research
+  lane killing this on "no specimen exists on this system" — true of Indigo and worthless as a
+  conclusion, because the emails go to CliveS's own mailbox, which nothing looked in. An
+  unsearched channel read as an empty one, which is the absent-state fault applied to research.
+  The plugin's own source says the opposite: `test_vpp_ledger.py:409` — "Axle email the result
+  days before the account page catches up" — and the live ledger's newest Axle row IS an email
+  row (`email-2026-08-16T19:00`, −3.87 kWh, 387p). The window-keyed supersede logic in
+  `import_axle_payload` was written for exactly this.
+
+So the email is the route, it needs no vendor negotiation, and it is blocked only on a
+specimen and on knowing which mailbox receives it. Both are one question to CliveS.
+
+### Tests
+
+1118 -> 1140. Eleven mutations, each written from the consequence, all eleven proven to turn
+the suite red.
+
+One SURVIVED the first sweep: removing `self._vpp_ledger_cache = None` from the merge changed
+nothing, because the cache is mtime-keyed and the file's mtime moves on write. The invalidation
+is not redundant though — the cache compares `cached[0] == mtime` exactly, so on any filesystem
+with coarse mtime a merge inside the same tick would serve pre-merge figures to the dashboard.
+APFS is fine-grained enough that no natural test can reach it, so a test now freezes
+`os.path.getmtime` and pins it. *A fixture only tests the regime it was built in.*
+
+---
+
 ## v5.91.0 — 05-09-2026
 
 **The VPP summary headlined the figure Axle does not pay on, and the per-minute snapshot

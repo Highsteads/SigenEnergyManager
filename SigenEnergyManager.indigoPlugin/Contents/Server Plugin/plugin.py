@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0)
-# Date:        05-09-2026 22:10
-# Version:     5.91.0
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.92.0)
+# Date:        05-09-2026 23:05
+# Version:     5.92.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -254,6 +254,11 @@ VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 # 60s poll, so 15 min leaves it ample room to do its job first; anything still
 # exporting a quarter of an hour late is a fault, not a late poll.
 VPP_OVERRUN_GRACE_MINS    = 15
+# How often to check the Axle EARNINGS LEDGER is still being fed. Hours, not
+# minutes: settlement runs days behind an event and the final revenue lands at
+# the end of the following month, so a fast check would only re-log the same
+# staleness. The check itself is local file work — no network, no Modbus.
+VPP_LEDGER_CHECK_INTERVAL = 21600  # 6 hours
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 # v5.89.0 — the energy tripwire. The identity residual and the derived-vs-device
 # house gap each warn once per day above max(absolute, fraction * throughput).
@@ -1254,6 +1259,14 @@ class Plugin(indigo.PluginBase):
         # runs the stuck-mode recovery, which returns the inverter to
         # self-consumption anyway, so a stale True would be noise.
         self.store["vpp_handback_pending"] = False
+
+        # Ledger-freshness bookkeeping. last_ledger_check starts at 0.0 so the
+        # first tick after a restart checks immediately rather than waiting out
+        # a whole interval — a stale ledger discovered six hours late is six
+        # hours of the silence this exists to end.
+        self.store["last_ledger_check"]  = 0.0
+        self.store["vpp_ledger_stale"]   = ""
+        self.store["vpp_ledger_logged"]  = 0.0
 
         # Flood prevention state (overnight pre-drain).
         # Persisted to pluginPrefs so a mid-pre-drain plugin restart doesn't leave
@@ -2730,6 +2743,11 @@ class Plugin(indigo.PluginBase):
 
         # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64)
         self._retry_vpp_handback()
+
+        # 12b. Earnings-ledger freshness (v5.92.0). Local file work only.
+        if now - self.store.get("last_ledger_check", 0.0) >= VPP_LEDGER_CHECK_INTERVAL:
+            self._check_ledger_freshness()
+            self.store["last_ledger_check"] = now
 
         # 13. Happy Hour overrun backstop — independent of the primary end path
         self._check_happy_hour_overrun()
@@ -6099,6 +6117,121 @@ class Plugin(indigo.PluginBase):
             self.store["vpp_api_logged"] = 0.0
             self.store["vpp_api_last_ok"] = time.time()
 
+
+    def _record_vpp_ledger_status(self, problem):
+        """Surface an earnings ledger that has stopped being fed.
+
+        The exact twin of _record_vpp_api_status above, for the other Axle feed.
+        That one exists because a dead events endpoint "looks exactly like a
+        quiet week" — this install polled a revoked token for six weeks in
+        silence. The LEDGER had no such guard at all: `axle_age_days` has been
+        computed on every summary since the ledger shipped and rendered by
+        nothing, and the only warning lived inside a menu item the user has to
+        fire by hand. On 05-Sep-2026 the Axle side was 17.2 days old and not one
+        thing on this system had said so.
+
+        A ledger that is merely OLD is not a fault — Axle settle days behind an
+        event, and a quiet fortnight with no events is normal. What is a fault is
+        nobody being able to tell the difference between "no events lately" and
+        "the feed stopped". So the message names the age and says what to do.
+
+        Logs on the first occurrence and hourly thereafter, and logs an explicit
+        recovery line when it clears — silence on recovery would leave the last
+        word on the subject being an error.
+        """
+        prev = self.store.get("vpp_ledger_stale") or ""
+        self.store["vpp_ledger_stale"] = problem or ""
+
+        if problem:
+            now = time.time()
+            if problem != prev or now - self.store.get("vpp_ledger_logged", 0.0) >= 3600.0:
+                self.store["vpp_ledger_logged"] = now
+                log(f"[VPP] Earnings ledger not being fed - {problem}. Import the "
+                    f"latest figures with Plugins > SigenEnergyManager > Import Axle "
+                    f"Ledger, or check the Axle account page.", "WARNING")
+        else:
+            if prev:
+                log("[VPP] Earnings ledger is being fed again - fresh figures imported.")
+            self.store["vpp_ledger_logged"] = 0.0
+
+    def _check_ledger_freshness(self):
+        """Compare the ledger's age against the threshold and report through
+        _record_vpp_ledger_status. Pure local work — the summary is served from
+        an mtime-keyed cache, so this costs nothing on a quiet tick.
+
+        NEVER IMPORTED is reported distinctly from OLD. An empty ledger has an
+        age of None, and treating that as fresh would be the absent-state fault
+        this estate keeps meeting: a feed that has never delivered once would
+        read healthier than one a day late.
+        """
+        if not self.pluginPrefs.get("axleEnabled", False):
+            self._record_vpp_ledger_status("")   # not an Axle user; nothing to feed
+            return
+
+        try:
+            summary = self._vpp_ledger_summary() or {}
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Ledger freshness check skipped: {exc}")
+            return
+
+        if summary.get("load_error"):
+            self._record_vpp_ledger_status(
+                f"the ledger file could not be read ({summary['load_error']})")
+            return
+
+        try:
+            limit_days = float(_as_float(self.pluginPrefs.get("ledgerStaleDays"), 7.0))
+        except (TypeError, ValueError):
+            limit_days = 7.0
+        if limit_days <= 0:
+            self._record_vpp_ledger_status("")     # checking switched off
+            return
+
+        age = summary.get("axle_age_days")
+        if age is None:
+            # Distinguish "never imported" from "imported and gone stale".
+            self._record_vpp_ledger_status(
+                "no Axle figures have ever been imported, so nothing here knows "
+                "what the events have paid")
+            return
+
+        if age >= limit_days:
+            days = int(round(age))
+            self._record_vpp_ledger_status(
+                f"the last import was {days} day{'' if days == 1 else 's'} ago, "
+                f"past the {limit_days:.0f}-day mark")
+        else:
+            self._record_vpp_ledger_status("")
+
+    def _merge_axle_payload(self, payload):
+        """Merge one Axle account payload into the ledger. Returns added count.
+
+        Lifted out of importAxleLedger in v5.92.0 so there is ONE merge path.
+        The plugin's own comment beside the ledger has always said Axle's rows
+        "arrive through ONE importer", but the load/merge/save/invalidate
+        sequence lived inline in a menu callback — so any automated feed would
+        have had to copy it, including the cache reset that three dashboard
+        pages depend on. Now the feed is a call, not a second copy.
+
+        REFUSES a ledger that failed to load. save_ledger drops the load_error
+        marker and rewrites the file wholesale, so merging over an unparseable
+        ledger would destroy both the evidence and whatever was still in it.
+        """
+        path   = self._vpp_ledger_path()
+        ledger = _vpp_ledger.load_ledger(path)
+        if ledger.get("load_error"):
+            raise RuntimeError(
+                f"refusing to merge over a ledger that did not parse "
+                f"({ledger['load_error']}) - fix or move {path} first")
+        ledger, added = _vpp_ledger.import_axle_payload(ledger, payload)
+        _vpp_ledger.save_ledger(path, ledger)
+        self._vpp_ledger_cache = None
+        # A successful merge is exactly what clears a staleness warning, and
+        # waiting up to six hours for the next tick to notice would leave the
+        # log contradicting the screen.
+        self._check_ledger_freshness()
+        return added
+
     def _poll_vpp(self):
         """Poll Axle API and advance VPP state machine."""
         if not self.pluginPrefs.get("axleEnabled", False):
@@ -8918,11 +9051,7 @@ class Plugin(indigo.PluginBase):
             payload = payload["data"]
 
         try:
-            path = self._vpp_ledger_path()
-            ledger = _vpp_ledger.load_ledger(path)
-            ledger, added = _vpp_ledger.import_axle_payload(ledger, payload)
-            _vpp_ledger.save_ledger(path, ledger)
-            self._vpp_ledger_cache = None
+            added = self._merge_axle_payload(payload)
         except Exception as exc:
             log(f"[VPP] Import failed: {exc}", level="ERROR")
             return
@@ -9069,6 +9198,13 @@ class Plugin(indigo.PluginBase):
                 {"key": "eventsSettled",     "value": int(summary.get("events_settled", 0) or 0)},
                 {"key": "eventsPending",     "value": int(pending or 0)},
                 {"key": "ledgerUpdated",     "value": summary.get("axle_fetched_local") or "never"},
+                # The age and the health beside the date. A bare "imported 19/08"
+                # reads as calmly as "imported this morning" on a control page,
+                # which is how 17 days went unremarked.
+                {"key": "ledgerAgeDays",     "value": (int(round(summary["axle_age_days"]))
+                                                       if summary.get("axle_age_days") is not None else -1)},
+                {"key": "ledgerStatus",      "value": (self.store.get("vpp_ledger_stale")
+                                                       or "being fed")},
             ]
         except Exception as exc:
             log(f"[VPP] Could not add ledger states: {exc}", level="WARNING")

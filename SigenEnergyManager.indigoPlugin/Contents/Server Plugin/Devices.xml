@@ -817,6 +817,16 @@
                 <TriggerLabel>Ledger import time changed</TriggerLabel>
                 <ControlPageLabel>Ledger Last Imported</ControlPageLabel>
             </State>
+            <State id="ledgerAgeDays">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Ledger age changed</TriggerLabel>
+                <ControlPageLabel>Ledger Age (days, -1 = never imported)</ControlPageLabel>
+            </State>
+            <State id="ledgerStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Ledger feed health changed</TriggerLabel>
+                <ControlPageLabel>Ledger Feed Health</ControlPageLabel>
+            </State>
             <State id="lastUpdate">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last update changed</TriggerLabel>

@@ -170,8 +170,25 @@ def import_axle_payload(ledger, payload, fetched_at=None):
 
     `payload` is the object Axle's account page is built from - the same shape
     whichever way it was obtained, which is the point of doing the merge here.
-    Today it arrives by hand; a cookie-authenticated fetch or a widened API
-    token would feed the identical dict through this one function.
+    Today it arrives by hand. The automated feed, when it comes, will hand the
+    identical dict through this one function - that is the whole point of doing
+    the merge here rather than at the source.
+
+    Researched 05-Sep-2026, so the next reader need not repeat it:
+      - Axle DO publish the data. Their OpenAPI spec (docs.axle.energy) carries
+        /rewards/{site_id}/info, /rewards/{site_id}/transactions and
+        /entities/site/{site_id}/flex-events. All three are documented as
+        requiring an ORGANISATIONAL bearer token, and a consumer token is
+        reported to get HTTP 403 (ha-axle-vpp issue #19). Four independent
+        integrations all stop at the events endpoint.
+      - A cookie-authenticated fetch of the account page is NOT the answer, and
+        the earlier note here saying it was is withdrawn: vpp.axle.energy is
+        React Router v7, so there is no ?_data= route-loader URL, and Axle
+        sign-in is magic-link only - no password, so no storable credential and
+        no way to revive a dead session without a human clicking an email.
+      - The settlement EMAIL is the live channel and already carries both
+        numbers days before the account page catches up (see the class
+        TestHandEnteredRowIsSuperseded, and the email- row in the live ledger).
 
     Expected keys (all optional): `balance`, `transactions`, `events`.
 
