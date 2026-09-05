@@ -54,9 +54,14 @@ _MONTHS = {m.lower(): i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July",
      "August", "September", "October", "November", "December"], start=1)}
 
-# "you exported 3.87 kWh during the grid event". Tolerant of the bold tags an
-# HTML mail wraps the number in, and of any run of whitespace.
-_RE_KWH = re.compile(r"exported\s+([0-9]+(?:\.[0-9]+)?)\s*kWh", re.I)
+# "you exported 3.87 kWh during the grid event", and the ZERO-EXPORT variant
+# "your battery exported *-0.00* *kWh*" - a different template with asterisks
+# round the figure, a minus sign, and no Earned tile at all (specimen
+# 20-Apr-2026). Both shapes matter: Axle record a nil event as a real
+# transaction of 0 kWh and 0 pence, so it belongs in the ledger like any other.
+# The sign is absorbed with abs() rather than matched away, so a future template
+# writing a real export as negative still reads correctly.
+_RE_KWH = re.compile(r"exported[\s*]*(-?[0-9]+(?:\.[0-9]+)?)[\s*]*kWh", re.I)
 
 # "3.87 kWh @ £1.00/kWh" - the rate line under the Earned tile. Preferred over
 # the headline "£3.87" because it carries the rate too, which is what lets us
@@ -64,8 +69,18 @@ _RE_KWH = re.compile(r"exported\s+([0-9]+(?:\.[0-9]+)?)\s*kWh", re.I)
 _RE_RATE_LINE = re.compile(
     r"([0-9]+(?:\.[0-9]+)?)\s*kWh\s*@\s*(?:GBP|£)\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*kWh", re.I)
 
-# The headline money, as a fallback: "Earned ... £3.87"
-_RE_GBP = re.compile(r"(?:GBP|£)\s*([0-9]+(?:\.[0-9]+)?)")
+# THERE IS DELIBERATELY NO LOOSE "find a pound sign" FALLBACK, and there must
+# never be one. Axle's low-export template ("This is less than we hoped") states
+# the kWh and carries NO money for the event at all - the only pound figure in
+# the whole body is the boilerplate "we're still guaranteeing *min GBP 10/month*
+# earnings". A bare money regex picks that up: measured on the real 21-May-2026
+# mail, it filed GBP 10.00 for an event Axle settled at 4p, an overstatement of
+# 250x. The rate line is the ONLY construction that ties a figure to THIS event.
+#
+# The one permitted fallback is anchored to the phrase "You earned", which
+# appears solely in the success template and solely about this event, so it
+# cannot reach the monthly-guarantee boilerplate.
+_RE_EARNED = re.compile(r"you\s+earned\s*(?:GBP|£)\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 
 # "on Sun 16th August" - note there is NO YEAR in the body, which is why the
 # year has to come from the message's own timestamp.
@@ -158,23 +173,36 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
     m_kwh = _RE_KWH.search(text)
     if not m_kwh:
         return {"payload": None, "note": "no exported kWh figure in the body"}
-    kwh = float(m_kwh.group(1))
+    kwh = abs(float(m_kwh.group(1)))     # the nil template writes it as -0.00
 
     rate = None
     m_rate = _RE_RATE_LINE.search(text)
     if m_rate:
         gbp  = float(m_rate.group(1)) * float(m_rate.group(2))
         rate = float(m_rate.group(2))
+    elif _RE_EARNED.search(text):
+        gbp = float(_RE_EARNED.search(text).group(1))
+    elif kwh == 0.0:
+        # The nil-export mail carries no Earned tile because there is nothing to
+        # earn. Zero exported IS zero earned - a fact, not an estimate - and Axle
+        # record it as a real transaction, so it belongs in the ledger.
+        gbp = 0.0
     else:
-        m_gbp = _RE_GBP.search(text)
-        if not m_gbp:
-            return {"payload": None, "note": "no money figure in the body"}
-        gbp = float(m_gbp.group(1))
+        # The low-export template: a real settlement whose money the email never
+        # states. We could multiply by the configured rate, and we deliberately
+        # do not - "Axle's figures, imported verbatim and never computed here" is
+        # the rule the whole axle side turns on, and a computed number presented
+        # as theirs is the worse error. Name the figure so it can be entered.
+        return {"payload": None,
+                "note": f"Axle settled {kwh} kWh but their low-export template states no "
+                        f"amount, so the money cannot be read from the mail - enter it by "
+                        f"hand if you want this event recorded"}
 
-    if not (0.0 < kwh <= MAX_EVENT_KWH):
+    if not (0.0 <= kwh <= MAX_EVENT_KWH):
         return {"payload": None, "note": f"exported figure {kwh} kWh is outside the plausible range"}
-    if not (0.0 < gbp <= MAX_EVENT_GBP):
+    if not (0.0 <= gbp <= MAX_EVENT_GBP):
         return {"payload": None, "note": f"earned figure GBP {gbp} is outside the plausible range"}
+
 
     # Cross-check the two independent figures. They come from different parts of
     # the mail, so a disagreement means the template moved and the parse can no

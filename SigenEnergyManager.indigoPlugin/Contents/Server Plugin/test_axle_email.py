@@ -146,12 +146,75 @@ class TestItRefusesWhatItShould(unittest.TestCase):
         self.assertIn("3.87", r["note"])       # the figure is not thrown away
 
     def test_a_body_with_no_date_is_refused(self):
-        r = self._parse(body="you exported 3.87 kWh during the grid event. Earned GBP 3.87")
+        r = self._parse(body="you exported 3.87 kWh during the grid event. You earned GBP 3.87")
         self.assertIsNone(r["payload"])
         self.assertIn("no event date", r["note"])
 
     def test_an_empty_body_is_refused(self):
         self.assertIsNone(self._parse(body="")["payload"])
+
+
+class TestTheOtherTemplates(unittest.TestCase):
+    """Axle have three shapes of this mail, and only one carries an Earned tile.
+    All three bodies below are taken from real messages."""
+
+    AT = SPECIMEN_AT
+
+    def _parse(self, body, **kw):
+        args = dict(sender=SPECIMEN_SENDER, subject=SPECIMEN_SUBJECT, body=body,
+                    received_at=self.AT, window_lookup=lookup)
+        args.update(kw)
+        return AE.parse_settlement_email(**args)
+
+    # The real 21-May-2026 body, trimmed. Note the ONLY pound figure in it is the
+    # monthly guarantee - there is no money for the event anywhere.
+    LOW_EXPORT = ("Hey, We've crunched the numbers - your battery exported *0.04* *kWh* during "
+                  "the grid event on *Sun 16th August*. This is less than we hoped. This might "
+                  "be because: * other devices in your household soaked up energy before it got "
+                  "to the grid ... And don't worry, we're still guaranteeing *min £10/month* "
+                  "earnings, even if things don't quite work out in these events.")
+
+    NIL_EXPORT = ("Hey, We've crunched the numbers - your battery exported *-0.00* *kWh* during "
+                  "the grid event on *Sun 16th August*. This is less than we hoped. "
+                  "And don't worry, we're still guaranteeing *min £10/month* earnings.")
+
+    def test_the_monthly_guarantee_is_never_mistaken_for_the_event_money(self):
+        """THE regression guard. A loose "find a pound sign" fallback picked up
+        "min £10/month" from the boilerplate and filed GBP 10.00 for an event
+        Axle settled at 4p - an overstatement of 250x, measured on the real
+        21-May-2026 mail. There must never be such a fallback again."""
+        r = self._parse(self.LOW_EXPORT)
+        self.assertIsNone(r["payload"])
+        self.assertNotIn("10", str(r["payload"]))
+        self.assertIn("states no amount", r["note"])
+
+    def test_a_low_export_names_the_figure_so_it_can_be_entered(self):
+        """Refusing is right - Axle's figures are imported verbatim, never
+        computed here - but the kWh must not be thrown away with the refusal."""
+        self.assertIn("0.04", self._parse(self.LOW_EXPORT)["note"])
+
+    def test_a_nil_export_is_filed_as_a_real_zero_settlement(self):
+        """Zero exported is zero earned - a fact, not an estimate - and Axle
+        record it as a transaction, so it belongs in the ledger."""
+        tx = self._parse(self.NIL_EXPORT)["payload"]["transactions"][0]
+        self.assertEqual(tx["flex_kwh"], 0.0)
+        self.assertEqual(tx["credit_pence"], 0)
+
+    def test_the_minus_sign_on_a_nil_export_does_not_leak_through(self):
+        """The nil template writes it as *-0.00*."""
+        self.assertGreaterEqual(self._parse(self.NIL_EXPORT)["payload"]["transactions"][0]["flex_kwh"], 0.0)
+
+    def test_a_signed_export_figure_is_still_filed_as_an_export(self):
+        """abs() on the parsed figure is not cosmetic. The nil template already
+        writes a minus sign, so a template that one day writes a real export the
+        same way would, without abs(), come out POSITIVE - the opposite sign to
+        every row Axle themselves send, and the ledger reads sign as direction.
+        A mutation dropping abs() survived on the nil case alone, because in
+        Python -0.0 >= 0.0 is true and -0.0 == 0.0."""
+        body = ("your battery exported *-3.87* *kWh* during the grid event on "
+                "*Sun 16th August*. You earned GBP 3.87")
+        tx = self._parse(body)["payload"]["transactions"][0]
+        self.assertEqual(tx["flex_kwh"], -3.87)
 
 
 class TestTheYearTheBodyNeverStates(unittest.TestCase):

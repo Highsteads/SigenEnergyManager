@@ -5162,6 +5162,25 @@ class TestSettlementEmailWiring(unittest.TestCase):
             p, _ = self._p(td)
             self.assertIsNone(p._window_for_event_date(date(2026, 8, 15)))
 
+    def test_the_window_falls_back_to_axles_own_event_list(self):
+        """Events from before self-drive shipped - and any the plugin did not
+        drive at all, because it was down - have no local row. Axle's own event
+        list carries the window for those, and without it a settlement for an
+        event we missed could never be filed: the money would arrive with
+        nothing recording it. Proven against five real pre-June settlements."""
+        import json as _j
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "vpp_ledger.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                _j.dump({"schema": 1, "local": [], "axle": {"events": [
+                    {"event_id": "x", "start_time": "2026-08-16T19:00:00+00:00",
+                     "end_time": "2026-08-16T20:00:00+00:00"}]}}, fh)
+            p = plugin.Plugin.__new__(plugin.Plugin)
+            p.logger = MagicMock()
+            p._vpp_ledger_path = MagicMock(return_value=path)
+            self.assertEqual(p._window_for_event_date(date(2026, 8, 16)),
+                             ("2026-08-16T19:00:00+00:00", "2026-08-16T20:00:00+00:00"))
+
     def test_an_email_is_parsed_and_filed(self):
         with tempfile.TemporaryDirectory() as td:
             p, path = self._p(td)

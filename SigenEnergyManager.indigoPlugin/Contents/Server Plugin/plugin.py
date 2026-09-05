@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.93.0)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.94.0)
 # Date:        05-09-2026 23:05
-# Version:     5.93.0
+# Version:     5.94.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6264,10 +6264,18 @@ class Plugin(indigo.PluginBase):
         evening event at 19:00 UTC is the 16th in both, but a late one is not.
         """
         try:
-            rows = (_vpp_ledger.load_ledger(self._vpp_ledger_path()).get("local") or [])
+            ledger = _vpp_ledger.load_ledger(self._vpp_ledger_path())
         except Exception as exc:
             self.logger.debug(f"[VPP] Window lookup failed: {exc}")
             return None
+        # Our own rows first - we drove those windows. Then Axle's own event
+        # list, which covers events from BEFORE self-drive shipped and any we
+        # did not drive at all (the plugin down, or an event we never saw).
+        # Without the second source, a settlement for an event we missed can
+        # never be filed, and the money would arrive with nothing recording it.
+        rows = list(ledger.get("local") or [])
+        rows += [e for e in ((ledger.get("axle") or {}).get("events") or [])
+                 if isinstance(e, dict)]
         for row in rows:
             start = row.get("start_time")
             end   = row.get("end_time")
