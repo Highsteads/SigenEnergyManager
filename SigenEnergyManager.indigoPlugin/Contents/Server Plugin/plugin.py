@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.92.0)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.92.1)
 # Date:        05-09-2026 23:05
-# Version:     5.92.0
+# Version:     5.92.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6153,6 +6153,22 @@ class Plugin(indigo.PluginBase):
             if prev:
                 log("[VPP] Earnings ledger is being fed again - fresh figures imported.")
             self.store["vpp_ledger_logged"] = 0.0
+
+        # Push the change to the device the moment it happens, rather than waiting
+        # for the next VPP poll. _update_vpp_device runs from _poll_vpp at tick
+        # stage 6 and this check is stage 12b, so on the tick that first finds the
+        # ledger stale the device has ALREADY been written with the old verdict —
+        # and the next VPP poll is up to ten minutes away while idle. That left the
+        # log saying "not being fed" and the control page saying "being fed" at the
+        # same moment, which is worse than either alone. Same stage-ordering trap as
+        # the midnight rollover reading state a later stage owns.
+        # Only on a CHANGE, so this costs nothing on the overwhelming majority of
+        # checks, and guarded so a device write can never break status recording.
+        if (problem or "") != prev:
+            try:
+                self._update_vpp_device()
+            except Exception as exc:
+                self.logger.debug(f"[VPP] Ledger status device refresh skipped: {exc}")
 
     def _check_ledger_freshness(self):
         """Compare the ledger's age against the threshold and report through

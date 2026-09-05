@@ -4987,6 +4987,30 @@ class TestLedgerStatusLogging(unittest.TestCase):
             p._record_vpp_ledger_status("")
             lg.assert_not_called()
 
+    def test_a_changed_verdict_refreshes_the_device_immediately(self):
+        """_update_vpp_device runs at tick stage 6 and this check at 12b, so on
+        the tick that first finds the ledger stale the device has already been
+        written with the old verdict — and the next VPP poll is up to ten minutes
+        away. Live-caught: the log said "not being fed" while the control page
+        said "being fed" at the same moment."""
+        p = self._p()
+        p._update_vpp_device = MagicMock()
+        p._record_vpp_ledger_status("stale")
+        p._update_vpp_device.assert_called_once()
+
+    def test_an_unchanged_verdict_does_not_touch_the_device(self):
+        p = self._p()
+        p._record_vpp_ledger_status("stale")
+        p._update_vpp_device = MagicMock()
+        p._record_vpp_ledger_status("stale")
+        p._update_vpp_device.assert_not_called()
+
+    def test_a_failing_device_write_cannot_break_status_recording(self):
+        p = self._p()
+        p._update_vpp_device = MagicMock(side_effect=RuntimeError("boom"))
+        p._record_vpp_ledger_status("stale")
+        self.assertEqual(p.store["vpp_ledger_stale"], "stale")
+
     def test_the_message_is_plain_english_not_a_value_dump(self):
         p = self._p()
         with patch.object(plugin, "log") as lg:
