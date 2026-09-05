@@ -90,6 +90,48 @@ unique, files restored byte-identically.
 0.0 -> 18.48/10.25), `halfhourly.home_kwh` for 4-Sep and 5-Sep from the SQL Logger identity, and
 `daily_summary` 4-Sep — `scripts/mend_daily_energy_2026_09.py`.
 
+## v5.88.0 — 04-09-2026
+
+**The bank-first latch classified today from yesterday's forecast.** `_record_bank_first_metrics`
+reset the latch on a local-date change and immediately re-armed it from `latest_forecast_data
+["todayKwh"]`, which between local midnight and the first fetch of the new day (84 minutes on
+4-Sep) still held YESTERDAY's total. 4-Sep was forecast 45-49 kWh from 00:24 and was held anyway,
+08:00-12:47, 7.244 kWh withheld. Fix: every forecast dict carries `forecastDate`; the latch arms
+only when it equals today. Second fix, same family: `_overflow_bank_first_blocked` read a missing
+forecast (`raw_today = 0.0`) as a small day and held export off; absent is now UNKNOWN and stands
+aside. 989 -> 995 tests, four sabotages proven red. Full detail: the README row and the
+Plugins/CLAUDE.MD chain entry (this file was not updated at the time — backfilled 05-09-2026).
+
+## v5.87.1 — 04-09-2026
+
+**Six config fields drew under the wrong heading.** `PluginConfig.xml` had no separator between the
+power-cut block and the solar-overflow block, so `solarOverflowTargetSoc`, `solarOverflowMinEndSoc`,
+both bank-first fields, `solarOverflowShadowEnabled` and `stormExportReleasePct` rendered under
+POWER-CUT NOTIFICATIONS. New `separator_solarexport` / `label_solarexport` (DAYTIME SOLAR EXPORT)
+plus an info line saying which fields start an export and which do not — CliveS had set the charge
+target to 93 meaning the export-start level. Wording and layout only; client restart to see it.
+Backfilled 05-09-2026.
+
+## v5.87.0 — 03-09-2026
+
+**The loop slept the interval on top of the work.** `runConcurrentThread` ran `_tick()` then
+`self.sleep(min(modbus_poll_s, 10))`, so the real period was work + interval: 43 s before v5.86.0
+and 12 s after, against a 5 s setting. Now sleeps the REMAINDER (`max(0.2, interval - tick_took)`),
+measured 12 s -> 8 s; long intervals unaffected. Companion fix: the energy fallback that integrated
+power used the CONFIGURED interval rather than measured elapsed time, under-counting ~8x; it now
+measures, clamped so a post-outage reconnect cannot dump an hour into the day. 982 -> 989 tests.
+Backfilled 05-09-2026.
+
+## v5.86.0 — 03-09-2026
+
+**Read tiering in `sigenergy_modbus.py` v1.13.** `read_all()` did 29 transactions at the spec's 1 s
+spacing, so a poll took 43 s MEASURED whatever `pollInterval` said, and the three power figures
+came from instants seconds apart while `homePowerWatts` is derived from them (0 W house readings
+on broken-cloud days). Now the six critical reads run every cycle, PV+ESS from ONE block read, and
+everything else rotates three per cycle behind `_slow_cache` (600 s TTL). ~8 transactions per
+cycle; fresh-reading gap 43 s -> 12 s. NB: this cache is what served the daily-load register across
+midnight and froze `homeDailyKwh` on 4/5-Sep — see v5.89.0. Backfilled 05-09-2026.
+
 ## v5.85.1 — 03-09-2026
 
 **`tokenBalance` said 1; the Octopus app showed CliveS 0.** Reported within the hour of v5.85.0
