@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.96.0)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.97.0)
 # Date:        05-09-2026 23:05
-# Version:     5.96.0
+# Version:     5.97.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -264,6 +264,34 @@ VPP_LEDGER_CHECK_INTERVAL = 21600  # 6 hours
 # reasoning as the ledger check: a settlement lands days after its event, so
 # hours is ample, and the walk costs ~1.6 s of the plugin's only thread.
 AXLE_MAIL_SCAN_INTERVAL   = 21600  # 6 hours
+# How far our own in-window measurement may sit from what Axle settled before it
+# is treated as a fault rather than meter difference.
+#
+# MEASURED 06-09-2026 over the seven events Axle have settled and we drove:
+# every single one reads HIGH by 0.127 to 0.198 kWh, mean 0.172 - our inverter's
+# CT against the DCC settlement meter, consistently in the same direction.
+# Crucially the offset is ABSOLUTE and does not scale: the 8.0 kWh event of
+# 12-Aug diverges by +0.189, indistinguishable from the 4 kWh ones. So this is a
+# flat threshold, NOT a percentage - a proportional gate would have been fitted
+# to a pattern the data does not show. 1.0 kWh is about five times the largest
+# divergence ever observed, which is the margin a gate needs over its noise.
+# Re-measure if events much larger than 8 kWh ever appear.
+SETTLEMENT_DIVERGENCE_KWH = 1.0
+# Only look this far back. Older events pre-date self-drive and have no
+# measurement of ours to compare against, so scanning them would report the
+# absence of a record as a fault.
+SETTLEMENT_CHECK_DAYS     = 45
+# The TIMING gate, and it is a fraction rather than a flat kWh on purpose.
+# MEASURED over the eight driven events on disk: a healthy event lands 92.5% to
+# 97.0% of what it drove inside the paid hour (the shortfall is the driver's
+# deliberate two minutes either side). The one real failure in the ledger, the
+# 11-Aug-2026 over-run, landed 56.7% inside. A flat kWh gate cannot work here:
+# a 30-minute event is worth at most 2 kWh at the DNO cap, so any threshold
+# clearing the noise would swallow the event whole.
+SETTLEMENT_INSIDE_FRACTION = 0.85
+# ...paired with an absolute floor, so a tiny event's noisy ratio cannot fire.
+# Largest healthy gap observed is 0.323 kWh, giving about 2.5x margin.
+SETTLEMENT_OUTSIDE_KWH     = 0.8
 ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 # v5.89.0 — the energy tripwire. The identity residual and the derived-vs-device
 # house gap each warn once per day above max(absolute, fraction * throughput).
@@ -1307,6 +1335,11 @@ class Plugin(indigo.PluginBase):
         # hours of the silence this exists to end.
         self.store["last_ledger_check"]  = 0.0
         self.store["last_mail_scan"]     = 0.0
+        # Windows already reported as diverging, so a re-scan does not re-warn.
+        # Deliberately NOT persisted: a restart re-surfaces an unresolved
+        # divergence once, which is the right way round for something that costs
+        # money and has not been dealt with.
+        self.store["settlement_warned"]  = set()
         self.store["mail_scan_problem"]  = ""
         self.store["vpp_ledger_stale"]   = ""
         self.store["vpp_ledger_logged"]  = 0.0
@@ -6302,6 +6335,11 @@ class Plugin(indigo.PluginBase):
         # waiting up to six hours for the next tick to notice would leave the
         # log contradicting the screen.
         self._check_ledger_freshness()
+        # New settlement figures are exactly when a divergence becomes knowable.
+        try:
+            self._check_settlement_divergence()
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Settlement divergence check skipped: {exc}")
         return added
 
 
@@ -6367,6 +6405,135 @@ class Plugin(indigo.PluginBase):
                 vpp_log("[VPP] Axle mail scan is finding settlement emails again.",
                         event=True)
             self.store["mail_scan_logged"] = 0.0
+
+    def _check_settlement_divergence(self):
+        """Warn when a paid window did not go the way we think it did.
+
+        WHY. On 21-May-2026 a BST/UTC mix-up drove the export a full hour late.
+        Axle settled 0.04 kWh; the only reason anything was earned is that the
+        driver starts two minutes before the window opens, so a sliver landed
+        inside it. Nothing compared what we drove against what was paid, so it
+        surfaced weeks later when a human read the settlement email.
+
+        THE FIRST VERSION OF THIS CHECK COULD NOT HAVE CAUGHT THAT, and the
+        ledger proves it. It compared our in-window export against Axle's
+        settled figure - but both are integrated over the SAME hour, so when the
+        export runs at the wrong time both fall together and agree. Run against
+        the real 11-Aug-2026 over-run, where the window failed to stop and
+        3.052 kWh went outside the paid hour, that comparison returns 0.198 kWh
+        - dead centre of the healthy band. A meter-agreement check wearing a
+        timing check's name, and worse than nothing because silence reads as
+        confidence.
+
+        The question that actually matters is: DID WHAT WE DROVE LAND INSIDE THE
+        PAID HOUR? That is run_kwh against window_kwh, both of which the ledger
+        has held all along. Measured over the eight driven events on disk:
+
+            healthy   92.5% to 97.0% inside, gap 0.226 to 0.323 kWh
+            11-Aug    56.7% inside, gap 3.052 kWh
+
+        The gap is the driver's deliberate two minutes either side, so it is
+        roughly constant while the fraction is scale-free - which matters,
+        because a 30-minute event is worth at most 2 kWh and any flat kWh gate
+        big enough to clear the noise would swallow the whole event. Both
+        conditions must hold: a real gap AND a poor fraction. Either alone
+        false-alarms, on a tiny event and on a long clean one respectively.
+
+        Four distinct faults, each said in its own words rather than lumped:
+          1. we exported outside the paid window (the 21-May fault);
+          2. Axle's meter and ours disagree about the same hour;
+          3. Axle settled an event we have no measurement of at all;
+          4. we drove a window but cannot tell how much landed inside it.
+        """
+        try:
+            path   = self._vpp_ledger_path()
+            ledger = _vpp_ledger.load_ledger(path)
+            # NOT _vpp_ledger_summary(): that caps at the 12 newest events while
+            # this looks back 45 days, so a busy spell would push an unsettled
+            # event off the list before its figure arrived.
+            summary = _vpp_ledger.summarise(ledger, recent=500)
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Settlement check skipped: {exc}")
+            return
+
+        warned = self.store.setdefault("settlement_warned", set())
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SETTLEMENT_CHECK_DAYS)
+
+        for ev in (summary.get("events") or []):
+            key = str(ev.get("start"))[:16]
+            if not key or key in warned:
+                continue
+            # A hand-typed drop-file row can carry a naive timestamp. Comparing
+            # naive to aware raises, and the caller swallows it to DEBUG - so one
+            # bad row would silently stop the whole guard. Treat naive as UTC,
+            # which is what vpp_ledger's own parser does.
+            try:
+                start = datetime.fromisoformat(str(ev.get("start")))
+            except (TypeError, ValueError):
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if start < cutoff:
+                continue
+
+            run   = ev.get("run_kwh")
+            ours  = ev.get("our_kwh")
+            paid  = ev.get("paid_kwh")
+            diff  = ev.get("diff_kwh")
+            when  = ev.get("start_local") or _local_time(start, "%d/%m %H:%M")
+
+            # 1. THE TIMING FAULT. Scale-free, so a short event is covered.
+            if run and ev.get("in_window") and ours is not None:
+                gap = run - ours
+                inside = (ours / run) if run > 0 else 1.0
+                if gap >= SETTLEMENT_OUTSIDE_KWH and inside < SETTLEMENT_INSIDE_FRACTION:
+                    warned.add(key)
+                    vpp_log(
+                        f"[VPP] Most of an export missed its paid hour. On {when} we sent "
+                        f"out {run:.2f} kWh altogether but only {ours:.2f} kWh of it landed "
+                        f"inside the window Axle pay for - {inside * 100:.0f}%, where a normal "
+                        f"event is above 92%. The other {gap:.2f} kWh earned the ordinary "
+                        f"export rate instead. That usually means the export ran at the wrong "
+                        f"time rather than anything being broken on the battery.", "WARNING")
+                    continue
+
+            # 2. THE METERS DISAGREE about the same hour. Different fault, and
+            #    the flat threshold is right here: the offset is absolute and
+            #    does not scale (0.127 to 0.198 kWh across 4 to 8 kWh events).
+            if diff is not None and abs(diff) >= SETTLEMENT_DIVERGENCE_KWH:
+                warned.add(key)
+                short = "less" if diff > 0 else "more"
+                vpp_log(
+                    f"[VPP] Axle settled a different amount from the one we measured. On "
+                    f"{when} we recorded {ours:.2f} kWh inside the paid hour and they "
+                    f"settled {paid:.2f} kWh, {abs(diff):.2f} kWh {short}. The seven events "
+                    f"before this agreed to within 0.2 kWh, so a gap this size is worth "
+                    f"querying with them.", "WARNING")
+                continue
+
+            # 3. THEY PAID FOR A WINDOW WE HAVE NO MEASUREMENT OF. No floor on
+            #    the amount: a settled row means the event was real, and the
+            #    21-May row Axle settled was 0.036 kWh - the very shape a floor
+            #    would have muted.
+            if ev.get("settled") and paid is not None and ours is None:
+                warned.add(key)
+                vpp_log(
+                    f"[VPP] Axle settled an event this plugin never recorded driving. They "
+                    f"paid for {paid:.2f} kWh on {when} and there is no measurement of ours "
+                    f"for that window at all, so the export may have been missed altogether "
+                    f"or the plugin may have been stopped at the time.", "WARNING")
+                continue
+
+            # 4. WE DROVE IT BUT CANNOT CHECK IT. Snapshots lost or too few to
+            #    integrate, so our_kwh fell back to the run total and neither
+            #    check above can speak. Absent is not agreement.
+            if run and not ev.get("in_window"):
+                warned.add(key)
+                vpp_log(
+                    f"[VPP] Cannot tell whether the {when} export landed in its paid hour. "
+                    f"We drove {run:.2f} kWh but the per-minute record for that window is "
+                    f"missing or too short to add up, so there is nothing to check Axle's "
+                    f"figure against.", "WARNING")
 
     def _window_for_event_date(self, event_date):
         """(start_iso, end_iso) for the VPP window this plugin drove on a date.

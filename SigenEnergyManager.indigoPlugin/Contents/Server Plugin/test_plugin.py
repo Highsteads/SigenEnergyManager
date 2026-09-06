@@ -5479,5 +5479,173 @@ class TestVppLogRouting(unittest.TestCase):
         self.assertGreater(len(re.findall(r'vpp_log\(\s*f?"\[VPP\]', src)), 80)
 
 
+class TestSettlementDivergence(unittest.TestCase):
+    """Did what we drove land inside the paid hour?
+
+    THE FIRST VERSION OF THIS CHECK COULD NOT HAVE CAUGHT ITS OWN MOTIVATING
+    FAULT. It compared our in-window export against Axle's settled figure, but
+    both are integrated over the SAME hour, so a mis-timed export makes both fall
+    together and agree. Against the real 11-Aug-2026 over-run in the ledger -
+    7.05 kWh driven, 3.05 of it outside the paid window - that comparison returns
+    0.198 kWh, dead centre of the healthy band. These tests are written against
+    the REAL figures on disk so that cannot happen again quietly.
+
+    Measured over the eight driven events: healthy is 92.5% to 97.0% of the run
+    landing inside the window; 11-Aug was 56.7%."""
+
+    REAL_HEALTHY = [(4.22, 3.992), (4.22, 3.991), (4.23, 4.004), (8.26, 8.009),
+                    (4.23, 4.000), (4.32, 3.997), (4.24, 4.000)]
+    REAL_FAILURE = (7.05, 3.998)          # 11-Aug-2026, the window did not stop
+
+    def _p(self, events):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.store  = {"settlement_warned": set()}
+        p._vpp_ledger_path = MagicMock(return_value="/nonexistent")
+        p._summary_for_test = {"events": events}
+        return p
+
+    def _ev(self, run=None, ours=None, paid=None, days_ago=2, settled=True,
+            in_window=None, start=None):
+        st = start or (datetime.now(timezone.utc) - timedelta(days=days_ago)).replace(microsecond=0).isoformat()
+        iw = (ours is not None) if in_window is None else in_window
+        diff = round(ours - paid, 3) if (iw and ours is not None and paid is not None) else None
+        return {"start": st, "start_local": "11 Aug 2026 19:30", "settled": settled,
+                "run_kwh": run, "our_kwh": ours, "paid_kwh": paid,
+                "diff_kwh": diff, "in_window": iw}
+
+    def _warn(self, p):
+        with patch.object(plugin._vpp_ledger, "load_ledger", return_value={}), \
+             patch.object(plugin._vpp_ledger, "summarise", return_value=p._summary_for_test), \
+             patch.object(plugin, "log") as lg:
+            p._check_settlement_divergence()
+        return [c.args[0] for c in lg.call_args_list]
+
+    # --- the real data must not cry wolf ---------------------------------
+    def test_every_real_healthy_event_is_silent(self):
+        for run, ours in self.REAL_HEALTHY:
+            p = self._p([self._ev(run=run, ours=ours, paid=ours - 0.17)])
+            self.assertEqual(self._warn(p), [], f"run {run} / window {ours} should be silent")
+
+    # --- the fault it exists for, with the real numbers -------------------
+    def test_the_real_11_aug_overrun_fires(self):
+        """The one genuine timing failure on disk. The OLD check was silent on
+        it: diff_kwh is 0.198, inside the healthy 0.127-0.198 band."""
+        run, ours = self.REAL_FAILURE
+        msgs = self._warn(self._p([self._ev(run=run, ours=ours, paid=3.80)]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("missed its paid hour", msgs[0])
+        self.assertIn("57%", msgs[0])
+        self.assertIn("3.05 kWh", msgs[0])
+
+    def test_the_old_metric_would_have_been_silent_on_it(self):
+        """Pins WHY the design changed, so nobody reverts it. Axle's settled
+        figure against ours for that event differs by 0.198 kWh - squarely
+        inside the healthy band - while 3.05 kWh went outside the window."""
+        run, ours = self.REAL_FAILURE
+        self.assertLess(abs(ours - 3.80), 0.2)      # the old gate saw nothing
+        self.assertGreater(run - ours, 3.0)          # the real signal was large
+
+    def test_a_big_but_proportionate_gap_does_not_fire(self):
+        """BOTH halves of the gate must earn their place. A long event can have a
+        large ABSOLUTE gap while still landing almost all of itself inside the
+        window - the tails are roughly constant, so a two-hour event's 1.0 kWh
+        gap is proportionally the same as an hour's 0.5. Without the fraction
+        test the flat kWh alone would fire on a perfectly good event.
+        Mutation-proven: dropping the fraction test survived until this case."""
+        msgs = self._warn(self._p([self._ev(run=20.0, ours=19.0, paid=18.83)]))
+        self.assertEqual(msgs, [], "95% inside is healthy however big the gap")
+
+    def test_a_poor_fraction_on_a_trivial_amount_does_not_fire(self):
+        """The other half. A nearly-empty event has a noisy ratio - 80% inside
+        of half a kWh is 0.1 kWh adrift and means nothing. Without the absolute
+        floor the fraction alone would fire on it.
+        Mutation-proven: dropping the floor survived until this case."""
+        msgs = self._warn(self._p([self._ev(run=0.50, ours=0.40, paid=0.35)]))
+        self.assertEqual(msgs, [], "0.1 kWh adrift is not a missed window")
+
+    def test_a_short_event_is_covered_because_the_gate_is_a_fraction(self):
+        """A 30-minute event is worth at most 2 kWh at the DNO cap, so any flat
+        kWh threshold big enough to clear the noise would swallow it whole."""
+        msgs = self._warn(self._p([self._ev(run=2.10, ours=0.30, paid=0.25)]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("missed its paid hour", msgs[0])
+
+    # --- the founding event, and the floor that would have muted it -------
+    def test_the_21_may_shape_is_reported_despite_being_tiny(self):
+        """Axle settled 0.036 kWh with no measurement of ours. An earlier draft
+        had a `paid > 0.1` floor which muted exactly this - the founding number.
+        A settled row means the event was real, however small the payment."""
+        msgs = self._warn(self._p([self._ev(ours=None, paid=0.036)]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("never recorded driving", msgs[0])
+
+    def test_a_zero_settlement_we_never_drove_is_still_reported(self):
+        self.assertEqual(len(self._warn(self._p([self._ev(ours=None, paid=0.0)]))), 1)
+
+    # --- the other two faults --------------------------------------------
+    def test_meters_disagreeing_about_the_same_hour_is_its_own_fault(self):
+        msgs = self._warn(self._p([self._ev(run=4.24, ours=4.00, paid=1.50)]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("settled a different amount", msgs[0])
+
+    def test_a_window_we_cannot_verify_is_reported_not_assumed_fine(self):
+        """Snapshots lost, so our_kwh fell back to the run total and neither
+        other check can speak. Absent is not agreement."""
+        msgs = self._warn(self._p([self._ev(run=4.24, ours=4.24, paid=0.04, in_window=False)]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("Cannot tell", msgs[0])
+
+    # --- absent is never a match -----------------------------------------
+    def test_an_unsettled_event_we_drove_cleanly_is_silent(self):
+        self.assertEqual(self._warn(self._p([self._ev(run=4.24, ours=4.00, paid=None, settled=False)])), [])
+
+    # --- robustness -------------------------------------------------------
+    def test_a_naive_timestamp_does_not_abort_the_whole_check(self):
+        """A hand-typed drop-file row can carry no offset. Comparing naive to
+        aware raises, and the caller swallows it to DEBUG - so one bad row would
+        silently stop the guard for every event after it."""
+        run, ours = self.REAL_FAILURE
+        naive = datetime.now().replace(microsecond=0).isoformat()      # no offset
+        msgs = self._warn(self._p([
+            self._ev(run=4.24, ours=4.00, paid=3.83, start=naive),
+            self._ev(run=run, ours=ours, paid=3.80),
+        ]))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("missed its paid hour", msgs[0])
+
+    def test_it_warns_once_per_window_not_on_every_scan(self):
+        run, ours = self.REAL_FAILURE
+        p = self._p([self._ev(run=run, ours=ours, paid=3.80)])
+        self.assertEqual(len(self._warn(p)), 1)
+        for _ in range(8):
+            self.assertEqual(self._warn(p), [])
+
+    def test_old_events_are_out_of_scope(self):
+        run, ours = self.REAL_FAILURE
+        self.assertEqual(self._warn(self._p([self._ev(run=run, ours=ours, paid=3.80, days_ago=400)])), [])
+
+    def test_it_asks_for_more_than_the_twelve_newest_events(self):
+        """summarise() defaults to recent=12 while this looks back 45 days, so a
+        busy spell would push an unsettled event off the list before its figure
+        arrived."""
+        p = self._p([])
+        with patch.object(plugin._vpp_ledger, "load_ledger", return_value={}), \
+             patch.object(plugin._vpp_ledger, "summarise", return_value={"events": []}) as sm, \
+             patch.object(plugin, "log"):
+            p._check_settlement_divergence()
+        self.assertGreater(sm.call_args.kwargs.get("recent", 12), 100)
+
+    def test_a_broken_ledger_does_not_raise(self):
+        p = self._p([])
+        with patch.object(plugin._vpp_ledger, "load_ledger", side_effect=RuntimeError("boom")):
+            p._check_settlement_divergence()
+
+    def test_the_messages_are_plain_ascii(self):
+        run, ours = self.REAL_FAILURE
+        for msgs in (self._warn(self._p([self._ev(run=run, ours=ours, paid=3.80)])),
+                     self._warn(self._p([self._ev(ours=None, paid=0.036)]))):
+            self.assertEqual([c for c in msgs[0] if ord(c) > 127], [])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
