@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.95.0)
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.96.0)
 # Date:        05-09-2026 23:05
-# Version:     5.95.0
+# Version:     5.96.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -936,16 +936,52 @@ def _lvl(level):
     return _LOG_LEVELS.get(str(level).upper(), logging.INFO)
 
 
+def _write_plugin_log(ts, message, level):
+    """Append one line to the plugin's own daily log file. Best-effort."""
+    if _plugin_log_fh is None:
+        return
+    try:
+        _plugin_log_fh.write(f"{ts} [{level:<7}] {message}\n")
+        _plugin_log_fh.flush()
+    except Exception:
+        pass
+
+
 def log(message, level="INFO"):
     """Custom log function — writes to Indigo event log and daily plugin log file."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     indigo.server.log(f"[{ts}] {message}", level=_lvl(level))
-    if _plugin_log_fh is not None:
-        try:
-            _plugin_log_fh.write(f"{ts} [{level:<7}] {message}\n")
-            _plugin_log_fh.flush()
-        except Exception:
-            pass
+    _write_plugin_log(ts, message, level)
+
+
+def vpp_log(message, level="INFO", event=False):
+    """VPP narration: the plugin's OWN log file, and NOT the Indigo event log.
+
+    There is a lot of it and there is going to be more - a line for every
+    announcement, pre-charge step, mode change, ledger write and summary, once
+    per event, for ever. CliveS asked for it out of the event log on 06-Sep-2026
+    and he was right: the event log is the estate's dashboard, not this plugin's
+    diary. Nothing is lost. Every line still lands in the plugin's own daily
+    file, which is where you go when you want the narrative.
+
+    FAULTS ARE THE EXCEPTION and still reach the event log, because that is the
+    only place Log_Error_Watch.py can see them, and a VPP failure nothing
+    surfaces is exactly the silence the ledger and API guards exist to end.
+    Making that decision here, once, is the point of the wrapper - the
+    alternative was 69 separate judgements at the call sites, which is 69
+    chances to put a fault somewhere nobody reads.
+
+    `event=True` forces one INFO line to the event log anyway. It exists for
+    RECOVERY messages: their warning half went to the event log, so sending the
+    all-clear only to the plugin's file would leave the event log's last word on
+    the subject an error, which reads as still broken. Marking them this way -
+    rather than calling log() directly - keeps the rule absolute, so the guard
+    in test_plugin can demand that EVERY [VPP] line goes through here.
+    """
+    if event or _lvl(level) >= logging.WARNING:
+        log(message, level)
+        return
+    _write_plugin_log(datetime.now().strftime("%H:%M:%S.%f")[:-3], message, level)
 
 
 # Latch so a missing tz database is reported ONCE, not on every 60-second
@@ -2758,7 +2794,7 @@ class Plugin(indigo.PluginBase):
             try:
                 self._scan_axle_mail()
             except Exception as exc:
-                log(f"[VPP] Axle mail scan failed: {exc}", "WARNING")
+                vpp_log(f"[VPP] Axle mail scan failed: {exc}", "WARNING")
             self.store["last_mail_scan"] = now
 
         # 12b. Earnings-ledger freshness (v5.92.0). Local file work only.
@@ -2800,7 +2836,7 @@ class Plugin(indigo.PluginBase):
             return          # nothing to do until the socket is back
         if self.modbus.set_self_consumption():
             self.store["vpp_handback_pending"] = False
-            log("[VPP] Hand-back to Self Consumption confirmed on retry — "
+            vpp_log("[VPP] Hand-back to Self Consumption confirmed on retry — "
                 "inverter is back on the safe baseline.")
 
     # ================================================================
@@ -6124,11 +6160,11 @@ class Plugin(indigo.PluginBase):
             now = time.time()
             if error != prev or now - self.store.get("vpp_api_logged", 0.0) >= 3600.0:
                 self.store["vpp_api_logged"] = now
-                log(f"[VPP] Axle poll failing - {error} "
+                vpp_log(f"[VPP] Axle poll failing - {error} "
                     f"(consecutive failures: {self.store['vpp_api_fails']})", "ERROR")
         else:
             if prev:
-                log(f"[VPP] Axle poll recovered after {self.store.get('vpp_api_fails', 0)} "
+                vpp_log(f"[VPP] Axle poll recovered after {self.store.get('vpp_api_fails', 0)} "
                     f"failure(s) - API reachable again")
             self.store["vpp_api_fails"]  = 0
             self.store["vpp_api_logged"] = 0.0
@@ -6160,15 +6196,18 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_ledger_stale"] = problem or ""
 
         if problem:
-            now = time.time()
-            if problem != prev or now - self.store.get("vpp_ledger_logged", 0.0) >= 3600.0:
-                self.store["vpp_ledger_logged"] = now
-                log(f"[VPP] Earnings ledger not being fed - {problem}. Import the "
+            # ONCE, on change. Not hourly: nothing here can fix itself without a
+            # human, so a repeat is a nag rather than news - it fired five times
+            # in one hour on 05-Sep-2026 and would have done so for ever. The
+            # current state is on the device as ledgerStatus for anyone looking.
+            if problem != prev:
+                vpp_log(f"[VPP] Earnings ledger not being fed - {problem}. Import the "
                     f"latest figures with Plugins > SigenEnergyManager > Import Axle "
                     f"Ledger, or check the Axle account page.", "WARNING")
         else:
             if prev:
-                log("[VPP] Earnings ledger is being fed again - fresh figures imported.")
+                vpp_log("[VPP] Earnings ledger is being fed again - fresh figures "
+                        "imported.", event=True)
             self.store["vpp_ledger_logged"] = 0.0
 
         # Push the change to the device the moment it happens, rather than waiting
@@ -6321,13 +6360,12 @@ class Plugin(indigo.PluginBase):
         prev = self.store.get("mail_scan_problem") or ""
         self.store["mail_scan_problem"] = problem or ""
         if problem:
-            now = time.time()
-            if problem != prev or now - self.store.get("mail_scan_logged", 0.0) >= 3600.0:
-                self.store["mail_scan_logged"] = now
-                log(f"[VPP] Axle mail scan found nothing - {problem}.", "WARNING")
+            if problem != prev:      # once, on change - see _record_vpp_ledger_status
+                vpp_log(f"[VPP] Axle mail scan found nothing - {problem}.", "WARNING")
         else:
             if prev:
-                log("[VPP] Axle mail scan is finding settlement emails again.")
+                vpp_log("[VPP] Axle mail scan is finding settlement emails again.",
+                        event=True)
             self.store["mail_scan_logged"] = 0.0
 
     def _window_for_event_date(self, event_date):
@@ -6385,7 +6423,7 @@ class Plugin(indigo.PluginBase):
             if note and "not an Axle settlement email" not in note:
                 # A genuine Axle mail we could not use is worth a warning; an
                 # unrelated message that merely tripped the trigger is not.
-                log(f"[VPP] Settlement email not imported - {note}", "WARNING")
+                vpp_log(f"[VPP] Settlement email not imported - {note}", "WARNING")
             else:
                 self.logger.debug(f"[VPP] Settlement email ignored - {note}")
             return note
@@ -6393,7 +6431,7 @@ class Plugin(indigo.PluginBase):
         try:
             added = self._merge_axle_payload(payload)
         except Exception as exc:
-            log(f"[VPP] Settlement email could not be filed: {exc}", "ERROR")
+            vpp_log(f"[VPP] Settlement email could not be filed: {exc}", "ERROR")
             return str(exc)
 
         tx = payload["transactions"][0]
@@ -6402,7 +6440,7 @@ class Plugin(indigo.PluginBase):
             when = _local_time(datetime.fromisoformat(tx["start_time"]), "%d/%m %H:%M")
         except (TypeError, ValueError):
             when = str(tx["start_time"])[:16]
-        log(f"[VPP] Settlement email imported - Axle settled "
+        vpp_log(f"[VPP] Settlement email imported - Axle settled "
             f"{abs(tx['flex_kwh']):.2f} kWh at {when} for GBP "
             f"{tx['credit_pence'] / 100:.2f}"
             + ("." if added else ", which we already held."))
@@ -6422,13 +6460,13 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             dev_id = 0
         if not dev_id or dev_id not in indigo.devices:
-            log("[VPP] Import Axle Settlement Email: no Email+ device chosen. Open the "
+            vpp_log("[VPP] Import Axle Settlement Email: no Email+ device chosen. Open the "
                 "action and pick the IMAP device carrying the message.", "ERROR")
             return
 
         email_dev = indigo.devices[dev_id]
         if not email_dev.enabled:
-            log(f"[VPP] Import Axle Settlement Email: '{email_dev.name}' has its "
+            vpp_log(f"[VPP] Import Axle Settlement Email: '{email_dev.name}' has its "
                 f"communication disabled, so its states are frozen at whatever they "
                 f"held when it was switched off. Enable it first.", "ERROR")
             return
@@ -6499,14 +6537,14 @@ class Plugin(indigo.PluginBase):
             if now < deadline:
                 return
             overshoot = (now - end_time).total_seconds() / 60.0
-            log(f"[VPP] BACKSTOP — window ended {_local_time(end_time)} but the export "
+            vpp_log(f"[VPP] BACKSTOP — window ended {_local_time(end_time)} but the export "
                 f"is still running {overshoot:.0f} min later. The Axle poll has not "
                 f"closed it, so the manager is force-ending it now. Check why "
                 f"_poll_vpp stopped advancing the state machine.", level="WARNING")
             self._end_vpp_export(now, stored)
         except Exception as exc:
             # Never let the backstop break the evaluate it is protecting.
-            log(f"[VPP] Over-run backstop failed: {exc}", level="ERROR")
+            vpp_log(f"[VPP] Over-run backstop failed: {exc}", level="ERROR")
 
     def _apply_vpp_event(self, event):
         """Advance the VPP state machine for a fetched event. Caller holds the lock."""
@@ -6532,7 +6570,7 @@ class Plugin(indigo.PluginBase):
                 start_key = str(event.get("start_time"))
                 if self.store.get("vpp_direction_warned") != start_key:
                     self.store["vpp_direction_warned"] = start_key
-                    log(f"[VPP] Axle announced a '{direction}' event "
+                    vpp_log(f"[VPP] Axle announced a '{direction}' event "
                         f"({_local_time(event['start_time'])}-"
                         f"{_local_time(event['end_time'])}) — this plugin only "
                         f"self-drives EXPORT windows, so it will NOT be driven. "
@@ -6558,7 +6596,7 @@ class Plugin(indigo.PluginBase):
 
             elif current_state != VPP_IDLE:
                 # Event cancelled / disappeared before the window opened — stand down.
-                log("[VPP] Event cancelled/disappeared - restoring self-consumption")
+                vpp_log("[VPP] Event cancelled/disappeared - restoring self-consumption")
                 self._restore_discharge_cutoff()
                 if self.store.get("export_active") and self.modbus:
                     self.modbus.set_self_consumption()
@@ -6585,7 +6623,7 @@ class Plugin(indigo.PluginBase):
             # Axle's own firmware will decline to dispatch.
             self._vpp_transition(VPP_ANNOUNCED)
             self._trigger_event("vppAnnounced")
-            log(
+            vpp_log(
                 f"[VPP] Event announced: {_local_time(start_time)} - "
                 f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
             )
@@ -6599,7 +6637,7 @@ class Plugin(indigo.PluginBase):
             # Axle published the event late — it's already under way.
             # Skip straight to ACTIVE; Axle's firmware already has control.
             mins_late = int(-hours_to_start * 60)
-            log(
+            vpp_log(
                 f"[VPP] Late detection: event already active {_local_time(start_time)} - "
                 f"{_local_time(end_time)} BST (Axle published {mins_late} min late) — "
                 f"entering ACTIVE, self-driving export"
@@ -6624,7 +6662,7 @@ class Plugin(indigo.PluginBase):
             # Single T-10min warning instead of the old minute-by-minute spam.
             # Fires once when we cross 10 min; latched via vpp_10min_warning_sent.
             if hours_to_start <= 10.0 / 60.0 and not self.store.get("vpp_10min_warning_sent"):
-                log(f"[VPP] Event in 10 minutes — Axle handover at T-5min, "
+                vpp_log(f"[VPP] Event in 10 minutes — Axle handover at T-5min, "
                     f"event window {_local_time(start_time)}-{_local_time(end_time)}")
                 self.store["vpp_10min_warning_sent"] = True
             # Existing pre-charge trigger at T-30min (unchanged)
@@ -6646,13 +6684,13 @@ class Plugin(indigo.PluginBase):
                 cur_mode = self.modbus.read_ems_mode() if self.modbus else None
                 if cur_mode == 0x06:
                     self.store["vpp_charge_stopped"] = True
-                    log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
+                    vpp_log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
                         f"{required_soc:.0f}% target. Axle already dispatching "
                         f"(40031=0x06) — leaving inverter under Axle control.")
                 elif self.modbus:
                     self.modbus.set_self_consumption()
                     self.store["vpp_charge_stopped"] = True
-                    log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
+                    vpp_log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
                         f"{required_soc:.0f}% target. Holding in Self Consumption.")
 
             # Start the self-driven export 2 min BEFORE the window opens, so we are
@@ -6663,7 +6701,7 @@ class Plugin(indigo.PluginBase):
                 self._vpp_transition(VPP_ACTIVE)
                 self.store["vpp_active"] = True
                 self._trigger_event("vppStarted")
-                log("[VPP] T-2min — self-driving export for the window "
+                vpp_log("[VPP] T-2min — self-driving export for the window "
                     "(ignoring Axle dispatch; meter-settled).")
 
         elif current_state == VPP_ACTIVE:
@@ -6739,9 +6777,9 @@ class Plugin(indigo.PluginBase):
         try:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(_json.dumps(record) + "\n")
-            log(f"[VPP] Event log: {path}")
+            vpp_log(f"[VPP] Event log: {path}")
         except Exception as exc:
-            log(f"[VPP] Could not write event header: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Could not write event header: {exc}", level="WARNING")
 
     def _vpp_driver(self, ems_mode):
         """Who is actually driving the inverter, judged from the live register.
@@ -6894,12 +6932,12 @@ class Plugin(indigo.PluginBase):
                         elif rtype == "event_ended":
                             ended = rec
             except Exception as exc:
-                log(f"[VPP] Could not parse event log {path}: {exc}",
+                vpp_log(f"[VPP] Could not parse event log {path}: {exc}",
                     level="WARNING")
         if foreign:
             # Never silent: a file holding another window's readings means
             # something upstream filed them wrongly, and that is worth knowing.
-            log(f"[VPP] Ignored {foreign} snapshot(s) in {os.path.basename(path)} "
+            vpp_log(f"[VPP] Ignored {foreign} snapshot(s) in {os.path.basename(path)} "
                 f"that fall outside this event's window — they belong to a "
                 f"different event and would have skewed the summary.",
                 level="WARNING")
@@ -7043,7 +7081,7 @@ class Plugin(indigo.PluginBase):
                     {"key": "lastVppLogPath",              "value": path or ""},
                 ])
         except Exception as exc:
-            log(f"[VPP] Could not update axleVppMonitor summary states: {exc}",
+            vpp_log(f"[VPP] Could not update axleVppMonitor summary states: {exc}",
                 level="WARNING")
 
         # Add our own figures for this window to the ledger — BOTH of them.
@@ -7060,7 +7098,7 @@ class Plugin(indigo.PluginBase):
                  for s in snapshots],
                 event.get("duration_hrs"))
         except Exception as exc:
-            log(f"[VPP] Could not integrate in-window export: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Could not integrate in-window export: {exc}", level="WARNING")
 
         self._record_vpp_ledger_event(event, export_kwh,
                                       driver=driver_str, log_path=path or "",
@@ -7145,7 +7183,7 @@ class Plugin(indigo.PluginBase):
         try:
             self._send_pushover(title, body, priority="0")
         except Exception as exc:
-            log(f"[VPP] Pushover summary send failed: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Pushover summary send failed: {exc}", level="WARNING")
 
         # Also log the headline to the Indigo Event Log so the user has a
         # single grep-able line for each event.  No JSONL spam, just the
@@ -7154,13 +7192,13 @@ class Plugin(indigo.PluginBase):
                      f"({export_kwh:.2f} kWh over the whole run)"
                      if window_kwh is not None
                      else f"{export_kwh:.2f} kWh exported (paid hour not measured)")
-        log(f"[VPP] Summary: {_paid_str}, "
+        vpp_log(f"[VPP] Summary: {_paid_str}, "
             f"PV {pv_kwh:.2f} kWh ({pv_status}), "
             f"peak grid export {peak_grid_export_w} W, "
             f"{window_str} window, driver {driver_str}, "
             f"EMS modes: {ems_modes_str}. Log: {path}")
         if external_seen:
-            log("[VPP] External control was detected during the window — the mode "
+            vpp_log("[VPP] External control was detected during the window — the mode "
                 "register held a value the plugin did not write. Check the JSONL "
                 "snapshots for when it changed.", level="WARNING")
 
@@ -7207,19 +7245,19 @@ class Plugin(indigo.PluginBase):
 
         if current_kwh >= required_kwh:
             if is_daytime:
-                log(
+                vpp_log(
                     f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
                     f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) — daytime, solar will recharge"
                 )
             else:
-                log(
+                vpp_log(
                     f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
                     f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) + dawn reserve "
                     f"({dawn_kwh:.1f} kWh)"
                 )
         else:
             shortfall = required_kwh - current_kwh
-            log(
+            vpp_log(
                 f"[VPP] SOC low ({current_soc:.0f}%, shortfall {shortfall:.1f} kWh) — "
                 f"proceeding without grid import; Axle will assess at dispatch time",
                 level="WARNING",
@@ -7262,7 +7300,7 @@ class Plugin(indigo.PluginBase):
             )
             self._send_pushover("Sigen VPP — battery low for event", body, priority="0")
         except Exception as exc:
-            log(f"[VPP] shortfall alert failed: {exc}", level="ERROR")
+            vpp_log(f"[VPP] shortfall alert failed: {exc}", level="ERROR")
 
     def _set_vpp_discharge_cutoff(self, event, is_daytime=False):
         """Set discharge cutoff at pre-charge time (30 min before event).
@@ -7293,7 +7331,7 @@ class Plugin(indigo.PluginBase):
         if self.modbus:
             self.modbus.set_discharge_cutoff(floor_pct)
             self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
-            log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
+            vpp_log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
 
     def _event_is_daytime(self, event_start):
         """Return True if event_start falls within the solar generation window.
@@ -7399,7 +7437,7 @@ class Plugin(indigo.PluginBase):
             health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
             self.modbus.set_discharge_cutoff(health_floor)
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
-            log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
+            vpp_log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
 
     def _disengage_to_safe_baseline(self, reason):
         """Return the inverter to the safe self-consumption baseline AND release any
@@ -7499,7 +7537,7 @@ class Plugin(indigo.PluginBase):
                 # and the failed write already flags the connection for reconnect.
                 released = bool(self.modbus.set_self_consumption())
         if not released:
-            log("[VPP] Hand-back to Self Consumption NOT confirmed at window end — "
+            vpp_log("[VPP] Hand-back to Self Consumption NOT confirmed at window end — "
                 "the inverter may still be exporting. Re-asserting every tick until "
                 "it lands.", level="WARNING")
         self.store["vpp_handback_pending"] = not released
@@ -7527,21 +7565,21 @@ class Plugin(indigo.PluginBase):
         except Exception:
             pass
 
-        log(f"[VPP] >>> EVENT COMPLETE <<<  self-driven export ~{vpp_export:.2f} kWh. "
+        vpp_log(f"[VPP] >>> EVENT COMPLETE <<<  self-driven export ~{vpp_export:.2f} kWh. "
             f"Restored to Self Consumption.")
 
         # Post-event summary -> axleVppMonitor states + Pushover (best-effort)
         try:
             self._summarise_vpp_event(event)
         except Exception as _exc:
-            log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
+            vpp_log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
 
     def _vpp_transition(self, new_state):
         """Transition VPP state machine to a new state."""
         old_state = self.store["vpp_state"]
         self.store["vpp_state"] = new_state
         if self.debug:
-            log(f"[VPP] State: {old_state} -> {new_state}")
+            vpp_log(f"[VPP] State: {old_state} -> {new_state}")
 
         # Any engagement cancels a pending hand-back retry — re-asserting the
         # 0x02 baseline during a live window would kill a paid export (v5.64).
@@ -7571,7 +7609,7 @@ class Plugin(indigo.PluginBase):
             self.store["vpp_is_daytime"]       = self._event_is_daytime(event.get("start_time"))
             self.store["vpp_export_submode"]   = None    # force a mode log on first drive
             self.store["vpp_bank_charge_cap_w"] = -1
-            log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
+            vpp_log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
                 f"({'daytime' if self.store['vpp_is_daytime'] else 'dark'} window, "
                 "DNO-capped; Axle dispatch ignored).")
             self._drive_vpp_export()
@@ -7608,14 +7646,14 @@ class Plugin(indigo.PluginBase):
             # register may still be raised in hardware (it survives a plugin
             # restart) — reset it to the health floor and drop back to Self
             # Consumption so the manager evaluates cleanly.
-            log(f"[VPP] Persisted window ended during downtime "
+            vpp_log(f"[VPP] Persisted window ended during downtime "
                 f"(ended {_local_time(event.get('end_time'))}) — cleaning up")
             try:
                 if self.modbus:
                     self.modbus.set_self_consumption()
                 self._restore_discharge_cutoff()
             except Exception as exc:
-                log(f"[VPP] Restart cleanup failed: {exc}", level="WARNING")
+                vpp_log(f"[VPP] Restart cleanup failed: {exc}", level="WARNING")
             self.store["vpp_event"]         = None
             self.store["vpp_active"]        = False
             self.store["export_active"]     = False
@@ -7630,7 +7668,7 @@ class Plugin(indigo.PluginBase):
         # Keeping vpp_cutoff_raised set stops _verify_ems_registers lowering the
         # floor before then.
         self.store["vpp_active"] = (state == VPP_ACTIVE)
-        log(f"[VPP] Resuming persisted '{state}' window after restart — "
+        vpp_log(f"[VPP] Resuming persisted '{state}' window after restart — "
             f"{_local_time(event.get('start_time'))}-{_local_time(event.get('end_time'))} "
             f"(Axle API not required; cutoff-raised="
             f"{self.store.get('vpp_cutoff_raised', False)})")
@@ -7697,7 +7735,7 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_self_consumption()
                 self.store["vpp_export_mode"]       = 0x02
                 self.store["vpp_bank_charge_cap_w"] = -1   # force the cap write below
-                log(f"[VPP] Bank-surplus export — PV {pv_w}W, home {home_w}W, surplus "
+                vpp_log(f"[VPP] Bank-surplus export — PV {pv_w}W, home {home_w}W, surplus "
                     f"{surplus_w}W >= target {target_w}W: mode 0x02, charge cap "
                     f"{charge_cap_w}W (export {target_w}W from PV, bank the rest).")
             prev_cap = self.store.get("vpp_bank_charge_cap_w", -1)
@@ -7713,7 +7751,7 @@ class Plugin(indigo.PluginBase):
                     self.modbus.night_export(inv_max_w)     # mode 0x06
                     self.store["vpp_export_mode"] = 0x06
                 self.store["vpp_bank_charge_cap_w"] = -1
-                log(f"[VPP] Discharge export — PV {pv_w}W, home {home_w}W, surplus "
+                vpp_log(f"[VPP] Discharge export — PV {pv_w}W, home {home_w}W, surplus "
                     f"{surplus_w}W < target {target_w}W: mode "
                     f"{'0x05 PV-first' if daytime else '0x06 ESS-first'}, battery tops "
                     f"the export up to {target_w}W.")
@@ -7824,7 +7862,7 @@ class Plugin(indigo.PluginBase):
             _old_start = self.store.get("vpp_export_start_kwh", 0.0)
             self.store["vpp_export_start_kwh"] = _vpp_export_anchor_after_midnight(
                 _old_start, _pre_total)
-            log(f"[VPP] Window spans midnight — export anchor re-based "
+            vpp_log(f"[VPP] Window spans midnight — export anchor re-based "
                 f"({max(0.0, _pre_total - _old_start):.2f} kWh banked before the rollover)")
 
         # New day. v5.89.0: the daily figures derive from lifetime counters anchored
@@ -9202,7 +9240,7 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             # A broken ledger must not take the status endpoint down with it,
             # and must not read as "no earnings" either.
-            log(f"[VPP] Ledger summary failed: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Ledger summary failed: {exc}", level="WARNING")
             summary = {"load_error": f"{type(exc).__name__}: {exc}"}
         self._vpp_ledger_cache = (mtime, summary)
         return summary
@@ -9227,10 +9265,10 @@ class Plugin(indigo.PluginBase):
                                            window_kwh=window_kwh)
             _vpp_ledger.save_ledger(path, ledger)
             self._vpp_ledger_cache = None
-            log(f"[VPP] Ledger: recorded {round(float(export_kwh), 2)} kWh for "
+            vpp_log(f"[VPP] Ledger: recorded {round(float(export_kwh), 2)} kWh for "
                 f"{_local_time(start, '%d/%m %H:%M')} (our figure — Axle settles later)")
         except Exception as exc:
-            log(f"[VPP] Could not record event in ledger: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Could not record event in ledger: {exc}", level="WARNING")
 
     def importAxleLedger(self, valuesDict=None, typeId=None):
         """Menu: merge <data_dir>/vpp_axle_import.json into the ledger.
@@ -9248,7 +9286,7 @@ class Plugin(indigo.PluginBase):
 
         drop = os.path.join(self.data_dir, "vpp_axle_import.json")
         if not os.path.exists(drop):
-            log(f"[VPP] No import file found. Save the Axle account JSON to:\n"
+            vpp_log(f"[VPP] No import file found. Save the Axle account JSON to:\n"
                 f"      {drop}\n"
                 f"      then run this menu item again.", level="WARNING")
             return
@@ -9257,7 +9295,7 @@ class Plugin(indigo.PluginBase):
             with open(drop, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
         except Exception as exc:
-            log(f"[VPP] Import file could not be read: {exc}", level="ERROR")
+            vpp_log(f"[VPP] Import file could not be read: {exc}", level="ERROR")
             return
 
         # Accept the whole loader object as well as the trimmed form — pulling
@@ -9268,12 +9306,12 @@ class Plugin(indigo.PluginBase):
         try:
             added = self._merge_axle_payload(payload)
         except Exception as exc:
-            log(f"[VPP] Import failed: {exc}", level="ERROR")
+            vpp_log(f"[VPP] Import failed: {exc}", level="ERROR")
             return
 
         summary = self._vpp_ledger_summary()
         life    = summary.get("lifetime_gbp")
-        log(f"[VPP] Ledger import complete — {added} new transaction(s). "
+        vpp_log(f"[VPP] Ledger import complete — {added} new transaction(s). "
             f"Lifetime {'£%.2f' % life if life is not None else 'unknown'}, "
             f"{summary.get('events_settled', 0)} settled, "
             f"{summary.get('events_pending', 0)} pending.")
@@ -9352,7 +9390,7 @@ class Plugin(indigo.PluginBase):
                                       if event.get("estimated_revenue_p") is not None else None),
             }
         except Exception as exc:
-            log(f"[VPP] Could not build next-event info: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Could not build next-event info: {exc}", level="WARNING")
             return None
 
     def _update_vpp_device(self):
@@ -9422,7 +9460,7 @@ class Plugin(indigo.PluginBase):
                                                        or "being fed")},
             ]
         except Exception as exc:
-            log(f"[VPP] Could not add ledger states: {exc}", level="WARNING")
+            vpp_log(f"[VPP] Could not add ledger states: {exc}", level="WARNING")
 
         dev.updateStatesOnServer(states)
 
@@ -9923,19 +9961,19 @@ class Plugin(indigo.PluginBase):
         state   = self.store.get("vpp_state", "idle")
         active  = self.store.get("vpp_active", False)
         event   = self.store.get("vpp_event") or {}
-        log(f"[VPP] State={state} Active={'YES' if active else 'no'}")
+        vpp_log(f"[VPP] State={state} Active={'YES' if active else 'no'}")
         if event:
             start = event.get("start_time")
             end   = event.get("end_time")
             start_s = _local_time(start, "%H:%M %d/%m") if start else "?"
             end_s   = _local_time(end)                  if end   else "?"
-            log(f"[VPP] Next event: {start_s} - {end_s} BST "
+            vpp_log(f"[VPP] Next event: {start_s} - {end_s} BST "
                 f"({event.get('duration_hrs', 0):.1f}h) "
                 f"precharge={self.store.get('vpp_pre_charge_soc', 0):.0f}%")
         else:
-            log("[VPP] No event scheduled")
+            vpp_log("[VPP] No event scheduled")
         if not self.axle:
-            log("[VPP] Axle API not configured", level="WARNING")
+            vpp_log("[VPP] Axle API not configured", level="WARNING")
         return True
 
     def menuShowVppExport(self):
@@ -9946,20 +9984,20 @@ class Plugin(indigo.PluginBase):
         last_export  = self.store.get("vpp_last_export_kwh", 0.0)
         had_vpp      = self.store.get("had_vpp_today", False) or active
 
-        log("[VPP] ============ VPP Export Summary ============")
-        log(f"[VPP] Axle enabled:        {'YES' if axle_enabled else 'NO'}")
-        log(f"[VPP] Axle token:          {'configured' if self.axle else 'not set'}")
-        log(f"[VPP] Current state:       {state}")
-        log(f"[VPP] Event active:        {'YES - Axle in control' if active else 'No'}")
+        vpp_log("[VPP] ============ VPP Export Summary ============")
+        vpp_log(f"[VPP] Axle enabled:        {'YES' if axle_enabled else 'NO'}")
+        vpp_log(f"[VPP] Axle token:          {'configured' if self.axle else 'not set'}")
+        vpp_log(f"[VPP] Current state:       {state}")
+        vpp_log(f"[VPP] Event active:        {'YES - Axle in control' if active else 'No'}")
 
         if active:
             ongoing = (self.store["grid_export_daily_kwh"]
                        - self.store.get("vpp_export_start_kwh", 0.0))
-            log(f"[VPP] Export so far:       {ongoing:.2f} kWh  (event in progress)")
+            vpp_log(f"[VPP] Export so far:       {ongoing:.2f} kWh  (event in progress)")
         elif had_vpp:
-            log(f"[VPP] Last event export:   {last_export:.2f} kWh")
+            vpp_log(f"[VPP] Last event export:   {last_export:.2f} kWh")
         else:
-            log("[VPP] Last event export:   No VPP event recorded today")
+            vpp_log("[VPP] Last event export:   No VPP event recorded today")
 
         dev = self._find_device("axleVppMonitor")
         if dev:
@@ -9968,14 +10006,14 @@ class Plugin(indigo.PluginBase):
             earn  = dev.states.get("estimatedEarnings", "")
             chg   = dev.states.get("preChargeRequired", "0")
             if start:
-                log(f"[VPP] Event window:        {start} - {end}")
-                log(f"[VPP] Est. earnings:       GBP {earn}")
+                vpp_log(f"[VPP] Event window:        {start} - {end}")
+                vpp_log(f"[VPP] Est. earnings:       GBP {earn}")
                 if float(chg) > 0:
-                    log(f"[VPP] Pre-charge target:   {chg}% SOC")
+                    vpp_log(f"[VPP] Pre-charge target:   {chg}% SOC")
                 else:
-                    log("[VPP] Pre-charge:          Not needed (SOC sufficient)")
+                    vpp_log("[VPP] Pre-charge:          Not needed (SOC sufficient)")
 
-        log("[VPP] =============================================")
+        vpp_log("[VPP] =============================================")
         return True
 
     def menuShowVppEarnings(self):
@@ -9990,43 +10028,43 @@ class Plugin(indigo.PluginBase):
         s = self._vpp_ledger_summary()
 
         if s.get("load_error"):
-            log(f"[VPP] Ledger could not be read: {s['load_error']}", level="ERROR")
+            vpp_log(f"[VPP] Ledger could not be read: {s['load_error']}", level="ERROR")
             return True
 
         def money(v, unknown="unknown"):
             return unknown if v is None else f"GBP {v:.2f}"
 
         by_kind = s.get("by_kind") or {}
-        log("[VPP] ============ EARNINGS LEDGER ============")
-        log(f"[VPP] Lifetime earnings:   {money(s.get('lifetime_gbp'))}")
-        log(f"[VPP] Available to draw:   {money(s.get('available_gbp'))}"
+        vpp_log("[VPP] ============ EARNINGS LEDGER ============")
+        vpp_log(f"[VPP] Lifetime earnings:   {money(s.get('lifetime_gbp'))}")
+        vpp_log(f"[VPP] Available to draw:   {money(s.get('available_gbp'))}"
             f"{'  (withdrawable now)' if s.get('can_withdraw') else ''}")
-        log(f"[VPP] This month:          {money(s.get('month_to_date_gbp'), 'nothing settled yet')}")
-        log("[VPP] ---- where the money came from ----")
-        log(f"[VPP]   Grid events:       GBP {by_kind.get('events_gbp', 0.0):.2f}")
-        log(f"[VPP]   Monthly top-ups:   GBP {by_kind.get('top_ups_gbp', 0.0):.2f}")
-        log(f"[VPP]   Bonuses/referrals: GBP {by_kind.get('other_gbp', 0.0):.2f}")
-        log(f"[VPP] Events: {s.get('events_settled', 0)} settled, "
+        vpp_log(f"[VPP] This month:          {money(s.get('month_to_date_gbp'), 'nothing settled yet')}")
+        vpp_log("[VPP] ---- where the money came from ----")
+        vpp_log(f"[VPP]   Grid events:       GBP {by_kind.get('events_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP]   Monthly top-ups:   GBP {by_kind.get('top_ups_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP]   Bonuses/referrals: GBP {by_kind.get('other_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP] Events: {s.get('events_settled', 0)} settled, "
             f"{s.get('events_pending', 0)} awaiting settlement")
 
         # A headline that disagrees with its own rows is worse than no
         # headline, so say which is which rather than quietly picking one.
         behind = s.get("balance_behind_gbp")
         if behind:
-            log(f"[VPP] NB the balance above is Axle's last reported figure and is "
+            vpp_log(f"[VPP] NB the balance above is Axle's last reported figure and is "
                 f"GBP {abs(behind):.2f} {'behind' if behind > 0 else 'ahead of'} the "
                 f"transactions listed here (they total "
                 f"GBP {s.get('rows_total_gbp', 0.0):.2f}). Import the account page "
                 f"to refresh it.", level="WARNING")
 
         age = s.get("axle_age_days")
-        log(f"[VPP] Axle data imported:  {s.get('axle_fetched_local') or 'never'}"
+        vpp_log(f"[VPP] Axle data imported:  {s.get('axle_fetched_local') or 'never'}"
             f"{f'  ({age:.0f} days old)' if age is not None and age >= 1 else ''}")
         if age is not None and age >= 14:
-            log("[VPP] Ledger is over a fortnight old — re-import from the Axle "
+            vpp_log("[VPP] Ledger is over a fortnight old — re-import from the Axle "
                 "account page to pick up newly settled events.", level="WARNING")
 
-        log("[VPP] ---- recent events (paid / ours) ----")
+        vpp_log("[VPP] ---- recent events (paid / ours) ----")
         for e in s.get("events", []):
             if e["settled"]:
                 paid = f"GBP {e['paid_gbp']:.2f} / {e['paid_kwh']:.3f} kWh"
@@ -10035,18 +10073,18 @@ class Plugin(indigo.PluginBase):
                 paid = "awaiting settlement"
             ours = f"{e['our_kwh']:.2f} kWh" if e["our_kwh"] is not None else "not logged"
             diff = f"  diff {e['diff_kwh']:+.3f} kWh" if e["diff_kwh"] is not None else ""
-            log(f"[VPP]   {e['start_local']}-{e['end_local']}  {paid:<28} ours {ours}{diff}")
+            vpp_log(f"[VPP]   {e['start_local']}-{e['end_local']}  {paid:<28} ours {ours}{diff}")
 
         next_ev = self._vpp_next_event_info()
         if next_ev:
             hrs = next_ev["seconds_until_start"] / 3600.0
             when = f"in {hrs:.1f}h" if hrs > 0 else "running now"
-            log(f"[VPP] Next event:          {next_ev['start_local']}-{next_ev['end_local']} ({when})")
+            vpp_log(f"[VPP] Next event:          {next_ev['start_local']}-{next_ev['end_local']} ({when})")
         else:
             api = self.store.get("vpp_api_error")
-            log(f"[VPP] Next event:          none announced"
+            vpp_log(f"[VPP] Next event:          none announced"
                 f"{f'  — WARNING, Axle feed is failing: {api}' if api else ''}")
-        log("[VPP] =========================================")
+        vpp_log("[VPP] =========================================")
         return True
 
     def menuShowTodaySummary(self):

@@ -10,6 +10,7 @@
 # Date:        06-06-2026
 # Version:     1.0
 
+import io
 import os
 import sys
 import threading
@@ -4957,13 +4958,21 @@ class TestLedgerStatusLogging(unittest.TestCase):
             p._record_vpp_ledger_status("stale")
             self.assertEqual(lg.call_count, 1)
 
-    def test_it_re_logs_after_an_hour(self):
+    def test_it_never_nags(self):
+        """Once, on change - and never again while the condition stands.
+
+        It used to repeat hourly, copied from the events-feed guard. That guard
+        watches something that can recover on its own; this one cannot, because
+        only a person can feed the ledger. So the repeat was a nag rather than
+        news: it fired five times in one hour on 05-Sep-2026 and would have gone
+        on for ever. The live state lives on the device as ledgerStatus."""
         p = self._p()
         with patch.object(plugin, "log") as lg:
             p._record_vpp_ledger_status("stale")
-            p.store["vpp_ledger_logged"] -= 3601
-            p._record_vpp_ledger_status("stale")
-            self.assertEqual(lg.call_count, 2)
+            for _ in range(50):
+                p.store["vpp_ledger_logged"] -= 3601     # however much time passes
+                p._record_vpp_ledger_status("stale")
+            self.assertEqual(lg.call_count, 1)
 
     def test_a_changed_problem_logs_immediately(self):
         p = self._p()
@@ -5403,6 +5412,71 @@ class TestAxleMailScanIsOptIn(unittest.TestCase):
             p._scan_axle_mail()
         self.assertEqual(p.store["mail_scan_problem"], "")
         self.assertTrue(any("finding settlement emails again" in c.args[0] for c in lg.call_args_list))
+
+
+class TestVppLogRouting(unittest.TestCase):
+    """VPP narration belongs in the plugin's own log, faults in the event log.
+
+    CliveS asked for the VPP lines out of the Indigo event log on 06-Sep-2026 —
+    there is a lot of it and there will be more, once per event, for ever. The
+    danger in obliging is over-shooting: a fault that stops reaching the event
+    log is invisible to Log_Error_Watch.py, which is the estate's only watcher."""
+
+    def test_routine_narration_does_not_reach_the_event_log(self):
+        with patch.object(plugin, "indigo") as ind, \
+             patch.object(plugin, "_write_plugin_log") as wpl:
+            plugin.vpp_log("[VPP] mode 0x06, battery tops the export up")
+        ind.server.log.assert_not_called()
+        wpl.assert_called_once()
+
+    def test_a_warning_still_reaches_the_event_log(self):
+        """Log_Error_Watch reads the EVENT log and nothing else. A VPP fault that
+        only lands in the plugin's own file is a fault nobody is watching."""
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "_write_plugin_log"):
+            plugin.vpp_log("[VPP] something broke", "WARNING")
+        ind.server.log.assert_called_once()
+
+    def test_an_error_still_reaches_the_event_log(self):
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "_write_plugin_log"):
+            plugin.vpp_log("[VPP] something broke badly", "ERROR")
+        ind.server.log.assert_called_once()
+
+    def test_the_event_log_line_keeps_its_real_level(self):
+        """A string level is silently ignored by indigo.server.log and the line
+        logs as plain Info — the estate-wide bug of 21-Jul-2026. The level must
+        survive the extra hop through vpp_log."""
+        import logging as _l
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "_write_plugin_log"):
+            plugin.vpp_log("[VPP] broke", "ERROR")
+        self.assertEqual(ind.server.log.call_args.kwargs.get("level"), _l.ERROR)
+
+    def test_narration_is_still_kept_not_thrown_away(self):
+        """Quieter, not lost. The whole narrative still lands in the plugin's own
+        daily file, which is where you go when you want it."""
+        with patch.object(plugin, "indigo"), patch.object(plugin, "_write_plugin_log") as wpl:
+            plugin.vpp_log("[VPP] Pre-charge complete")
+        self.assertIn("Pre-charge complete", wpl.call_args.args[1])
+
+    def test_a_recovery_can_be_forced_to_the_event_log(self):
+        """A recovery's warning half went to the event log, so the all-clear must
+        too - otherwise the event log's last word on the subject stays an error,
+        which reads as still broken."""
+        with patch.object(plugin, "indigo") as ind, patch.object(plugin, "_write_plugin_log"):
+            plugin.vpp_log("[VPP] fed again", event=True)
+        ind.server.log.assert_called_once()
+
+    def test_every_vpp_call_site_goes_through_the_wrapper(self):
+        """Structural: one new `log(f"[VPP] ...")` slipped in later would put that
+        line straight back in the event log, and nobody would notice until the
+        log filled up again. 93 call sites were routed; none may drift back."""
+        import re
+        here = os.path.dirname(os.path.abspath(plugin.__file__))
+        src = io.open(os.path.join(here, "plugin.py"), encoding="utf-8").read()
+        stray = re.findall(r'(?<![\w.])log\(\s*f?"\[VPP\]', src)
+        self.assertEqual(stray, [], f"{len(stray)} [VPP] call(s) bypassing vpp_log()")
+        # ...and the scan actually found the call sites, rather than passing
+        # vacuously on a regex that matches nothing.
+        self.assertGreater(len(re.findall(r'vpp_log\(\s*f?"\[VPP\]', src)), 80)
 
 
 if __name__ == "__main__":
