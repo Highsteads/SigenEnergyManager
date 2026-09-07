@@ -102,7 +102,10 @@
         <Label>Gas meter serial:</Label>
     </Field>
     <Field id="gasKwhPerM3" type="textfield" defaultValue="">
-        <Label>Gas calorific factor (kWh per m3, optional — default ~11.19). Set this to the exact figure on your Octopus bill for penny-accurate gas costs.</Label>
+        <Label>Gas calorific factor (kWh per m3, optional):</Label>
+    </Field>
+    <Field id="label_gasKwhPerM3_info" type="label">
+        <Label>Defaults to about 11.19. Set it to the exact figure on your Octopus bill if you want gas costs accurate to the penny.</Label>
     </Field>
     <Field id="gasMeterUnit" type="menu" defaultValue="m3">
         <Label>Gas meter reports in:</Label>
@@ -148,10 +151,16 @@
         <Label>Inverter max charge power (kW):</Label>
     </Field>
     <Field id="dawnSocTarget" type="textfield" defaultValue="15">
-        <Label>Summer resilience buffer (Apr-Sep, %, default 15, minimum 15) — minimum SOC kept overnight on flat-rate tariffs for power-cut protection; also VPP and storm floor:</Label>
+        <Label>Summer resilience buffer (Apr-Sep, %, default 15, min 15):</Label>
+    </Field>
+    <Field id="label_dawnSocTarget_info" type="label">
+        <Label>The minimum battery level kept overnight on flat-rate tariffs, so a power cut does not find the house empty. It is also the floor for VPP windows and storm preparation. Minimum 15.</Label>
     </Field>
     <Field id="winterBufferPct" type="textfield" defaultValue="20">
-        <Label>Winter resilience buffer (Oct-Mar, %, default 20) — raised floor for longer nights and weaker solar; storm warnings can raise further:</Label>
+        <Label>Winter resilience buffer (Oct-Mar, %, default 20):</Label>
+    </Field>
+    <Field id="label_winterBufferPct_info" type="label">
+        <Label>The same floor over the winter months, raised for longer nights and weaker solar. A storm warning can raise it further still.</Label>
     </Field>
     <Field id="batteryHealthCutoff" type="textfield" defaultValue="1">
         <Label>Battery health cutoff floor (%, default 1):</Label>
@@ -208,7 +217,10 @@
         <Label>Axle API token (Bearer):</Label>
     </Field>
     <Field id="axleVppRatePerKwh" type="textfield" defaultValue="1.00" visibleBindingId="axleEnabled" visibleBindingValue="true">
-        <Label>Axle VPP payment rate (GBP per kWh exported during an event, default 1.00) — used for the earnings estimate on the Axle VPP Monitor. Stacks on top of your Octopus export rate:</Label>
+        <Label>Axle VPP payment rate (GBP per kWh, default 1.00):</Label>
+    </Field>
+    <Field id="label_axleVppRatePerKwh_info" type="label">
+        <Label>What Axle pay for each kWh exported during an event. Used for the earnings estimate on the Axle VPP Monitor, and it stacks on top of your ordinary Octopus export rate.</Label>
     </Field>
 
     <Field id="axleScanMail" type="checkbox" defaultValue="false" visibleBindingId="axleEnabled" visibleBindingValue="true">
@@ -217,7 +229,10 @@
     </Field>
 
     <Field id="ledgerStaleDays" type="textfield" defaultValue="7" visibleBindingId="axleEnabled" visibleBindingValue="true">
-        <Label>Warn when the Axle earnings figures have not been imported for this many days (0 turns the warning off). Axle settle a few days behind an event, so 7 catches a feed that has genuinely stopped without complaining about a quiet week:</Label>
+        <Label>Warn if the earnings figures are this many days stale (0 = off):</Label>
+    </Field>
+    <Field id="label_ledgerStaleDays_info" type="label">
+        <Label>Axle settle a few days behind an event, so seven days catches a feed that has genuinely stopped without complaining about a quiet week.</Label>
     </Field>
 
     <Field id="separator_savingsessions" type="separator"/>

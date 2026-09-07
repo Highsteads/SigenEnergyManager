@@ -15,6 +15,38 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.99.1 — 07-09-2026
+
+**NOT ONE CONTROL IN THE CONFIGURE DIALOG WAS ON SCREEN.** All six pop-up buttons measured
+at window-local **x=1425** (System Events, all six identical) in a window whose width is
+**hard-locked at 1041** — `set size` was refused from both 1200 and 2000. Every field,
+checkbox and menu was 384 pt past the right edge, no horizontal scrollbar, green zoom
+button inert, edge-drag scrolls the content instead of resizing. The dialog opened,
+looked normal, and could not be used.
+
+**Cause, straight from `official-plugin-xml.md`:** *"each of those Label elements is right
+aligned and the actual control is left aligned directly to the right of the label"* — so
+the WIDEST control `<Label>` sets the control column for the entire dialog. Five had grown
+into paragraphs: `ledgerStaleDays` 231 chars, `axleVppRatePerKwh` 175, `dawnSocTarget` 163,
+`gasKwhPerM3` 141, `winterBufferPct` 134. Longest now 82 (`siteLocationName`), unchanged.
+
+Prose moved into `type="label"` fields, which the same doc describes as the way "to
+communicate a much longer chunk of text - like instructions". No pref, default, binding or
+code path touched.
+
+**A SIXTH WAS IN `Actions.xml` AND ONLY THE TEST FOUND IT** — `powerKw` on Force Grid
+Export, 140 chars, which pushes that action's own dialog the same way. It was never going
+to be found by looking at PluginConfig.xml, which is where the fault was reported.
+
+New `TestControlLabelsStayShort` in `test_config_xml.py` caps a control label at 100 chars
+and carries the measurement basis in its comment (231 -> x=1425, window max 1041, measured
+07-09-2026). It asserts its own scan found >20 labels first, so it cannot pass vacuously.
+Mutation-checked: a 150-char label turns it red, and the restore is byte-identical.
+
+1265 -> 1267 tests. **The Indigo client caches plugin dialog XML — a client restart is
+needed before the new layout appears.**
+---
+
 ## v5.99.0 — 07-09-2026
 
 **The shared export driver asked a flag that only the VPP state machine ever writes.**

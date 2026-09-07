@@ -117,5 +117,56 @@ class TestCurrentModeTokensMatchDevicesXml(unittest.TestCase):
                          f"currentMode tokens with no <Option> in Devices.xml: {missing}")
 
 
+
+# Indigo right-aligns every control's <Label> and places the control immediately to its
+# right (official-plugin-xml.md: "each of those Label elements is right aligned and the
+# actual control is left aligned directly to the right of the label"). So the WIDEST
+# label sets the control column for the entire dialog, and the dialog window has a hard
+# maximum width — MEASURED 07-09-2026 on this Mac: System Events refused to set the
+# Configure window wider than 1041 pt, from both 1200 and 2000.
+#
+# With a 231-character label present, all six pop-up buttons sat at window-local x=1425
+# (measured via System Events, all six identical) — 384 pt beyond the right edge of a
+# 1041-wide window. Every field, checkbox and menu in the dialog was off-screen, with no
+# horizontal scrollbar and no way to widen it. The dialog opened and could not be used.
+#
+# 100 characters is a deliberately loose cap: the longest label that survives today is 82
+# (siteLocationName / siteArraysJson), and 231 is what broke it. Anything approaching the
+# cap belongs in a type="label" field, which is what those are for — the docs call them a
+# way "to communicate a much longer chunk of text - like instructions".
+MAX_CONTROL_LABEL_CHARS = 100
+
+
+class TestControlLabelsStayShort(unittest.TestCase):
+    """A paragraph used as a control's Label pushes every control off the dialog."""
+
+    def _control_labels(self):
+        found = []
+        for path in XML_FILES:
+            root = ET.parse(path).getroot()
+            for field in root.iter("Field"):
+                if field.get("type") in ("label", "separator"):
+                    continue
+                label = field.find("Label")
+                text = (label.text or "").strip() if label is not None else ""
+                found.append((os.path.basename(path), field.get("id"), text))
+        return found
+
+    def test_there_are_control_labels_to_check(self):
+        """A scan that matches nothing passes every assertion after it."""
+        self.assertGreater(len(self._control_labels()), 20)
+
+    def test_no_control_label_is_a_paragraph(self):
+        too_long = [
+            (f, fid, len(t))
+            for f, fid, t in self._control_labels()
+            if len(t) > MAX_CONTROL_LABEL_CHARS
+        ]
+        self.assertEqual(
+            too_long, [],
+            "These control Labels are long enough to push the control column off the "
+            "dialog — move the prose into a type=\"label\" field below the control:\n"
+            + "\n".join(f"  {f} {fid}: {n} chars" for f, fid, n in too_long))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
