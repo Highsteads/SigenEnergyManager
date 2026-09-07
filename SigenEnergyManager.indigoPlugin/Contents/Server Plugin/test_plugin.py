@@ -167,14 +167,40 @@ class TestDriveVppExport(unittest.TestCase):
 
     TARGET_W = 4000   # maxExportKw 4.0
 
+    # A real solar day (07-Sep-2026): dawn 08:00, last generating slot 19:00 local.
+    # NOON and MIDNIGHT are passed as the clock so the daytime/dark split is decided
+    # by the same code production uses, not by a flag the test sets.
+    NOON     = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)   # 13:00 BST
+    MIDNIGHT = datetime(2026, 9, 7, 23, 30, tzinfo=timezone.utc)  # 00:30 BST, past dusk
+
+    @staticmethod
+    def solar_day_forecast():
+        """_dawn_times + hourly slots for 07-Sep-2026: generating 08:00 to 19:00 local."""
+        return {
+            "_dawn_times": {
+                "2026-09-07": plugin._london_localise(datetime(2026, 9, 7, 8, 0)),
+            },
+            "_hourly_p50_today": {
+                "2026-09-07 08:00:00": 500,
+                "2026-09-07 13:00:00": 5000,
+                "2026-09-07 19:00:00": 520,
+                "2026-09-07 20:00:00": 0,
+            },
+        }
+
     def _mk(self, pv_w, home_w, daytime=True, prev_sub=None, prev_cap=-1):
         p = plugin.Plugin.__new__(plugin.Plugin)
         p.modbus = MagicMock()
+        p.logger = MagicMock()
         p.latest_inverter_data = {"pvPowerWatts": pv_w, "homePowerWatts": home_w}
+        p.latest_forecast_data = self.solar_day_forecast()
         p.pluginPrefs = {"inverterMaxKw": "10.0", "maxExportKw": "4.0"}
-        p.store = {"export_active": True, "vpp_is_daytime": daytime,
+        # vpp_is_daytime is deliberately set to the OPPOSITE of the clock: nothing
+        # may read it any more, and a test that agreed with it could not tell.
+        p.store = {"export_active": True, "vpp_is_daytime": not daytime,
                    "vpp_export_submode": prev_sub, "vpp_bank_charge_cap_w": prev_cap}
         p._trigger_event = lambda *a, **k: None
+        p._now = self.NOON if daytime else self.MIDNIGHT
         return p
 
     def _charge_cap_writes(self, p):
@@ -183,7 +209,7 @@ class TestDriveVppExport(unittest.TestCase):
     def test_high_pv_picks_bank_and_caps_charge(self):
         """Daytime, surplus 8952 >> 4000 -> bank: mode 0x02, charge cap = surplus-target."""
         p = self._mk(pv_w=9630, home_w=678)        # surplus 8952
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "bank")
         p.modbus.set_self_consumption.assert_called_once()
         self.assertEqual(p.store["vpp_bank_charge_cap_w"], 8952 - self.TARGET_W)
@@ -194,7 +220,7 @@ class TestDriveVppExport(unittest.TestCase):
     def test_low_pv_daytime_picks_discharge_0x05(self):
         """Daytime, surplus 1200 < 4000 -> discharge via daytime_export (mode 0x05)."""
         p = self._mk(pv_w=2000, home_w=800)        # surplus 1200
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "discharge")
         p.modbus.daytime_export.assert_called_once()
         p.modbus.set_self_consumption.assert_not_called()
@@ -202,7 +228,7 @@ class TestDriveVppExport(unittest.TestCase):
     def test_dark_window_always_discharge_0x06(self):
         """Dark window -> discharge via night_export (mode 0x06) regardless of PV."""
         p = self._mk(pv_w=0, home_w=600, daytime=False)
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "discharge")
         p.modbus.night_export.assert_called_once()
         p.modbus.daytime_export.assert_not_called()
@@ -210,7 +236,7 @@ class TestDriveVppExport(unittest.TestCase):
     def test_bank_entry_charge_cap_is_surplus_minus_target(self):
         """At the bank entry threshold (surplus = target+HYST) cap = surplus-target, >= 0."""
         p = self._mk(pv_w=4500, home_w=100)        # surplus 4400 = target+HYST -> bank
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "bank")
         self.assertGreaterEqual(p.store["vpp_bank_charge_cap_w"], 0)
         self.assertEqual(p.store["vpp_bank_charge_cap_w"], 400)
@@ -219,25 +245,25 @@ class TestDriveVppExport(unittest.TestCase):
         """In the [target, target+HYST) band with no prior sub-mode, default to
         discharge so the export is guaranteed (don't gamble on self-consumption)."""
         p = self._mk(pv_w=4300, home_w=100)        # surplus 4200, prev None
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "discharge")
 
     def test_hysteresis_holds_submode_in_band(self):
         """In the +/-400W band around target, keep the previous sub-mode (no flap)."""
         # surplus 4100 is within [3600, 4400]; was discharging -> stays discharge
         p = self._mk(pv_w=4900, home_w=800, prev_sub="discharge")   # surplus 4100
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "discharge")
         # same surplus but previously banking -> stays bank
         p2 = self._mk(pv_w=4900, home_w=800, prev_sub="bank", prev_cap=100)
-        p2._drive_vpp_export()
+        p2._drive_vpp_export(p2._now)
         self.assertEqual(p2.store["vpp_export_submode"], "bank")
 
     def test_bank_drops_to_discharge_below_target(self):
         """Latched in bank but surplus fell below target -> discharge, so the
         battery tops the export up (guarantee). Was the <=target-HYST gap."""
         p = self._mk(pv_w=4400, home_w=700, prev_sub="bank", prev_cap=0)   # surplus 3700 < 4000
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         self.assertEqual(p.store["vpp_export_submode"], "discharge")
         p.modbus.daytime_export.assert_called_once()
 
@@ -245,7 +271,7 @@ class TestDriveVppExport(unittest.TestCase):
         """Already banking with a near-identical cap -> no fresh charge-limit write."""
         # surplus 5000 -> cap 1000; prev cap 1100 (within 300 deadband) -> no write
         p = self._mk(pv_w=5800, home_w=800, prev_sub="bank", prev_cap=1100)
-        p._drive_vpp_export()
+        p._drive_vpp_export(p._now)
         p.modbus.set_self_consumption.assert_not_called()   # no sub-mode change
         self.assertEqual(len(self._charge_cap_writes(p)), 0)
 
@@ -1349,13 +1375,15 @@ class TestDriveVppExportStartLatch(unittest.TestCase):
     def test_first_drive_latches_and_fires_exportStarted(self):
         p = plugin.Plugin.__new__(plugin.Plugin)
         p.modbus = MagicMock()
+        p.logger = MagicMock()
         p.latest_inverter_data = {"pvPowerWatts": 9630, "homePowerWatts": 678}
+        p.latest_forecast_data = TestDriveVppExport.solar_day_forecast()
         p.pluginPrefs = {"inverterMaxKw": "10.0", "maxExportKw": "4.0"}
         p.store = {"export_active": False, "vpp_is_daytime": True,
                    "vpp_export_submode": None, "vpp_bank_charge_cap_w": -1}
         fired = []
         p._trigger_event = lambda name: fired.append(name)
-        p._drive_vpp_export()
+        p._drive_vpp_export(TestDriveVppExport.NOON)
         self.assertTrue(p.store["export_active"])
         self.assertIn("exportStarted", fired)
 
@@ -5779,6 +5807,282 @@ class TestTariffDeviceShowsTheActiveTariff(unittest.TestCase):
         self.assertEqual(body.count("self._rate_str("), 11,
                          "every rate field on the device goes through _rate_str")
 
+
+
+class TestExportIsDaylight(unittest.TestCase):
+    """_export_is_daylight — the daylight question asked at DRIVE time.
+
+    _drive_vpp_export used to read store["vpp_is_daytime"], a flag only the VPP
+    state machine ever writes, so every other caller steered on a value left over
+    from the last VPP window. Live cost 07-Sep-2026: a Saving Session drove 0x06
+    with the sun 1h42m off setting and the array read 0 W for 57 minutes.
+    """
+
+    FCAST = None   # set in setUp from the shared solar-day fixture
+
+    def setUp(self):
+        self.FCAST = TestDriveVppExport.solar_day_forecast()
+
+    def _mk(self, forecast, latched=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.latest_forecast_data = forecast
+        p.store = {} if latched is None else {"vpp_is_daytime": latched}
+        return p
+
+    def test_noon_is_daylight(self):
+        p = self._mk(self.FCAST)
+        self.assertTrue(p._export_is_daylight(TestDriveVppExport.NOON))
+
+    def test_past_dusk_is_dark(self):
+        p = self._mk(self.FCAST)
+        self.assertFalse(p._export_is_daylight(TestDriveVppExport.MIDNIGHT))
+
+    def test_before_dawn_is_dark(self):
+        """05:00 BST, three hours before the first generating slot."""
+        p = self._mk(self.FCAST)
+        self.assertFalse(p._export_is_daylight(
+            datetime(2026, 9, 7, 4, 0, tzinfo=timezone.utc)))
+
+    def test_a_stale_latched_flag_cannot_make_night_into_day(self):
+        """THE 07-Sep-2026 FAULT, inverted. The clock decides; the flag is ignored."""
+        p = self._mk(self.FCAST, latched=True)
+        self.assertFalse(p._export_is_daylight(TestDriveVppExport.MIDNIGHT))
+
+    def test_a_stale_latched_flag_cannot_make_day_into_night(self):
+        """The 07-Sep-2026 fault as it actually happened: latched False in daylight."""
+        p = self._mk(self.FCAST, latched=False)
+        self.assertTrue(p._export_is_daylight(TestDriveVppExport.NOON))
+
+    def test_no_forecast_assumes_daylight(self):
+        """Unknown resolves to daylight: 0x05 at night behaves as 0x06, but 0x06 in
+        daylight curtails the array. The costs are not symmetric, so nor is the guess."""
+        for empty in ({}, None, {"_dawn_times": {}, "_hourly_p50_today": {}}):
+            with self.subTest(forecast=empty):
+                p = self._mk(empty)
+                self.assertTrue(p._export_is_daylight(TestDriveVppExport.MIDNIGHT))
+
+    def test_a_forecast_with_no_solar_that_day_is_dark(self):
+        """A forecast that HAS data and says no sun is a real answer, not an absence."""
+        p = self._mk({"_dawn_times": {"2026-01-01": None},
+                      "_hourly_p50_today": {"2026-01-01 12:00:00": 0}})
+        self.assertFalse(p._export_is_daylight(TestDriveVppExport.NOON))
+
+    def test_a_broken_forecast_assumes_daylight(self):
+        """An exception must not fall through to the mode that curtails."""
+        p = self._mk(self.FCAST)
+        p._event_is_daytime = MagicMock(side_effect=ValueError("boom"))
+        self.assertTrue(p._export_is_daylight(TestDriveVppExport.NOON))
+
+
+class TestDriveVppExportUsesTheClockNotTheLatch(unittest.TestCase):
+    """The end-to-end shape of the 07-Sep-2026 curtailment: a Saving Session calling
+    the shared driver with whatever vpp_is_daytime the last VPP window left."""
+
+    def _mk(self, latched, now, pv_w=0, home_w=900):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.modbus = MagicMock()
+        p.logger = MagicMock()
+        p.latest_inverter_data = {"pvPowerWatts": pv_w, "homePowerWatts": home_w}
+        p.latest_forecast_data = TestDriveVppExport.solar_day_forecast()
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "maxExportKw": "4.0"}
+        p.store = {"export_active": True, "vpp_is_daytime": latched,
+                   "vpp_export_submode": None, "vpp_bank_charge_cap_w": -1}
+        p._trigger_event = lambda *a, **k: None
+        p._now = now
+        return p
+
+    def test_daylight_with_a_stale_dark_latch_uses_0x05(self):
+        """07-Sep-2026 exactly: latch False, sun up, low PV. Must NOT pick night_export
+        — 0x06 in daylight is what took the array to zero for 57 minutes."""
+        p = self._mk(latched=False, now=TestDriveVppExport.NOON, pv_w=930)
+        p._drive_vpp_export(p._now)
+        p.modbus.daytime_export.assert_called_once()
+        p.modbus.night_export.assert_not_called()
+
+    def test_dark_with_a_stale_daylight_latch_uses_0x06(self):
+        """The mirror, which is how the flag sits on disk right now (True, from an
+        evening window). Must not claim daylight at half past midnight."""
+        p = self._mk(latched=True, now=TestDriveVppExport.MIDNIGHT)
+        p._drive_vpp_export(p._now)
+        p.modbus.night_export.assert_called_once()
+        p.modbus.daytime_export.assert_not_called()
+
+    def test_daylight_with_ample_pv_still_banks(self):
+        """Bank-surplus is unaffected by the change — it never consulted the latch."""
+        p = self._mk(latched=False, now=TestDriveVppExport.NOON, pv_w=9630, home_w=678)
+        p._drive_vpp_export(p._now)
+        self.assertEqual(p.store["vpp_export_submode"], "bank")
+        p.modbus.set_self_consumption.assert_called_once()
+
+
+class TestDrivenExportOwnsRegisters(unittest.TestCase):
+    """_driven_export_owns_registers — which windows the verify loop must keep out of."""
+
+    def _mk(self, **store):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = store
+        return p
+
+    def test_vpp_active_owns_them(self):
+        self.assertTrue(self._mk(vpp_state=plugin.VPP_ACTIVE)._driven_export_owns_registers())
+
+    def test_vpp_pre_charging_owns_them(self):
+        self.assertTrue(
+            self._mk(vpp_state=plugin.VPP_PRE_CHARGING)._driven_export_owns_registers())
+
+    def test_a_saving_session_owns_them(self):
+        """THE FIX. vpp_state is IDLE through a session, so the old test saw nothing."""
+        self.assertTrue(self._mk(vpp_state=plugin.VPP_IDLE,
+                                 saving_session_export_active=True
+                                 )._driven_export_owns_registers())
+
+    def test_an_idle_plugin_does_not(self):
+        self.assertFalse(self._mk(vpp_state=plugin.VPP_IDLE,
+                                  saving_session_export_active=False
+                                  )._driven_export_owns_registers())
+
+    def test_an_empty_store_does_not(self):
+        self.assertFalse(self._mk()._driven_export_owns_registers())
+
+
+class TestVerifyLeavesASavingSessionAlone(unittest.TestCase):
+    """_verify_ems_registers must not 'correct' the mode or the limits a Saving
+    Session is deliberately holding.
+
+    Without the fix it read expected_mode 0x06 from export_active and overwrote the
+    driver's 0x05 (or 0x02) inside 60 seconds, then put the pinned charge cap back to
+    inverter max — and _drive_vpp_export only writes the mode on a sub-mode CHANGE,
+    so nothing healed it. A silently unpaid window.
+    """
+
+    def _mk(self, ems_mode, charge_w, session=True, submode="discharge"):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "batteryHealthCutoff": "1.0"}
+        p.store = {
+            "vpp_state": plugin.VPP_IDLE,
+            "saving_session_export_active": session,
+            "export_active": True,
+            "vpp_export_submode": submode,
+            "vpp_export_mode": ems_mode,
+            "vpp_bank_charge_cap_w": -1,
+            "vpp_is_daytime": True,
+            "solar_overflow_active": False,
+            "vpp_cutoff_raised": False,
+            "flood_prev_target_soc": None,
+            "import_charge_cutoff_pct": None,
+            "import_active": False,
+        }
+        m = p.modbus = MagicMock()
+        m.connected = True
+        m.read_ems_mode.return_value        = ems_mode
+        m.read_discharge_limit.return_value = 10000
+        m.read_charge_limit.return_value    = charge_w
+        m.read_discharge_cutoff.return_value = 1.0
+        m.read_charge_cutoff.return_value    = 100.0
+        return p
+
+    def test_daytime_discharge_mode_is_left_alone(self):
+        """0x05 + charge pinned 0 — the sub-mode the stale flag SHOULD have picked
+        on 07-Sep. Nothing may write the mode or reopen the charge limit."""
+        p = self._mk(ems_mode=0x05, charge_w=0)
+        p._verify_ems_registers()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+        p.modbus.set_charge_limit.assert_not_called()
+        p.modbus.set_discharge_limit.assert_not_called()
+
+    def test_bank_mode_is_left_alone(self):
+        """0x02 + a charge cap IS the export mechanism in bank. Forcing 0x06 here
+        drains the battery and curtails the roof at the same time."""
+        p = self._mk(ems_mode=0x02, charge_w=4952, submode="bank")
+        p.store["vpp_bank_charge_cap_w"] = 4952
+        p._verify_ems_registers()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+        p.modbus.set_charge_limit.assert_not_called()
+
+    def test_without_a_session_the_mode_is_still_corrected(self):
+        """The guard must not go so wide it stops verify doing its job. No session,
+        export_active True, inverter drifted to 0x02 -> corrected back to 0x06."""
+        p = self._mk(ems_mode=0x02, charge_w=10000, session=False)
+        p._verify_ems_registers()
+        p.modbus.set_remote_ems_mode.assert_called_once_with(0x06)
+
+    def test_a_session_export_is_actually_verified(self):
+        """Left alone is not the same as unwatched: a charge limit that drifted off
+        the pinned 0 under 0x05 must be re-asserted, because an open charge limit in
+        0x05 banks PV instead of selling it (the v5.29.0 failure)."""
+        p = self._mk(ems_mode=0x05, charge_w=10000)
+        p._verify_ems_registers()
+        p.modbus.set_charge_limit.assert_called_once_with(0, quiet=True)
+
+    def test_a_session_mode_drift_is_re_asserted(self):
+        """The inverter fell out of 0x05 on its own — put it back."""
+        p = self._mk(ems_mode=0x05, charge_w=0)
+        p.modbus.read_ems_mode.return_value = 0x02      # drifted
+        p._verify_ems_registers()
+        p.modbus.set_remote_ems_mode.assert_called_once_with(0x05)
+
+
+class TestSavingSessionClaimsTheDriverState(unittest.TestCase):
+    """A Saving Session must reset vpp_export_submode on entry, as VPP entry does.
+
+    _drive_vpp_export writes the mode register ONLY on a sub-mode change, so a
+    session inheriting "discharge" from the previous window writes nothing at all
+    and 'exports' in whatever mode the last hand-back left — 0x02, self-consumption.
+    Asserted from the parsed tree because the branch sits inside _evaluate_and_act,
+    which needs a whole live plugin to reach.
+    """
+
+    @staticmethod
+    def _saving_session_branch():
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(plugin))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            if not (isinstance(node.left, ast.Name) and node.left.id == "action"):
+                continue
+            for c in node.comparators:
+                if isinstance(c, ast.Name) and c.id == "ACTION_SAVING_SESSION":
+                    return node
+        return None
+
+    def test_the_branch_is_found(self):
+        """A search that matches nothing passes every assertion after it."""
+        self.assertIsNotNone(self._saving_session_branch())
+
+    def test_entry_resets_the_driver_submode_before_driving(self):
+        import ast
+        cmp_node = self._saving_session_branch()
+        # The enclosing `elif action == ACTION_SAVING_SESSION:` body.
+        import inspect
+        tree = ast.parse(inspect.getsource(plugin))
+        body = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and node.test is cmp_node:
+                body = node.body
+        if body is None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(cmp_node):
+                    body = node.body
+        self.assertIsNotNone(body, "could not reach the branch body")
+        assigned = set()
+        drive_seen = []
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign):
+                    for tgt in sub.targets:
+                        if (isinstance(tgt, ast.Subscript)
+                                and isinstance(tgt.slice, ast.Constant)):
+                            assigned.add(tgt.slice.value)
+                if (isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == "_drive_vpp_export"):
+                    drive_seen.append(sub)
+        self.assertIn("vpp_export_submode", assigned)
+        self.assertIn("vpp_bank_charge_cap_w", assigned)
+        self.assertTrue(drive_seen, "the branch no longer drives the export")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.2)
-# Date:        07-09-2026 15:10
-# Version:     5.98.2
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.0)
+# Date:        07-09-2026 21:25
+# Version:     5.99.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -5282,6 +5282,17 @@ class Plugin(indigo.PluginBase):
             if not self.store.get("saving_session_export_active"):
                 log(f"[Manager] Saving Session export — {decision.reason}")
                 self.store["saving_session_export_active"] = True
+                # Claim the driver's sub-mode state, exactly as _vpp_transition does
+                # on entry to VPP_ACTIVE. Without this a session inherits whatever
+                # sub-mode the LAST driven window left behind, and _drive_vpp_export
+                # only writes the mode register on a sub-mode CHANGE — so a session
+                # following another session (both "discharge") would write NOTHING
+                # and "export" in whichever mode the previous hand-back left, which
+                # is 0x02 self-consumption. No export, no error, no log line.
+                # A VPP window is unaffected either way: _end_vpp_export and
+                # _vpp_transition(VPP_ACTIVE) both already reset these.
+                self.store["vpp_export_submode"]    = None
+                self.store["vpp_bank_charge_cap_w"] = -1
             self._drive_vpp_export()
 
         elif action == ACTION_HAPPY_HOUR_IMPORT:
@@ -5498,6 +5509,33 @@ class Plugin(indigo.PluginBase):
                 self.modbus.set_charge_cutoff(100.0)
             self._set_import_cutoff(None)
 
+    def _driven_export_owns_registers(self):
+        """True while a self-driven export window owns the mode and limit registers.
+
+        TWO things drive the inverter through _drive_vpp_export — an Axle VPP window
+        and an Octopus Saving Session — and both must be able to hold a mode the
+        verify loop would otherwise "correct". Gating on vpp_state alone saw only
+        the first. A Saving Session leaves vpp_state IDLE with export_active True,
+        so _verify_ems_registers expected 0x06 and would have overwritten a bank
+        (0x02) or daytime-discharge (0x05 + charge 0) window inside 60 seconds, then
+        put the charge cap back to inverter max — and _drive_vpp_export only writes
+        the mode on a sub-mode CHANGE, so nothing would ever have healed it. A
+        silently unpaid window, with one WARNING line to show for it.
+
+        Live near-miss 07-Sep-2026: the session survived only because a stale
+        vpp_is_daytime picked night_export (0x06), the one sub-mode verify agrees
+        with. The persisted flag was left True by that evening's VPP window, so the
+        NEXT session would have picked 0x05 and been fought. Fixed here and in
+        _export_is_daylight together — either alone still loses the window.
+
+        VPP_PRE_CHARGING stays in the list: pre-charge is a grid IMPORT that owns
+        the same registers. The export re-assert itself is additionally gated on
+        export_active, which pre-charge does not set.
+        """
+        if self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE):
+            return True
+        return bool(self.store.get("saving_session_export_active"))
+
     def _verify_ems_registers(self):
         """Read back HOLD_ESS_MAX_DISCHARGE and HOLD_ESS_MAX_CHARGE and correct if wrong.
 
@@ -5537,14 +5575,15 @@ class Plugin(indigo.PluginBase):
             expected_charge_w = inv_max_w
 
         # --- EMS mode ---
-        # Skip during VPP_PRE_CHARGING and VPP_ACTIVE — the VPP state machine and
-        # manager own the inverter mode through the window (self-driven export), so
-        # the verify loop must not overwrite mode 0x06 with our self-consumption
-        # expectation. Normal verification resumes the moment the window ends.
+        # Skip while a self-driven export (VPP window OR Saving Session) owns the
+        # inverter mode, so the verify loop cannot overwrite the driver's 0x02/0x05/
+        # 0x06 with our self-consumption expectation. Normal verification resumes the
+        # moment the window ends. See _driven_export_owns_registers for why the old
+        # vpp_state-only test was not enough.
         mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First",
                       0x05: "Discharge PV First", 0x06: "Discharge ESS First"}
-        _vpp_state = self.store.get("vpp_state", VPP_IDLE)
-        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE):
+        _export_driven = self._driven_export_owns_registers()
+        if not _export_driven:
             # Determine what mode the inverter should be in based on store flags.
             # After a restart all flags are False, so expected_mode = 0x02 (Self Consumption).
             # If the inverter is stuck in 0x06 (Discharge ESS First) from overnight export
@@ -5564,17 +5603,19 @@ class Plugin(indigo.PluginBase):
                     level="WARNING",
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
-        elif _vpp_state == VPP_ACTIVE and self.store.get("export_active"):
+        elif self.store.get("export_active"):
             # v5.91.0: extracted so _log_vpp_snapshot can run the SAME checks
             # on the registers it has already read, instead of only filing them.
             self._verify_vpp_export_registers()
 
         # --- Discharge limit and charge limit ---
-        # Skip during VPP_PRE_CHARGING and VPP_ACTIVE: the self-driven export owns
-        # these registers through the window (night_export sets the discharge limit
-        # to inverter max). A stray write here once caused a brief 2kW grid import
-        # (10-Apr-2026) when the solar_overflow charge cap was written back mid-window.
-        if _vpp_state not in (VPP_PRE_CHARGING, VPP_ACTIVE):
+        # Skip while a self-driven export owns these registers (night_export sets the
+        # discharge limit to inverter max; daytime_export pins the charge limit to 0).
+        # A stray write here once caused a brief 2kW grid import (10-Apr-2026) when the
+        # solar_overflow charge cap was written back mid-window — and writing the charge
+        # limit back to inverter max under a Saving Session's 0x05 would resurrect the
+        # v5.29.0 missed-dispatch failure, which is the other half of this gate.
+        if not _export_driven:
             actual_discharge_w = self.modbus.read_discharge_limit()
             if actual_discharge_w is not None:
                 if abs(actual_discharge_w - expected_discharge_w) > 200:
@@ -5663,8 +5704,10 @@ class Plugin(indigo.PluginBase):
         # The state guard lives HERE rather than at the call sites. It used to be
         # the elif condition in _verify_ems_registers; now that a second caller
         # exists, a check that RE-ASSERTS an export mode must be unable to fire
-        # outside a live export window whoever calls it.
-        if self.store.get("vpp_state", VPP_IDLE) != VPP_ACTIVE:
+        # outside a live export window whoever calls it. It covers a Saving Session
+        # as well as a VPP window — a driven export that nothing verifies is exactly
+        # the gap this function was written to close.
+        if not self._driven_export_owns_registers():
             return
         if not self.store.get("export_active"):
             return
@@ -7881,8 +7924,51 @@ class Plugin(indigo.PluginBase):
             f"(Axle API not required; cutoff-raised="
             f"{self.store.get('vpp_cutoff_raised', False)})")
 
-    def _drive_vpp_export(self):
-        """Self-drive the VPP export, re-evaluated each manager tick during VPP_ACTIVE.
+    def _export_is_daylight(self, now_utc=None):
+        """Is there sun on the roof RIGHT NOW? Picks 0x05 (PV-first) over 0x06 (ESS-first).
+
+        READ AT DRIVE TIME, NEVER LATCHED. _drive_vpp_export used to read
+        store["vpp_is_daytime"], which ONLY the VPP state machine ever writes
+        (_vpp_transition, on entry to VPP_ACTIVE). Every other caller of the driver
+        — today the Octopus Saving Session — therefore steered on a flag left behind
+        by the last VPP window, which can be days old and is not about now at all.
+
+        Live cost, 07-Sep-2026: a Saving Session ran 18:00-19:00 BST with the flag
+        stale-False from a plugin restart, so the driver chose night_export (0x06).
+        PV read 932 W at 17:00:45 UTC and 0 W at 17:01:06 — twenty-one seconds after
+        the mode commit — and stayed at zero for the next 57 minutes, with sunset
+        still 1h42m away. Roughly 0.3-0.5 kWh of free solar thrown away and taken
+        out of the battery instead (estimated from the 932 W measured at the commit
+        decaying to the 25-66 W measured an hour later under 0x05; the uncurtailed
+        case was never run, so it cannot be measured exactly).
+
+        UNKNOWN RESOLVES TO DAYLIGHT, and the asymmetry is the whole argument. The
+        two modes are not equal-and-opposite: daytime_export's own docstring records
+        that at PV == 0 mode 0x05 "behaves exactly like night_export", so guessing
+        daylight in the dark costs nothing whatever, while guessing dark in daylight
+        curtails the array to zero for the length of the window. So a missing
+        forecast must not fall through to 0x06. (_event_is_daytime keeps its own
+        night-is-safe fallback: its other callers ask a different question — what
+        the discharge floor should be, and whether a zero-PV window deserves a
+        "curtailed" verdict — where an unwarranted daylight answer is the costly one.)
+
+        The latched store flag is left alone: the post-window summary wants
+        "was this a daylight window", decided once, and that is a fair question.
+        """
+        fcast = self.latest_forecast_data or {}
+        if not fcast.get("_dawn_times") and not fcast.get("_hourly_p50_today"):
+            return True   # no forecast to reason from — assume sun, the cheap error
+        try:
+            return bool(self._event_is_daytime(now_utc or datetime.now(timezone.utc)))
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Daylight check failed ({exc}) — assuming daylight")
+            return True
+
+    def _drive_vpp_export(self, now_utc=None):
+        """Self-drive the export, re-evaluated each manager tick while a window runs.
+
+        Driven by BOTH the VPP state machine (ACTION_VPP_EXPORT) and an Octopus
+        Saving Session (ACTION_SAVING_SESSION) — the name is historical.
 
         Two sub-modes, chosen from live PV vs the export target:
 
@@ -7910,7 +7996,7 @@ class Plugin(indigo.PluginBase):
         first      = not self.store.get("export_active")
         inv_max_w  = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
         target_w   = int(_as_float(self.pluginPrefs.get("maxExportKw"), 4.0) * 1000)
-        daytime    = bool(self.store.get("vpp_is_daytime"))
+        daytime    = self._export_is_daylight(now_utc)
 
         inv       = self.latest_inverter_data or {}
         pv_w      = int(inv.get("pvPowerWatts", 0))

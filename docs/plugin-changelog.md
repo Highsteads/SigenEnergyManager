@@ -15,6 +15,56 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.99.0 — 07-09-2026
+
+**The shared export driver asked a flag that only the VPP state machine ever writes.**
+`_drive_vpp_export` read `store["vpp_is_daytime"]`, set exactly once, in
+`_vpp_transition` on entry to `VPP_ACTIVE`. `ACTION_SAVING_SESSION` calls the same
+driver, so a session steered on the last VPP window's answer — days old, and about a
+different hour.
+
+Live cost, 07-Sep-2026: the session ran 18:00-19:00 BST with the flag stale-False from
+the 15:12 restart, so the driver chose `night_export` (0x06). PV read **932 W at
+17:00:45 UTC and 0 W at 17:01:06** — twenty-one seconds after the mode commit — and
+stayed at zero for 57 minutes, with sunset at 18:42 UTC. Roughly 0.3-0.5 kWh curtailed
+(estimated from the 932 W at the commit decaying to the 25-66 W measured an hour later
+under 0x05; the uncurtailed case was never run, so it cannot be measured exactly).
+
+New `_export_is_daylight(now_utc=None)`, read at drive time, never latched.
+`_drive_vpp_export(now_utc=None)` takes the clock so a test can drive it.
+**UNKNOWN RESOLVES TO DAYLIGHT** — the modes are not symmetric: `daytime_export`'s own
+docstring records that at PV == 0 mode 0x05 behaves exactly as 0x06, so guessing
+daylight in the dark costs nothing and guessing dark in daylight costs the array.
+`_event_is_daytime` keeps its night-is-safe fallback; its other callers ask a different
+question (the discharge floor, and whether a zero-PV window earns a "curtailed"
+verdict) where the unwarranted daylight answer is the expensive one. The latched flag
+stays for the post-window summary, which fairly asks "was this a daylight window".
+
+**AND THE VERIFY LOOP WOULD HAVE FOUGHT THE FIX.** `_verify_ems_registers` gated on
+`vpp_state in (VPP_PRE_CHARGING, VPP_ACTIVE)`. A Saving Session leaves `vpp_state` IDLE
+with `export_active` True, so it expected 0x06 and would have overwritten a bank (0x02)
+or daytime-discharge (0x05 + charge 0) window inside 60 s, then put the pinned charge
+cap back to inverter max — the v5.29.0 missed-dispatch failure, reached by a new door.
+`_drive_vpp_export` only writes the mode on a sub-mode CHANGE, so nothing would have
+healed it: a silently unpaid window with one WARNING line. New
+`_driven_export_owns_registers()` is the one owner of that question, used by both the
+skip gates and by `_verify_vpp_export_registers`, which had the same blind spot and so
+was not checking a session's registers at all. **Either fix alone still loses the
+window** — the daylight fix would have chosen 0x05 and the verify loop would have taken
+it away.
+
+**Third, same family:** the `ACTION_SAVING_SESSION` branch never claimed the driver's
+sub-mode state the way `_vpp_transition(VPP_ACTIVE)` does, so a session following
+another session (both "discharge") would write NO mode at all and "export" in whatever
+the last hand-back left — 0x02. Not persisted, so a restart hid it; 07-Sep worked
+because the 15:12 restart had cleared it.
+
+1242 -> 1265 tests. 9/9 mutations killed, `__pycache__` cleared before every run.
+The existing `_drive_vpp_export` fixtures now carry a real forecast and a real clock,
+with `vpp_is_daytime` set to the OPPOSITE of the truth so a regression to the latch
+cannot pass.
+---
+
 ## v5.98.2 — 07-09-2026
 
 **Third site of the same bug, found by the same rehearsal.** `_update_tariff_device` also did

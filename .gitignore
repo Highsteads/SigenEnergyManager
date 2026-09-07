@@ -17,3 +17,7 @@ CLAUDE.md
 # pytest cache
 .pytest_cache/
 **/.pytest_cache/
+
+# ruff cache — a runtime artefact; it appeared inside the bundle on 07-Sep-2026
+.ruff_cache/
+**/.ruff_cache/
