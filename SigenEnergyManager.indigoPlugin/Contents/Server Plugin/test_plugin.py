@@ -5647,5 +5647,92 @@ class TestSettlementDivergence(unittest.TestCase):
                      self._warn(self._p([self._ev(ours=None, paid=0.036)]))):
             self.assertEqual([c for c in msgs[0] if ord(c) > 127], [])
 
+# ======================================================================
+# v5.98.1 — the displayed rate follows the ACTIVE tariff
+#
+# Found by switching the v5.98.0 Agile override on for real: the status line
+# read monitored["tracker"] whatever the tariff was, so on Agile it printed
+# "today: Nonep" for ever, and its change-detector compared None against None
+# so it went nearly silent. _build_tariff_data had been fixed for exactly this
+# and carried a comment warning about it; the log line 40 lines away had not.
+# ======================================================================
+
+_AGILE_RATES = {
+    "tariff_info": {"tariff_key": "agile", "display_name": "Octopus Agile"},
+    "agile":       {"today_p": 16.842},
+    "agile_slots": [(datetime(2026, 9, 7, 13, 0, tzinfo=timezone.utc), 16.842)] * 46,
+    # The Tracker bucket is NOT filled when Tracker is not active. If it ever is,
+    # reading it on Agile shows a price from a tariff the house is not on.
+    "tracker":     {},
+}
+_TRACKER_RATES = {
+    "tariff_info": {"tariff_key": "tracker", "display_name": "Octopus Tracker"},
+    "tracker":     {"today_p": 29.0115, "tomorrow_p": 26.208},
+}
+
+
+class TestRatesFollowActiveTariff(unittest.TestCase):
+
+    def test_agile_shows_the_current_half_hour_not_tracker(self):
+        today, tomorrow = plugin.Plugin._rates_for_tariff("agile", _AGILE_RATES)
+        self.assertAlmostEqual(today, 16.842)
+        self.assertIsNone(tomorrow, "Agile has no single tomorrow rate")
+
+    def test_agile_never_reads_the_tracker_bucket(self):
+        # The dangerous case: Tracker data present while Agile is active.
+        rates = dict(_AGILE_RATES, tracker={"today_p": 29.0115, "tomorrow_p": 26.208})
+        today, tomorrow = plugin.Plugin._rates_for_tariff("agile", rates)
+        self.assertAlmostEqual(today, 16.842)
+        self.assertNotAlmostEqual(today, 29.0115)
+        self.assertIsNone(tomorrow)
+
+    def test_tracker_still_shows_both_days(self):
+        today, tomorrow = plugin.Plugin._rates_for_tariff("tracker", _TRACKER_RATES)
+        self.assertAlmostEqual(today, 29.0115)
+        self.assertAlmostEqual(tomorrow, 26.208)
+
+    def test_flexible_is_flat_so_tomorrow_is_none(self):
+        rates = {"flexible": {"today_p": 24.5}, "tracker": {"today_p": 29.0}}
+        today, tomorrow = plugin.Plugin._rates_for_tariff("flexible", rates)
+        self.assertAlmostEqual(today, 24.5)
+        self.assertIsNone(tomorrow)
+
+    def test_absent_rates_give_none_not_a_wrong_number(self):
+        for key in ("agile", "tracker", "flexible"):
+            today, tomorrow = plugin.Plugin._rates_for_tariff(key, {})
+            self.assertIsNone(today, key)
+            self.assertIsNone(tomorrow, key)
+
+    def test_build_tariff_data_and_the_log_line_share_one_owner(self):
+        # Both must go through _rates_for_tariff or they drift apart again, which
+        # is the whole bug. Assert the source calls it exactly twice.
+        src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "plugin.py"), encoding="utf-8").read()
+        self.assertEqual(src.count("self._rates_for_tariff("), 2,
+                         "both _build_tariff_data and the status line must use the helper")
+        self.assertNotIn('tracker    = monitored.get("tracker", {})', src,
+                         "the status line must not read the Tracker bucket directly")
+
+
+class TestAgileStatusLineDoesNotFlood(unittest.TestCase):
+    """On Agile the price moves every half hour, so it must not gate the log line."""
+
+    # Drives the REAL guard. The first version of this class re-implemented it
+    # locally, so a mutation of the shipped code survived untouched.
+    _changed = staticmethod(plugin.Plugin._tariff_line_changed)
+
+    def test_agile_price_change_alone_does_not_log(self):
+        self.assertFalse(self._changed("agile", 21.5, "agile", 16.842))
+
+    def test_agile_still_logs_when_the_tariff_key_changes(self):
+        self.assertTrue(self._changed("agile", 16.842, "tracker", 29.0115))
+
+    def test_tracker_still_logs_on_its_daily_rate_change(self):
+        self.assertTrue(self._changed("tracker", 26.208, "tracker", 29.0115))
+
+    def test_tracker_does_not_log_when_nothing_moved(self):
+        self.assertFalse(self._changed("tracker", 29.0115, "tracker", 29.0115))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

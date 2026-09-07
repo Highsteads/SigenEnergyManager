@@ -15,6 +15,37 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.98.1 — 07-09-2026
+
+**The rehearsal found a real bug within four minutes, which is the whole point of it.**
+Switched `tariffOverride` to `agile` on the live system and the status line read
+`[Octopus] Tariff: Octopus Agile (forced) (AGILE-24-10-01), today: Nonep, tomorrow: Nonep`.
+
+`_refresh_rates` did `tracker = monitored.get("tracker", {})` and took the displayed price
+from there **whatever the active tariff was**. `_build_tariff_data`, forty lines away, had
+already been fixed for exactly this and carried a comment saying that falling through to
+the Tracker branch "would display a price from a tariff we are not on" — the log line never
+got the same treatment. Two consequences on real Agile, not just under the override:
+- the price shows as `None` for ever, because the Tracker bucket is not filled when Tracker
+  is not the active tariff;
+- worse, the change-detector compares `None != None`, so the line effectively stops
+  reporting. Had the Tracker bucket been populated it would have printed a Tracker price
+  beside an Agile tariff name, which is the failure the existing comment warns about.
+
+Fixed by giving the choice ONE owner: `Plugin._rates_for_tariff(tariff_key, rates)`, used by
+both `_build_tariff_data` and the status line. A test asserts the source calls it exactly
+twice and that the direct Tracker read is gone, so they cannot drift apart again.
+
+`_tariff_line_changed` lifted out too, and that was a finding about the TEST rather than the
+code: the first flood test re-implemented the guard locally, so mutating the shipped code
+left it green. Extracted and pointed at the real function. On Agile the price moves every
+half hour by design, so the key alone gates the line — otherwise 48 entries a day in the
+event log. The line now reads `now 16.842p (this half-hour), 46 slots held`.
+
+1221 -> 1231 tests, 5/5 mutations killed after the survivor was fixed.
+
+---
+
 ## v5.98.0 — 07-09-2026
 
 **A tariff can now be rehearsed before it is switched to.** The Agile path has existed since

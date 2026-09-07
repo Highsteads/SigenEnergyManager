@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.0)
-# Date:        07-09-2026 14:03
-# Version:     5.98.0
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.1)
+# Date:        07-09-2026 15:01
+# Version:     5.98.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -5105,29 +5105,51 @@ class Plugin(indigo.PluginBase):
         return self._window_of_direction(
             SAVING_SESSION_TURN_DOWN, "savingSessionExport", now_utc)
 
+    @staticmethod
+    def _rates_for_tariff(tariff_key, rates):
+        """(today_p, tomorrow_p) for the ACTIVE tariff — the one owner of that choice.
+
+        Extracted in v5.98.1. _build_tariff_data already selected per tariff and
+        carried a comment warning that falling through to the Tracker branch
+        "would display a price from a tariff we are not on" — and the status log
+        line 40 lines away did exactly that, reading monitored["tracker"] whatever
+        the tariff was. Caught the first time the Agile override was switched on:
+        it printed "today: Nonep" because the Tracker bucket is not filled when
+        Tracker is not the active tariff. One intent, one function.
+        """
+        if tariff_key == TARIFF_FLEXIBLE:
+            return rates.get(TARIFF_FLEXIBLE, {}).get("today_p"), None
+        if tariff_key == TARIFF_AGILE:
+            # Agile has 48 prices a day, so "today's rate" is the slot in force right
+            # now (octopus_api fills it). There is no single tomorrow rate.
+            return rates.get(TARIFF_AGILE, {}).get("today_p"), None
+        tracker = rates.get(TARIFF_TRACKER, {})
+        return tracker.get("today_p"), tracker.get("tomorrow_p")
+
+    @staticmethod
+    def _tariff_line_changed(tariff_key, today_rate, last_key, last_rate):
+        """Should the status line speak? Lifted out in v5.98.1 so a test can drive it.
+
+        On Agile the price moves every half hour BY DESIGN, so gating on it would
+        put 48 lines a day in the event log. The tariff key alone gates it there;
+        the live slot price is on the device and the dashboard. Left inline in
+        _refresh_rates this was reachable only by a structural assertion, and a
+        mutation walked straight through it.
+        """
+        if tariff_key != last_key:
+            return True
+        if tariff_key == TARIFF_AGILE:
+            return False
+        return today_rate != last_rate
+
     def _build_tariff_data(self):
         """Build a TariffData object from the latest Octopus rates."""
         rates       = self.latest_rates_data
         tariff_info = rates.get("tariff_info", {})
         tariff_key  = tariff_info.get("tariff_key", TARIFF_TRACKER)
 
-        tracker  = rates.get(TARIFF_TRACKER, {})
-        tou      = rates.get(tariff_key, {})     # cheap window data for Go/Flux/iGo/iFlux
-
-        # today_rate_p: use the active tariff's rate, not always Tracker.
-        # Flexible is a flat rate — no tomorrow rate.
-        if tariff_key == TARIFF_FLEXIBLE:
-            today_rate_p    = rates.get(TARIFF_FLEXIBLE, {}).get("today_p")
-            tomorrow_rate_p = None
-        elif tariff_key == TARIFF_AGILE:
-            # Agile has 48 prices a day, so "today's rate" is the slot in force right now
-            # (octopus_api fills it). There is no single tomorrow rate. Falling through to
-            # the Tracker branch here would display a price from a tariff we are not on.
-            today_rate_p    = rates.get(TARIFF_AGILE, {}).get("today_p")
-            tomorrow_rate_p = None
-        else:
-            today_rate_p    = tracker.get("today_p")
-            tomorrow_rate_p = tracker.get("tomorrow_p")
+        tou = rates.get(tariff_key, {})          # cheap window data for Go/Flux/iGo/iFlux
+        today_rate_p, tomorrow_rate_p = self._rates_for_tariff(tariff_key, rates)
 
         return TariffData(
             tariff_key      = tariff_key,
@@ -5871,21 +5893,28 @@ class Plugin(indigo.PluginBase):
             self._write_tariff_schedule_variables(tariff_info, monitored)
 
             # Log on first fetch or when tariff / rate changes; also in debug mode
-            tracker    = monitored.get("tracker", {})
             tariff_key = tariff_info.get("tariff_key", "?")
-            today_rate = tracker.get("today_p")
+            today_rate, tomorrow_rate = self._rates_for_tariff(tariff_key, monitored)
             with self._state_lock:   # v5.45.0: fetch unlocked, store merge locked
-                _changed   = (tariff_key != self.store.get("_last_tariff_key")
-                              or today_rate != self.store.get("_last_tariff_rate"))
+                _changed = self._tariff_line_changed(
+                    tariff_key, today_rate,
+                    self.store.get("_last_tariff_key"),
+                    self.store.get("_last_tariff_rate"))
                 if _changed:
                     self.store["_last_tariff_key"]  = tariff_key
                     self.store["_last_tariff_rate"] = today_rate
             if _changed or self.debug:
+                _now  = f"{today_rate:.3f}p" if today_rate is not None else "not published"
+                if tariff_key == TARIFF_AGILE:
+                    _slots = len(monitored.get("agile_slots", []))
+                    _tail  = f"now {_now} (this half-hour), {_slots} slots held"
+                else:
+                    _tmrw  = (f"{tomorrow_rate:.3f}p" if tomorrow_rate is not None
+                              else "not published yet")
+                    _tail  = f"today {_now}, tomorrow {_tmrw}"
                 log(
                     f"[Octopus] Tariff: {tariff_info.get('display_name', tariff_key)} "
-                    f"({tariff_info.get('product_code', '?')}), "
-                    f"today: {today_rate}p, "
-                    f"tomorrow: {tracker.get('tomorrow_p', 'TBD')}p"
+                    f"({tariff_info.get('product_code', '?')}) — {_tail}"
                 )
 
         except Exception as e:
