@@ -15,6 +15,150 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.98.0 — 07-09-2026
+
+**A tariff can now be rehearsed before it is switched to.** The Agile path has existed since
+v5.44.0 and had never run once: `agile_slots` only populates when the LIVE account is already
+on Agile (`octopus_api.py`, the `tariff_key == TARIFF_AGILE` gate), so the first execution of
+detection, the half-hourly fetch, the planner and the dashboard would all have been on the
+first morning of being billed for it. That is the wrong morning to find a fault.
+
+New `tariffOverride` pref (menu, default `auto`) and an `OctopusAPI(tariff_override=...)`
+kwarg. When set, `get_current_tariff()` short-circuits to `_forced_tariff_info()`.
+
+**The forced tariff resolves its OWN product code, and that is the whole design.** Reusing
+the detected code would leave a Tracker product under an `agile` key, and
+`get_active_tariff_schedule()` would then fetch Tracker rates and label them Agile — a
+silently wrong number, which is the failure class this file is full of. The exception is
+forcing the tariff already active, where the detected codes ARE the right ones: Tracker is
+delisted from the public products listing, so the prefix probe cannot find it, and without
+that branch forcing `tracker` would resolve to nothing.
+
+Guards, each earned:
+- An unrecognised string is IGNORED with a warning, never honoured. A typo must not select a
+  planner branch.
+- `TARIFF_UNKNOWN` is absent from `TARIFF_OVERRIDE_CHOICES`. Forcing it would pick the branch
+  that imports immediately at half inverter power, which is a fallback and never a choice.
+- An unresolvable product warns rather than pretending; the planner then takes its no-rates
+  branch honestly.
+- `detected_key` / `detected_product_code` carry the REAL agreement alongside the forced one,
+  so the log can say what is billed as well as what is being rehearsed.
+- `display_name` gains "(forced)" and a WARNING is logged at every start and every prefs save
+  (`_log_tariff_override_setting`, modelled on `_log_bank_first_setting`). An override quietly
+  left on is worse than none, so the armed state is observable without reading the config.
+
+Billing is untouched: the Kraken financials path still reads the real agreement, because that
+is what Octopus charges. `TARIFF_DISPLAY_NAMES` hoisted out of `_detect_tariff_from_account()`
+so detection and the override name a tariff identically.
+
+New config section has its own `separator_tariff` — v5.87.1 is the reminder that a block
+appended without one draws under the previous heading.
+
+1216 -> 1227 tests (11 new), 5/5 mutations killed with `__pycache__` cleared before every run
+and the source restored byte-identical. The first run of the suite was a TEST fault, not a
+code one: the mock logger was attached after `__init__` had already validated the override, so
+the constructor's warning went to the real logger and the assertion could never see it.
+
+---
+
+## v5.97.0 — 06-09-2026
+
+**Settlement tripwire.** On 21-05-2026 a BST/UTC mix-up drove the export a full hour late;
+Axle settled 0.036 kWh and only the two-minute pre-roll earned anything. Nothing compared what
+was driven against what was paid, so it surfaced weeks later when CliveS read the email.
+
+**The first implementation could not have caught it, and the adversarial pass found that before
+it shipped.** It compared our in-window export against Axle's settled figure — both integrate
+the SAME hour, so a mis-timed export makes both fall together and agree. Against the real
+11-Aug over-run on disk (7.05 kWh driven, 3.05 outside the window) it returns 0.198 kWh, dead
+centre of the healthy band. A meter-agreement check wearing a timing check's name, and worse
+than nothing, because its silence reads as confidence.
+
+Rewritten around how much of what was driven landed inside the paid hour. Measured over the
+eight driven events on disk, healthy is 92.5-97.0%; 11-Aug was 56.7%. Gate is
+`gap >= 0.8 kWh AND inside < 85%`, both halves mutation-proven load-bearing. Proportional on
+purpose — a 30-minute event is worth at most 2 kWh at the DNO cap, so any flat threshold
+clearing the noise would swallow it whole. Latched per window, ignores anything over 45 days
+old. 1211 -> 1214 tests, 11/11 mutations killed. Live: flags exactly one event, correctly.
+
+---
+
+## v5.96.0 — 06-09-2026
+
+**VPP narration out of the Indigo event log.** CliveS: *"remove the Axle VPP lines, they are
+going to grow and i dont need to see them"*. The growth was real — a line for every
+announcement, pre-charge step, mode change, ledger write and summary, once per event, for ever.
+The event log is the estate's dashboard, not this plugin's diary.
+
+New module-level `vpp_log()`. INFO goes only to the plugin's own daily file via the extracted
+`_write_plugin_log()`; **WARNING and ERROR still reach the event log**, because that is the only
+place `Log_Error_Watch.py` can see them, and a VPP failure nothing surfaces is exactly the
+silence the other guards exist to end. All 93 `[VPP]` call sites swept through it, so the
+routing is ONE decision rather than 69 judgements at the call sites.
+
+`event=True` forces a single INFO line to the event log, used only for RECOVERY messages: their
+warning half went there, so sending the all-clear elsewhere would leave the event log's last
+word an error, which reads as still broken.
+
+**Both hourly nags removed.** The ledger-staleness warning had been modelled on the events-feed
+guard, which is fair to repeat because that feed can recover on its own — a ledger only a person
+can feed cannot. Once, on change, with live state on the device. A structural test forbids any
+`[VPP]` line bypassing the wrapper and asserts its own scan matched over 80 sites, so it cannot
+pass vacuously. 1192 -> 1199 tests, 6/6 mutations killed.
+
+---
+
+## v5.95.0 — 05-09-2026
+
+**Reads the settlement mail from the local Apple Mail store.** CliveS corrected a wrong
+assumption: he does not use Email+ or the indigo@highsteads.co.uk account at all. The whole
+IMAP-and-forwarding plan was built on my mistake, and none of it was needed.
+
+Verified live: an Indigo plugin host CAN read `~/Library/Mail` — it has Full Disk Access, and
+Apple Mail has already downloaded the messages, so the fetch is a file read. No mailbox login,
+no credential anywhere, no forwarding rule, no Email+ device, and no trigger to build in the
+client.
+
+`iter_settlement_messages()` walks `~/Library/Mail/V*` — globbed, because V10 becomes V11 at
+some macOS release and a pinned path would silently stop finding anything. Two cheap filters
+before any parsing, since this runs on the plugin's only thread: an mtime window, then a 4 KB
+byte prefilter on sender and subject. Measured: 16,276 messages -> 621 recent -> 13 hits in
+1.64 s.
+
+`_scan_axle_mail()` on a 6 h tick, deliberately BEFORE the ledger freshness check so an import
+clears the staleness warning on the same pass rather than leaving the log contradicting itself.
+No seen-set: the merge is window-keyed so re-reading is free, and no bookkeeping means no
+bookkeeping to drift. **Opt-in, default false** — this plugin is published, and reading
+someone's personal mail store must never begin on an upgrade. 1179 -> 1192 tests, 10/10
+mutations killed; one survived the first pass because the "corrupt message" fixture lacked the
+Axle markers, so the PREFILTER rejected it before the parser was ever reached.
+
+---
+
+## v5.94.0 — 05-09-2026
+
+**Parser tested against all 13 real settlement emails**, harvested read-only from the local Mail
+store. Yesterday's parser was built from ONE specimen, and the real corpus uses THREE templates.
+
+**It found a 250x bug shipped in 5.93.0.** When an event exports almost nothing, Axle's "this is
+less than we hoped" template states the kWh in words and no event money at all — and the only
+pound figure in the body is the boilerplate minimum-earnings guarantee. The loose `_RE_GBP`
+fallback read that as the event's earnings: on the real 21-May-2026 mail it produced GBP 10.00
+for an event Axle settled at 4p. Money now comes only from the rate line or the phrase "you
+earned", neither of which can reach the boilerplate, and a regression test carries the real
+wording.
+
+Also from the real data: a nil event is filed as a genuine 0 kWh / 0p row, which is what Axle
+themselves record; `_window_for_event_date` falls back to Axle's own events list so a settlement
+for an event the plugin did not drive can still be filed; and the low-export template is REFUSED
+rather than guessed at, because computing it from the configured rate would break the rule that
+Axle's figures are taken verbatim and never derived here.
+
+Result: 12 of 13 parse, and **12 of 12 agree exactly with Axle's settled figures**. The 13th
+refuses honestly. 1173 -> 1177 tests, 17/17 mutations killed.
+
+---
+
 ## v5.93.0 — 05-09-2026
 
 **The settlement email files itself.** Built against a REAL specimen — the 16-Aug-2026 mail,

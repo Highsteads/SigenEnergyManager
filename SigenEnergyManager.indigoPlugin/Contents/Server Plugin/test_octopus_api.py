@@ -752,5 +752,113 @@ class TestSavingSessionsPartialFailure(unittest.TestCase):
         self.assertTrue(data["has_joined"])
 
 
+# ======================================================================
+# v5.98.0 — manual tariff override
+#
+# The override exists so an unswitched tariff can be REHEARSED. Every test below
+# is written from the consequence rather than the code: "a forced tariff must not
+# borrow the detected tariff's product code" is the bug that would make
+# get_active_tariff_schedule() fetch Tracker rates and label them Agile.
+# ======================================================================
+
+_TRACKER_DETECTED = {
+    "tariff_key":   octopus_api.TARIFF_TRACKER,
+    "tariff_code":  "E-1R-SILVER-26-04-01-F",
+    "product_code": "SILVER-26-04-01",
+    "display_name": "Octopus Tracker",
+}
+
+
+def _override_api(override, detected=None, probe="AGILE-24-10-01"):
+    """Client with detection and the public product probe both stubbed."""
+    # The logger must be injected at CONSTRUCTION: the override is validated in
+    # __init__, so a mock attached afterwards misses that warning entirely.
+    api = octopus_api.OctopusAPI(api_key="k", account_id="A", mpan="m", serial="s",
+                                 tariff_override=override, logger=MagicMock())
+    api._detect_tariff_from_account = MagicMock(
+        return_value=dict(detected) if detected else dict(_TRACKER_DETECTED))
+    api._detect_tariff_from_kraken = MagicMock(return_value=None)
+    api._probe_product_by_prefix = MagicMock(return_value=probe)
+    return api
+
+
+class TestTariffOverride(unittest.TestCase):
+
+    def test_absent_override_detects_normally(self):
+        for value in ("", "auto", "none", "  AUTO  ", None):
+            api = _override_api(value)
+            self.assertEqual(api.tariff_override, "")
+            self.assertEqual(api.get_current_tariff()["tariff_key"],
+                             octopus_api.TARIFF_TRACKER)
+
+    def test_unrecognised_override_is_ignored_and_warned(self):
+        api = _override_api("agilee")
+        self.assertEqual(api.tariff_override, "")
+        self.assertEqual(api.get_current_tariff()["tariff_key"],
+                         octopus_api.TARIFF_TRACKER)
+        self.assertTrue(api.logger.warning.called)
+
+    def test_unknown_may_not_be_forced(self):
+        # Forcing "unknown" would select the import-now-at-half-power branch.
+        self.assertNotIn(octopus_api.TARIFF_UNKNOWN,
+                         octopus_api.TARIFF_OVERRIDE_CHOICES)
+        self.assertEqual(_override_api("unknown").tariff_override, "")
+
+    def test_forced_agile_reports_agile(self):
+        info = _override_api("agile").get_current_tariff()
+        self.assertEqual(info["tariff_key"], octopus_api.TARIFF_AGILE)
+        self.assertTrue(info["overridden"])
+        self.assertIn("forced", info["display_name"].lower())
+
+    def test_forced_tariff_never_borrows_the_detected_product_code(self):
+        # THE bug this design exists to prevent: Tracker's product code under an
+        # Agile key makes the active-schedule fetch return Tracker rates as Agile.
+        info = _override_api("agile").get_current_tariff()
+        self.assertEqual(info["product_code"], "AGILE-24-10-01")
+        self.assertNotEqual(info["product_code"], _TRACKER_DETECTED["product_code"])
+        self.assertIn("AGILE", info["tariff_code"])
+
+    def test_the_real_agreement_is_still_reported(self):
+        info = _override_api("agile").get_current_tariff()
+        self.assertEqual(info["detected_key"], octopus_api.TARIFF_TRACKER)
+        self.assertEqual(info["detected_product_code"], "SILVER-26-04-01")
+
+    def test_forcing_the_active_tariff_reuses_its_real_codes(self):
+        # Tracker is delisted from the public products listing, so the prefix probe
+        # returns nothing; forcing it must still yield a usable product code.
+        api  = _override_api("tracker", probe=None)
+        info = api.get_current_tariff()
+        self.assertEqual(info["product_code"], "SILVER-26-04-01")
+        self.assertEqual(info["tariff_code"], "E-1R-SILVER-26-04-01-F")
+        self.assertFalse(api.logger.warning.called)
+
+    def test_unresolvable_product_warns_rather_than_pretending(self):
+        api  = _override_api("agile", probe=None)
+        info = api.get_current_tariff()
+        self.assertEqual(info["tariff_key"], octopus_api.TARIFF_AGILE)
+        self.assertEqual(info["product_code"], "")
+        self.assertEqual(info["tariff_code"], "")
+        self.assertTrue(api.logger.warning.called)
+
+    def test_override_wins_over_a_cached_detected_tariff(self):
+        # A cache populated before the override was set must not be served.
+        api = _override_api("agile")
+        api._tariff_cache    = dict(_TRACKER_DETECTED)
+        api._tariff_cache_at = 9e9
+        self.assertEqual(api.get_current_tariff()["tariff_key"],
+                         octopus_api.TARIFF_AGILE)
+
+    def test_result_is_cached_between_calls(self):
+        api = _override_api("agile")
+        api.get_current_tariff()
+        api.get_current_tariff()
+        self.assertEqual(api._probe_product_by_prefix.call_count, 1)
+
+    def test_every_choice_has_a_display_name(self):
+        for key in octopus_api.TARIFF_OVERRIDE_CHOICES:
+            self.assertIn(key, octopus_api.TARIFF_DISPLAY_NAMES)
+
+
+
 if __name__ == "__main__":
     unittest.main()

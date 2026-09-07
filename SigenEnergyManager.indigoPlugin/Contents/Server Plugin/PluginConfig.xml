@@ -392,6 +392,27 @@ Guards, all automatic: it only ever runs for a session you have actually opted i
         <Label>During an active storm warning, export is held off so the battery banks charge ahead of a possible power cut — but only while it is below this percentage. At or above it the reserve is already banked, so export resumes (Solar Overflow throttles the charge and pushes surplus to grid) rather than ramming the battery to 100% and clipping every watt of PV above your export cap. Never drops below the storm reserve target (50% yellow / 80% amber-red). Default 85.</Label>
     </Field>
 
+    <Field id="separator_tariff" type="separator"/>
+    <Field id="tariffOverrideHeading" type="label" fontColor="darkgray">
+        <Label>TARIFF OVERRIDE (rehearsal only)</Label>
+    </Field>
+    <Field id="tariffOverride" type="menu" defaultValue="auto">
+        <Label>Plan as though the tariff were:</Label>
+        <List>
+            <Option value="auto">Automatic — detect from your Octopus account</Option>
+            <Option value="agile">Force: Octopus Agile</Option>
+            <Option value="tracker">Force: Octopus Tracker</Option>
+            <Option value="go">Force: Octopus Go</Option>
+            <Option value="igo">Force: Intelligent Go</Option>
+            <Option value="flux">Force: Octopus Flux</Option>
+            <Option value="iflux">Force: Intelligent Flux</Option>
+            <Option value="flexible">Force: Octopus Flexible</Option>
+        </List>
+    </Field>
+    <Field id="tariffOverrideInfo" type="label">
+        <Label>Leave this on Automatic unless you are rehearsing a tariff you have not switched to yet. The plugin normally reads your live agreement from Octopus, and until you are actually on a tariff there is no way to prove its planning works — the first run happens on the first morning you are billed for it. Setting this forces the whole chain to behave as if you were already on that tariff: detection, the half-hourly rate fetch, the import planner and the dashboard all use it, against the real published prices. It does NOT change what Octopus charges you, and your bill, balance and agreement are still read from your actual account. It does mean the battery makes decisions for a tariff you are not on, so the sensible time to use it is a period when the battery is not importing anyway. A warning is logged at every start and every save while it is on, and the tariff is shown as "(forced)" so it cannot be left set by accident. Set it back to Automatic once your real tariff matches.</Label>
+    </Field>
+
     <Field id="separator_debug" type="separator"/>
     <Field id="showDebugInfo" type="checkbox" defaultValue="false">
         <Label>Enable debug logging:</Label>

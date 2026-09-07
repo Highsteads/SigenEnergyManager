@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.97.0)
-# Date:        05-09-2026 23:05
-# Version:     5.97.0
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.0)
+# Date:        07-09-2026 14:03
+# Version:     5.98.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1473,6 +1473,7 @@ class Plugin(indigo.PluginBase):
         # quiet-boot convention: v5.79.0 changes when the system exports, and a
         # behaviour change that arrives silently on upgrade is not acceptable.
         self._log_bank_first_setting()
+        self._log_tariff_override_setting()
 
         # Auto-update check (best-effort, daily-cached, fully silent on failure).
         try:
@@ -10604,6 +10605,27 @@ class Plugin(indigo.PluginBase):
             # waiting for the next plugin restart.
             self._write_site_config()
         self._log_bank_first_setting()
+        self._log_tariff_override_setting()
+
+    def _log_tariff_override_setting(self):
+        """Say loudly, at startup and on every prefs save, that a tariff is being forced.
+
+        An override that is quietly left on is worse than no override at all: the
+        planner would keep making decisions for a tariff the house is not on, and
+        nothing in the log would say so. Announcing it on every prefs save and every
+        start is what makes the armed state observable.
+        """
+        try:
+            forced = (self.pluginPrefs.get("tariffOverride") or "").strip().lower()
+            if forced in ("", "auto", "none"):
+                return
+            log(f"[Octopus] TARIFF OVERRIDE IS ON — the plugin is planning as though the "
+                f"house were on '{forced}'. This is a rehearsal setting: it does not "
+                f"change what Octopus bills, and it should be set back to Automatic once "
+                f"the real tariff matches. Plugins -> Sigenergy Manager -> Configure.",
+                level="WARNING")
+        except Exception as exc:
+            self.logger.debug(f"[Octopus] override announcement skipped: {exc!r}")
 
     def _log_bank_first_setting(self):
         """Say what the export hold is set to, at startup and on every prefs save.
@@ -10746,6 +10768,7 @@ class Plugin(indigo.PluginBase):
             export_serial=self.export_serial,
             gas_kwh_per_m3=gas_kwh_per_m3,
             gas_unit=(self.pluginPrefs.get("gasMeterUnit") or "m3"),
+            tariff_override=(self.pluginPrefs.get("tariffOverride") or ""),
         )
 
         # Axle VPP. Pass our own logger — AxleAPI's private fallback logger has no

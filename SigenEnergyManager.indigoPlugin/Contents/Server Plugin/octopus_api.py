@@ -100,6 +100,26 @@ TARIFF_AGILE    = "agile"
 TARIFF_FLEXIBLE = "flexible"   # Octopus Flexible / standard variable rate
 TARIFF_UNKNOWN  = "unknown"
 
+# Human-readable names, keyed by tariff key. Hoisted out of _detect_tariff_from_account()
+# (v5.98.0) so the manual override below names a forced tariff the same way detection does.
+TARIFF_DISPLAY_NAMES = {
+    TARIFF_TRACKER:  "Octopus Tracker",
+    TARIFF_GO:       "Octopus Go",
+    TARIFF_FLUX:     "Octopus Flux",
+    TARIFF_IGO:      "Intelligent Go",
+    TARIFF_IFLUX:    "Intelligent Flux",
+    TARIFF_AGILE:    "Octopus Agile",
+    TARIFF_FLEXIBLE: "Octopus Flexible",
+}
+
+# Tariff keys a user may force from PluginConfig. TARIFF_UNKNOWN is deliberately absent:
+# forcing it would select the planner branch that imports immediately at half inverter
+# power, which is a fallback, never a choice.
+TARIFF_OVERRIDE_CHOICES = (
+    TARIFF_TRACKER, TARIFF_GO, TARIFF_FLUX, TARIFF_IGO,
+    TARIFF_IFLUX, TARIFF_AGILE, TARIFF_FLEXIBLE,
+)
+
 # Product code prefixes for auto-detection
 # Product-code prefixes used to classify the account's tariff.
 #
@@ -171,7 +191,8 @@ class OctopusAPI:
                  region="F", data_dir=None, logger=None,
                  gas_mprn="", gas_serial="",
                  export_mpan="", export_serial="",
-                 gas_kwh_per_m3=GAS_KWH_PER_M3, gas_unit="m3"):
+                 gas_kwh_per_m3=GAS_KWH_PER_M3, gas_unit="m3",
+                 tariff_override=""):
         """Initialise Octopus API client.
 
         Args:
@@ -187,6 +208,10 @@ class OctopusAPI:
             export_mpan:    Electricity export meter point number (optional)
             export_serial:  Electricity export meter serial number (optional)
             gas_kwh_per_m3: m3->kWh calorific factor (default ~11.19)
+            tariff_override: Force the active tariff instead of detecting it. One of
+                            TARIFF_OVERRIDE_CHOICES, or "" / "auto" to detect normally.
+                            Rehearses a tariff you have not switched to yet; it does not
+                            change what Octopus bills.
             gas_unit:       Native unit the gas meter reports — "m3" (metric SMETS,
                             needs the calorific conversion) or "kwh" (some SMETS2
                             report kWh directly, so the conversion must be skipped to
@@ -207,6 +232,21 @@ class OctopusAPI:
         self.gas_unit       = (gas_unit or "m3").strip().lower()
         if self.gas_unit not in ("m3", "kwh"):
             self.gas_unit = "m3"
+
+        # Manual tariff override. Anything unrecognised is IGNORED with a warning rather
+        # than honoured — a typo must never select a planner branch, and silently falling
+        # back to detection is the safe direction.
+        override = (tariff_override or "").strip().lower()
+        if override in ("", "auto", "none"):
+            self.tariff_override = ""
+        elif override in TARIFF_OVERRIDE_CHOICES:
+            self.tariff_override = override
+        else:
+            self.tariff_override = ""
+            self.logger.warning(
+                f"[Octopus] Tariff override '{tariff_override}' is not one of "
+                f"{', '.join(TARIFF_OVERRIDE_CHOICES)} — ignoring it and detecting "
+                f"the tariff from your account as usual.")
 
         # HTTP Basic auth header (api_key as username, empty password)
         if api_key:
@@ -281,6 +321,9 @@ class OctopusAPI:
             product_code:   Product code (e.g. "TRACKER-VAR-25-04-01")
             display_name:   Human-readable name
         """
+        if self.tariff_override:
+            return self._forced_tariff_info(force=force)
+
         now = time.time()
         if (not force and self._tariff_cache
                 and now - self._tariff_cache_at < RATES_CACHE_TTL):
@@ -315,6 +358,65 @@ class OctopusAPI:
         self._tariff_cache    = tariff_info
         self._tariff_cache_at = now
         return tariff_info
+
+    def _forced_tariff_info(self, force=False):
+        """Resolve the tariff the user has FORCED in PluginConfig.
+
+        Rehearsal, not billing. The point is that every downstream consumer — the
+        import planner, the agile_slots fetch, the monitor device, the dashboard —
+        behaves exactly as it would on the forced tariff, so a switch can be proven
+        before it happens rather than on the first morning of it. What Octopus
+        actually charges is untouched, and the Kraken financials path still reports
+        the real agreement.
+
+        The forced tariff's OWN product code is resolved, not the detected one: a
+        Tracker product code sitting under an "agile" key would make
+        get_active_tariff_schedule() fetch Tracker rates and label them Agile.
+        """
+        now = time.time()
+        if (not force and self._tariff_cache
+                and self._tariff_cache.get("overridden")
+                and self._tariff_cache.get("tariff_key") == self.tariff_override
+                and now - self._tariff_cache_at < RATES_CACHE_TTL):
+            return self._tariff_cache
+
+        key = self.tariff_override
+
+        # Detect anyway, purely so the log and the dashboard can say what is really
+        # being billed alongside what is being rehearsed.
+        detected = (self._detect_tariff_from_account()
+                    or self._detect_tariff_from_kraken() or {})
+
+        if detected.get("tariff_key") == key:
+            # Forcing the tariff already active — reuse the real codes. Tracker needs
+            # this: it is delisted from the public products listing, so the prefix
+            # probe below cannot find it.
+            product_code = detected.get("product_code", "")
+            tariff_code  = detected.get("tariff_code", "")
+        else:
+            product_code = self._probe_product_by_prefix(
+                TARIFF_PRODUCT_PREFIXES.get(key, ())) or ""
+            tariff_code  = self._build_tariff_code(product_code) if product_code else ""
+
+        if not product_code or not tariff_code:
+            self.logger.warning(
+                f"[Octopus] Tariff override is set to '{key}' but no live product could "
+                f"be found for it, so there are no rates to plan from. Check the product "
+                f"is still listed at {OCTOPUS_API_BASE}/products/ — until then the "
+                f"planner falls back to its no-rates branch.")
+
+        info = {
+            "tariff_key":            key,
+            "tariff_code":           tariff_code or "",
+            "product_code":          product_code or "",
+            "display_name":          f"{TARIFF_DISPLAY_NAMES.get(key, key.title())} (forced)",
+            "overridden":            True,
+            "detected_key":          detected.get("tariff_key", TARIFF_UNKNOWN),
+            "detected_product_code": detected.get("product_code", ""),
+        }
+        self._tariff_cache    = info
+        self._tariff_cache_at = now
+        return info
 
     # ================================================================
     # Public: Rate Fetching
@@ -1547,20 +1649,12 @@ class OctopusAPI:
         for tariff_key, prefixes in TARIFF_PRODUCT_PREFIXES.items():
             for prefix in prefixes:
                 if product_code.upper().startswith(prefix):
-                    display_names = {
-                        TARIFF_TRACKER:  "Octopus Tracker",
-                        TARIFF_GO:       "Octopus Go",
-                        TARIFF_FLUX:     "Octopus Flux",
-                        TARIFF_IGO:      "Intelligent Go",
-                        TARIFF_IFLUX:    "Intelligent Flux",
-                        TARIFF_AGILE:    "Octopus Agile",
-                        TARIFF_FLEXIBLE: "Octopus Flexible",
-                    }
                     return {
                         "tariff_key":   tariff_key,
                         "tariff_code":  tariff_code,
                         "product_code": product_code,
-                        "display_name": display_names.get(tariff_key, tariff_key.title()),
+                        "display_name": TARIFF_DISPLAY_NAMES.get(
+                            tariff_key, tariff_key.title()),
                     }
 
         # An unrecognised tariff is NOT a cosmetic problem: the planner's unknown branch
