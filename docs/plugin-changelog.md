@@ -15,6 +15,30 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.98.2 — 07-09-2026
+
+**Third site of the same bug, found by the same rehearsal.** `_update_tariff_device` also did
+`str(tracker.get("today_p", ""))` for the active rate whatever the tariff, so the Tariff Monitor
+device — the one control pages read — carried `rateToday = 'None'` on Agile while the Battery
+Manager device beside it correctly held `18.543`. Now goes through `_rates_for_tariff` like the
+other two.
+
+**And `str(d.get(k, ""))` returns the STRING "None" whenever the key exists holding None**, which
+is every unmonitored rate. Live, that device was showing `goPeakRate = 'None'`,
+`trackerRateToday = 'None'`. New `_rate_str()` renders absent as blank — which is what
+`rateTomorrow` and `flexibleRate` already did, so the device was inconsistent with itself.
+**Zero and negative survive**: on Agile both are real prices, and an absent-is-blank helper that
+also blanked 0.0 would hide a genuine settled slot.
+
+A structural test asserts the device body contains no bare `"value": str(` and routes all eleven
+rate fields through the helper. The FIRST version of that test asserted `'str(tracker.get('` was
+absent — which also matches the CORRECT `_rate_str(tracker.get(`, so it failed on the fix it was
+guarding. The source-text-scanning trap, again.
+
+1237 -> 1242 tests.
+
+---
+
 ## v5.98.1 — 07-09-2026
 
 **The rehearsal found a real bug within four minutes, which is the whole point of it.**
@@ -42,7 +66,7 @@ left it green. Extracted and pointed at the real function. On Agile the price mo
 half hour by design, so the key alone gates the line — otherwise 48 entries a day in the
 event log. The line now reads `now 16.842p (this half-hour), 46 slots held`.
 
-1221 -> 1231 tests, 5/5 mutations killed after the survivor was fixed.
+1227 -> 1237 tests, 5/5 mutations killed after the survivor was fixed.
 
 ---
 

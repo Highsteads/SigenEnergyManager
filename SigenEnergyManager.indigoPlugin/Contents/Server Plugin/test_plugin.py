@@ -5708,8 +5708,12 @@ class TestRatesFollowActiveTariff(unittest.TestCase):
         # is the whole bug. Assert the source calls it exactly twice.
         src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "plugin.py"), encoding="utf-8").read()
-        self.assertEqual(src.count("self._rates_for_tariff("), 2,
-                         "both _build_tariff_data and the status line must use the helper")
+        # THREE call sites as of v5.98.2: _build_tariff_data, the status log line,
+        # and _update_tariff_device. This count is deliberately exact — it went from
+        # 2 to 3 and the guard caught it, which is the point of pinning it.
+        self.assertEqual(src.count("self._rates_for_tariff("), 3,
+                         "_build_tariff_data, the status line and the tariff device "
+                         "must all use the helper")
         self.assertNotIn('tracker    = monitored.get("tracker", {})', src,
                          "the status line must not read the Tracker bucket directly")
 
@@ -5732,6 +5736,48 @@ class TestAgileStatusLineDoesNotFlood(unittest.TestCase):
 
     def test_tracker_does_not_log_when_nothing_moved(self):
         self.assertFalse(self._changed("tracker", 29.0115, "tracker", 29.0115))
+
+
+# ======================================================================
+# v5.98.2 — the tariff DEVICE follows the active tariff too, and absent is blank
+#
+# The live Agile rehearsal showed the Tariff Monitor device carrying
+# rateToday = 'None' (the string) while the Battery Manager beside it
+# correctly showed 18.543. Third site of the same Tracker-bucket read.
+# ======================================================================
+
+
+class TestTariffDeviceShowsTheActiveTariff(unittest.TestCase):
+
+    def test_absent_rate_is_blank_not_the_word_none(self):
+        self.assertEqual(plugin.Plugin._rate_str(None), "")
+
+    def test_a_real_rate_survives(self):
+        self.assertEqual(plugin.Plugin._rate_str(18.543), "18.543")
+
+    def test_zero_is_a_price_not_an_absence(self):
+        # A negative-price Agile slot can legitimately settle at exactly zero.
+        self.assertEqual(plugin.Plugin._rate_str(0), "0")
+        self.assertEqual(plugin.Plugin._rate_str(0.0), "0.0")
+
+    def test_negative_agile_price_survives(self):
+        self.assertEqual(plugin.Plugin._rate_str(-4.53), "-4.53")
+
+    def test_the_device_never_writes_the_string_none(self):
+        # The shape that produced it: str(d.get(k, "")) where the key holds None.
+        src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "plugin.py"), encoding="utf-8").read()
+        start = src.index("def _update_tariff_device")
+        body  = src[start:src.index("def _vpp_event_str", start)]
+        # Match the BARE str() form only. A naive 'str(tracker.get(' also matches
+        # the CORRECT `_rate_str(tracker.get(` — a guard that fails on the fix it
+        # is guarding, which is the source-text-scanning trap.
+        self.assertNotIn('"value": str(', body,
+                         "a bare str() writes the word None for an absent rate")
+        self.assertIn("self._rates_for_tariff(", body,
+                      "the device must ask the same owner as the log line")
+        self.assertEqual(body.count("self._rate_str("), 11,
+                         "every rate field on the device goes through _rate_str")
 
 
 if __name__ == "__main__":

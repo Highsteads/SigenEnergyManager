@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.1)
-# Date:        07-09-2026 15:01
-# Version:     5.98.1
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.98.2)
+# Date:        07-09-2026 15:10
+# Version:     5.98.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -5106,6 +5106,17 @@ class Plugin(indigo.PluginBase):
             SAVING_SESSION_TURN_DOWN, "savingSessionExport", now_utc)
 
     @staticmethod
+    def _rate_str(value):
+        """A rate for a device state: blank when there isn't one, never "None".
+
+        `str(d.get(k, ""))` returns the STRING "None" whenever the key exists
+        holding None — which is every unmonitored rate — and a control page then
+        displays the word None where a price should be. Blank is what the other
+        fields on this device already use for absent, so absent reads as absent.
+        """
+        return "" if value is None else str(value)
+
+    @staticmethod
     def _rates_for_tariff(tariff_key, rates):
         """(today_p, tomorrow_p) for the ACTIVE tariff — the one owner of that choice.
 
@@ -9347,27 +9358,25 @@ class Plugin(indigo.PluginBase):
         flux       = monitored.get("flux",     {})
         flexible   = monitored.get("flexible", {})
 
-        # rateToday: show the active tariff's actual unit rate
-        if active_key == TARIFF_FLEXIBLE:
-            active_rate_today    = str(flexible.get("today_p", ""))
-            active_rate_tomorrow = ""                                 # flat rate — no tomorrow
-        else:
-            active_rate_today    = str(tracker.get("today_p", ""))
-            active_rate_tomorrow = str(tracker.get("tomorrow_p") or "")
+        # v5.98.2: the THIRD site that read the Tracker bucket whatever the tariff.
+        # Caught on the live Agile rehearsal, where this device showed rateToday
+        # "None" while the Battery Manager beside it correctly showed 18.543.
+        active_rate_today, active_rate_tomorrow = self._rates_for_tariff(
+            active_key, monitored)
 
         states = [
             {"key": "tariffActive",        "value": tariff_info.get("display_name", "")},
-            {"key": "rateToday",           "value": active_rate_today},
-            {"key": "rateTomorrow",        "value": active_rate_tomorrow},
-            {"key": "trackerRateToday",    "value": str(tracker.get("today_p", ""))},
-            {"key": "trackerRateTomorrow", "value": str(tracker.get("tomorrow_p") or "")},
-            {"key": "goOffPeakRate",       "value": str(go.get("cheap_p", ""))},
-            {"key": "goStandardRate",      "value": str(go.get("standard_p", ""))},
-            {"key": "goPeakRate",          "value": str(go.get("peak_p", ""))},
-            {"key": "fluxOffPeakRate",     "value": str(flux.get("cheap_p", ""))},
-            {"key": "fluxStandardRate",    "value": str(flux.get("standard_p", ""))},
-            {"key": "fluxPeakRate",        "value": str(flux.get("peak_p", ""))},
-            {"key": "flexibleRate",        "value": str(flexible.get("today_p", ""))},
+            {"key": "rateToday",           "value": self._rate_str(active_rate_today)},
+            {"key": "rateTomorrow",        "value": self._rate_str(active_rate_tomorrow)},
+            {"key": "trackerRateToday",    "value": self._rate_str(tracker.get("today_p"))},
+            {"key": "trackerRateTomorrow", "value": self._rate_str(tracker.get("tomorrow_p"))},
+            {"key": "goOffPeakRate",       "value": self._rate_str(go.get("cheap_p"))},
+            {"key": "goStandardRate",      "value": self._rate_str(go.get("standard_p"))},
+            {"key": "goPeakRate",          "value": self._rate_str(go.get("peak_p"))},
+            {"key": "fluxOffPeakRate",     "value": self._rate_str(flux.get("cheap_p"))},
+            {"key": "fluxStandardRate",    "value": self._rate_str(flux.get("standard_p"))},
+            {"key": "fluxPeakRate",        "value": self._rate_str(flux.get("peak_p"))},
+            {"key": "flexibleRate",        "value": self._rate_str(flexible.get("today_p"))},
             {"key": "lastUpdate",          "value": datetime.now().strftime("%H:%M:%S")},
         ]
         dev.updateStatesOnServer(states)
