@@ -168,5 +168,49 @@ class TestControlLabelsStayShort(unittest.TestCase):
             "dialog — move the prose into a type=\"label\" field below the control:\n"
             + "\n".join(f"  {f} {fid}: {n} chars" for f, fid, n in too_long))
 
+
+# A <Description> is laid out on ONE LINE at its natural width and never wraps, so the
+# longest one in a dialog sets the content width for every row in it. A <Label> field
+# does wrap, which is why a paragraph belongs there instead.
+#
+# MEASURED 07-09-2026 on this Mac, by shortening the single 403-character Description in
+# this dialog and reopening it: the window went 1041 -> 741 and the label frames
+# 2890 -> 712. 1041 is the window's hard maximum (System Events refused 1200 and 2000),
+# so at 2890 every label was clipped by 1849 pt and the dialog looked broken. Dashboards,
+# whose longest Description is 54 characters, measures 696/666 — a clean fit.
+#
+# Descriptions start at the control column (x~316 here) and run about 6.4 pt per
+# character, so 100 characters lands near 960 — inside the 1041 ceiling with room to
+# spare, and comfortably under it for a dialog with a wider label column than this one.
+MAX_DESCRIPTION_CHARS = 100
+
+
+class TestDescriptionsStayShort(unittest.TestCase):
+    """A paragraph in a <Description> stretches every row of its dialog past the window."""
+
+    def _descriptions(self):
+        found = []
+        for path in XML_FILES:
+            root = ET.parse(path).getroot()
+            for field in root.iter("Field"):
+                desc = field.find("Description")
+                if desc is None:
+                    continue
+                found.append((os.path.basename(path), field.get("id"),
+                              (desc.text or "").strip()))
+        return found
+
+    def test_no_description_is_a_paragraph(self):
+        too_long = [
+            (f, fid, len(t))
+            for f, fid, t in self._descriptions()
+            if len(t) > MAX_DESCRIPTION_CHARS
+        ]
+        self.assertEqual(
+            too_long, [],
+            "A <Description> never wraps, so these stretch the whole dialog past the "
+            "window — move the prose into a type=\"label\" field below the control:\n"
+            + "\n".join(f"  {f} {fid}: {n} chars" for f, fid, n in too_long))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

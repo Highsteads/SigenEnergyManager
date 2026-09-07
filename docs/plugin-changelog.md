@@ -15,6 +15,40 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.99.2 — 07-09-2026
+
+**A `<Description>` NEVER WRAPS, so the longest one sets the dialog's content width.**
+v5.99.1 fixed the control column; the prose beside it was still clipped, because this is a
+second and independent mechanism.
+
+MEASURED, by shortening the single 403-char Description and reopening the dialog:
+
+| | window | widest label frame |
+|---|---|---|
+| before | 1041 (hard max) | 2890 |
+| after  | 741             | 712  |
+
+So a 403-character Description stretched every row to 2890 in a window that cannot exceed
+1041 — 1849 pt of overflow, and every line of help text in the dialog clipped mid-word.
+Dashboards, whose longest Description is 54 chars, measures 696/666: a clean fit.
+
+**The JSON example was the obvious suspect and was NOT the cause** — `siteArraysInfo`
+carries a 131-character unbreakable token, and breaking it with spaces changed the width
+by nothing at all (2890 before, 2890 after). Tested before fixing, which is the only
+reason a wrong "fix" did not ship.
+
+`axleScanMail` (403) and `happyHourTokensRequired` (255) moved from `<Description>` to
+`type="label"` fields, which DO wrap. No Descriptions remain in this dialog.
+
+New `TestDescriptionsStayShort` caps a Description at 100 chars, with the measurement and
+its basis in the comment. 1267 -> 1268 tests.
+
+**ESTATE SWEEP (07-09-2026): 78 over-long Descriptions across 13 OTHER plugins**, worst
+Zigbee2MQTTBridge at 781 chars — over twice this one, so its dialog is worse. Control
+`<Label>` lengths estate-wide are CLEAN: 1369 fields scanned across 39 bundles, longest 94
+(GarageDoor `lightOnlyIfPresent`), so v5.99.1's fault was unique to this plugin.
+---
+
 ## v5.99.1 — 07-09-2026
 
 **NOT ONE CONTROL IN THE CONFIGURE DIALOG WAS ON SCREEN.** All six pop-up buttons measured
