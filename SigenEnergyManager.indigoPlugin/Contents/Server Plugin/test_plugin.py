@@ -568,6 +568,40 @@ class TestVppExportModePersistence(unittest.TestCase):
         self.assertNotIn("vpp_export_mode", p.store)
 
 
+class TestDailyEventFlagPersistence(unittest.TestCase):
+    """A restart after VPP dispatch must not erase it from the daily history."""
+
+    def test_save_persists_completed_event_flags(self):
+        payload = TestVppExportModePersistence()._saved_payload(
+            TestVppExportModePersistence._base_store(
+                had_vpp_today=True, had_import_today=True))
+        for key in ("had_vpp_today", "had_import_today"):
+            self.assertIs(payload[key], True)
+
+    def _restored(self, day, flags):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "accumulators.json"), "w", encoding="utf-8") as f:
+                json.dump({"today_date": day, **flags}, f)
+            p = plugin.Plugin.__new__(plugin.Plugin)
+            p.logger = MagicMock()
+            p.pluginPrefs = {}
+            p.store = {}
+            p._get_data_dir = lambda: tmp
+            with patch.object(plugin, "_local_today_str", return_value="2026-09-08"):
+                p._load_accumulators()
+            return p.store
+
+    def test_same_day_restores_completed_vpp(self):
+        self.assertIs(self._restored("2026-09-08", {"had_vpp_today": True})["had_vpp_today"], True)
+
+    def test_previous_day_does_not_mark_today(self):
+        self.assertNotIn("had_vpp_today", self._restored("2026-09-07", {"had_vpp_today": True}))
+
+    def test_old_file_without_flags_defaults_to_false(self):
+        self.assertIs(self._restored("2026-09-08", {})["had_vpp_today"], False)
+
+
 class TestVppMidnightAnchor(unittest.TestCase):
     """_vpp_export_anchor_after_midnight — a window spanning midnight keeps its
     export delta across the daily counter reset. Latent since v5.28.0: the
@@ -3286,6 +3320,14 @@ class TestVppHandbackConfirmation(unittest.TestCase):
 
     # ---- _end_vpp_export -------------------------------------------------
 
+    def test_completion_flag_is_present_when_transition_saves(self):
+        p = self._p()
+        captured = []
+        p._vpp_transition.side_effect = lambda state: captured.append(
+            p.store.get("had_vpp_today", False))
+        p._end_vpp_export(datetime.now(timezone.utc), {})
+        self.assertEqual(captured, [True])
+
     def test_confirmed_handback_leaves_no_pending_flag(self):
         p = self._p(results=(True,))
         p._end_vpp_export(datetime.now(timezone.utc), {})
@@ -4248,6 +4290,56 @@ class TestBankFirstMetrics(unittest.TestCase):
         st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 55.0})
         self._record(st, self._decision(), self._Snap(raw_today_kwh=55.0))
         self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_a_later_complete_forecast_above_the_threshold_clears_the_classification(self):
+        """The live fault of 04-Sep-2026, and the one this fix closes.
+
+        A day whose first post-midnight fetch read 31.0 kWh (small) was later
+        revised to 46.0 kWh by a fresh, COMPLETE fetch for the SAME day. The old
+        one-way-to-small latch could never clear once armed, so the day stayed
+        "small" for its whole length and cost 101 minutes of clipped solar. The
+        classification now tracks whichever complete fetch is freshest, so a
+        genuinely big day stops being held the moment the forecast says so.
+        """
+        st = self._stub(store={"bank_first_small_latched": True,
+                                "bank_first_latch_date": "2026-08-31"},
+                        forecast={"forecastStatus": "OK", "todayKwh": 46.0,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=46.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+    def test_a_later_complete_forecast_below_the_threshold_arms_it_mid_day(self):
+        """The mirror case: a day that opened big and is later revised down past
+        the threshold must be classified small from that point on — not just on
+        the very first evaluation of the day, or the fix above only half works."""
+        st = self._stub(store={"bank_first_small_latched": False,
+                                "bank_first_latch_date": "2026-08-31"},
+                        forecast={"forecastStatus": "OK", "todayKwh": 22.0,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=22.0))
+        self.assertTrue(st.store["bank_first_small_latched"])
+
+    def test_a_partial_forecast_does_not_clear_an_already_small_day(self):
+        """A degraded fetch must change nothing — including standing DOWN a real
+        small-day classification, which a naive "always re-derive" fix would do
+        if it did not also gate on forecastStatus being complete."""
+        st = self._stub(store={"bank_first_small_latched": True,
+                                "bank_first_latch_date": "2026-08-31"},
+                        forecast={"forecastStatus": "Partial 3/4", "todayKwh": 55.0,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=55.0))
+        self.assertTrue(st.store["bank_first_small_latched"])
+
+    def test_a_wrong_day_forecast_does_not_clear_an_already_small_day(self):
+        """Same protection, wrong-date shape — a leftover forecast for a
+        different day must not be allowed to un-classify today just because it
+        happens to read big."""
+        st = self._stub(store={"bank_first_small_latched": True,
+                                "bank_first_latch_date": "2026-08-31"},
+                        forecast={"forecastStatus": "OK", "todayKwh": 55.0,
+                                  "forecastDate": "2026-08-30"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=55.0))
+        self.assertTrue(st.store["bank_first_small_latched"])
 
     def test_the_latch_clears_on_a_new_local_day(self):
         st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 55.0},

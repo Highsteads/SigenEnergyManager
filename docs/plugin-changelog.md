@@ -15,6 +15,48 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.99.3 — 08-09-2026
+
+**THE BANK-FIRST "SMALL DAY" CLASSIFIER LOCKED ONTO WHICHEVER FORECAST ARRIVED FIRST, AND
+NEVER CAUGHT UP.** Found by the `bank-first-week-one-check` scheduled task's routine
+one-week review of the 31-Aug-2026 feature. `_record_bank_first_metrics` armed
+`bank_first_small_latched` from the first COMPLETE, correctly-dated forecast that read
+under the threshold — a genuine fix at the time (v5.88.0) for a day-rollover bug — but
+nothing then re-checked it. Open-Meteo revises a day's total several times through the
+morning, and on **04-Sep-2026** the overnight fetch read **31.0 kWh** (small), armed the
+day, and never released it even after a later fetch revised the total to **46.0 kWh** — a
+genuinely big day, held for its whole length regardless. Cost: **101 minutes with export
+pinned at the DNO cap while the battery had already stopped taking anything** — exactly the
+waste `clip_boundary_minutes` exists to measure. Live evidence, from `daily_history.json`'s
+`bank_first` block:
+
+| Date | final `pv_forecast_kwh` | classified small | `clip_boundary_minutes` |
+|---|---|---|---|
+| 04-Sep-2026 | 46.0 kWh | yes (wrongly) | 101 |
+| 05-Sep-2026 | 48.4 kWh | yes (wrongly) | 4 |
+
+**Fix:** the classification now tracks the FRESHEST complete, correctly-dated fetch, in
+EITHER direction, instead of arming once and sticking. A partial, failed, or wrong-day
+fetch still changes nothing — that protection (against one bad reading deciding the
+afternoon) is exactly what it was before and is unchanged; the only thing that changed is
+that a GOOD fetch, however many came before it, now always wins. `battery_manager.py`'s
+`_overflow_bank_first_blocked` was not touched — its same-tick `raw_today` fallback beside
+the stored flag was always correct and stays exactly as it was; only the two stale comments
+describing the old one-way semantics were corrected. **The 40 kWh threshold itself is not
+the problem** and was NOT moved — every day in the week-one sample that classified correctly
+clipped 0-6 minutes, negligible; the 101-minute outlier traces entirely to the
+misclassification.
+
+4 new tests (`test_a_later_complete_forecast_above_the_threshold_clears_the_classification`,
+its mirror arming the day mid-day instead of only on the first tick, and two guards proving
+a partial/wrong-day fetch cannot clear an already-small day). All four verified failing
+against the pre-fix code (sabotage re-applied the old one-way arm, `__pycache__` cleared,
+exactly one test went red — the one pinning the live bug — restore verified byte-identical).
+1277 tests, 0 skipped, ruff clean. **NOT RESTARTED — CliveS restarts this one (it drives the
+battery)**, so the running host stays on 5.99.2 until he does.
+
+---
+
 ## v5.99.2 — 07-09-2026
 
 **A `<Description>` NEVER WRAPS, so the longest one sets the dialog's content width.**

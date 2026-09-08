@@ -2140,12 +2140,17 @@ class TestSolarOverflowBankFirst(unittest.TestCase):
                     raw_today=raw, active=True))
 
     def test_the_small_day_latch_survives_a_high_sample(self):
-        """Once a complete forecast has read the day small, one high sample must not
-        lift the hold. The latch is one-way in the safe direction."""
+        """Within ONE call, a `latched=True` snapshot field still holds even against
+        a `raw_today` that reads big — the OR is a same-tick fallback for whenever
+        plugin.py's stored classification has not caught up yet this cycle. It is
+        NOT what keeps the classification itself one-way — since 05-Sep-2026 that is
+        tracked freshest-fetch-wins, both directions, in plugin.py's
+        _record_bank_first_metrics (see test_plugin.TestBankFirstMetrics)."""
         self.assertIsNone(self._decide(10.4, raw_today=45.0, latched=True))
 
     def test_the_latch_cannot_make_a_big_day_export_early(self):
-        """Sanity on the latch's direction: it can only ever say SMALL."""
+        """Sanity on the OR's direction within one call: a snapshot with
+        latched=False defers entirely to the live raw_today reading."""
         self.assertIsNotNone(self._decide(10.4, raw_today=45.0, latched=False))
 
     # ── Composition with the neighbouring gates ────────────────────────────

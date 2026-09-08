@@ -582,9 +582,13 @@ class ManagerSnapshot:
     # the day. That stability is what stops the classification wandering.
     raw_today_kwh: float = 0.0
 
-    # True once the day has been classified SMALL from a COMPLETE forecast. A
-    # one-way day latch in the safe direction: a forecast oscillating on the
-    # threshold cannot lift the hold once the day has read small. Owned by
+    # True while the day is classified SMALL by the freshest COMPLETE forecast FOR
+    # TODAY. Kept in step with that forecast in both directions (05-Sep-2026 fix —
+    # it used to arm SMALL once and never clear, which held a genuinely big day for
+    # its whole length and cost 101 minutes of clipped solar on 04-Sep-2026 — see
+    # plugin.py's _record_bank_first_metrics for the full account). A degraded
+    # fetch — partial, failed, or dated for the wrong day — changes nothing, which
+    # is what stops one bad reading deciding the classification. Owned by
     # plugin.py's store so the manager stays stateless.
     bank_first_small_latched: bool = False
 
@@ -1780,8 +1784,12 @@ class BatteryManager:
         if raw_today <= 0.0 and not snapshot.bank_first_small_latched:
             return False
 
-        # The latch can only ever say SMALL, never BIG, so it only ever broadens the
-        # block. Set by plugin.py, and only from a COMPLETE forecast FOR TODAY.
+        # bank_first_small_latched tracks the freshest COMPLETE forecast FOR TODAY
+        # (plugin.py's _record_bank_first_metrics keeps it in step, both directions,
+        # as of 05-Sep-2026 — it used to arm SMALL once and never clear, which is
+        # exactly the shape of bug this file's own header now warns against). The
+        # live raw_today check alongside it is the same-tick fallback for whenever
+        # that stored value has not caught up yet within this cycle.
         small_day = bool(snapshot.bank_first_small_latched) or (raw_today < max_kwh)
         if not small_day:
             return False                      # big day — today's pacing earns its keep

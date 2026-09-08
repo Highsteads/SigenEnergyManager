@@ -7,9 +7,9 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2)
-# Date:        07-09-2026 22:25
-# Version:     5.99.2
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3)
+# Date:        08-09-2026 17:40
+# Version:     5.99.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3361,10 +3361,15 @@ class Plugin(indigo.PluginBase):
         """Measure what the bank-first hold did today. Never touches control.
 
         Three jobs, all of them measurement:
-          1. Latch the day SMALL, once, from a COMPLETE forecast only. A partial or
-             failed fetch reads low, and reading low is exactly when you want to keep
-             the kWh — but a degraded reading must not LOCK the day, or one bad fetch
-             decides the afternoon.
+          1. Classify the day SMALL from the latest COMPLETE forecast FOR TODAY, and
+             keep that classification in step with the forecast for as long as one
+             keeps arriving — in EITHER direction. A partial or failed fetch reads
+             low, and reading low is exactly when you want to keep the kWh, so a
+             degraded reading changes nothing; but a good one always wins, however
+             many came before it. (05-Sep-2026: this used to arm SMALL once and never
+             clear — a day whose first post-midnight fetch read 31.0 kWh stayed
+             "small" all day even after later fetches revised it to 46.0 and
+             48.4 kWh, and cost 101 minutes of clipped solar on the 46.0 kWh day.)
           2. Count the hold: samples, minutes, and the export actually withheld,
              obtained by re-running the gate against a copy of the snapshot with the
              feature switched off. The 0.0-means-off contract is what makes that
@@ -3402,7 +3407,7 @@ class Plugin(indigo.PluginBase):
             local_now = _to_london(snapshot.now)
             today_str = local_now.strftime("%Y-%m-%d")
 
-            # ── 1. the day latch ────────────────────────────────────────────
+            # ── 1. the day classification ───────────────────────────────────
             if store.get("bank_first_latch_date") != today_str:
                 store["bank_first_latch_date"]    = today_str
                 store["bank_first_small_latched"] = False
@@ -3412,16 +3417,22 @@ class Plugin(indigo.PluginBase):
             raw_kwh = float(snapshot.raw_today_kwh or 0.0)
             # The forecast must be FOR today. Between local midnight and the first
             # fetch of the new day, latest_forecast_data still holds YESTERDAY's
-            # totals while today_str has already rolled — so the latch armed from
-            # the previous day's number and, being one-way, could never be cleared
-            # by the real forecast arriving an hour later. Live on 04-Sep-2026: a
-            # 45.3 kWh day was held for 4h18m off a 31.0 kWh predecessor, and the
-            # log line said "45.3 kWh is below the 40.0 kWh threshold".
+            # totals while today_str has already rolled — checked via fc_date below.
             fc_date = str(self.latest_forecast_data.get("forecastDate", ""))
+            # Re-derive the classification from the freshest complete, correctly-dated
+            # fetch every time one lands — never freeze on the first. This USED to be
+            # a one-way arm-to-SMALL-only latch (comment above this block, before
+            # 05-Sep-2026, called that "the safe direction"), and it was not: the
+            # overnight fetch for 04-Sep read 31.0 kWh, armed the day SMALL, and never
+            # cleared when the forecast was later revised to 46.0 kWh — a genuinely
+            # big day held for its whole length, 101 minutes of it spent clipping
+            # solar at the DNO cap with the battery already full. A partial, failed,
+            # or wrong-day fetch leaves the stored value exactly where it was — that
+            # is what stops one bad reading deciding the afternoon — but any COMPLETE
+            # fetch for today, in either direction, updates it.
             if (max_kwh > 0.0 and status.upper().startswith("OK")
-                    and fc_date == today_str
-                    and raw_kwh > 0.0 and raw_kwh < max_kwh):
-                store["bank_first_small_latched"] = True
+                    and fc_date == today_str and raw_kwh > 0.0):
+                store["bank_first_small_latched"] = raw_kwh < max_kwh
 
             # ── 2. the hold ─────────────────────────────────────────────────
             if getattr(decision, "bank_first_holding", False):
@@ -7798,9 +7809,10 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_active"]           = False
         self.store["vpp_export_submode"]   = None
         self.store["vpp_bank_charge_cap_w"] = -1
+        # The transition persists accumulators: include completion in that snapshot.
+        self.store["had_vpp_today"] = True
         self._vpp_transition(VPP_IDLE)
         self.store["vpp_event"]     = None
-        self.store["had_vpp_today"] = True
         self._trigger_event("vppEnded")
 
         # Wrap-up record in the per-event JSONL file (best-effort)
@@ -11017,6 +11029,9 @@ class Plugin(indigo.PluginBase):
             "peak_pv_w":                 self.store.get("peak_pv_w", 0),
             "peak_pv_time":              self.store.get("peak_pv_time", ""),
             "today_date":                self.store["today_date"],
+            # Daily event flags must survive a same-day restart after dispatch.
+            "had_vpp_today":             bool(self.store.get("had_vpp_today", False)),
+            "had_import_today":          bool(self.store.get("had_import_today", False)),
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
             "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
@@ -11213,6 +11228,8 @@ class Plugin(indigo.PluginBase):
             today = _local_today_str()   # Europe/London, matches the save/midnight basis
             if data.get("today_date") == today:
                 # Same day — restore accumulators and lifetime anchors
+                for event_flag in ("had_vpp_today", "had_import_today"):
+                    self.store[event_flag] = bool(data.get(event_flag, False))
                 self.store["pv_daily_kwh"]              = data.get("pv_daily_kwh", 0.0)
                 self.store["grid_import_daily_kwh"]     = data.get("grid_import_daily_kwh", 0.0)
                 self.store["grid_export_daily_kwh"]     = data.get("grid_export_daily_kwh", 0.0)
