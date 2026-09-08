@@ -21,3 +21,8 @@ CLAUDE.md
 # ruff cache — a runtime artefact; it appeared inside the bundle on 07-Sep-2026
 .ruff_cache/
 **/.ruff_cache/
+
+# Offline experiment area — scratch work that never reaches the bundle.
+# experiments/agile_trading/ (08-Sep-2026) is the offline Agile trading
+# controller: it never imports indigo, opens Modbus or sends a command.
+experiments/
