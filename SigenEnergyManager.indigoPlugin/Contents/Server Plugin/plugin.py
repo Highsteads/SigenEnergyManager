@@ -7,9 +7,10 @@
 #              reach next-day solar at minimum SOC. Export to prevent 100% cap.
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
-#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3)
-# Date:        08-09-2026 17:40
-# Version:     5.99.3
+#              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
+#              Claude Fable 5.1 (5.100.0)
+# Date:        10-09-2026 10:42
+# Version:     5.100.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3342,6 +3343,7 @@ class Plugin(indigo.PluginBase):
 
         # 6. Log if action changed or heartbeat
         self._log_manager_decision(decision, snapshot, soc_pct)
+        self._note_import_hold(decision)
 
         # 7. Verify persistent inverter registers haven't drifted before acting
         self._verify_ems_registers()
@@ -3356,6 +3358,34 @@ class Plugin(indigo.PluginBase):
         #     reports the SAME gate the manager acts on (single source of truth — stops
         #     the advisory re-deriving and drifting; see the 23/24-Jun-2026 case).
         self._publish_flood_preview(snapshot, decision)
+
+    def _note_import_hold(self, decision):
+        """Say, once a day, that tomorrow needed a grid import and none could be priced.
+
+        v5.100.0. The planner now HOLDS on self-consumption when it has no Agile
+        rates to plan from, when the published slots do not cover a charge, or when
+        the tariff is unrecognised — instead of importing 10 kW blind. A hold that
+        looks exactly like "24h sufficient" is the one way that change could hide a
+        broken Octopus connection until the bill, so: a WARNING in the event log
+        (Log_Error_Watch collects it) and one Pushover a day at normal priority.
+        """
+        if not getattr(decision, "import_held", False):
+            return
+        today = _london_today().isoformat()
+        if self.store.get("import_hold_noted_date") == today:
+            return
+        self.store["import_hold_noted_date"] = today
+        log(f"[Manager] Grid import HELD — {decision.reason}", level="WARNING")
+        kwh = float(getattr(decision, "import_kwh", 0.0) or 0.0)
+        why = str(getattr(decision, "import_held_why", "") or "no price could be found")
+        body = (
+            f"Tomorrow needs about {kwh:.0f} kWh more than the battery and the solar "
+            f"forecast can supply, but the plugin could not price a grid import: "
+            f"{why}. Until it can, the house draws from the grid as it needs to, "
+            f"which costs the daytime rate instead of a cheaper overnight one. "
+            f"Check the Octopus connection and the plugin log."
+        )
+        self._send_pushover("Battery import held tonight", body)
 
     def _record_bank_first_metrics(self, snapshot, decision, soc_pct):
         """Measure what the bank-first hold did today. Never touches control.
@@ -5235,20 +5265,27 @@ class Plugin(indigo.PluginBase):
                     self._set_import_cutoff(cutoff)
                     self._trigger_event("emergencyImportTriggered")
 
-        elif action == ACTION_STOP_IMPORT:
-            if prev_import:
-                log("[Manager] Import complete - returning to self-consumption")
-                self.modbus.set_self_consumption()
-                self._restore_import_cutoff()
-                self.store["import_active"] = False
+        # There is deliberately NO ACTION_STOP_IMPORT branch. battery_manager has not
+        # returned that action since the v4.0 sufficiency model, and the import
+        # teardown lives in the SELF_CONSUMPTION branch below (target reached) and
+        # the unconditional target check at the end of this method. A dead copy sat
+        # here until v5.100.0 and read as the place imports were ended (10-09-2026
+        # review: "the teardown sits in a branch nothing can reach").
 
         elif action == ACTION_SCHEDULE_IMPORT:
-            # Store the scheduled time - checked in _check_scheduled_import
-            self.store["import_scheduled_time"] = decision.scheduled_time
-            self.store["import_target_soc"]     = decision.target_soc_pct
-            if self.store.get("import_scheduled_logged") != str(decision.scheduled_time):
-                log(f"[Manager] Import scheduled: {decision.reason}")
-                self.store["import_scheduled_logged"] = str(decision.scheduled_time)
+            # v5.100.0: never arm while an import is RUNNING. The planner's window
+            # used to exclude the slot in progress, so mid-import it re-emitted
+            # SCHEDULE for the NEXT half-hour; stored, that time outlived the import
+            # (nothing clears it on completion) and _check_scheduled_import fired a
+            # second charge seconds after the first reached target. The running
+            # import is the plan; the manager re-plans the moment it ends.
+            if not prev_import:
+                # Store the scheduled time - checked in _check_scheduled_import
+                self.store["import_scheduled_time"] = decision.scheduled_time
+                self.store["import_target_soc"]     = decision.target_soc_pct
+                if self.store.get("import_scheduled_logged") != str(decision.scheduled_time):
+                    log(f"[Manager] Import scheduled: {decision.reason}")
+                    self.store["import_scheduled_logged"] = str(decision.scheduled_time)
 
         elif action == ACTION_START_EXPORT:
             # Idempotent: only call night_export if not already exporting
@@ -5378,6 +5415,12 @@ class Plugin(indigo.PluginBase):
                     self._set_flood_prev_target(None)
                     self._trigger_event("floodPreventionStopped")
                 self.modbus.set_charge_limit(cap_w, quiet=True)
+                if prev_import:
+                    # v5.100.0: an import interrupted by dawn kept its raised charge
+                    # cutoff (40047) — this path cleared the flag without restoring
+                    # the register, and _verify_ems_registers then re-asserted the
+                    # import target as the PV charge ceiling for the rest of the day.
+                    self._restore_import_cutoff()
                 self.store["solar_overflow_active"]       = True
                 self.store["solar_overflow_charge_cap_w"] = cap_w
                 self.store["export_active"]               = False
@@ -9860,6 +9903,8 @@ class Plugin(indigo.PluginBase):
             log(f"[Action] Force export: discharge limit {power_kw:.1f}kW "
                 f"(grid export auto-capped at the DNO limit)")
             if self.modbus and self.modbus.night_export(discharge_w):
+                if self.store.get("import_active"):
+                    self._restore_import_cutoff()          # v5.100.0
                 self.store["export_active"]  = True
                 self.store["import_active"]  = False
 
@@ -9903,6 +9948,8 @@ class Plugin(indigo.PluginBase):
             log("[Action] Set self-consumption mode")
             if self.modbus:
                 self.modbus.set_self_consumption()
+                if self.store.get("import_active"):
+                    self._restore_import_cutoff()          # v5.100.0
                 self.store["import_active"] = False
                 self.store["export_active"] = False
 
@@ -9912,6 +9959,8 @@ class Plugin(indigo.PluginBase):
             log("[Action] Return to local EMS control")
             if self.modbus:
                 self.modbus.return_to_local()
+                if self.store.get("import_active"):
+                    self._restore_import_cutoff()          # v5.100.0
                 self.store["import_active"] = False
                 self.store["export_active"] = False
 

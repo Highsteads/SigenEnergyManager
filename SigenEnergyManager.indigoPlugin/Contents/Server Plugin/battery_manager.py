@@ -670,6 +670,12 @@ class Decision:
     soc_at_dawn_kwh: float = 0.0
     import_kwh:      float = 0.0
     export_kw:       float = 0.0    # kW being exported (solar overflow)
+    # v5.100.0 — the import planner found a genuine tomorrow deficit and no price to
+    # buy it at (no Agile rates, unpriced half-hours, an unrecognised tariff) and is
+    # HOLDING on self-consumption rather than importing blind. plugin.py warns and
+    # pages once a day on the flag; import_held_why is the plain phrase it quotes.
+    import_held:     bool  = False
+    import_held_why: str   = ""
     # v3.11 — set when the bank-first gate is what refused the overflow branch.
     # Carried as a FLAG, not as text: the overflow reason string is already close
     # to the 255-char device-state limit and two tests assert on its literal text.
@@ -1411,16 +1417,12 @@ class BatteryManager:
         if tariff.tariff_key == TARIFF_FLEXIBLE:
             return self._plan_flexible_import(snapshot, balance, target_soc)
 
-        # Unknown tariff — import now at half inverter power
-        return Decision(
-            action         = ACTION_START_IMPORT,
-            reason         = (
-                f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
-                f"need {balance.tomorrow_need_kwh:.1f}). Unknown tariff — importing now."
-            ),
-            power_watts    = int(min(10000, snapshot.capacity_kwh * 1000 / 2)),
-            target_soc_pct = target_soc,
-        )
+        # Unknown tariff — HOLD (v5.100.0; was "import now at half inverter power").
+        # There is no price to buy at, so passthrough is the honest baseline;
+        # _classify_tariff_code has already warned, naming the product code to add
+        # to TARIFF_PRODUCT_PREFIXES.
+        return self._hold_import(
+            balance, f"the tariff '{tariff.tariff_key}' is not recognised")
 
     def _plan_tou_import(
         self,
@@ -1577,117 +1579,175 @@ class BatteryManager:
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
 
+    def _hold_import(self, balance: SufficiencyBalance, why: str) -> Decision:
+        """Tomorrow needs a grid import and the plugin has no price to buy it at.
+
+        v5.100.0. Passthrough, not a blind 10 kW import: the house draws what it
+        needs from the grid as it needs it, which is the baseline the round-trip gate
+        already prefers on flat days and cannot cost more than an unknown price would.
+        import_held=True is the executor's cue to say so (a WARNING and one Pushover a
+        day) — a hold that reads like "24h sufficient" is the fault, not the hold.
+        """
+        return Decision(
+            action          = ACTION_SELF_CONSUMPTION,
+            reason          = (
+                f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
+                f"need {balance.tomorrow_need_kwh:.1f}) — import HELD: {why}. "
+                f"Grid supplies the house directly until a price is available"
+            ),
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            import_held     = True,
+            import_held_why = why,
+        )
+
     def _plan_agile_import(
         self,
         snapshot:   ManagerSnapshot,
         balance:    SufficiencyBalance,
         target_soc: float,
     ) -> Decision:
-        """Plan import on Agile — find cheapest available slot before dawn."""
+        """Plan import on Agile — start where the whole CHARGE is cheapest.
+
+        v5.100.0 (10-09-2026 review, docs/agile-readiness-review-brief.md). Until
+        then this picked the single cheapest half-hour before dawn and the executor
+        charged forward from it to target. On Agile the cheapest half-hour is often
+        a spike-down at the tail of the trough or on the morning ramp, so the block
+        it starts climbs. Replayed over 150 real region-F nights (Oct-2025 to
+        Feb-2026, product AGILE-24-10-01, 20 kWh at 9.5 kW, measured 10-09-2026):
+        single-slot start GBP 421.16, cheapest contiguous block GBP 396.38 —
+        GBP 24.79 a season, GBP 61.63 at 30 kWh a night, GBP 44.06 if the battery
+        only takes 6 kW. The N cheapest non-contiguous half-hours would save a
+        further GBP 6.01 but need an executor that stops and restarts; not built.
+
+        The block is n half-hours from a candidate start, n from the GRID-side need
+        at the inverter's charge rate (the executor charges at inverterMaxKw). Every
+        half-hour of the block must be priced — a block that runs past the published
+        slots is not a candidate, so the planner never buys an unpriced half-hour.
+        The slot in progress IS a candidate: importing now is sometimes the best
+        move (a midday plunge before tomorrow's rates publish) and `now < dt` used to
+        exclude it. The round-trip gate judges the block's MEAN, not its cheapest
+        half-hour, against the daytime reference.
+
+        Three things this deliberately no longer does, each of them a 10 kW import
+        with no price on it: import "now" when there are no slots, import "now" when
+        no published slot lies before dawn, and import "now" when the battery cannot
+        "safely reach" the cheap slot. The first two HOLD (see _hold_import). The
+        third is dropped outright: a battery that meets its discharge floor before
+        the cheap block leaves the house on grid for its own load (~0.3 kWh/h at the
+        evening rate) instead of buying the whole deficit at that rate — on the
+        29-Nov-2025 shape that is 19 kWh at 32.5p against ~2 kWh at 17p. Agile has
+        no resilience floor either way; _check_resilience_buffer covers flat and TOU
+        tariffs only.
+        """
         tariff  = snapshot.tariff
         now     = snapshot.now
         dawn_dt = balance.dawn_dt
 
         if not tariff.agile_slots or dawn_dt is None:
+            return self._hold_import(balance, "no Agile rates to plan from")
+
+        # Block shape: n half-hours of grid-side energy at the charge rate.
+        charge_kw = max(1.0, float(snapshot.inverter_max_kw or 10.0))
+        per_slot  = charge_kw * 0.5
+        need_grid = max(float(balance.import_kwh_grid), MIN_IMPORT_KWH)
+        n_slots   = max(1, int(-(-need_grid // per_slot)))
+        energies  = [per_slot] * (n_slots - 1) + [need_grid - per_slot * (n_slots - 1)]
+
+        half  = timedelta(minutes=30)
+        slots = sorted(tariff.agile_slots, key=lambda s: s[0])
+        by_dt = {dt: rate for dt, rate in slots}
+        best  = None                    # (cost, start_dt, block rates)
+        for start_dt, _ in slots:
+            if start_dt + half <= now or start_dt >= dawn_dt:
+                continue                # already over, or after dawn
+            block = []
+            for k in range(n_slots):
+                rate = by_dt.get(start_dt + k * half)
+                if rate is None:
+                    block = None
+                    break               # runs into a half-hour nobody has priced
+                block.append(rate)
+            if block is None:
+                continue
+            cost = sum(r * e for r, e in zip(block, energies))
+            if best is None or cost < best[0]:
+                best = (cost, start_dt, block)
+
+        if best is None:
+            return self._hold_import(
+                balance, "the published Agile slots do not cover a charge before dawn")
+
+        cost, start_dt, block = best
+        # Prices are quoted to 4 dp; rounding the mean the same way keeps a flat
+        # block exact at the break-even boundary instead of a float hair under it.
+        mean_p    = round(cost / need_grid, 4)
+        effective = mean_p / max(0.01, snapshot.efficiency)
+        reference = self._agile_daytime_reference_rate(tariff, dawn_dt)
+        end_dt    = start_dt + n_slots * half
+        span      = (f"{self._to_local(start_dt).strftime('%H:%M')}-"
+                     f"{self._to_local(end_dt).strftime('%H:%M')}")
+
+        # Round-trip break-even (v5.44.0): pre-charging loses ~6% in AC->DC->AC
+        # conversion, so the block only beats letting the inverter pass grid
+        # straight to the house tomorrow when mean / efficiency undercuts
+        # tomorrow's daytime rates.
+        if reference is not None and effective >= reference:
+            return Decision(
+                action          = ACTION_SELF_CONSUMPTION,
+                reason          = (
+                    f"Tomorrow shortfall — cheapest Agile block {span} averages "
+                    f"{mean_p:.2f}p, {effective:.2f}p after "
+                    f"~{(1 - snapshot.efficiency) * 100:.0f}% conversion loss, vs "
+                    f"{reference:.2f}p daytime average. Grid imports direct to house "
+                    f"instead; pre-charging would cost more than it saves"
+                ),
+                dawn_viable     = True,
+                soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            )
+        if start_dt <= now + timedelta(minutes=5):
             return Decision(
                 action         = ACTION_START_IMPORT,
-                reason         = "Tomorrow at risk — no Agile rates available, importing now",
-                power_watts    = 10000,
-                target_soc_pct = target_soc,
-            )
-
-        cap_kwh   = snapshot.capacity_kwh
-        floor_kwh = snapshot.health_cutoff_pct / 100.0 * cap_kwh
-
-        available_slots = [
-            (dt, rate) for dt, rate in tariff.agile_slots
-            if now < dt < dawn_dt
-        ]
-
-        if not available_slots:
-            return Decision(
-                action         = ACTION_START_IMPORT,
-                reason         = "Tomorrow at risk — no future Agile slots before dawn, importing now",
-                power_watts    = 10000,
-                target_soc_pct = target_soc,
-            )
-
-        # Find cheapest slot the battery can safely reach
-        cheapest_viable = None
-        for slot_dt, rate in sorted(available_slots, key=lambda x: x[1]):
-            drain = self._estimate_consumption_until(
-                now, slot_dt, snapshot.consumption_profile
-            )
-            if (snapshot.current_soc_pct / 100.0 * cap_kwh) - drain >= floor_kwh:
-                cheapest_viable = (slot_dt, rate)
-                break
-
-        if cheapest_viable:
-            slot_dt, rate = cheapest_viable
-            # Round-trip break-even (v5.44.0): pre-charging loses ~6% in
-            # AC->DC->AC conversion, so the cheapest slot only beats letting
-            # the inverter pass grid straight to the house tomorrow when
-            # rate / efficiency undercuts tomorrow's daytime rates. Tracker
-            # and Flexible already gate on exactly this economics — Agile
-            # was the one path that imported unconditionally, which loses
-            # money on flat-ish Agile days (overnight 22p vs daytime 23p:
-            # 22 / 0.94 = 23.4p effective).
-            reference = self._agile_daytime_reference_rate(tariff, dawn_dt)
-            effective = rate / max(0.01, snapshot.efficiency)
-            if reference is not None and effective >= reference:
-                return Decision(
-                    action          = ACTION_SELF_CONSUMPTION,
-                    reason          = (
-                        f"Tomorrow shortfall — cheapest Agile slot {rate:.2f}p is "
-                        f"{effective:.2f}p after ~{(1 - snapshot.efficiency) * 100:.0f}% "
-                        f"conversion loss, vs {reference:.2f}p daytime average. "
-                        f"Grid imports direct to house instead; pre-charging would "
-                        f"cost more than it saves"
-                    ),
-                    dawn_viable     = True,
-                    soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
-                )
-            if slot_dt <= now + timedelta(minutes=5):
-                return Decision(
-                    action         = ACTION_START_IMPORT,
-                    reason         = (
-                        f"Tomorrow at risk — cheapest Agile slot now ({rate:.2f}p/kWh), "
-                        f"importing"
-                    ),
-                    power_watts    = 10000,
-                    target_soc_pct = target_soc,
-                )
-            return Decision(
-                action         = ACTION_SCHEDULE_IMPORT,
                 reason         = (
-                    f"Tomorrow at risk — Agile import at "
-                    f"{slot_dt.strftime('%H:%M')} ({rate:.2f}p/kWh)"
+                    f"Tomorrow at risk — cheapest Agile block {span} is now "
+                    f"({mean_p:.2f}p/kWh average), importing"
                 ),
                 power_watts    = 10000,
                 target_soc_pct = target_soc,
-                scheduled_time = slot_dt,
             )
-
-        # Cannot safely reach any slot — import now
         return Decision(
-            action         = ACTION_START_IMPORT,
-            reason         = "Tomorrow at risk — no viable Agile slot available, importing now",
+            action         = ACTION_SCHEDULE_IMPORT,
+            reason         = (
+                f"Tomorrow at risk — Agile import {span} ({mean_p:.2f}p/kWh average, "
+                f"{min(block):.2f}p cheapest half-hour)"
+            ),
             power_watts    = 10000,
             target_soc_pct = target_soc,
+            scheduled_time = start_dt,
         )
 
     @staticmethod
     def _agile_daytime_reference_rate(tariff: TariffData, dawn_dt):
         """Mean of tomorrow's daytime Agile slots (dawn -> dawn+12h), the
-        passthrough price an overnight pre-charge competes against. Falls back
-        to today's rate when tomorrow's slots aren't published yet; None when
-        no reference exists (caller then imports ungated, as before v5.44.0).
+        passthrough price an overnight pre-charge competes against.
+
+        Tomorrow is unpublished until ~16:00, and until v5.100.0 the fallback was
+        today_rate_p — on Agile the CURRENT half-hour, which at 17:00 is the peak
+        (flatters any import) and in a midday plunge is negative (refuses every
+        import). Replayed over 150 winter days (10-09-2026) it flipped the verdict
+        in 297 of 2,284 daytime half-hours; today's own daytime mean, the same
+        12-hour window one day earlier, flipped none. So that is the fallback now.
+        today_rate_p is reached only when neither day has a daytime slot, and None
+        when there is no reference at all (the caller then imports ungated, as it
+        has since v5.44.0).
         """
         if tariff.agile_slots and dawn_dt is not None:
-            day_rates = [r for dt, r in tariff.agile_slots
-                         if dawn_dt <= dt < dawn_dt + timedelta(hours=12)]
-            if day_rates:
-                return sum(day_rates) / len(day_rates)
+            for days_back in (0, 1):
+                start = dawn_dt - timedelta(days=days_back)
+                day_rates = [r for dt, r in tariff.agile_slots
+                             if start <= dt < start + timedelta(hours=12)]
+                if day_rates:
+                    return sum(day_rates) / len(day_rates)
         return tariff.today_rate_p or None
 
     def _plan_flexible_import(

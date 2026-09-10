@@ -273,6 +273,8 @@ class OctopusAPI:
         self._saving_sessions_neg_at   = 0.0    # last failure (negative-cache debounce)
         self._rates_neg_at        = {}     # cache_key -> last failed fetch (debounce)
         self._tariff_neg_at       = 0.0    # last failed tariff detection (debounce)
+        self._last_agile_slots    = []     # last NON-EMPTY Agile slot list (v5.100.0)
+        self._agile_stale_warned  = False  # one WARNING per empty-fetch run
 
         # Rate-limit tracker.  Octopus permits roughly 100 requests/hour per
         # endpoint family.  We're nowhere near that under normal poll cadence
@@ -508,6 +510,24 @@ class OctopusAPI:
                         f"[Octopus] Agile slot fetch failed for {day}: "
                         f"{type(exc).__name__}: {exc}")
             slots.sort(key=lambda s: s[0])
+            if slots:
+                self._last_agile_slots   = list(slots)
+                self._agile_stale_warned = False
+            else:
+                # v5.100.0: an empty fetch (probe failed, rate-limit guard, HTTP
+                # error, 404) used to REPLACE the slots the planner already held,
+                # and the planner then imported 10 kW with no price on it. Keep
+                # the last good list instead. Slots carry their own times, so the
+                # ones that have ended fall out of the planner's window by
+                # themselves — a stale list is self-limiting, an empty one is not.
+                _cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+                kept = [s for s in self._last_agile_slots if s[0] > _cutoff]
+                if kept and not self._agile_stale_warned:
+                    self.logger.warning(
+                        f"[Octopus] Agile rate fetch returned nothing — planning on "
+                        f"the {len(kept)} slot(s) still ahead from the last good fetch")
+                    self._agile_stale_warned = True
+                slots = kept
             result["agile_slots"] = slots
 
             # The monitor device and dashboards read today_p. On Agile a single "today's
@@ -1407,6 +1427,18 @@ class OctopusAPI:
             # Fall back to public products listing (SILVER-* or TRACKER-VAR-* prefixes)
             return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
+        if tariff_key == TARIFF_AGILE:
+            # v5.100.0: the account names the product the house is billed on; the
+            # public listing is a guess that picks the NEWEST "AGILE-" product, which
+            # diverges the day Octopus issues an Agile version this account is not
+            # moved to (and its prefix also matches AGILE-OUTGOING-*). Same shape as
+            # Tracker above. The probe remains the route while billed elsewhere —
+            # that is the log-only shadow comparison.
+            info = self.get_current_tariff()
+            if (info and info.get("tariff_key") == TARIFF_AGILE
+                    and info.get("product_code")):
+                return info.get("product_code", "")
+
         return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
     def _probe_product_by_prefix(self, prefixes):
@@ -1448,7 +1480,13 @@ class OctopusAPI:
             return best_code
 
         except Exception as e:
-            self.logger.debug(f"Product probe error: {e}")
+            # v5.100.0: WARNING, not debug. None here empties the Agile slot list,
+            # and until v5.100.0 the planner then imported 10 kW at whatever the
+            # price happened to be. It was the one failure on the path that logged
+            # below the level anything watches.
+            self.logger.warning(
+                f"[Octopus] Product probe failed ({e}) — no product code for "
+                f"{prefixes}, so no rates can be fetched for it this cycle")
 
         return None
 

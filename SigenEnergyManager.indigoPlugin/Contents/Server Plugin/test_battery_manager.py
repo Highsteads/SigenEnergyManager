@@ -1416,13 +1416,16 @@ class TestAgileBreakEven(unittest.TestCase):
         snapshot.tariff.tariff_key = "agile"
         dawn = _tomorrow_dawn(hour=7)
         slots = []
+        # Contiguous half-hours, because v5.100.0's planner prices a whole
+        # charge and a block that runs into an unpriced half-hour is not a
+        # candidate. The old fixture was three hourly points a side.
         if overnight_p is not None:
-            for h in (23, 24, 25):                       # tonight, before dawn
-                slots.append((_now(hour=20) + timedelta(hours=h - 20),
+            for k in range(8):                           # tonight 23:00-03:00
+                slots.append((_now(hour=23) + k * timedelta(minutes=30),
                               overnight_p))
         if daytime_p is not None:
-            for h in (3, 5, 7):                          # tomorrow daytime
-                slots.append((dawn + timedelta(hours=h), daytime_p))
+            for k in range(6, 20):                       # tomorrow 10:00-17:00
+                slots.append((dawn + k * timedelta(minutes=30), daytime_p))
         snapshot.tariff.agile_slots = slots
         balance = self.bm._calculate_24h_balance(snapshot)
         return self.bm._plan_agile_import(snapshot, balance, target_soc=50.0)

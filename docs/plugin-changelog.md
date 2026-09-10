@@ -15,6 +15,89 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.100.0 — 10-09-2026
+
+**THE AGILE IMPORT PATH, MADE SAFE BEFORE IT SPENDS REAL MONEY.** Adversarial review of
+`_plan_agile_import` and everything around it, three weeks before the 1-October switch
+(brief: `docs/agile-readiness-review-brief.md`; report with the numbers:
+`docs/agile-readiness-review-2026-09-10.md`). The 07/08-Sept rehearsal proved the plumbing and
+could not reach the decision — a September battery has no deficit — so this is the first time
+the money path was exercised, and it was exercised on **7,248 real region-F half-hours**
+(Oct-2025 to Feb-2026, product AGILE-24-10-01, pulled from the public API on 10-09-2026)
+rather than on a two-band fixture. Reproducible: `python3 scripts/agile_replay.py`.
+
+Findings, in money order:
+
+1. **The single-cheapest-slot rule was a spike-down trap (CONFIRMED, £24.79-£61.63 a
+   season).** The planner picked the cheapest half-hour before dawn and the executor charged
+   forward from it to target. On Agile that half-hour is often the tail of the trough or a dip
+   on the morning ramp: 29-Nov-2025 it was 06:00 at 9.64p, and the four half-hours from there
+   cost 13-18p while 01:30-03:30 sat at 9.8-10.6p. Replayed over 150 nights at 20 kWh / 9.5 kW:
+   single-slot **£421.16**, cheapest contiguous block **£396.38**, N cheapest non-contiguous
+   £390.36 (needs a stop/start executor; not built, £6 residual). At 30 kWh a night the gap is
+   £61.63; at a 6 kW cold-battery charge rate £44.06. `_plan_agile_import` now prices every
+   candidate block — n half-hours from the GRID-side need at `inverter_max_kw` — requires every
+   half-hour of it to be published, starts where the block is cheapest, and the round-trip gate
+   judges the block MEAN, which also closes the case where a 20p slot passed the gate for a
+   block averaging 26p.
+2. **Four branches imported 10 kW with no price (CONFIRMED, up to ~£5 an occurrence, the
+   evening peak).** No slots, no future slot before dawn, no "safely reachable" slot, unknown
+   tariff — and all of them reachable on the REAL path, not just the override: a failed
+   `_probe_product_by_prefix` logged at DEBUG and returned None, `get_agile_rates` returned []
+   silently, `get_all_monitored_rates` replaced the slots the planner already held with that
+   [], and the planner bought at whatever the price was. Now: the probe WARNs; Agile uses the
+   account's own product code (the listing was a guess for the newest `AGILE-` product, which
+   also matches `AGILE-OUTGOING-*`); an empty fetch keeps the last good slots, with one
+   WARNING per outage — a stale list is self-limiting because slots carry their own times, an
+   empty one is not; and the planner HOLDS on self-consumption with `import_held=True`, which
+   `plugin.py._note_import_hold` turns into a WARNING and one Pushover a day. Passthrough is
+   the baseline the gate already prefers on flat days and cannot cost more than an unknown
+   price. The reachability filter is dropped outright: a battery that meets its floor before
+   the cheap block costs the house ~0.3 kWh/h of grid at the evening rate, not 19 kWh at it.
+3. **The reference-rate fallback was the current half-hour (CONFIRMED, harmless in winter,
+   wrong in principle).** Before ~16:00 tomorrow's daytime mean is unpublished and the gate
+   fell back to `today_rate_p` — on Agile the slot in force NOW. Over 2,284 daytime half-hours
+   it flipped the verdict in **297 (13%)**, every one a refusal on a cheap or negative current
+   slot; the overnight decision after 16:00 was never affected (0 of 150 declines under any
+   reference — winter Agile nights always clear the gate). Fallback is now today's daytime
+   mean, the same 12-hour window one day earlier: 0 flips. And the slot in progress is a
+   candidate (`start + 30min > now`, not `now < start`), so a midday plunge is bought while it
+   is happening instead of declined against itself.
+4. **What ends an import (CONFIRMED, the brief's question 1).** `ACTION_STOP_IMPORT` has not
+   been returned by `battery_manager` since the v4.0 sufficiency model. The teardown lives in
+   `_act_on_decision`'s SELF_CONSUMPTION branch (target reached) and the unconditional target
+   check at its foot, and both restore the charge cutoff — so the dead branch was a leftover,
+   removed. BUT four OTHER exits from `import_active` cleared the flag without
+   `_restore_import_cutoff()`: solar-overflow entry, Force Export, Set Self-Consumption and
+   Return to Local EMS. `_verify_ems_registers` re-asserts `import_charge_cutoff_pct` every
+   minute, so an import interrupted by dawn left 40047 pinned at target+3% as the PV charge
+   ceiling for the rest of the day. All four restore it now.
+5. **A schedule armed mid-import (CONFIRMED, small).** The window excluded the slot in
+   progress, so while importing the planner re-emitted SCHEDULE for the next half-hour;
+   stored, that time outlived the import (nothing clears it on completion) and could fire a
+   second charge seconds after the first completed — with `import_target_soc` already 0.0, so
+   a 12% cutoff and little energy, but a mode write and a wrong log line. SCHEDULE no longer
+   arms while `prev_import`.
+6. **Negative prices (this is fine).** Sorting by rate puts the most negative first,
+   `rate / efficiency` on a negative number stays negative, the gate passes, and the planner
+   buys the deficit only. Trading beyond it is the offline `experiments/agile_trading/` work,
+   deliberately not wired in. 54 negative half-hours over 7 days in the replayed winter.
+7. **Interactions (this is fine, one decision for CliveS).** VPP and Saving Session outrank
+   the import in `evaluate()`, and `_check_scheduled_import` holds a queued import through
+   PRE_CHARGING/ACTIVE; flood prevention needs a 3x-demand forecast, which has no deficit;
+   bank-first is priority 5, below import. The gap: `_check_resilience_buffer` covers flat and
+   TOU tariffs only, so on Agile the winter power-cut reserve (`winterBufferPct`, 20%) is not
+   maintained at all. Nothing broken and no money at stake; queued in `TRIAGE_QUEUE.md` as
+   the policy choice it is.
+
+Tests **1277 -> 1306**: `test_agile_readiness.py` (29), every one run against the pre-fix code
+first (21 failed, the 8 that passed are the both-sides guards); `TestAgileBreakEven`'s fixture
+made contiguous half-hours, because a block planner cannot price hourly points. Mutation
+sweep **20/20 killed, 0 skipped**, `__pycache__` cleared before every run. Nothing here
+touches a register until the next deficit, and the rehearsal override stays ON.
+
+---
+
 ## v5.99.3 — 08-09-2026
 
 **THE BANK-FIRST "SMALL DAY" CLASSIFIER LOCKED ONTO WHICHEVER FORECAST ARRIVED FIRST, AND
