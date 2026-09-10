@@ -13,6 +13,8 @@ SigenEnergyManager.indigoPlugin/Contents/Packages/
 
 # Claude Code context file — local only
 CLAUDE.md
+# Agent handover file for Codex / ChatGPT Astra — local only, same treatment
+AGENTS.md
 
 # pytest cache
 .pytest_cache/
