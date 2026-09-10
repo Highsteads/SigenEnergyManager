@@ -124,7 +124,8 @@ No longer armed while an import runs.
 
 *Update, later the same day: decision 1 was taken as option (a) and shipped as v5.101.0 — the
 reserve is bought through the block planner, sized to hold the floor at dawn, ungated. Decision 2
-remains open.*
+was taken too: a first-billed-night check now fires at 09:00 on 2 October, and the 26 October
+check was rewritten for the new planner.*
 
 1. **The winter power-cut reserve is not maintained on Agile.** The resilience buffer fires on flat
    tariffs any time overnight and on Go/Flux inside the cheap window; on Agile it returns nothing, so
