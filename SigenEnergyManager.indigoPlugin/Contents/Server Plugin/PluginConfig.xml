@@ -154,7 +154,7 @@
         <Label>Summer resilience buffer (Apr-Sep, %, default 15, min 15):</Label>
     </Field>
     <Field id="label_dawnSocTarget_info" type="label">
-        <Label>The minimum battery level kept overnight on flat-rate tariffs, so a power cut does not find the house empty. It is also the floor for VPP windows and storm preparation. Minimum 15.</Label>
+        <Label>The minimum battery level kept overnight so a power cut does not find the house empty. Flat-rate tariffs top it up whenever the battery drops below it; Go and Flux inside their cheap window; Agile buys enough in the cheapest block before dawn to still hold it at dawn. It is also the floor for VPP windows and storm preparation. Minimum 15.</Label>
     </Field>
     <Field id="winterBufferPct" type="textfield" defaultValue="20">
         <Label>Winter resilience buffer (Oct-Mar, %, default 20):</Label>

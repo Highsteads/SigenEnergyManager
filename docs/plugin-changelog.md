@@ -15,6 +15,37 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.101.0 — 10-09-2026
+
+**THE POWER-CUT RESERVE IS KEPT ON AGILE, THROUGH THE BLOCK PLANNER.** The decision CliveS took
+from the readiness review's triage entry (option (a)). `_check_resilience_buffer` fired on flat
+tariffs any time overnight and on Go/Flux inside the cheap window, and returned None on Agile —
+so from 1 October `winterBufferPct` (20%, `_apply_seasonal_override` Oct-Mar) and a storm's
+raised `dawn_target_pct` would have done nothing.
+
+- **The Agile top-up is a dawn projection, not a now-floor.** The flat rule tops up to the floor
+  NOW and re-fires whenever SOC drops under it again, which costs nothing extra on a flat rate.
+  On Agile a top-up is one cheap block, so `_agile_reserve_shortfall_kwh` sizes it from the
+  balance's `battery_at_dawn_kwh`: the block carries the drain between its end and dawn as
+  well. The battery may sit under the reserve in the evening before the block — the same trade
+  Go/Flux make with their window — and holds it from the block to dawn.
+- **Not gated.** `_plan_agile_import(purpose="reserve")` skips the round-trip comparison:
+  resilience is not arbitrage, and neither the flat nor the TOU branch ever priced it.
+  `Decision.import_purpose` carries the difference; the hold notice is worded from it.
+- **One block on a deficit night.** `_plan_agile_import_with_reserve` buys the larger of the
+  deficit and the reserve shortfall, and if the gate turns the deficit down the reserve is
+  planned on its own regardless. `_plan_agile_reserve` returns None while `import_needed` is
+  True, so the two branches never plan the same block — pinned by the audit trail.
+- **MIN_IMPORT_KWH, daytime and "already held" all leave it alone**, as before.
+
+`test_agile_readiness.py` +12 (29 -> 41 in the file), 8 failing against the pre-fix code; the three that passed are the both-sides guards. Mutation sweep 12/12 after
+two fixture repairs — a reserve fixture whose cheapest block passed the gate on its own could
+not see a gated reserve, and a sunny daytime fixture had no shortfall for a daylight planner
+to buy. Both now carry a value that would move the answer. 1306 -> 1318. PluginConfig's
+`dawnSocTarget` help names all three behaviours. NOT RESTARTED; override left ON.
+
+---
+
 ## v5.100.0 — 10-09-2026
 
 **THE AGILE IMPORT PATH, MADE SAFE BEFORE IT SPENDS REAL MONEY.** Adversarial review of

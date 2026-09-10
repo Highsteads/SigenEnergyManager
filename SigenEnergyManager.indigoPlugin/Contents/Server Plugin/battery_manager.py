@@ -124,7 +124,7 @@
 #       21-May-2026 incident where a post-midnight check used the day-after's
 #       forecast and dumped the battery into a poor-today/sunny-day-after pair.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
 
@@ -676,6 +676,10 @@ class Decision:
     # pages once a day on the flag; import_held_why is the plain phrase it quotes.
     import_held:     bool  = False
     import_held_why: str   = ""
+    # v5.101.0 — what an Agile import (or hold) is FOR: "tomorrow" buys the deficit
+    # and is gated on the round-trip comparison; "reserve" buys the power-cut floor
+    # and is not. plugin.py words the hold notice from it.
+    import_purpose:  str   = "tomorrow"
     # v3.11 — set when the bank-first gate is what refused the overflow branch.
     # Carried as a FLAG, not as text: the overflow reason string is already close
     # to the 255-char device-state limit and two tests assert on its literal text.
@@ -779,7 +783,8 @@ class BatteryManager:
         ))
 
         # 2. Resilience buffer (flat-rate any-time; TOU only in the cheap window
-        #    when tomorrow is already covered — see _check_resilience_buffer)
+        #    when tomorrow is already covered; Agile in the cheapest block, v5.101.0
+        #    — see _check_resilience_buffer)
         resilience = self._check_resilience_buffer(snapshot, balance)
         if resilience is not None:
             audit.append(("RESILIENCE", f"matched -> {resilience.reason}"))
@@ -1043,17 +1048,26 @@ class BatteryManager:
         bought at the night rate, never the peak/day rate. Without this, on
         Go/iGo the reserve is never guaranteed (added 05-Jul-2026).
 
+        Agile (v5.101.0): the reserve is bought through the block planner — the
+        cheapest priced block before dawn is Agile's cheap window — sized to hold
+        dawn_target_pct AT DAWN rather than now, and not gated on the round-trip
+        comparison. See _plan_agile_reserve. Until v5.101.0 this returned None on
+        Agile, so the winter buffer did nothing there at all.
+
         Returns None when not applicable (unknown tariff, daytime, battery above
         the floor, or — on TOU — tomorrow already being covered or outside the
         cheap window).
         """
         tariff_key = snapshot.tariff.tariff_key
-        is_flat = tariff_key in (TARIFF_TRACKER, TARIFF_FLEXIBLE)
-        is_tou  = tariff_key in (TARIFF_GO, TARIFF_IGO, TARIFF_FLUX, TARIFF_IFLUX)
-        if not (is_flat or is_tou):
+        is_flat  = tariff_key in (TARIFF_TRACKER, TARIFF_FLEXIBLE)
+        is_tou   = tariff_key in (TARIFF_GO, TARIFF_IGO, TARIFF_FLUX, TARIFF_IFLUX)
+        is_agile = tariff_key == TARIFF_AGILE
+        if not (is_flat or is_tou or is_agile):
             return None
         if balance.is_daytime:
             return None
+        if is_agile:
+            return self._plan_agile_reserve(snapshot, balance)
         if snapshot.current_soc_pct >= snapshot.dawn_target_pct:
             return None
 
@@ -1093,6 +1107,74 @@ class BatteryManager:
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
+
+    @staticmethod
+    def _agile_reserve_shortfall_kwh(snapshot: ManagerSnapshot,
+                                     balance: SufficiencyBalance) -> float:
+        """kWh the battery must GAIN tonight to still hold dawn_target_pct at dawn.
+
+        The flat-tariff buffer tops up to the floor NOW and re-fires whenever SOC
+        drops under it again, which on a flat rate costs nothing extra. On Agile
+        every top-up is one cheap block, so the block has to carry the drain
+        between its end and dawn as well — hence the dawn projection the balance
+        already makes (battery_at_dawn_kwh), not the SOC now.
+        """
+        reserve_kwh = snapshot.dawn_target_pct / 100.0 * snapshot.capacity_kwh
+        return max(0.0, reserve_kwh - balance.battery_at_dawn_kwh)
+
+    @staticmethod
+    def _target_for(snapshot: ManagerSnapshot, gain_kwh: float) -> float:
+        """Executor target SOC for a charge that adds gain_kwh now (+2% anti-cycling)."""
+        battery_kwh = snapshot.current_soc_pct / 100.0 * snapshot.capacity_kwh
+        return min(98.0, (battery_kwh + gain_kwh) / max(1.0, snapshot.capacity_kwh) * 100.0 + 2.0)
+
+    def _plan_agile_reserve(self, snapshot: ManagerSnapshot,
+                            balance: SufficiencyBalance):
+        """The power-cut reserve on Agile (v5.101.0): the cheapest block, ungated.
+
+        None when tomorrow needs an import anyway (the import branch then buys
+        the larger of the deficit and the reserve in one block — see
+        _plan_agile_import_with_reserve), when the projection already holds the
+        reserve, or when the shortfall is under MIN_IMPORT_KWH. Otherwise a
+        block-planned import sized to hold dawn_target_pct at dawn. Not gated on
+        the round-trip comparison: resilience is not arbitrage, and the flat and
+        TOU branches never priced it either.
+        """
+        if balance.import_needed:
+            return None
+        short      = self._agile_reserve_shortfall_kwh(snapshot, balance)
+        short_grid = short / max(0.01, snapshot.efficiency)
+        if short_grid < MIN_IMPORT_KWH:
+            return None
+        reserve_balance = replace(balance, import_kwh=round(short, 2),
+                                  import_kwh_grid=round(short_grid, 2), import_needed=True)
+        return self._plan_agile_import(snapshot, reserve_balance,
+                                       self._target_for(snapshot, short), purpose="reserve")
+
+    def _plan_agile_import_with_reserve(self, snapshot: ManagerSnapshot,
+                                        balance: SufficiencyBalance,
+                                        target_soc: float) -> Decision:
+        """Agile import branch (v5.101.0): the larger of tomorrow's deficit and the
+        reserve shortfall, in ONE block. If the round-trip gate turns the deficit
+        down, the reserve is bought on its own regardless — the gate is about
+        arbitrage and the reserve is not.
+        """
+        short      = self._agile_reserve_shortfall_kwh(snapshot, balance)
+        short_grid = short / max(0.01, snapshot.efficiency)
+        combined, combined_target = balance, target_soc
+        if short > balance.import_kwh:
+            combined        = replace(balance, import_kwh=round(short, 2),
+                                      import_kwh_grid=round(short_grid, 2))
+            combined_target = self._target_for(snapshot, short)
+        decision = self._plan_agile_import(snapshot, combined, combined_target)
+        declined = decision.action == ACTION_SELF_CONSUMPTION and not decision.import_held
+        if declined and short_grid >= MIN_IMPORT_KWH:
+            reserve_balance = replace(balance, import_kwh=round(short, 2),
+                                      import_kwh_grid=round(short_grid, 2))
+            return self._plan_agile_import(snapshot, reserve_balance,
+                                           self._target_for(snapshot, short),
+                                           purpose="reserve")
+        return decision
 
     # ================================================================
     # 24-Hour Sufficiency Check
@@ -1412,7 +1494,7 @@ class BatteryManager:
             return self._plan_tracker_import(snapshot, balance, target_soc)
 
         if tariff.tariff_key == TARIFF_AGILE:
-            return self._plan_agile_import(snapshot, balance, target_soc)
+            return self._plan_agile_import_with_reserve(snapshot, balance, target_soc)
 
         if tariff.tariff_key == TARIFF_FLEXIBLE:
             return self._plan_flexible_import(snapshot, balance, target_soc)
@@ -1579,26 +1661,35 @@ class BatteryManager:
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
         )
 
-    def _hold_import(self, balance: SufficiencyBalance, why: str) -> Decision:
-        """Tomorrow needs a grid import and the plugin has no price to buy it at.
+    def _hold_import(self, balance: SufficiencyBalance, why: str,
+                     purpose: str = "tomorrow", reserve_pct: float = 0.0) -> Decision:
+        """A grid import is wanted and the plugin has no price to buy it at.
 
         v5.100.0. Passthrough, not a blind 10 kW import: the house draws what it
         needs from the grid as it needs it, which is the baseline the round-trip gate
         already prefers on flat days and cannot cost more than an unknown price would.
         import_held=True is the executor's cue to say so (a WARNING and one Pushover a
         day) — a hold that reads like "24h sufficient" is the fault, not the hold.
+        purpose "reserve" (v5.101.0) is the power-cut floor rather than tomorrow's
+        deficit; the notice is worded from it.
         """
+        if purpose == "reserve":
+            reason = (f"Reserve short ({balance.import_kwh:.1f} kWh to hold {reserve_pct:.0f}% "
+                      f"at dawn) — top-up HELD: {why}. The battery keeps what it has "
+                      f"until a price is available")
+        else:
+            reason = (f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
+                      f"need {balance.tomorrow_need_kwh:.1f}) — import HELD: {why}. "
+                      f"Grid supplies the house directly until a price is available")
         return Decision(
             action          = ACTION_SELF_CONSUMPTION,
-            reason          = (
-                f"Tomorrow shortfall ({balance.available_tomorrow_kwh:.1f} kWh avail, "
-                f"need {balance.tomorrow_need_kwh:.1f}) — import HELD: {why}. "
-                f"Grid supplies the house directly until a price is available"
-            ),
+            reason          = reason,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            import_kwh      = round(float(balance.import_kwh_grid), 2),
             import_held     = True,
             import_held_why = why,
+            import_purpose  = purpose,
         )
 
     def _plan_agile_import(
@@ -1606,6 +1697,7 @@ class BatteryManager:
         snapshot:   ManagerSnapshot,
         balance:    SufficiencyBalance,
         target_soc: float,
+        purpose:    str = "tomorrow",
     ) -> Decision:
         """Plan import on Agile — start where the whole CHARGE is cheapest.
 
@@ -1636,16 +1728,19 @@ class BatteryManager:
         third is dropped outright: a battery that meets its discharge floor before
         the cheap block leaves the house on grid for its own load (~0.3 kWh/h at the
         evening rate) instead of buying the whole deficit at that rate — on the
-        29-Nov-2025 shape that is 19 kWh at 32.5p against ~2 kWh at 17p. Agile has
-        no resilience floor either way; _check_resilience_buffer covers flat and TOU
-        tariffs only.
+        29-Nov-2025 shape that is 19 kWh at 32.5p against ~2 kWh at 17p.
+
+        purpose (v5.101.0): "tomorrow" buys the deficit and is gated on the
+        round-trip comparison; "reserve" buys the power-cut floor through the same
+        block selection and is not gated — see _plan_agile_reserve.
         """
         tariff  = snapshot.tariff
         now     = snapshot.now
         dawn_dt = balance.dawn_dt
 
         if not tariff.agile_slots or dawn_dt is None:
-            return self._hold_import(balance, "no Agile rates to plan from")
+            return self._hold_import(balance, "no Agile rates to plan from",
+                                     purpose, snapshot.dawn_target_pct)
 
         # Block shape: n half-hours of grid-side energy at the charge rate.
         charge_kw = max(1.0, float(snapshot.inverter_max_kw or 10.0))
@@ -1676,7 +1771,8 @@ class BatteryManager:
 
         if best is None:
             return self._hold_import(
-                balance, "the published Agile slots do not cover a charge before dawn")
+                balance, "the published Agile slots do not cover a charge before dawn",
+                purpose, snapshot.dawn_target_pct)
 
         cost, start_dt, block = best
         # Prices are quoted to 4 dp; rounding the mean the same way keeps a flat
@@ -1692,7 +1788,7 @@ class BatteryManager:
         # conversion, so the block only beats letting the inverter pass grid
         # straight to the house tomorrow when mean / efficiency undercuts
         # tomorrow's daytime rates.
-        if reference is not None and effective >= reference:
+        if purpose == "tomorrow" and reference is not None and effective >= reference:
             return Decision(
                 action          = ACTION_SELF_CONSUMPTION,
                 reason          = (
@@ -1705,25 +1801,34 @@ class BatteryManager:
                 dawn_viable     = True,
                 soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
             )
+        if purpose == "reserve":
+            head = "Reserve short"
+            tail = f" to hold {snapshot.dawn_target_pct:.0f}% at dawn"
+        else:
+            head, tail = "Tomorrow at risk", ""
         if start_dt <= now + timedelta(minutes=5):
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = (
-                    f"Tomorrow at risk — cheapest Agile block {span} is now "
-                    f"({mean_p:.2f}p/kWh average), importing"
+                    f"{head} — cheapest Agile block {span} is now "
+                    f"({mean_p:.2f}p/kWh average), importing {need_grid:.1f} kWh{tail}"
                 ),
                 power_watts    = 10000,
                 target_soc_pct = target_soc,
+                import_kwh     = round(need_grid, 2),
+                import_purpose = purpose,
             )
         return Decision(
             action         = ACTION_SCHEDULE_IMPORT,
             reason         = (
-                f"Tomorrow at risk — Agile import {span} ({mean_p:.2f}p/kWh average, "
-                f"{min(block):.2f}p cheapest half-hour)"
+                f"{head} — Agile import {span} ({mean_p:.2f}p/kWh average, "
+                f"{min(block):.2f}p cheapest half-hour){tail}"
             ),
             power_watts    = 10000,
             target_soc_pct = target_soc,
             scheduled_time = start_dt,
+            import_kwh     = round(need_grid, 2),
+            import_purpose = purpose,
         )
 
     @staticmethod

@@ -109,7 +109,8 @@ def _daytime_slots(dawn, price=25.0, hours=12, days_back=0):
 
 
 def _snap(slots, now_off, dawn_off=17.0, soc=40.0, today_rate_p=None,
-          health_floor=10.0, tariff_key=TARIFF_AGILE):
+          health_floor=10.0, tariff_key=TARIFF_AGILE, dawn_target=10.0,
+          tomorrow_kwh=0.0):
     """Snapshot at now = 16:00 + now_off hours, dawn at 16:00 + dawn_off hours.
 
     weekday == weekend so the need is day-agnostic; the flat 0.3 kWh/slot profile
@@ -121,12 +122,12 @@ def _snap(slots, now_off, dawn_off=17.0, soc=40.0, today_rate_p=None,
                         agile_slots=list(slots))
     return ManagerSnapshot(
         current_soc_pct=soc, capacity_kwh=CAPACITY_KWH, efficiency=EFFICIENCY,
-        dawn_target_pct=10.0, health_cutoff_pct=health_floor,
+        dawn_target_pct=dawn_target, health_cutoff_pct=health_floor,
         export_enabled=False, tariff=tariff, forecast_p50={},
         dawn_times=dawn_times, consumption_profile=[0.30] * 48,
         now=_base() + timedelta(hours=now_off),
         weekday_kwh=22.0, weekend_kwh=22.0, inverter_max_kw=10.0,
-        corrected_tomorrow_kwh=0.0,
+        corrected_tomorrow_kwh=tomorrow_kwh,
     )
 
 
@@ -510,6 +511,190 @@ class TestHoldReachesTheExecutor(unittest.TestCase):
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         self.assertIn("_note_import_hold", calls)
         self.assertGreater(calls.index("_note_import_hold"), calls.index("_log_manager_decision"))
+
+
+# ============================================================
+# 5. The power-cut reserve on Agile (v5.101.0)
+# ============================================================
+
+def _gate_declining_slots():
+    """Overnight prices that fail the round-trip gate against tomorrow's 25p daytime
+    mean whatever the block: a flat 28p, 29.8p after the 6% loss. A first version
+    left one 20p half-hour in, and a one- or two-slot reserve block from it passed
+    the gate on its own — so a mutation that gated the reserve survived. The
+    fixture has to carry a value that would move the answer."""
+    dawn = _dawn(17.0)
+    return ([(_base() + timedelta(hours=h), 28.0)
+             for h in (6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0)]
+            + _daytime_slots(dawn, 25.0))
+
+
+def _reserve_oracle(snap, slots, dawn_off, reserve_pct):
+    """Independent oracle for the reserve top-up: the grid-side shortfall to hold
+    reserve_pct at dawn, and the cheapest priced block start for it."""
+    bm = BatteryManager()
+    balance = bm._calculate_24h_balance(snap)
+    short = reserve_pct / 100.0 * CAPACITY_KWH - balance.battery_at_dawn_kwh
+    need  = short / EFFICIENCY
+    per   = 5.0
+    n     = int(-(-need // per))
+    energies = [per] * (n - 1) + [need - per * (n - 1)]
+    costs = {dt: _block_cost(slots, dt, energies)
+             for dt, _ in slots if _block_cost(slots, dt, energies) is not None
+             and snap.now < dt < _dawn(dawn_off)}
+    return short, min(costs, key=costs.get)
+
+
+class TestAgileReserveIsBoughtInTheCheapestBlock(unittest.TestCase):
+    """On Tracker the resilience buffer buys the reserve whenever SOC is below it at
+    night; on Go/Flux inside the cheap window; on Agile it returned None, so the
+    winter 20% buffer did nothing from 1 October. Now it buys what the battery
+    needs to still hold the reserve AT DAWN, in the cheapest priced block, gated on
+    nothing but the price shape — resilience is not arbitrage."""
+
+    def test_reserve_short_and_tomorrow_covered_schedules_the_cheapest_block(self):
+        slots = _slots(NIGHT_2025_11_29)
+        snap  = _snap(slots, now_off=4.0, soc=40.0, tomorrow_kwh=40.0, dawn_target=50.0)
+        d = BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap))
+        self.assertIsNotNone(d, "Agile used to return None here")
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        short, best = _reserve_oracle(snap, slots, 17.0, 50.0)
+        self.assertEqual(d.scheduled_time, best)
+        self.assertNotAlmostEqual(_offset_of(d.scheduled_time), 14.0, places=1,
+            msg="06:00 is the single cheapest slot; a three-slot block from it climbs")
+
+    def test_top_up_is_sized_to_hold_the_reserve_at_dawn_not_now(self):
+        slots = _slots(NIGHT_2025_11_29)
+        snap  = _snap(slots, now_off=4.0, soc=40.0, tomorrow_kwh=40.0, dawn_target=50.0)
+        d = BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap))
+        short, _ = _reserve_oracle(snap, slots, 17.0, 50.0)
+        expected = (0.40 * CAPACITY_KWH + short) / CAPACITY_KWH * 100.0 + 2.0
+        self.assertAlmostEqual(d.target_soc_pct, expected, places=1)
+        self.assertGreater(d.target_soc_pct, 52.0,
+            "the flat-tariff rule tops up to the floor plus 2 NOW; on Agile the "
+            "overnight drain after the block has to be bought as well")
+        self.assertAlmostEqual(d.import_kwh, round(short / EFFICIENCY, 2), places=2,
+            msg="the block is sized on the GRID side of the conversion loss")
+
+    def test_reserve_is_not_gated_on_the_round_trip_comparison(self):
+        snap = _snap(_gate_declining_slots(), now_off=4.0, soc=40.0, tomorrow_kwh=40.0,
+                     dawn_target=30.0)
+        d = BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap))
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        self.assertEqual(getattr(d, "import_purpose", ""), "reserve")
+
+    def test_reserve_short_with_no_rates_holds_and_says_so(self):
+        snap = _snap([], now_off=4.0, soc=40.0, tomorrow_kwh=40.0, dawn_target=20.0)
+        d = BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap))
+        self.assertIsNotNone(d)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertTrue(getattr(d, "import_held", False))
+        self.assertEqual(getattr(d, "import_purpose", ""), "reserve")
+
+    def test_reserve_already_held_at_dawn_does_nothing(self):
+        snap = _snap(_slots(NIGHT_2025_11_29), now_off=4.0, soc=80.0, tomorrow_kwh=40.0,
+                     dawn_target=20.0)
+        self.assertIsNone(BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap)))
+
+    def test_a_shortfall_under_the_minimum_import_does_nothing(self):
+        # 40% now, 10.2 kWh drain -> 3.8 kWh at dawn; an 11% reserve is 3.85 kWh, so the
+        # gap is 0.05 kWh, well under MIN_IMPORT_KWH.
+        snap = _snap(_slots(NIGHT_2025_11_29), now_off=4.0, soc=40.0, tomorrow_kwh=40.0,
+                     dawn_target=11.0)
+        self.assertIsNone(BatteryManager()._check_resilience_buffer(
+            snap, BatteryManager()._calculate_24h_balance(snap)))
+
+    def test_daytime_is_left_to_the_sun_on_agile_too(self):
+        from battery_manager import _to_london, SOLAR_DUSK_THRESHOLD_WH
+        slots = _slots(NIGHT_2025_11_29)
+        snap  = _snap(slots, now_off=-4.0, soc=20.0, tomorrow_kwh=40.0, dawn_target=50.0)  # 12:00
+        today = _to_london(snap.now).date().strftime("%Y-%m-%d")
+        # A DULL day: just enough forecast to count as daytime, not enough to lift
+        # the dawn projection — so the reserve IS short, and only the daytime gate
+        # stops it being planned. A sunny fixture had no shortfall to plan, and a
+        # mutant that planned in daylight survived it.
+        snap.forecast_p50 = {f"{today} {h:02d}:00:00": SOLAR_DUSK_THRESHOLD_WH + 100
+                             for h in range(7, 20)}
+        snap.dawn_times   = dict(snap.dawn_times, **{today: _now(hour=7)})
+        balance = BatteryManager()._calculate_24h_balance(snap)
+        self.assertTrue(balance.is_daytime, "fixture must be daytime for this to mean anything")
+        self.assertGreater(BatteryManager._agile_reserve_shortfall_kwh(snap, balance), 1.0,
+            "fixture must leave the reserve short, or the gate is untested")
+        self.assertIsNone(BatteryManager()._check_resilience_buffer(snap, balance))
+
+
+class TestAgileDeficitImportCarriesTheReserve(unittest.TestCase):
+    """When tomorrow needs an import as well, the reserve rides in the same block —
+    the bigger of the two shortfalls, one charge — and if the round-trip gate
+    declines the deficit, the reserve is bought on its own regardless."""
+
+    def test_import_target_is_the_larger_of_deficit_and_reserve(self):
+        slots = _slots(NIGHT_2025_11_29)
+        snap  = _snap(slots, now_off=4.0, soc=40.0, tomorrow_kwh=15.0, dawn_target=50.0)
+        d, balance = _plan(snap)
+        self.assertLess(balance.import_kwh, 5.0, "fixture: a small deficit ...")
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        short, best = _reserve_oracle(snap, slots, 17.0, 50.0)
+        self.assertGreater(short, balance.import_kwh, "... and a bigger reserve shortfall")
+        expected = (0.40 * CAPACITY_KWH + short) / CAPACITY_KWH * 100.0 + 2.0
+        self.assertAlmostEqual(d.target_soc_pct, expected, places=1)
+        self.assertEqual(d.scheduled_time, best)
+
+    def test_gate_declines_the_deficit_but_the_reserve_is_still_bought(self):
+        snap = _snap(_gate_declining_slots(), now_off=4.0, soc=40.0, tomorrow_kwh=0.0,
+                     dawn_target=20.0)
+        d, balance = _plan(snap)
+        self.assertGreater(balance.import_kwh, 15.0, "fixture: a real deficit")
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        self.assertEqual(getattr(d, "import_purpose", ""), "reserve")
+        short = 0.20 * CAPACITY_KWH - balance.battery_at_dawn_kwh
+        expected = (0.40 * CAPACITY_KWH + short) / CAPACITY_KWH * 100.0 + 2.0
+        self.assertAlmostEqual(d.target_soc_pct, expected, places=1,
+            msg="the reserve alone, not the deficit the gate turned down")
+
+    def test_a_deficit_night_leaves_the_reserve_to_the_import_branch(self):
+        slots = _slots(NIGHT_2025_11_29)
+        snap  = _snap(slots, now_off=4.0, soc=40.0, tomorrow_kwh=15.0, dawn_target=50.0)
+        d = BatteryManager().evaluate(snap)
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        tags = {tag: msg for tag, msg in d.audit_trail}
+        self.assertTrue(tags["RESILIENCE"].startswith("skipped"),
+            "two branches must not both plan the same block")
+        self.assertTrue(tags["IMPORT"].startswith("matched"))
+        short, best = _reserve_oracle(snap, slots, 17.0, 50.0)
+        self.assertAlmostEqual(d.target_soc_pct,
+                               (0.40 * CAPACITY_KWH + short) / CAPACITY_KWH * 100.0 + 2.0, places=1)
+
+    def test_evaluate_fires_the_reserve_at_priority_two(self):
+        snap = _snap(_slots(NIGHT_2025_11_29), now_off=4.0, soc=40.0, tomorrow_kwh=40.0,
+                     dawn_target=20.0)
+        d = BatteryManager().evaluate(snap)
+        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+        self.assertTrue(any(tag == "RESILIENCE" and msg.startswith("matched")
+                            for tag, msg in d.audit_trail))
+
+
+class TestReserveHoldNoticeSpeaksOfTheReserve(unittest.TestCase):
+
+    def test_body_names_the_reserve_not_tomorrows_need(self):
+        p = _p(import_active=False)
+        held = Decision(action=ACTION_SELF_CONSUMPTION, import_held=True,
+                        import_purpose="reserve", import_held_why="no Agile rates to plan from",
+                        import_kwh=3.4, reason="Reserve short")
+        with patch.object(plugin, "log"), \
+                patch.object(plugin, "_london_today", return_value=date(2026, 12, 1)):
+            p._note_import_hold(held)
+        title, body = p._send_pushover.call_args.args[:2]
+        self.assertIn("reserve", body.lower())
+        self.assertNotIn("Tomorrow needs", body)
+        self.assertTrue(body.isascii() and len(body) <= 1024)
+        self.assertNotIn("=", body); self.assertNotIn("|", body)
 
 
 if __name__ == "__main__":

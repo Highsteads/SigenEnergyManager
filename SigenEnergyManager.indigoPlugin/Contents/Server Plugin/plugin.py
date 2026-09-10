@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0)
-# Date:        10-09-2026 10:42
-# Version:     5.100.0
+#              Claude Fable 5.1 (5.100.0-5.101.0)
+# Date:        10-09-2026 11:20
+# Version:     5.101.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3378,14 +3378,28 @@ class Plugin(indigo.PluginBase):
         log(f"[Manager] Grid import HELD — {decision.reason}", level="WARNING")
         kwh = float(getattr(decision, "import_kwh", 0.0) or 0.0)
         why = str(getattr(decision, "import_held_why", "") or "no price could be found")
-        body = (
-            f"Tomorrow needs about {kwh:.0f} kWh more than the battery and the solar "
-            f"forecast can supply, but the plugin could not price a grid import: "
-            f"{why}. Until it can, the house draws from the grid as it needs to, "
-            f"which costs the daytime rate instead of a cheaper overnight one. "
-            f"Check the Octopus connection and the plugin log."
-        )
-        self._send_pushover("Battery import held tonight", body)
+        if str(getattr(decision, "import_purpose", "") or "") == "reserve":
+            # v5.101.0: the power-cut reserve on Agile is bought through the same
+            # planner, so it can be held for the same reasons — but it is a
+            # different thing to tell someone about.
+            title = "Battery reserve top-up held"
+            body  = (
+                f"The battery is on course to be below its power-cut reserve by dawn, "
+                f"about {kwh:.0f} kWh short, but the plugin could not price a grid "
+                f"top-up: {why}. Until it can, the battery keeps what it has and the "
+                f"house draws from the grid as it needs to. Check the Octopus "
+                f"connection and the plugin log."
+            )
+        else:
+            title = "Battery import held tonight"
+            body  = (
+                f"Tomorrow needs about {kwh:.0f} kWh more than the battery and the solar "
+                f"forecast can supply, but the plugin could not price a grid import: "
+                f"{why}. Until it can, the house draws from the grid as it needs to, "
+                f"which costs the daytime rate instead of a cheaper overnight one. "
+                f"Check the Octopus connection and the plugin log."
+            )
+        self._send_pushover(title, body)
 
     def _record_bank_first_metrics(self, snapshot, decision, soc_pct):
         """Measure what the bank-first hold did today. Never touches control.
