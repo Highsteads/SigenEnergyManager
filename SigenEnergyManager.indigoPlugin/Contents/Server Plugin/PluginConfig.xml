@@ -241,6 +241,14 @@
     <Field id="label_savingsessions" type="label">
         <Label>OCTOPUS SAVING SESSIONS</Label>
     </Field>
+    <Field id="savingSessionAutoJoin" type="checkbox" defaultValue="false">
+        <Label>Opt in to Power Down sessions automatically:</Label>
+    </Field>
+    <Field id="label_savingSessionAutoJoin_info" type="label" fontSize="small">
+        <Label>Joining the Saving Sessions campaign does NOT enrol you in each session — every one is a separate opt-in, and a session you have not joined pays nothing however much you export. With this ticked the plugin opts you in as soon as a session is announced, so none is missed while you are asleep or away.
+
+It only ever joins a Power Down, never a Power Up (which wants you to use MORE) and never a Weekend Happy Hour (which is a booking that spends a token, and that stays your decision). Opting in is one-way — Octopus offer no way to withdraw — but a session you end up not meeting simply pays nothing, with no penalty.</Label>
+    </Field>
     <Field id="savingSessionExport" type="checkbox" defaultValue="false">
         <Label>Export the battery during a Saving Session:</Label>
     </Field>
@@ -261,7 +269,7 @@ It only ever runs for the slot you actually booked (Octopus offers four each Sun
     <Field id="label_savingsessions_info" type="label" fontSize="small">
         <Label>Alerts are always sent when a session is announced. This checkbox is the separate question of whether the battery is driven to export during the window, which is what earns the Octopoints.
 
-Guards, all automatic: it only ever runs for a session you have actually opted into in the Octopus app (an un-joined session pays nothing); an Axle VPP window always wins, and energy Axle has already promised is held back for it; and it will not export at all if that would leave the battery unable to reach next morning without buying from the grid. Storms and the post-power-cut lockout stand it down as usual.</Label>
+Guards, all automatic: it only ever runs for a session you are actually opted into (an un-joined session pays nothing, so tick the box above and the plugin will handle that too); an Axle VPP window always wins, and energy Axle has already promised is held back for it; and it will not export at all if that would leave the battery unable to reach next morning without buying from the grid. Storms and the post-power-cut lockout stand it down as usual.</Label>
     </Field>
 
     <Field id="separator_dashboard" type="separator"/>

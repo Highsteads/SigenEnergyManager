@@ -10,6 +10,7 @@
 # Date:        06-06-2026
 # Version:     1.0
 
+import ast
 import io
 import os
 import sys
@@ -2365,18 +2366,25 @@ class TestCheckSavingSessions(unittest.TestCase):
     newly-announced future event, deduped and persisted so a restart can't re-send."""
 
     class _Stub:
-        def __init__(self, octopus_data, store=None):
+        def __init__(self, octopus_data, store=None, prefs=None):
             self.octopus     = MagicMock()
             self.octopus.get_saving_sessions.return_value = octopus_data
             self.store        = store if store is not None else {"saving_sessions_notified": []}
             self.sent         = []
             self.saved        = 0
+            self.pluginPrefs  = prefs if prefs is not None else {}
+            self.logger       = MagicMock()
 
         def _send_pushover(self, title, body, priority="0"):
             self.sent.append((title, body, priority))
 
         def _save_accumulators(self):
             self.saved += 1
+
+        # The REAL auto-join, not a stub. Every existing test below therefore runs
+        # it with the checkbox absent, which is what proves the default-off path is
+        # genuinely inert rather than merely untested.
+        _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
 
     def _check(self, stub):
         plugin.Plugin._check_saving_sessions(stub)
@@ -6175,6 +6183,202 @@ class TestSavingSessionClaimsTheDriverState(unittest.TestCase):
         self.assertIn("vpp_export_submode", assigned)
         self.assertIn("vpp_bank_charge_cap_w", assigned)
         self.assertTrue(drive_seen, "the branch no longer drives the export")
+
+
+# ======================================================================
+# Automatic opt-in to Saving Sessions (10-Sep-2026)
+# ======================================================================
+# Joining is ONE-WAY: the Kraken schema has joinSavingSessionsEvent and no
+# counterpart to leave (introspected against the live API). So the guards on
+# WHICH events may be joined are the load-bearing part of this feature, and
+# every one of them is asserted here from both sides.
+
+class TestAutoJoinSavingSessions(unittest.TestCase):
+
+    TURN_DOWN  = "TURN_DOWN"
+    TURN_UP    = "TURN_UP"
+    HAPPY_HOUR = "WEEKEND_HAPPY_HOUR"
+
+    class _Stub:
+        def __init__(self, prefs=None, store=None, result=None):
+            self.pluginPrefs = prefs if prefs is not None else {}
+            self.store       = store if store is not None else {}
+            self.logger      = MagicMock()
+            self.saved       = 0
+            self.octopus     = MagicMock()
+            self.octopus.join_saving_session_event.return_value = (
+                result if result is not None else
+                {"ok": True, "already": False, "permanent": False, "reason": "opted in"})
+
+        def _save_accumulators(self):
+            self.saved += 1
+
+        _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+
+    def _event(self, direction="TURN_DOWN", joined=False, hours=6,
+               code="E1", capacity=None):
+        return {"id": "1", "code": code, "direction": direction, "joined": joined,
+                "capacity": capacity, "reward_per_kwh_points": 76,
+                "start_at": datetime.now(timezone.utc) + timedelta(hours=hours),
+                "end_at":   datetime.now(timezone.utc) + timedelta(hours=hours + 1)}
+
+    def _run(self, events, prefs=None, store=None, result=None):
+        stub = self._Stub(prefs=prefs if prefs is not None else {"savingSessionAutoJoin": True},
+                          store=store, result=result)
+        stub._auto_join_saving_sessions({"events": events}, datetime.now(timezone.utc))
+        return stub
+
+    # ---- the switch --------------------------------------------------
+    def test_off_by_default_joins_nothing(self):
+        stub = self._run([self._event()], prefs={})
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_the_string_false_is_off_not_on(self):
+        # Indigo stores a saved checkbox as the STRING "false", and bare bool()
+        # calls that True — which would opt the account in against the setting.
+        stub = self._run([self._event()], prefs={"savingSessionAutoJoin": "false"})
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_on_joins_an_announced_turn_down(self):
+        stub = self._run([self._event()])
+        stub.octopus.join_saving_session_event.assert_called_once_with("E1")
+
+    # ---- which events may be joined ----------------------------------
+    def test_never_joins_a_turn_up(self):
+        # A Power Up wants MORE consumption. Opting in commits to something the
+        # battery cannot help with.
+        stub = self._run([self._event(direction=self.TURN_UP)])
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_never_books_a_happy_hour(self):
+        # Booking SPENDS a token, and the balance cannot be reconstructed from
+        # the account history. That stays the owner's decision.
+        stub = self._run([self._event(direction=self.HAPPY_HOUR)])
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_never_joins_an_unknown_direction(self):
+        for bad in ("UNKNOWN", "", None, "SOMETHING_NEW"):
+            with self.subTest(direction=bad):
+                stub = self._run([self._event(direction=bad)])
+                stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_does_not_rejoin_one_already_joined(self):
+        stub = self._run([self._event(joined=True)])
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_does_not_join_an_event_that_has_started(self):
+        stub = self._run([self._event(hours=-1)])
+        stub.octopus.join_saving_session_event.assert_not_called()
+
+    def test_does_not_attempt_a_full_event(self):
+        stub = self._run([self._event(capacity="FULL")])
+        stub.octopus.join_saving_session_event.assert_not_called()
+        self.assertIn("E1", stub.store["saving_sessions_join_refused"])
+
+    # ---- what a result does to the state -----------------------------
+    def test_success_marks_the_event_joined_in_place(self):
+        # The alert and the manager's window cache are both built from this same
+        # dict AFTER this runs. Without the write-through, a session we just
+        # joined would be advertised as "NOT OPTED IN" and left un-armed.
+        ev = self._event()
+        self._run([ev])
+        self.assertTrue(ev["joined"])
+
+    def test_already_joined_result_also_marks_it_joined(self):
+        ev = self._event()
+        self._run([ev], result={"ok": True, "already": True,
+                                "permanent": False, "reason": "already opted in"})
+        self.assertTrue(ev["joined"])
+
+    def test_permanent_refusal_is_remembered_and_not_retried(self):
+        store = {}
+        bad = {"ok": False, "already": False, "permanent": True, "reason": "not eligible"}
+        stub = self._run([self._event()], store=store, result=bad)
+        self.assertIn("E1", store["saving_sessions_join_refused"])
+        self.assertEqual(stub.saved, 1)          # persisted, so a restart honours it
+        # Second poll, same event: no further attempt.
+        stub2 = self._run([self._event()], store=store, result=bad)
+        stub2.octopus.join_saving_session_event.assert_not_called()
+
+    def test_transient_failure_is_NOT_remembered_and_IS_retried(self):
+        store = {}
+        flaky = {"ok": False, "already": False, "permanent": False,
+                 "reason": "network error"}
+        self._run([self._event()], store=store, result=flaky)
+        self.assertEqual(store.get("saving_sessions_join_refused", []), [])
+        stub2 = self._run([self._event()], store=store, result=flaky)
+        stub2.octopus.join_saving_session_event.assert_called_once_with("E1")
+
+    def test_a_raising_api_does_not_kill_the_poll(self):
+        stub = self._Stub(prefs={"savingSessionAutoJoin": True})
+        stub.octopus.join_saving_session_event.side_effect = RuntimeError("boom")
+        stub._auto_join_saving_sessions({"events": [self._event()]},
+                                        datetime.now(timezone.utc))   # must not raise
+
+    def test_no_octopus_client_is_silent_not_fatal(self):
+        stub = self._Stub(prefs={"savingSessionAutoJoin": True})
+        stub.octopus = None
+        stub._auto_join_saving_sessions({"events": [self._event()]},
+                                        datetime.now(timezone.utc))   # must not raise
+
+    def test_nothing_persisted_when_nothing_changed(self):
+        stub = self._run([self._event()])
+        self.assertEqual(stub.saved, 0)   # a plain success writes no refusal
+
+
+class TestAutoJoinOrdering(unittest.TestCase):
+    """The opt-in must happen BEFORE the alert and BEFORE the window cache.
+
+    Structural, from the parsed tree: both orderings are correctness, not style.
+    Joining after the alert would push "NOT OPTED IN — join it in the Octopus app"
+    for a session just joined; joining after the cache build would leave it
+    un-armed until the next poll, which may be an hour and outlast the session.
+    """
+
+    def _body(self):
+        src  = io.open(plugin.__file__.replace(".pyc", ".py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_saving_sessions":
+                return node
+        self.fail("_check_saving_sessions not found")
+
+    def _line_of_call(self, fn, attr):
+        for sub in ast.walk(fn):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == attr):
+                return sub.lineno
+        return None
+
+    def _line_of_assign_to(self, fn, key):
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Assign):
+                for tgt in sub.targets:
+                    if (isinstance(tgt, ast.Subscript)
+                            and isinstance(tgt.slice, ast.Constant)
+                            and tgt.slice.value == key):
+                        return sub.lineno
+        return None
+
+    def test_auto_join_is_called_at_all(self):
+        self.assertIsNotNone(
+            self._line_of_call(self._body(), "_auto_join_saving_sessions"),
+            "the poll no longer opts in")
+
+    def test_auto_join_runs_before_the_pushover(self):
+        fn   = self._body()
+        join = self._line_of_call(fn, "_auto_join_saving_sessions")
+        push = self._line_of_call(fn, "_send_pushover")
+        self.assertIsNotNone(push, "the poll no longer alerts")
+        self.assertLess(join, push)
+
+    def test_auto_join_runs_before_the_window_cache_is_built(self):
+        fn     = self._body()
+        join   = self._line_of_call(fn, "_auto_join_saving_sessions")
+        cache  = self._line_of_assign_to(fn, "saving_sessions_windows")
+        self.assertIsNotNone(cache, "the window cache is no longer built here")
+        self.assertLess(join, cache)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

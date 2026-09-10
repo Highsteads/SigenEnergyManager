@@ -1103,6 +1103,121 @@ class OctopusAPI:
         self._saving_sessions_neg_at   = 0.0
         return result
 
+    def join_saving_session_event(self, event_code):
+        """Opt this account in to ONE Saving Sessions event. Returns a result dict.
+
+        Being JOINED is the difference between earning and not earning: campaign
+        membership does NOT enrol you in each event (measured 03-Sep-2026 — this
+        account read hasJoinedCampaign=True while every session since 16-Aug was
+        un-joined, and they were all missed in silence).
+
+        Returns:
+            {"ok": bool,          # the account IS now joined to this event
+             "already": bool,     # it was joined before this call (a no-op)
+             "permanent": bool,   # refused for a reason retrying cannot fix
+             "reason": str}       # human-readable, safe to log or push
+
+        `ok` is only ever True when the mutation's OWN reply lists the event code
+        among the account's joined events, or when Octopus says it was already
+        signed up. The API vouches for itself and nothing here infers success
+        from the absence of an error.
+
+        THERE IS NO WAY BACK. Introspected 10-Sep-2026: the schema has
+        joinSavingSessionsEvent and no leave/withdraw/unjoin counterpart, so a
+        join is one-way. That is tolerable only because failing a session costs
+        nothing (this account has 11 fails against 24 successes and no penalty) —
+        do not extend this pattern to anything that can.
+        """
+        blank = {"ok": False, "already": False, "permanent": False, "reason": ""}
+        if not event_code:
+            return dict(blank, permanent=True, reason="no event code given")
+        if not self.api_key or not self.account_id:
+            return dict(blank, reason="no Octopus account configured")
+        token = self._get_kraken_token()
+        if not token:
+            return dict(blank, reason="could not obtain a Kraken token")
+        if not self._record_request():
+            return dict(blank, reason="Octopus API rate limit reached")
+
+        mutation = json.dumps({
+            "query": ("mutation ($a: String!, $c: String!) {"
+                      "  joinSavingSessionsEvent(input: {accountNumber: $a, eventCode: $c}) {"
+                      "    joinedEventCodes"
+                      "  }"
+                      "}"),
+            "variables": {"a": self.account_id, "c": event_code},
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL_BACKEND,
+                data=mutation.encode(),
+                headers={"Content-Type": "application/json",
+                         # RAW token, exactly as get_saving_sessions above — the
+                         # backend host and the main host take DIFFERENT auth
+                         # conventions. MEASURED 10-Sep-2026 against the live API
+                         # with all three forms: raw and "Bearer <token>" both
+                         # authenticate; "JWT <token>" returns errorCode OE-0102.
+                         # And EVERY one of the three answered HTTP 200, so
+                         # response.ok cannot tell them apart — this is the same
+                         # failure shape that shipped v5.80.0 silently dead.
+                         "Authorization": token},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except (requests.RequestException, ValueError) as e:
+            return dict(blank, reason=f"network error: {e}")
+
+        if not response.ok:
+            if response.status_code in (401, 403):
+                self._kraken_token = None
+            return dict(blank, reason=f"HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as e:
+            return dict(blank, reason=f"malformed reply: {e}")
+
+        errs = (payload or {}).get("errors") or []
+        for err in errs:
+            ext    = err.get("extensions") or {}
+            code   = ext.get("errorCode") or "?"
+            # `reason` is where Octopus says WHICH ineligibility this is, and the
+            # distinction decides whether retrying is sane.
+            detail = (ext.get("reason") or err.get("message") or "").strip()
+            if code == "OE-0102":
+                # Invalid Authorization header — purge so the next attempt
+                # re-authenticates rather than resending a dead token.
+                self._kraken_token = None
+                return dict(blank, reason=f"auth rejected ({code}): {detail}")
+            if code == "OE-1308":
+                # Overloaded: "already signed up" is a SUCCESS wearing an error's
+                # clothes, while a full or ineligible event is a permanent no.
+                # Measured 10-Sep-2026 on an already-joined event: OE-1308,
+                # reason "Account is already signed up to this event and cannot
+                # join again." Treating the whole code as failure would make a
+                # correct state look broken and retry hourly for ever.
+                if "already" in detail.lower():
+                    return {"ok": True, "already": True, "permanent": False,
+                            "reason": "already opted in"}
+                return dict(blank, permanent=True,
+                            reason=f"Octopus refused ({code}): {detail}")
+            return dict(blank, reason=f"{code}: {detail}")
+
+        data = ((payload or {}).get("data") or {}).get("joinSavingSessionsEvent")
+        if not data:
+            # HTTP 200, no errors, no data. Never seen, and never assumed to mean
+            # success — an unknown answer is not a licence to guess.
+            return dict(blank, reason="no data returned")
+
+        joined_codes = data.get("joinedEventCodes") or []
+        if event_code not in joined_codes:
+            return dict(blank,
+                        reason="the reply did not list this event as joined")
+
+        # The account state changed, so the cached read is now wrong. Drop it
+        # rather than letting a 30-minute TTL keep reporting the old answer.
+        self._saving_sessions_cache_at = 0.0
+        return {"ok": True, "already": False, "permanent": False,
+                "reason": "opted in"}
+
     # ================================================================
     # Internal: Tracker Rates
     # ================================================================

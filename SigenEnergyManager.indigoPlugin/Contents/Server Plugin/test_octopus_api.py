@@ -860,5 +860,143 @@ class TestTariffOverride(unittest.TestCase):
 
 
 
+
+
+# ======================================================================
+# joinSavingSessionsEvent — opting the account in to ONE session
+# ======================================================================
+# Every shape below was MEASURED against the live API on 10-Sep-2026 by firing
+# the mutation at an event the account was ALREADY joined to, which cannot change
+# state either way. The headline finding is that all three auth conventions and
+# both business outcomes answer HTTP 200, so `response.ok` distinguishes none of
+# them — the same failure shape that shipped v5.80.0 silently dead.
+
+def _join_ok(code="E1", extra=None):
+    return {"data": {"joinSavingSessionsEvent": {
+        "joinedEventCodes": (extra or []) + [code]}}}
+
+
+def _join_err(error_code, reason):
+    return {"data": {"joinSavingSessionsEvent": None},
+            "errors": [{"message": "Account ineligible to join Saving Sessions event.",
+                        "path": ["joinSavingSessionsEvent"],
+                        "extensions": {"errorCode": error_code,
+                                       "errorDescription": "…",
+                                       "reason": reason}}]}
+
+
+class TestJoinSavingSessionEvent(unittest.TestCase):
+    def setUp(self):
+        self.api = _make_api()
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def _post(self, payload, ok=True, status=200):
+        octopus_api.requests.post.return_value = _FakeResp(payload, ok=ok, status=status)
+
+    # ---- the happy path, and its self-verification --------------------
+    def test_join_succeeds_when_the_reply_lists_the_event(self):
+        self._post(_join_ok("E1"))
+        r = self.api.join_saving_session_event("E1")
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["already"])
+
+    def test_reply_that_omits_the_event_is_NOT_success(self):
+        # The mutation returns every code the account has joined, so the event we
+        # asked for being absent means it did not take. Nothing here may infer
+        # success from the mere absence of an error.
+        self._post(_join_ok("SOMETHING_ELSE"))
+        r = self.api.join_saving_session_event("E1")
+        self.assertFalse(r["ok"])
+
+    def test_uses_the_backend_host(self):
+        self._post(_join_ok("E1"))
+        self.api.join_saving_session_event("E1")
+        self.assertEqual(octopus_api.requests.post.call_args[0][0],
+                         octopus_api.KRAKEN_GRAPHQL_BACKEND)
+
+    def test_sends_the_raw_token_not_the_JWT_prefixed_form(self):
+        # MEASURED: "JWT <token>" on this host returns OE-0102 while still
+        # answering HTTP 200. The main host is the mirror image. Do not
+        # "make these consistent".
+        self._post(_join_ok("E1"))
+        self.api.join_saving_session_event("E1")
+        auth = octopus_api.requests.post.call_args[1]["headers"]["Authorization"]
+        self.assertEqual(auth, "tok")
+        self.assertNotIn("JWT", auth)
+
+    # ---- OE-1308 is overloaded and the reason discriminates -----------
+    def test_already_signed_up_is_success_not_failure(self):
+        # The live wording, verbatim. Treating the whole error code as failure
+        # would make a correct state look broken and retry it hourly for ever.
+        self._post(_join_err("OE-1308",
+                             "Account is already signed up to this event and "
+                             "cannot join again."))
+        r = self.api.join_saving_session_event("E1")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["already"])
+        self.assertFalse(r["permanent"])
+
+    def test_other_ineligibility_is_permanent(self):
+        self._post(_join_err("OE-1308", "Account is not eligible for this event."))
+        r = self.api.join_saving_session_event("E1")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["permanent"])
+
+    # ---- auth -----------------------------------------------------------
+    def test_auth_error_purges_the_cached_token(self):
+        self.api._kraken_token = "stale"
+        self._post(_join_err("OE-0102", "'Authorization' header is invalid"))
+        r = self.api.join_saving_session_event("E1")
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["permanent"])          # retryable with a fresh token
+        self.assertIsNone(self.api._kraken_token)
+
+    # ---- the shapes that must NOT read as success ------------------------
+    def test_http_200_with_null_data_and_no_errors_is_not_success(self):
+        self._post({"data": {"joinSavingSessionsEvent": None}})
+        self.assertFalse(self.api.join_saving_session_event("E1")["ok"])
+
+    def test_http_error_is_not_success(self):
+        self._post({}, ok=False, status=500)
+        self.assertFalse(self.api.join_saving_session_event("E1")["ok"])
+
+    def test_network_error_is_caught_and_not_success(self):
+        # `requests` is a MagicMock here, so its RequestException is a Mock and
+        # cannot be caught by an except clause. Give the mock a REAL exception
+        # class, or this exercises a shape production never meets.
+        class _Boom(Exception):
+            pass
+        octopus_api.requests.RequestException = _Boom
+        octopus_api.requests.post.side_effect = _Boom("connection reset")
+        r = self.api.join_saving_session_event("E1")   # must not propagate
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["permanent"])               # transient — retry next poll
+        self.assertIn("connection reset", r["reason"])
+
+    def test_no_event_code_is_refused_without_a_network_call(self):
+        r = self.api.join_saving_session_event("")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["permanent"])
+        octopus_api.requests.post.assert_not_called()
+
+    def test_no_account_configured_makes_no_network_call(self):
+        api = octopus_api.OctopusAPI(api_key="", account_id="", mpan="", serial="")
+        r = api.join_saving_session_event("E1")
+        self.assertFalse(r["ok"])
+        octopus_api.requests.post.assert_not_called()
+
+    # ---- the account changed, so the cached read is now wrong ------------
+    def test_success_invalidates_the_saving_sessions_cache(self):
+        self.api._saving_sessions_cache    = {"has_joined": True, "events": []}
+        self.api._saving_sessions_cache_at = 9e9
+        self._post(_join_ok("E1"))
+        self.api.join_saving_session_event("E1")
+        self.assertEqual(self.api._saving_sessions_cache_at, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

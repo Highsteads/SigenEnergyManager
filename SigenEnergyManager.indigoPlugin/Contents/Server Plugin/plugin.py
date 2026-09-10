@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0)
-# Date:        10-09-2026 11:20
-# Version:     5.101.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0)
+# Date:        10-09-2026 14:20
+# Version:     5.102.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1253,6 +1253,11 @@ class Plugin(indigo.PluginBase):
         self.store["last_saving_sessions"]      = 0.0   # time.time() of last poll
         self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
         self.store["saving_sessions_windows"]   = []    # joined windows, cached for the manager
+        # Event codes Octopus PERMANENTLY refused to let us join (full, ineligible).
+        # A transient failure is deliberately NOT recorded, so it retries next poll;
+        # only a refusal retrying cannot fix earns a place here, which is what stops
+        # an hourly re-attempt for the life of the plugin.
+        self.store["saving_sessions_join_refused"] = []
         # Happy Hour token balance, reported verbatim by the API. None means NOT
         # REPORTED, which is deliberately distinct from 0 — a missing balance must
         # never be shown as "you have none".
@@ -1475,6 +1480,7 @@ class Plugin(indigo.PluginBase):
         # behaviour change that arrives silently on upgrade is not acceptable.
         self._log_bank_first_setting()
         self._log_tariff_override_setting()
+        self._log_saving_session_auto_join_setting()
 
         # Auto-update check (best-effort, daily-cached, fully silent on failure).
         try:
@@ -4876,6 +4882,93 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             return 2
 
+    def _auto_join_saving_sessions(self, data, now_utc):
+        """Opt in to announced TURN_DOWN sessions, if the owner asked us to.
+
+        Gated on the `savingSessionAutoJoin` checkbox and OFF by default, like every
+        other feature here that reaches outside the house. Joining is a commitment
+        made on the owner's behalf against their energy account, and it is ONE-WAY:
+        the Kraken schema has joinSavingSessionsEvent and no counterpart to leave
+        (introspected 10-Sep-2026). It is defensible only because failing a session
+        carries no penalty — this account has 11 fails against 24 successes and lost
+        nothing by them.
+
+        TURN_DOWN only, and that is the same guard the export branch and the window
+        cache already carry. A TURN_UP session wants MORE consumption, so opting in
+        commits to something the battery cannot help with; a WEEKEND_HAPPY_HOUR is
+        not an opt-in at all but a BOOKING that spends a scarce token, and spending
+        one automatically is not a decision to take out of the owner's hands. Both
+        arrive in this same feed. An absent or unrecognised direction is never joined.
+
+        Mutates `data` in place on success so the alert below and the window cache
+        both see the new state immediately. That writes through to the API layer's
+        30-minute cache, which is deliberate: the account really did change, and a
+        cached "not joined" would otherwise outlive the fact.
+        """
+        if not _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False):
+            return
+        if not self.octopus:
+            return
+
+        refused = {str(x) for x in (self.store.get("saving_sessions_join_refused") or [])}
+        joined_any = False
+
+        for event in data.get("events") or []:
+            code     = event.get("code")
+            start_at = event.get("start_at")
+            if not code or start_at is None:
+                continue
+            if event.get("joined"):
+                continue                      # already in — nothing to do
+            if event.get("direction") != SAVING_SESSION_TURN_DOWN:
+                continue                      # see the docstring: turn-downs only
+            if start_at <= now_utc:
+                continue                      # started or past; joining earns nothing
+            if str(code) in refused:
+                continue                      # Octopus already said no, permanently
+            # A full event cannot be joined, and trying earns a refusal that would
+            # then be remembered as permanent. Skip it and say so instead.
+            if event.get("capacity") == "FULL":
+                log(f"[SavingSessions] {code} is full, so it cannot be joined.",
+                    level="WARNING")
+                refused.add(str(code))
+                continue
+
+            try:
+                result = self.octopus.join_saving_session_event(code)
+            except Exception as exc:                                # noqa: BLE001
+                log(f"[SavingSessions] joining {code} raised: {exc}", level="WARNING")
+                continue
+
+            if result.get("ok"):
+                event["joined"] = True
+                joined_any = True
+                if not result.get("already"):
+                    tz    = _london_tz()
+                    start = start_at.astimezone(tz) if tz else start_at
+                    log(f"[SavingSessions] Opted in to {code} "
+                        f"({start.strftime('%a %d %b, %H:%M')}, "
+                        f"{event.get('reward_per_kwh_points', 0)} pts/kWh) automatically.")
+            elif result.get("permanent"):
+                refused.add(str(code))
+                log(f"[SavingSessions] Could not opt in to {code} and will not try "
+                    f"again: {result.get('reason')}", level="WARNING")
+            else:
+                # Transient — a network blip, a rate limit, an expired token. NOT
+                # recorded, so the next poll tries again.
+                log(f"[SavingSessions] Opting in to {code} failed, will retry: "
+                    f"{result.get('reason')}", level="WARNING")
+
+        if refused != {str(x) for x in (self.store.get("saving_sessions_join_refused") or [])}:
+            self.store["saving_sessions_join_refused"] = list(refused)[-200:]
+            self._save_accumulators()
+        if joined_any and not _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
+            # Worth one line: opted in is not the same as being driven, and the two
+            # are separate checkboxes on purpose. Without this the owner can be
+            # joined to a session nothing will act on and have no way to know.
+            log("[SavingSessions] Opted in, but 'drive the battery' is switched off, "
+                "so the export will not be driven for it.", level="WARNING")
+
     def _check_saving_sessions(self):
         """Notify on newly-announced Octopus Saving Sessions events.
 
@@ -4920,6 +5013,15 @@ class Plugin(indigo.PluginBase):
             return
 
         now_utc  = datetime.now(timezone.utc)
+        # Opt in BEFORE the alert loop below, and before the window cache is built
+        # at the end of this method. Both orderings matter:
+        #   * the Pushover would otherwise tell the owner to "join it in the Octopus
+        #     app" for a session this method has just joined them to, which is advice
+        #     that is not merely useless but wrong;
+        #   * the manager's window cache admits joined events only, so building it
+        #     first would leave a session we just joined un-armed until the NEXT poll
+        #     — up to an hour, and the session may not last that long.
+        self._auto_join_saving_sessions(data, now_utc)
         # Normalised to str on BOTH sides. GraphQL's ID type is specified to
         # serialise as a STRING, and this payload happens to return an int — so
         # comparing the raw value against a persisted set is one API tweak away
@@ -10323,6 +10425,60 @@ class Plugin(indigo.PluginBase):
                 f"standard={flux.get('standard_p', '?')}p")
         return True
 
+    def menuShowSavingSessions(self):
+        """Menu: what Octopus is offering, and whether we are actually in it.
+
+        REPORT ONLY. It forces a fresh poll, and joining happens only as a side
+        effect of that poll when the owner has ticked automatic opt-in. There is
+        deliberately no "join now" button here: one decision, one owner. A status
+        menu that quietly commits the account to a session would be a second route
+        to the same irreversible act, and the two would drift.
+        """
+        if log_startup_banner:
+            log_startup_banner(self.pluginId, self.pluginDisplayName, self.pluginVersion)
+        if not self.octopus:
+            log("[SavingSessions] No Octopus account is configured.", level="WARNING")
+            return
+        auto = _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False)
+        drive = _as_bool(self.pluginPrefs.get("savingSessionExport"), False)
+        log(f"[SavingSessions] Automatic opt-in: {'ON' if auto else 'off'}   "
+            f"Drive the battery: {'ON' if drive else 'off'}")
+        try:
+            data = self.octopus.get_saving_sessions(force=True)
+        except Exception as exc:                                    # noqa: BLE001
+            log(f"[SavingSessions] Fetch failed: {exc}", level="WARNING")
+            return
+        if not data:
+            log("[SavingSessions] Could not read the account — see the warnings above.",
+                level="WARNING")
+            return
+
+        tokens = data.get("token_balance")
+        log(f"[SavingSessions] Campaign joined: "
+            f"{'YES' if data.get('has_joined') else 'NO'}   "
+            f"Happy Hour tokens: {'not reported' if tokens is None else tokens}")
+
+        now_utc = datetime.now(timezone.utc)
+        tz      = _london_tz()
+        upcoming = [e for e in (data.get("events") or [])
+                    if e.get("end_at") and e["end_at"] > now_utc]
+        if not upcoming:
+            log("[SavingSessions] No sessions announced.")
+            return
+        for e in upcoming:
+            start = e["start_at"].astimezone(tz) if tz else e["start_at"]
+            end   = e["end_at"].astimezone(tz)   if tz else e["end_at"]
+            log(f"[SavingSessions]   {start.strftime('%a %d %b %H:%M')}"
+                f"-{end.strftime('%H:%M')}  "
+                f"{(e.get('direction') or 'UNKNOWN').replace('_', ' ').title():<18} "
+                f"{e.get('reward_per_kwh_points', 0)} pts/kWh  "
+                f"{'OPTED IN' if e.get('joined') else 'not opted in'}"
+                + (f"  [{e['capacity']}]" if e.get("capacity") else ""))
+        refused = self.store.get("saving_sessions_join_refused") or []
+        if refused:
+            log(f"[SavingSessions] Previously refused and not retried: "
+                f"{', '.join(str(x) for x in refused)}")
+
     def menuShowVppStatus(self):
         """Menu: Log current VPP state and next event details."""
         state   = self.store.get("vpp_state", "idle")
@@ -10805,6 +10961,29 @@ class Plugin(indigo.PluginBase):
             self._write_site_config()
         self._log_bank_first_setting()
         self._log_tariff_override_setting()
+        self._log_saving_session_auto_join_setting()
+        # Force the next tick to poll Octopus rather than waiting out the remaining
+        # hour. Ticking "opt in automatically" at 18:55 for a 19:00 session has to
+        # act now, and a settings save is exactly when the owner expects it to.
+        self.store["last_saving_sessions"] = 0.0
+
+    def _log_saving_session_auto_join_setting(self):
+        """Say whether the plugin will opt in on the owner's behalf. Start and every save.
+
+        Auto-join commits his account to something, and it is one-way. An armed
+        state that reaches outside the house has to be visible in the log without
+        anyone going looking for it — the same reason the tariff override announces
+        itself. Silence would leave "it joined that on my behalf" indistinguishable
+        from "I must have tapped it in the app and forgotten".
+        """
+        try:
+            if not _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False):
+                return
+            log("[SavingSessions] Automatic opt-in is ON — announced Power Down "
+                "sessions will be joined for you. Power Ups and Happy Hours are "
+                "never joined automatically.")
+        except Exception as exc:                                    # noqa: BLE001
+            self.logger.debug(f"[SavingSessions] setting announcement skipped: {exc!r}")
 
     def _log_tariff_override_setting(self):
         """Say loudly, at startup and on every prefs save, that a tariff is being forced.
@@ -11144,6 +11323,10 @@ class Plugin(indigo.PluginBase):
             # Saving Sessions notified-event ids — not day-specific, persisted so a
             # restart between the announcement and the session can't re-send the push.
             "saving_sessions_notified":  list(self.store.get("saving_sessions_notified") or [])[-200:],
+            # Permanently-refused joins, persisted for the same reason: a restart
+            # must not turn a settled "Octopus said no" back into an hourly retry.
+            "saving_sessions_join_refused":
+                list(self.store.get("saving_sessions_join_refused") or [])[-200:],
             # Happy Hour: the anchor is the ONLY way the free-kWh figure survives a
             # restart mid-window without double-counting, so it is persisted on entry.
             "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
@@ -11212,6 +11395,9 @@ class Plugin(indigo.PluginBase):
                 self.store["storm_level"] = data.get("storm_level")
             if data.get("saving_sessions_notified"):
                 self.store["saving_sessions_notified"] = list(data["saving_sessions_notified"])[-200:]
+            if data.get("saving_sessions_join_refused"):
+                self.store["saving_sessions_join_refused"] = \
+                    list(data["saving_sessions_join_refused"])[-200:]
             # Restore a Happy Hour that was mid-window when we stopped. The overrun
             # backstop then ends it on the first tick if the window has since closed.
             if data.get("happy_hour_import_active"):
