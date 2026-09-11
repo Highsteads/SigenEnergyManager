@@ -9,8 +9,8 @@
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
 #              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0)
-# Date:        10-09-2026 14:20
-# Version:     5.102.0
+# Date:        11-09-2026 14:20
+# Version:     5.102.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

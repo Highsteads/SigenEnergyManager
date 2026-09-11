@@ -46,3 +46,9 @@ jobs:
       # And again as the plugin actually ships, with pymodbus and pytz present.
       - name: Tests — with the bundled dependencies (the real install shape)
         run: python scripts/run_tests.py
+      # tests/ is OUTSIDE the bundle and pytest-style, so run_tests.py (unittest over the
+      # bundle) cannot collect it. Added 11-Sep-2026 with the canonical version-consistency guard.
+      - name: Version consistency (tests/, pytest)
+        run: |
+          pip install pytest
+          python -m pytest tests -q
