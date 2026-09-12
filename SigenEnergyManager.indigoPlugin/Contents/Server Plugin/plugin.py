@@ -9,8 +9,8 @@
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
 #              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0)
-# Date:        12-09-2026 22:55
-# Version:     5.103.2
+# Date:        12-09-2026 23:20
+# Version:     5.103.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6836,6 +6836,7 @@ class Plugin(indigo.PluginBase):
             return
 
         warned = self.store.setdefault("settlement_warned", set())
+        before = len(warned)
         cutoff = datetime.now(timezone.utc) - timedelta(days=SETTLEMENT_CHECK_DAYS)
 
         for ev in (summary.get("events") or []):
@@ -6913,6 +6914,16 @@ class Plugin(indigo.PluginBase):
                     f"We drove {run:.2f} kWh but the per-minute record for that window is "
                     f"missing or too short to add up, so there is nothing to check Axle's "
                     f"figure against.", "WARNING")
+
+        # Persist AT ONCE when the latch grows rather than waiting out the
+        # five-minute accumulator tick. A warning raised and then lost to a
+        # restart in the gap is a warning raised twice, which is the whole fault
+        # being fixed here. Cheap (one small atomic write) and only on a change.
+        if len(warned) != before:
+            try:
+                self._save_accumulators()
+            except Exception as exc:
+                self.logger.debug(f"[VPP] Latch save skipped: {exc}")
 
     def _window_for_event_date(self, event_date):
         """(start_iso, end_iso) for the VPP window this plugin drove on a date.
@@ -11539,6 +11550,21 @@ class Plugin(indigo.PluginBase):
             # must not turn a settled "Octopus said no" back into an hourly retry.
             "saving_sessions_join_refused":
                 list(self.store.get("saving_sessions_join_refused") or [])[-200:],
+            # WARN-ONCE LATCHES. Persisted for exactly the reason above, and it
+            # is not a nicety: an in-memory latch is a warn-once-PER-RESTART
+            # latch, which on a plugin restarted several times in a working day
+            # is not "once" at all. Measured 12-Sep-2026: the settlement
+            # divergence warning had fired 18 times over 6 days, every one about
+            # the SAME 11-Aug event — a fault already found and fixed in v5.61.1,
+            # about a window a month old that nobody can now do anything about.
+            # A warning that cannot be acted on and cannot be cleared only
+            # teaches the reader to skim warnings.
+            "settlement_warned":
+                list(self.store.get("settlement_warned") or [])[-200:],
+            "vpp_settled_unpaid_seen":
+                list(self.store.get("vpp_settled_unpaid_seen") or [])[-200:],
+            "vpp_email_refusal_seen":
+                list(self.store.get("vpp_email_refusal_seen") or [])[-200:],
             # Happy Hour: the anchor is the ONLY way the free-kWh figure survives a
             # restart mid-window without double-counting, so it is persisted on entry.
             "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
@@ -11610,6 +11636,14 @@ class Plugin(indigo.PluginBase):
             if data.get("saving_sessions_join_refused"):
                 self.store["saving_sessions_join_refused"] = \
                     list(data["saving_sessions_join_refused"])[-200:]
+            # The warn-once latches come back as SETS, because that is what the
+            # three checks that read them expect; JSON can only carry a list, so
+            # the conversion has to happen on the way in. Restored WITHOUT
+            # re-warning: a fault already reported once has already been reported.
+            for _k in ("settlement_warned", "vpp_settled_unpaid_seen",
+                       "vpp_email_refusal_seen"):
+                if data.get(_k):
+                    self.store[_k] = {str(x) for x in list(data[_k])[-200:]}
             # Restore a Happy Hour that was mid-window when we stopped. The overrun
             # backstop then ends it on the first tick if the window has since closed.
             if data.get("happy_hour_import_active"):

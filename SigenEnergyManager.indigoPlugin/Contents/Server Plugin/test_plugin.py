@@ -6628,5 +6628,90 @@ class TestLedgerHasFigureFor(unittest.TestCase):
         self.assertFalse(self._ask(p, "2026-05-21T19:30:00+00:00"))
 
 
+class TestWarnOnceLatchesSurviveARestart(unittest.TestCase):
+    """An in-memory warn-once latch is a warn-once-PER-RESTART latch.
+
+    Measured 12-Sep-2026: the settlement-divergence warning had fired 18 times
+    over 6 days, every one about the SAME 11-Aug event — a fault already found
+    and fixed in v5.61.1, about a window a month old that nobody could now act
+    on. `self.store["settlement_warned"] = set()` runs at every start, so the
+    latch was reset by every reload. A warning that cannot be cleared only
+    teaches the reader to skim warnings.
+    """
+
+    LATCHES = ("settlement_warned", "vpp_settled_unpaid_seen", "vpp_email_refusal_seen")
+
+    # The saver reads these directly with store[...], so a bare dict raises
+    # KeyError before it ever reaches the latches. Listed explicitly rather than
+    # defaulted, so a new mandatory key fails this fixture loudly instead of
+    # quietly changing what the test covers.
+    _REQUIRED = {"pv_daily_kwh": 0.0, "grid_import_daily_kwh": 0.0,
+                 "grid_export_daily_kwh": 0.0, "home_daily_kwh": 0.0,
+                 "peak_soc": 0.0, "min_soc": 100.0, "today_date": "2026-09-12",
+                 "pv_lifetime_start_kwh": 0.0, "import_lifetime_start_kwh": 0.0,
+                 "export_lifetime_start_kwh": 0.0, "power_cut_started_at": None}
+
+    def _plugin(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store   = dict(self._REQUIRED)
+        p.logger  = MagicMock()
+        p.pluginPrefs = {}
+        p.daily_energy = None
+        p._state_lock = threading.RLock()
+        # Collaborators the saver/loader call on the way past. Mocked so this
+        # test is about the LATCHES and fails only when they break.
+        p._save_home_profile = MagicMock()
+        p._load_home_profile = MagicMock()
+        p._get_data_dir      = lambda: p.data_dir
+        return p
+
+    def test_all_three_latches_are_written_to_the_accumulator_file(self):
+        p = self._plugin()
+        for k in self.LATCHES:
+            p.store[k] = {f"2026-08-11T19:{i:02d}" for i in range(3)}
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "accumulators.json")
+            p.data_dir = td
+            p._save_accumulators_locked(path)
+            import json as _json
+            data = _json.load(open(path, encoding="utf-8"))
+        for k in self.LATCHES:
+            self.assertIn(k, data, f"{k} is not persisted")
+            self.assertEqual(len(data[k]), 3)
+            self.assertIsInstance(data[k], list, "a set is not JSON-serialisable")
+
+    def test_THEY_COME_BACK_AS_SETS_AFTER_A_RESTART(self):
+        """The three checks that read them do `key in latch` and `.add()`, so a
+        list would work for the first and silently break the second."""
+        p = self._plugin()
+        for k in self.LATCHES:
+            p.store[k] = {"2026-08-11T19:30"}
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "accumulators.json")
+            p.data_dir = td
+            p._save_accumulators_locked(path)
+
+            fresh = self._plugin()
+            fresh.data_dir = td
+            for k in self.LATCHES:
+                fresh.store[k] = set()          # what __init__ does at every start
+            fresh._load_accumulators()
+
+        for k in self.LATCHES:
+            self.assertIsInstance(fresh.store[k], set, f"{k} came back as a list")
+            self.assertIn("2026-08-11T19:30", fresh.store[k],
+                          f"{k} lost its entry across the restart")
+
+    def test_an_absent_file_leaves_the_latches_empty_rather_than_raising(self):
+        p = self._plugin()
+        with tempfile.TemporaryDirectory() as td:
+            p.data_dir = td
+            for k in self.LATCHES:
+                p.store[k] = set()
+            p._load_accumulators()             # no file at all
+        for k in self.LATCHES:
+            self.assertEqual(p.store[k], set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
