@@ -9,8 +9,8 @@
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
 #              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0)
-# Date:        12-09-2026 22:20
-# Version:     5.103.1
+# Date:        12-09-2026 22:55
+# Version:     5.103.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6953,6 +6953,36 @@ class Plugin(indigo.PluginBase):
                 return (str(start), str(end))
         return None
 
+    def _ledger_has_figure_for(self, start_iso):
+        """Does the ledger already hold Axle's own settled figure for this window?
+
+        The question a refusal has to ask before it complains. A message we
+        cannot parse matters only when nothing else has supplied the money —
+        once the account import has, there is nothing for anyone to do and
+        nothing to say.
+
+        A genuine 0p row counts as a figure: Axle record a nil event as a real
+        transaction, and treating it as missing would nag for ever about an
+        event that settled correctly at nothing.
+        """
+        if not start_iso:
+            return False
+        try:
+            ledger = _vpp_ledger.load_ledger(self._vpp_ledger_path())
+            if ledger.get("load_error"):
+                return False        # unknown is not "already held"
+            key = str(start_iso)[:16]
+            for tx in (ledger.get("axle") or {}).get("transactions") or []:
+                if not isinstance(tx, dict):
+                    continue
+                if (tx.get("transaction_type") or "").strip() != "flex event":
+                    continue
+                if str(tx.get("start_time") or "")[:16] == key:
+                    return True
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Ledger check skipped: {exc}")
+        return False
+
     def _ingest_settlement_email(self, sender, subject, body, received_at):
         """Parse one Axle settlement email into the ledger. Returns a note.
 
@@ -6964,15 +6994,42 @@ class Plugin(indigo.PluginBase):
             sender, subject, body, received_at,
             window_lookup=self._window_for_event_date)
         payload, note = result.get("payload"), result.get("note") or ""
+        window = result.get("window")
 
         if payload is None:
-            if note and "not an Axle settlement email" not in note:
-                # A genuine Axle mail we could not use is worth a warning; an
-                # unrelated message that merely tripped the trigger is not.
-                vpp_log(f"[VPP] Settlement email not imported - {note}", "WARNING")
-            else:
+            start = window[0] if window else None
+            if not note or "not an Axle settlement email" in note:
                 self.logger.debug(f"[VPP] Settlement email ignored - {note}")
+            elif start and self._ledger_has_figure_for(start):
+                # NOTHING TO DO. The mail scan re-reads every message every six
+                # hours by design, so a message we can never parse was warning
+                # on every pass - 42 times in the week to 12-Sep-2026 - about the
+                # 21-May event, whose authentic figure (0.036 kWh, 4p) Axle's own
+                # account had already supplied. "Enter it by hand" was not merely
+                # noise, it was wrong: the row was there. Suppressed on the
+                # EVIDENCE OF SUCCESS (a settled figure for that window), never on
+                # the identity of the message, so a window that later loses its
+                # figure starts warning again.
+                self.logger.debug(
+                    f"[VPP] Settlement email unreadable but already settled - {note}")
+            else:
+                # Genuinely missing. Say it ONCE per window rather than every
+                # scan: the fault is real but static, and an amber line every six
+                # hours only teaches the eye to skim them.
+                seen = self.store.setdefault("vpp_email_refusal_seen", set())
+                key  = start or note
+                if key not in seen:
+                    seen.add(key)
+                    vpp_log(f"[VPP] Settlement email not imported - {note}"
+                            + (" - enter it by hand if you want this event recorded."
+                               if start else "."), "WARNING")
+                else:
+                    self.logger.debug(f"[VPP] Settlement email still not importable - {note}")
             return note
+
+        # A window that has just been filed is no longer an outstanding refusal.
+        if window and window[0]:
+            self.store.setdefault("vpp_email_refusal_seen", set()).discard(window[0])
 
         try:
             added = self._merge_axle_payload(payload)

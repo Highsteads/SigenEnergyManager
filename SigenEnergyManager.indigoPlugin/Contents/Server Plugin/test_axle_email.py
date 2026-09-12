@@ -259,5 +259,65 @@ class TestTextFlattening(unittest.TestCase):
         self.assertEqual(AE.to_text(None), "")
 
 
+class TestRefusalsCarryTheirWindow(unittest.TestCase):
+    """A refusal has to say which EVENT it is about, or the caller cannot tell
+    "we could not read this" from "there is nothing to do, the figure is already
+    in the ledger" — which is how one unparseable May message produced 42
+    identical warnings in the week to 12-Sep-2026, each telling the owner to
+    hand-enter a row Axle had already supplied."""
+
+    LOW_EXPORT = """
+    <p>Your battery exported <b>0.04 kWh</b> during the grid event on
+    <b>Wed 21st May</b>. This is less than we hoped.</p>
+    <p>Don't worry - we're still guaranteeing <b>min &pound;10/month</b> earnings.</p>
+    """
+    AT = datetime(2026, 5, 24, 15, 33, tzinfo=timezone.utc)
+    WINDOW = ("2026-05-21T19:30:00+00:00", "2026-05-21T20:30:00+00:00")
+
+    def _lookup(self, d):
+        return self.WINDOW if d.isoformat() == "2026-05-21" else None
+
+    def test_the_low_export_refusal_names_its_window(self):
+        r = AE.parse_settlement_email(SPECIMEN_SENDER, SPECIMEN_SUBJECT,
+                                      self.LOW_EXPORT, self.AT, self._lookup)
+        self.assertIsNone(r["payload"])
+        self.assertIn("low-export", r["note"])
+        self.assertEqual(r["window"], self.WINDOW)
+
+    def test_the_refusal_no_longer_tells_the_caller_what_to_say(self):
+        """The advice moved to the caller, which is the only thing that knows
+        whether the figure is already held."""
+        r = AE.parse_settlement_email(SPECIMEN_SENDER, SPECIMEN_SUBJECT,
+                                      self.LOW_EXPORT, self.AT, self._lookup)
+        self.assertNotIn("by hand", r["note"])
+
+    def test_a_success_carries_its_window_too(self):
+        r = AE.parse_settlement_email(SPECIMEN_SENDER, SPECIMEN_SUBJECT,
+                                      SPECIMEN_BODY, SPECIMEN_AT,
+                                      lambda d: ("2026-08-16T19:00:00+00:00",
+                                                 "2026-08-16T20:00:00+00:00"))
+        self.assertIsNotNone(r["payload"])
+        self.assertEqual(r["window"][0], "2026-08-16T19:00:00+00:00")
+
+    def test_a_window_that_cannot_be_resolved_is_none_not_an_error(self):
+        r = AE.parse_settlement_email(SPECIMEN_SENDER, SPECIMEN_SUBJECT,
+                                      self.LOW_EXPORT, self.AT, lambda d: None)
+        self.assertIsNone(r["payload"])
+        self.assertIsNone(r["window"])
+
+    def test_every_return_path_carries_the_key(self):
+        """A caller reading result["window"] must never meet a KeyError, whatever
+        the message was."""
+        cases = [
+            ("someone@else.com", "Hello", "body"),
+            (SPECIMEN_SENDER, SPECIMEN_SUBJECT, "<p>no figures here at all</p>"),
+            (SPECIMEN_SENDER, SPECIMEN_SUBJECT, self.LOW_EXPORT),
+            (SPECIMEN_SENDER, SPECIMEN_SUBJECT, SPECIMEN_BODY),
+        ]
+        for sender, subject, body in cases:
+            r = AE.parse_settlement_email(sender, subject, body, self.AT, self._lookup)
+            self.assertIn("window", r, f"{subject!r} / {body[:30]!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

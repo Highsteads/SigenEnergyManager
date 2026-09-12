@@ -6481,5 +6481,152 @@ class TestPollAxleAccount(unittest.TestCase):
             p._poll_axle_account()      # must not raise
 
 
+class TestSettlementEmailRefusalIsQuietWhenAlreadySettled(unittest.TestCase):
+    """42 identical warnings in the week to 12-Sep-2026, every six hours, about
+    the 21-May event — whose authentic figure (0.036 kWh, 4p) Axle's own account
+    had already supplied. "Enter it by hand" was not noise, it was wrong."""
+
+    WINDOW = ("2026-05-21T19:30:00+00:00", "2026-05-21T20:30:00+00:00")
+    NOTE   = "Axle settled 0.04 kWh but their low-export template states no amount"
+
+    _NO_WINDOW = object()   # `window=None` must be expressible; a bare None default
+                            # fell through to WINDOW and the no-window case could
+                            # never actually be tested.
+
+    def _plugin(self, refusal=True, window=_NO_WINDOW):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store  = {}
+        p.logger = MagicMock()
+        p._window_for_event_date = MagicMock(return_value=None)
+        p._merge_axle_payload    = MagicMock(return_value=1)
+        p._ledger_has_figure_for = MagicMock(return_value=False)
+        p._parsed = {"payload": None, "note": self.NOTE,
+                     "window": self.WINDOW if window is self._NO_WINDOW else window}
+        if not refusal:
+            p._parsed = {"payload": {"transactions": [{
+                "start_time": "2026-05-21T19:30:00+00:00",
+                "flex_kwh": -0.036, "credit_pence": 4}]},
+                "note": "", "window": self.WINDOW}
+        return p
+
+    def _run(self, p):
+        with patch.object(plugin._axle_email, "parse_settlement_email",
+                          return_value=p._parsed), \
+             patch.object(plugin, "vpp_log") as vlog:
+            p._ingest_settlement_email("a@axle.energy", "results are in", "b", None)
+        return vlog
+
+    def test_SILENT_WHEN_THE_LEDGER_ALREADY_HOLDS_THE_FIGURE(self):
+        p = self._plugin()
+        p._ledger_has_figure_for = MagicMock(return_value=True)
+        vlog = self._run(p)
+        vlog.assert_not_called()
+        p.logger.debug.assert_called()
+
+    def test_warns_once_when_the_figure_really_is_missing(self):
+        p = self._plugin()
+        vlog = self._run(p)
+        self.assertEqual(vlog.call_count, 1)
+        self.assertEqual(vlog.call_args[0][1], "WARNING")
+        self.assertIn("by hand", vlog.call_args[0][0])
+
+    def test_AND_STAYS_QUIET_ON_EVERY_LATER_SCAN(self):
+        """The mail scan re-reads the same message every six hours by design."""
+        p = self._plugin()
+        first = self._run(p)
+        self.assertEqual(first.call_count, 1)
+        for _ in range(4):
+            again = self._run(p)
+            self.assertEqual(again.call_count, 0)
+
+    def test_a_successful_import_clears_the_latch(self):
+        p = self._plugin()
+        self._run(p)
+        self.assertIn(self.WINDOW[0], p.store["vpp_email_refusal_seen"])
+        p._parsed = self._plugin(refusal=False)._parsed
+        self._run(p)
+        self.assertNotIn(self.WINDOW[0], p.store["vpp_email_refusal_seen"])
+
+    def test_a_refusal_with_no_window_still_warns_but_offers_no_hand_entry(self):
+        """Nothing to hand-enter against if we cannot say which event it was."""
+        p = self._plugin(window=None)
+        vlog = self._run(p)
+        self.assertEqual(vlog.call_count, 1)
+        self.assertNotIn("by hand", vlog.call_args[0][0])
+
+    def test_an_unrelated_message_never_warns(self):
+        p = self._plugin()
+        p._parsed = {"payload": None, "note": "not an Axle settlement email",
+                     "window": None}
+        vlog = self._run(p)
+        vlog.assert_not_called()
+
+
+class TestLedgerHasFigureFor(unittest.TestCase):
+
+    def _plugin(self, ledger):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p._vpp_ledger_path = MagicMock(return_value="/nowhere/vpp_ledger.json")
+        p._ledger = ledger
+        return p
+
+    def _ask(self, p, start):
+        with patch.object(plugin._vpp_ledger, "load_ledger", return_value=p._ledger):
+            return p._ledger_has_figure_for(start)
+
+    def _led(self, txs):
+        return {"axle": {"transactions": txs}}
+
+    def test_true_for_a_settled_window(self):
+        p = self._plugin(self._led([{"transaction_type": "flex event",
+                                     "start_time": "2026-05-21T19:30:00+00:00",
+                                     "credit_pence": 4}]))
+        self.assertTrue(self._ask(p, "2026-05-21T19:30:00+00:00"))
+
+    def test_A_GENUINE_ZERO_STILL_COUNTS_AS_A_FIGURE(self):
+        """Axle record a nil event as a real 0p transaction. Treating it as
+        missing would nag for ever about an event that settled correctly."""
+        p = self._plugin(self._led([{"transaction_type": "flex event",
+                                     "start_time": "2026-04-20T07:00:00+00:00",
+                                     "credit_pence": 0}]))
+        self.assertTrue(self._ask(p, "2026-04-20T07:00:00+00:00"))
+
+    def test_false_for_a_different_window(self):
+        p = self._plugin(self._led([{"transaction_type": "flex event",
+                                     "start_time": "2026-05-21T19:30:00+00:00",
+                                     "credit_pence": 4}]))
+        self.assertFalse(self._ask(p, "2026-09-11T17:00:00+00:00"))
+
+    def test_a_top_up_is_not_an_event_figure(self):
+        p = self._plugin(self._led([{"transaction_type": "flex period top-up",
+                                     "start_time": "2026-05-21T19:30:00+00:00",
+                                     "credit_pence": 806}]))
+        self.assertFalse(self._ask(p, "2026-05-21T19:30:00+00:00"))
+
+    def test_AN_UNREADABLE_LEDGER_IS_NOT_ALREADY_HELD(self):
+        """Unknown must never be read as 'nothing to do' — that would silence
+        the warning for the one case where it matters most.
+
+        The rows below WOULD match. An empty list cannot test this: it returns
+        False whether the load_error guard is there or not, so the assertion
+        passes for the wrong reason — a mutation removing the guard survived
+        exactly that fixture."""
+        p = self._plugin({"load_error": "boom",
+                          "axle": {"transactions": [
+                              {"transaction_type": "flex event",
+                               "start_time": "2026-05-21T19:30:00+00:00",
+                               "credit_pence": 4}]}})
+        self.assertFalse(self._ask(p, "2026-05-21T19:30:00+00:00"))
+
+    def test_no_start_is_false(self):
+        p = self._plugin(self._led([]))
+        self.assertFalse(self._ask(p, None))
+
+    def test_rubbish_rows_do_not_raise(self):
+        p = self._plugin(self._led([None, 7, "x", {}]))
+        self.assertFalse(self._ask(p, "2026-05-21T19:30:00+00:00"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

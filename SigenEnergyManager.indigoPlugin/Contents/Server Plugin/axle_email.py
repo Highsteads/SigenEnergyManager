@@ -166,19 +166,36 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
     lookup over its OWN ledger rows, because it drove the window and already
     knows it to the second; the email only draws it inside a chart image.
 
-    Returns {"payload": dict|None, "note": str}. `payload` is None whenever the
-    message is not a settlement mail or could not be trusted, and `note` says
-    which - never a silent skip, because a settlement that quietly fails to land
-    is the exact failure this whole feed exists to end.
+    Returns {"payload": dict|None, "note": str, "window": tuple|None}. `payload`
+    is None whenever the message is not a settlement mail or could not be
+    trusted, and `note` says which - never a silent skip, because a settlement
+    that quietly fails to land is the exact failure this whole feed exists to end.
+
+    `window` is the event this message is ABOUT, whenever that much could be
+    worked out, and it is carried on a refusal as well as on a success. Without
+    it a caller cannot tell "we could not read this message" from "there is
+    nothing to do, because Axle's own figure for that event is already in the
+    ledger" - and the second of those was being reported as the first, once
+    every six hours, telling the owner to hand-enter a row that had been there
+    since May.
     """
     if not is_settlement_email(sender, subject):
-        return {"payload": None, "note": "not an Axle settlement email"}
+        return {"payload": None, "note": "not an Axle settlement email", "window": None}
 
     text = to_text(body)
 
+    # Resolved UP HERE so every refusal below can name its event. The checks
+    # themselves stay in their original order, so which refusal fires for a
+    # given message is unchanged - only what rides along with it.
+    event_date = event_date_from_body(text, received_at)
+    window = window_lookup(event_date) if (window_lookup and event_date) else None
+
+    def _refuse(note):
+        return {"payload": None, "note": note, "window": window}
+
     m_kwh = _RE_KWH.search(text)
     if not m_kwh:
-        return {"payload": None, "note": "no exported kWh figure in the body"}
+        return _refuse("no exported kWh figure in the body")
     kwh = abs(float(m_kwh.group(1)))     # the nil template writes it as -0.00
 
     rate = None
@@ -199,15 +216,13 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
         # do not - "Axle's figures, imported verbatim and never computed here" is
         # the rule the whole axle side turns on, and a computed number presented
         # as theirs is the worse error. Name the figure so it can be entered.
-        return {"payload": None,
-                "note": f"Axle settled {kwh} kWh but their low-export template states no "
-                        f"amount, so the money cannot be read from the mail - enter it by "
-                        f"hand if you want this event recorded"}
+        return _refuse(f"Axle settled {kwh} kWh but their low-export template states no "
+                       f"amount, so the money cannot be read from the mail")
 
     if not (0.0 <= kwh <= MAX_EVENT_KWH):
-        return {"payload": None, "note": f"exported figure {kwh} kWh is outside the plausible range"}
+        return _refuse(f"exported figure {kwh} kWh is outside the plausible range")
     if not (0.0 <= gbp <= MAX_EVENT_GBP):
-        return {"payload": None, "note": f"earned figure GBP {gbp} is outside the plausible range"}
+        return _refuse(f"earned figure GBP {gbp} is outside the plausible range")
 
 
     # Cross-check the two independent figures. They come from different parts of
@@ -216,18 +231,14 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
     if rate:
         implied = kwh * rate
         if abs(implied - gbp) > 0.02:
-            return {"payload": None,
-                    "note": f"the kWh and money figures disagree ({kwh} x {rate} is not {gbp})"}
+            return _refuse(f"the kWh and money figures disagree ({kwh} x {rate} is not {gbp})")
 
-    event_date = event_date_from_body(text, received_at)
     if event_date is None:
-        return {"payload": None, "note": "no event date in the body"}
+        return _refuse("no event date in the body")
 
-    window = window_lookup(event_date) if window_lookup else None
     if not window:
-        return {"payload": None,
-                "note": f"settled {kwh} kWh for {event_date.isoformat()} but this plugin has "
-                        f"no record of driving a window that day, so the row cannot be keyed"}
+        return _refuse(f"settled {kwh} kWh for {event_date.isoformat()} but this plugin has "
+                       f"no record of driving a window that day, so the row cannot be keyed")
     start_iso, end_iso = window
 
     # `email-<start>` matches the id convention the hand-typed rows already use,
@@ -246,6 +257,7 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
             "credit_pence":     int(round(gbp * 100)),
         }]},
         "note": "",
+        "window": window,
     }
 
 
