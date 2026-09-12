@@ -254,6 +254,16 @@ def import_axle_payload(ledger, payload, fetched_at=None):
     if payload.get("balance") is not None:
         axle["balance"] = payload["balance"]
 
+    # A settlement fingerprint, so a merge that only carries EVENTS can still
+    # count as news. `settled_via` flipping from None to a method is Axle
+    # telling us an event has been paid, which is exactly the thing worth
+    # timing - see last_new_row_at below.
+    def _settle_print(events):
+        return {(e.get("start_time"), e.get("settled_via"))
+                for e in (events or []) if isinstance(e, dict)}
+
+    before_print = _settle_print(axle.get("events"))
+
     if payload.get("events"):
         by_window = {}
         for ev in (axle.get("events") or []):
@@ -268,7 +278,24 @@ def import_axle_payload(ledger, payload, fetched_at=None):
             reverse=True,
         )
 
-    axle["fetched_at"] = fetched_at or datetime.now(timezone.utc).isoformat()
+    stamp = fetched_at or datetime.now(timezone.utc).isoformat()
+
+    # WHEN DID WE LAST LOOK, AND WHEN DID AXLE LAST SAY SOMETHING NEW. They are
+    # different questions and conflating them cost GBP 8 and a week.
+    #
+    # `fetched_at` is stamped on EVERY merge, no-op or not. The mail scan
+    # re-imports the same old messages every six hours, so it sits at ~0 days
+    # for ever - and both the staleness warning and the dashboard note were
+    # gated on it, which is why a feed that had been dead for three weeks read
+    # as perfectly healthy on 12-Sep-2026.
+    #
+    # `last_new_row_at` only moves when a merge actually brought something in.
+    # Absent on a ledger written before this existed, and a consumer must treat
+    # that as UNKNOWN rather than as stale - alarming about the past on the
+    # first run after an upgrade would be inventing a fault.
+    axle["fetched_at"] = stamp
+    if added or _settle_print(axle.get("events")) != before_print:
+        axle["last_new_row_at"] = stamp
     return ledger, added
 
 
@@ -571,6 +598,20 @@ def summarise(ledger, now=None, recent=12):
 
     pending = [e for e in events if not e["settled"]]
 
+    # HOW LONG HAS THE OLDEST UNPAID EVENT BEEN WAITING. This is the backstop
+    # that owes nothing to any feed: it moves only when Axle settle something,
+    # so no amount of scanning, re-importing or re-stamping on our side can
+    # flatter it. Measured on this account, settlement lands 2.8 to 5.8 days
+    # after the event (n=7, the parsed settlement emails to 16-Aug-2026), so a
+    # week of waiting is genuinely unusual rather than merely slow.
+    oldest_pending_start = None
+    oldest_pending_days  = None
+    for ev in pending:
+        age = _age_days(ev.get("start"), now)
+        if age is not None and (oldest_pending_days is None or age > oldest_pending_days):
+            oldest_pending_days  = age
+            oldest_pending_start = ev.get("start")
+
     # Month to date, on Axle's settled rows only. An estimate has no business
     # in a figure presented as earnings.
     month_key = to_london(now).strftime("%Y-%m") if now else None
@@ -605,6 +646,16 @@ def summarise(ledger, now=None, recent=12):
         "axle_fetched_local": _local_str((ledger.get("axle") or {}).get("fetched_at"),
                                          "%d/%m %H:%M"),
         "axle_age_days":      _age_days((ledger.get("axle") or {}).get("fetched_at"), now),
+        # When Axle last told us something NEW, as against when we last looked.
+        # None means no merge has brought anything in since this was added -
+        # UNKNOWN, not stale. See the note in import_axle_payload.
+        "axle_new_row_at":       (ledger.get("axle") or {}).get("last_new_row_at"),
+        "axle_new_row_local":    _local_str((ledger.get("axle") or {}).get("last_new_row_at"),
+                                            "%d/%m %H:%M"),
+        "axle_new_row_age_days": _age_days((ledger.get("axle") or {}).get("last_new_row_at"), now),
+        "oldest_pending_start":      oldest_pending_start,
+        "oldest_pending_start_local": _local_str(oldest_pending_start, "%d %b %Y %H:%M"),
+        "oldest_pending_days":       oldest_pending_days,
         "load_error":         ledger.get("load_error"),
     }
 
@@ -612,6 +663,56 @@ def summarise(ledger, now=None, recent=12):
 # ======================================================================
 # Helpers
 # ======================================================================
+
+def ledger_problem(summary, limit_days):
+    """Is the earnings feed in trouble, and in which of its three ways?
+
+    Returns the problem in plain words, or "" when all is well. Lifted out of
+    the plugin so it can be driven by a test: left inline in a tick handler the
+    decision was reachable only by a structural assertion, and a mutation
+    disabling the whole pending-age branch survived a 1407-test suite.
+
+    THE ORDER IS THE POINT. The pending-age question goes first because it is
+    the only one of the three that owes nothing to our own behaviour: an unpaid
+    event stops ageing only when Axle settle it. The import-age check below it
+    reads from `fetched_at`, which every scan re-stamps whether or not anything
+    arrived - which is exactly how a dead feed reported itself as 0.1 days old
+    for three weeks in September 2026.
+    """
+    if not isinstance(summary, dict):
+        return ""
+    if summary.get("load_error"):
+        return f"the ledger file could not be read ({summary['load_error']})"
+
+    try:
+        limit_days = float(limit_days)
+    except (TypeError, ValueError):
+        limit_days = 7.0
+    if limit_days <= 0:
+        return ""                      # checking switched off
+
+    age = summary.get("axle_age_days")
+    if age is None:
+        # "Never imported" is reported distinctly from "gone stale". Treating an
+        # empty ledger as fresh would make a feed that has never delivered once
+        # read healthier than one a day late.
+        return ("no Axle figures have ever been imported, so nothing here knows "
+                "what the events have paid")
+
+    pending_days = summary.get("oldest_pending_days")
+    if pending_days is not None and pending_days >= limit_days:
+        days = int(round(pending_days))
+        when = summary.get("oldest_pending_start_local") or "an earlier event"
+        return (f"the {when} event has been waiting {days} day"
+                f"{'' if days == 1 else 's'} for a settlement figure, and Axle "
+                f"normally pay within three")
+
+    if age >= limit_days:
+        days = int(round(age))
+        return (f"the last import was {days} day{'' if days == 1 else 's'} ago, "
+                f"past the {limit_days:.0f}-day mark")
+    return ""
+
 
 def _pence_to_gbp(pence):
     """Pence to GBP, preserving None. None means "not known", and it has to

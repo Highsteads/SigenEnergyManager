@@ -623,5 +623,178 @@ class TestEstimateIsPricedOffThePaidHour(unittest.TestCase):
         self.assertEqual(led["local"][0]["estimate_basis"], "run")
 
 
+class TestLastNewRowClock(unittest.TestCase):
+    """`fetched_at` answers "when did we last look". `last_new_row_at` answers
+    "when did Axle last say something new". Conflating them is what let a feed
+    that had been dead for three weeks report itself as 0.1 days old on
+    12-Sep-2026, because the six-hourly mail scan re-stamped it every run.
+    """
+
+    TX = {"transaction_id": "t1", "transaction_type": "flex event",
+          "start_time": "2026-09-07T18:00:00+00:00",
+          "end_time": "2026-09-07T19:00:00+00:00",
+          "flex_kwh": -4.001, "credit_pence": 400}
+
+    def test_a_new_transaction_moves_the_clock(self):
+        led, added = VL.import_axle_payload(VL.empty_ledger(), {"transactions": [self.TX]},
+                                           fetched_at="2026-09-12T10:00:00+00:00")
+        self.assertEqual(added, 1)
+        self.assertEqual(led["axle"]["last_new_row_at"], "2026-09-12T10:00:00+00:00")
+
+    def test_RE_IMPORTING_THE_SAME_ROW_DOES_NOT(self):
+        """The exact shape of the bug: the mail scan re-reads the same old
+        messages every six hours for ever. `fetched_at` must move and
+        `last_new_row_at` must not."""
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), {"transactions": [self.TX]},
+                                       fetched_at="2026-09-01T10:00:00+00:00")
+        led, added = VL.import_axle_payload(led, {"transactions": [self.TX]},
+                                           fetched_at="2026-09-12T10:00:00+00:00")
+        self.assertEqual(added, 0)
+        self.assertEqual(led["axle"]["fetched_at"], "2026-09-12T10:00:00+00:00")
+        self.assertEqual(led["axle"]["last_new_row_at"], "2026-09-01T10:00:00+00:00")
+
+    def test_an_event_becoming_settled_moves_the_clock_with_no_new_money(self):
+        """The events feed carries `settled_via` and no money at all. Axle
+        saying "this is now settled" is news, and the clock has to notice it or
+        layer 1 would not be able to keep time on its own."""
+        ev = {"start_time": "2026-09-07T18:00:00+00:00",
+              "end_time": "2026-09-07T19:00:00+00:00", "settled_via": None}
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), {"events": [ev]},
+                                       fetched_at="2026-09-08T10:00:00+00:00")
+        settled = dict(ev, settled_via="boundary_meter")
+        led, added = VL.import_axle_payload(led, {"events": [settled]},
+                                           fetched_at="2026-09-12T10:00:00+00:00")
+        self.assertEqual(added, 0)
+        self.assertEqual(led["axle"]["last_new_row_at"], "2026-09-12T10:00:00+00:00")
+
+    def test_re_importing_the_same_events_does_not_move_it(self):
+        ev = {"start_time": "2026-09-07T18:00:00+00:00",
+              "end_time": "2026-09-07T19:00:00+00:00", "settled_via": "boundary_meter"}
+        led, _ = VL.import_axle_payload(VL.empty_ledger(), {"events": [ev]},
+                                       fetched_at="2026-09-08T10:00:00+00:00")
+        led, _ = VL.import_axle_payload(led, {"events": [ev]},
+                                       fetched_at="2026-09-12T10:00:00+00:00")
+        self.assertEqual(led["axle"]["last_new_row_at"], "2026-09-08T10:00:00+00:00")
+
+    def test_a_ledger_written_before_this_existed_reports_unknown_not_stale(self):
+        """Alarming about the past on the first run after an upgrade would be
+        inventing a fault, so an absent stamp is None and the consumer decides."""
+        led = VL.empty_ledger()
+        led["axle"]["fetched_at"] = "2026-09-12T10:00:00+00:00"
+        s = VL.summarise(led, now=datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNone(s["axle_new_row_at"])
+        self.assertIsNone(s["axle_new_row_age_days"])
+
+
+class TestOldestPending(unittest.TestCase):
+    """The backstop that owes nothing to any feed: an unpaid event stops ageing
+    only when Axle settle it, so nothing we do on our side can quiet it."""
+
+    def _with(self, *starts):
+        led = VL.empty_ledger()
+        led["local"] = [{"start_time": s, "end_time": s, "export_kwh": 4.0,
+                         "window_kwh": 4.0} for s in starts]
+        return led
+
+    NOW = datetime(2026, 9, 12, 18, 0, tzinfo=timezone.utc)
+
+    def test_reports_the_oldest_unpaid_event(self):
+        s = VL.summarise(self._with("2026-09-05T18:30:00+00:00",
+                                   "2026-09-11T17:00:00+00:00"), now=self.NOW)
+        self.assertEqual(s["oldest_pending_start"], "2026-09-05T18:30:00+00:00")
+        self.assertAlmostEqual(s["oldest_pending_days"], 6.98, places=1)
+
+    def test_none_when_nothing_is_pending(self):
+        led = self._with("2026-09-05T18:30:00+00:00")
+        led["axle"]["transactions"] = [{"transaction_id": "t",
+                                        "transaction_type": "flex event",
+                                        "start_time": "2026-09-05T18:30:00+00:00",
+                                        "credit_pence": 400}]
+        s = VL.summarise(led, now=self.NOW)
+        self.assertEqual(s["events_pending"], 0)
+        self.assertIsNone(s["oldest_pending_days"])
+
+    def test_none_on_an_empty_ledger(self):
+        s = VL.summarise(VL.empty_ledger(), now=self.NOW)
+        self.assertIsNone(s["oldest_pending_days"])
+        self.assertIsNone(s["oldest_pending_start"])
+
+    def test_a_settled_event_paying_zero_is_not_pending(self):
+        """A real 0p row is a settlement, not an absence."""
+        led = self._with("2026-04-20T07:00:00+00:00")
+        led["axle"]["transactions"] = [{"transaction_id": "t",
+                                        "transaction_type": "flex event",
+                                        "start_time": "2026-04-20T07:00:00+00:00",
+                                        "credit_pence": 0}]
+        self.assertIsNone(VL.summarise(led, now=self.NOW)["oldest_pending_days"])
+
+    def test_the_newest_event_being_pending_is_normal_and_small(self):
+        """Settlement runs 2.8 to 5.8 days behind, so yesterday's event pending
+        must not produce a figure anywhere near a week."""
+        s = VL.summarise(self._with("2026-09-11T17:00:00+00:00"), now=self.NOW)
+        self.assertLess(s["oldest_pending_days"], 2)
+
+
+class TestLedgerProblem(unittest.TestCase):
+    """The three ways the earnings feed can be in trouble, and the order they
+    are asked in. A mutation disabling the pending-age branch survived the whole
+    suite while this decision sat inline in a tick handler."""
+
+    def _s(self, **kw):
+        base = {"axle_age_days": 0.1, "oldest_pending_days": None,
+                "oldest_pending_start_local": None, "load_error": None}
+        base.update(kw)
+        return base
+
+    def test_healthy_feed_says_nothing(self):
+        self.assertEqual(VL.ledger_problem(self._s(), 7), "")
+
+    def test_a_long_unpaid_event_is_reported(self):
+        got = VL.ledger_problem(self._s(oldest_pending_days=8.2,
+                                        oldest_pending_start_local="05 Sep 2026 19:30"), 7)
+        self.assertIn("05 Sep 2026 19:30", got)
+        self.assertIn("8 days", got)
+
+    def test_THE_PENDING_CHECK_SURVIVES_A_FRESHLY_STAMPED_IMPORT(self):
+        """The 12-Sep-2026 fault exactly: the mail scan keeps `fetched_at` at
+        nearly zero for ever, so anything gated on it alone is asleep. The
+        pending-age branch has to speak over the top of a healthy import age."""
+        got = VL.ledger_problem(self._s(axle_age_days=0.1, oldest_pending_days=9.0), 7)
+        self.assertTrue(got)
+        self.assertIn("waiting", got)
+
+    def test_a_recent_pending_event_is_not_a_problem(self):
+        self.assertEqual(VL.ledger_problem(self._s(oldest_pending_days=3.0), 7), "")
+
+    def test_a_stale_import_is_reported_when_nothing_is_pending(self):
+        got = VL.ledger_problem(self._s(axle_age_days=9.0), 7)
+        self.assertIn("last import", got)
+
+    def test_never_imported_reads_differently_from_stale(self):
+        got = VL.ledger_problem(self._s(axle_age_days=None), 7)
+        self.assertIn("ever been imported", got)
+        # The distinction is the point: an empty ledger must never borrow the
+        # stale-import wording, which would imply a feed that once worked.
+        self.assertNotIn("last import", got)
+
+    def test_a_load_error_outranks_everything(self):
+        got = VL.ledger_problem(self._s(load_error="boom", oldest_pending_days=99), 7)
+        self.assertIn("could not be read", got)
+
+    def test_zero_turns_the_check_off(self):
+        self.assertEqual(VL.ledger_problem(self._s(oldest_pending_days=99), 0), "")
+
+    def test_a_junk_limit_falls_back_to_seven_rather_than_raising(self):
+        self.assertTrue(VL.ledger_problem(self._s(oldest_pending_days=9.0), "not a number"))
+
+    def test_one_day_is_singular(self):
+        got = VL.ledger_problem(self._s(axle_age_days=1.0), 1)
+        self.assertIn("1 day ago", got)
+
+    def test_a_non_dict_summary_does_not_raise(self):
+        for bad in (None, [], "x"):
+            self.assertEqual(VL.ledger_problem(bad, 7), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

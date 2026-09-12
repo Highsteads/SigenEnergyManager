@@ -6380,5 +6380,106 @@ class TestAutoJoinOrdering(unittest.TestCase):
         self.assertLess(join, cache)
 
 
+class TestPollAxleAccount(unittest.TestCase):
+    """The wiring of the two-layer account read.
+
+    Written because a mutation that removed the no-token guard survived the
+    whole suite: every pure function underneath was covered and the method that
+    calls them was not.
+    """
+
+    def _plugin(self, **prefs):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.pluginPrefs = dict({"axleEnabled": True, "axleReadAccount": True}, **prefs)
+        p.store  = {}
+        p.logger = MagicMock()
+        p._merge_axle_payload   = MagicMock(return_value=0)
+        p._check_unsettled_money = MagicMock()
+        return p
+
+    def test_does_nothing_at_all_when_the_pref_is_off(self):
+        p = self._plugin(axleReadAccount=False)
+        with patch.object(plugin._axle_account, "newest_live_token") as tok:
+            p._poll_axle_account()
+        tok.assert_not_called()
+        p._merge_axle_payload.assert_not_called()
+
+    def test_does_nothing_when_axle_itself_is_off(self):
+        p = self._plugin(axleEnabled=False)
+        with patch.object(plugin._axle_account, "newest_live_token") as tok:
+            p._poll_axle_account()
+        tok.assert_not_called()
+
+    def test_NO_LIVE_TOKEN_MEANS_NO_FETCH_AND_A_NAMED_PROBLEM(self):
+        """Without this guard the plugin calls the account with `None` as the
+        bearer and reports whatever 401 comes back, which says nothing useful
+        about the real cause."""
+        p = self._plugin()
+        with patch.object(plugin._axle_account, "newest_live_token", return_value=None), \
+             patch.object(plugin._axle_account, "fetch_events") as fe:
+            p._poll_axle_account()
+        fe.assert_not_called()
+        p._merge_axle_payload.assert_not_called()
+        self.assertIn("sign-in link", p.store["axle_account_problem"])
+
+    def test_a_failing_events_feed_stops_before_the_money(self):
+        p = self._plugin()
+        with patch.object(plugin._axle_account, "newest_live_token",
+                          return_value=("tok", datetime.now(timezone.utc), "site")), \
+             patch.object(plugin._axle_account, "fetch_events",
+                          return_value={"events": None, "note": "HTTP 403"}), \
+             patch.object(plugin._axle_account, "fetch_account") as fa:
+            p._poll_axle_account()
+        fa.assert_not_called()
+        self.assertIn("403", p.store["axle_account_problem"])
+
+    def test_THE_EVENT_LIST_LANDS_EVEN_WHEN_THE_MONEY_FETCH_FAILS(self):
+        """The whole reason for two layers. If the account payload's encoding
+        moves, the ledger must still learn which events Axle consider settled,
+        so the failure is loud rather than silent."""
+        p = self._plugin()
+        events = [{"start_time": "2026-09-07T18:00:00+00:00",
+                   "end_time": "2026-09-07T19:00:00+00:00",
+                   "settled_via": "boundary_meter"}]
+        with patch.object(plugin._axle_account, "newest_live_token",
+                          return_value=("tok", datetime.now(timezone.utc), "site")), \
+             patch.object(plugin._axle_account, "fetch_events",
+                          return_value={"events": events, "note": ""}), \
+             patch.object(plugin._axle_account, "fetch_account",
+                          return_value={"payload": None, "note": "could not be decoded"}):
+            p._poll_axle_account()
+
+        p._merge_axle_payload.assert_called_once_with({"events": events})
+        self.assertEqual(p.store["axle_account_problem"], "")
+        self.assertIn("decoded", p.store["axle_money_problem"])
+        p._check_unsettled_money.assert_called_once()
+
+    def test_both_layers_landing_clears_both_problems(self):
+        p = self._plugin()
+        payload = {"balance": {}, "transactions": []}
+        with patch.object(plugin._axle_account, "newest_live_token",
+                          return_value=("tok", datetime.now(timezone.utc), "site")), \
+             patch.object(plugin._axle_account, "fetch_events",
+                          return_value={"events": [], "note": ""}), \
+             patch.object(plugin._axle_account, "fetch_account",
+                          return_value={"payload": payload, "note": ""}):
+            p._poll_axle_account()
+
+        self.assertEqual(p._merge_axle_payload.call_count, 2)
+        self.assertEqual(p.store["axle_account_problem"], "")
+        self.assertEqual(p.store["axle_money_problem"], "")
+
+    def test_a_broken_unsettled_check_cannot_take_the_tick_down(self):
+        p = self._plugin()
+        p._check_unsettled_money = MagicMock(side_effect=RuntimeError("boom"))
+        with patch.object(plugin._axle_account, "newest_live_token",
+                          return_value=("tok", datetime.now(timezone.utc), "site")), \
+             patch.object(plugin._axle_account, "fetch_events",
+                          return_value={"events": [], "note": ""}), \
+             patch.object(plugin._axle_account, "fetch_account",
+                          return_value={"payload": None, "note": "x"}):
+            p._poll_axle_account()      # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

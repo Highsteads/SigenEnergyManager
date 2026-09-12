@@ -230,11 +230,20 @@
         <Label>Axle email what each event paid, a few days after it runs. With this on, the plugin reads those emails straight out of Apple Mail's own files and files the figures in the earnings ledger by itself. It only ever opens messages from noreply@axle.energy with Axle's settlement subject, it never signs in to anything, and no password is stored. Leave it off if you would rather type the figures in yourself.</Label>
     </Field>
 
+    <Field id="axleReadAccount" type="checkbox" defaultValue="false" visibleBindingId="axleEnabled" visibleBindingValue="true">
+        <Label>Read your Axle account page directly:</Label>
+    </Field>
+    <Field id="label_axleReadAccount_info" type="label">
+        <Label>Every email Axle send carries a sign-in link that works for seven days, and an event always sends one on the day it finishes. With this on, the plugin borrows that link from Apple Mail and reads your account the same way your browser does, so earnings arrive whether or not Axle send a settlement email for them.
+
+You never sign in and nothing is stored: the link is read fresh each time and expires on its own. It matters because Axle changed how they settle this site in September 2026 and simply stopped emailing the figures — two events were paid and invisible here for a week. Their account page also says plainly which events have been settled, so the plugin can now tell you money is owed even when it cannot read the amount.</Label>
+    </Field>
+
     <Field id="ledgerStaleDays" type="textfield" defaultValue="7" visibleBindingId="axleEnabled" visibleBindingValue="true">
         <Label>Warn if the earnings figures are this many days stale (0 = off):</Label>
     </Field>
     <Field id="label_ledgerStaleDays_info" type="label">
-        <Label>Axle settle a few days behind an event, so seven days catches a feed that has genuinely stopped without complaining about a quiet week.</Label>
+        <Label>Axle settle a few days behind an event, so seven days catches a feed that has genuinely stopped without complaining about a quiet week. Measured on this account, settlement lands between 2.8 and 5.8 days after the event.</Label>
     </Field>
 
     <Field id="separator_savingsessions" type="separator"/>

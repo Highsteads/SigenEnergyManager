@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0)
-# Date:        11-09-2026 14:20
-# Version:     5.102.1
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0)
+# Date:        12-09-2026 18:10
+# Version:     5.103.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -188,6 +188,7 @@ from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
                            DASHBOARD_BIND_LOOPBACK)
 import vpp_ledger as _vpp_ledger
 import axle_email as _axle_email
+import axle_account as _axle_account
 
 # ============================================================
 # Constants
@@ -265,6 +266,7 @@ VPP_LEDGER_CHECK_INTERVAL = 21600  # 6 hours
 # reasoning as the ledger check: a settlement lands days after its event, so
 # hours is ample, and the walk costs ~1.6 s of the plugin's only thread.
 AXLE_MAIL_SCAN_INTERVAL   = 21600  # 6 hours
+AXLE_ACCOUNT_POLL_INTERVAL = 21600 # 6 hours — settlement moves in days, not minutes
 # How far our own in-window measurement may sit from what Axle settled before it
 # is treated as a fault rather than meter difference.
 #
@@ -2837,6 +2839,18 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 vpp_log(f"[VPP] Axle mail scan failed: {exc}", "WARNING")
             self.store["last_mail_scan"] = now
+
+        # 12a-ii. Axle account read (v5.103.0). AFTER the mail scan, so on a
+        # tick where both run the account's own figures are the last word -
+        # they are Axle's authentic rows, where the mail gives a row we built
+        # from prose. Both are window-keyed, so the order only decides which
+        # wins a tie, and it should be this one.
+        if now - self.store.get("last_account_poll", 0.0) >= AXLE_ACCOUNT_POLL_INTERVAL:
+            try:
+                self._poll_axle_account()
+            except Exception as exc:
+                vpp_log(f"[VPP] Axle account read failed: {exc}", "WARNING")
+            self.store["last_account_poll"] = now
 
         # 12b. Earnings-ledger freshness (v5.92.0). Local file work only.
         if now - self.store.get("last_ledger_check", 0.0) >= VPP_LEDGER_CHECK_INTERVAL:
@@ -6533,34 +6547,11 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[VPP] Ledger freshness check skipped: {exc}")
             return
 
-        if summary.get("load_error"):
-            self._record_vpp_ledger_status(
-                f"the ledger file could not be read ({summary['load_error']})")
-            return
-
-        try:
-            limit_days = float(_as_float(self.pluginPrefs.get("ledgerStaleDays"), 7.0))
-        except (TypeError, ValueError):
-            limit_days = 7.0
-        if limit_days <= 0:
-            self._record_vpp_ledger_status("")     # checking switched off
-            return
-
-        age = summary.get("axle_age_days")
-        if age is None:
-            # Distinguish "never imported" from "imported and gone stale".
-            self._record_vpp_ledger_status(
-                "no Axle figures have ever been imported, so nothing here knows "
-                "what the events have paid")
-            return
-
-        if age >= limit_days:
-            days = int(round(age))
-            self._record_vpp_ledger_status(
-                f"the last import was {days} day{'' if days == 1 else 's'} ago, "
-                f"past the {limit_days:.0f}-day mark")
-        else:
-            self._record_vpp_ledger_status("")
+        # The verdict itself lives in vpp_ledger.ledger_problem, so a test can
+        # drive it directly - see the note there. This method's remaining job is
+        # to fetch the summary, read the pref and report.
+        limit_days = _as_float(self.pluginPrefs.get("ledgerStaleDays"), 7.0)
+        self._record_vpp_ledger_status(_vpp_ledger.ledger_problem(summary, limit_days))
 
     def _merge_axle_payload(self, payload):
         """Merge one Axle account payload into the ledger. Returns added count.
@@ -6596,6 +6587,139 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[VPP] Settlement divergence check skipped: {exc}")
         return added
 
+
+    def _poll_axle_account(self):
+        """Read the Axle account directly, in two layers.
+
+        OFF BY DEFAULT, like the mail scan and for the same reason: this is a
+        published plugin and it reads the user's own Mail store to find the
+        sign-in link Axle put there. Nothing is stored and nothing is typed -
+        the link expires on its own after seven days, and an event always sends
+        a fresh one on the day it finishes.
+
+        THE TWO LAYERS ARE DELIBERATELY NOT ONE CALL. `events` is ordinary JSON
+        from Axle's own published API and tells us WHICH events are settled;
+        the account payload carries the money but rides on a web framework's
+        internal encoding. Fetching events FIRST and merging it regardless
+        means that when the money fetch breaks - and one day it will - the
+        ledger still knows a settled event exists, `_check_unsettled_money`
+        still speaks, and the failure is loud instead of silent.
+        """
+        if not _as_bool(self.pluginPrefs.get("axleReadAccount"), False):
+            return
+        if not _as_bool(self.pluginPrefs.get("axleEnabled"), False):
+            return
+
+        found = _axle_account.newest_live_token()
+        if not found:
+            self._note_account_problem(
+                "no live Axle sign-in link was found in Apple Mail on this Mac - they "
+                "arrive with every Axle email and last a week, so opening your account "
+                "page from any of their emails will supply a fresh one")
+            return
+        token, expires, site_id = found
+
+        events = _axle_account.fetch_events(site_id, token)
+        if events["events"] is None:
+            self._note_account_problem(events["note"])
+            return
+
+        # Layer 1 lands on its own, before the fragile half is even attempted.
+        try:
+            self._merge_axle_payload({"events": events["events"]})
+        except Exception as exc:
+            self._note_account_problem(f"the event list could not be filed ({exc})")
+            return
+        self._note_account_problem("")
+        vpp_log(f"[VPP] Axle account read: {len(events['events'])} event(s), "
+                f"sign-in link good until {_local_time(expires, '%d/%m %H:%M')}.")
+
+        # Layer 2. A failure here is reported and survivable - layer 1 has
+        # already told the ledger which events Axle consider settled.
+        account = _axle_account.fetch_account(site_id, token)
+        if account["payload"] is None:
+            self._note_money_problem(account["note"])
+        else:
+            try:
+                added = self._merge_axle_payload(account["payload"])
+                self._note_money_problem("")
+                if added:
+                    vpp_log(f"[VPP] Axle account read brought in {added} new "
+                            f"settlement figure(s).", event=True)
+            except Exception as exc:
+                self._note_money_problem(f"the account figures could not be filed ({exc})")
+
+        try:
+            self._check_unsettled_money()
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Unsettled-money check skipped: {exc}")
+
+    def _note_account_problem(self, problem):
+        """Report a failing account read, once and then on change only."""
+        prev = self.store.get("axle_account_problem") or ""
+        self.store["axle_account_problem"] = problem or ""
+        if problem:
+            if problem != prev:
+                vpp_log(f"[VPP] Axle account could not be read - {problem}.", "WARNING")
+        elif prev:
+            vpp_log("[VPP] Axle account is readable again.", event=True)
+
+    def _note_money_problem(self, problem):
+        """Report a failing MONEY read separately from a failing account read.
+
+        Separate because the remedies differ and lumping them would hide the
+        interesting case: the event list working while the figures do not means
+        the account payload's encoding has moved, which is a plugin fix, not
+        anything the user can do.
+        """
+        prev = self.store.get("axle_money_problem") or ""
+        self.store["axle_money_problem"] = problem or ""
+        if problem:
+            if problem != prev:
+                vpp_log(f"[VPP] Axle settled figures could not be read - {problem}. "
+                        f"Which events have been settled is still known, so nothing "
+                        f"is lost track of.", "WARNING")
+        elif prev:
+            vpp_log("[VPP] Axle settled figures are readable again.", event=True)
+
+    def _check_unsettled_money(self):
+        """Warn when Axle say an event is settled but we hold no figure for it.
+
+        THE POINT OF THIS CHECK IS THAT IT IS POSITIVE. It rests on Axle's own
+        `settled_via`, so it is not inferring a fault from an absence - it is
+        repeating back something Axle have stated. That is what makes it able
+        to catch the 12-Sep-2026 fault, where the feed was dead, every staleness
+        measure read healthy, and the only evidence anywhere was Axle saying
+        "settled" about two events we had no money for.
+
+        Latched per window, so a figure that genuinely never arrives says so
+        once rather than every six hours.
+        """
+        ledger  = _vpp_ledger.load_ledger(self._vpp_ledger_path())
+        if ledger.get("load_error"):
+            return
+        missing = _axle_account.settled_without_figures(ledger)
+        seen    = self.store.setdefault("vpp_settled_unpaid_seen", set())
+
+        for start in missing:
+            if start in seen:
+                continue
+            seen.add(start)
+            # settled_without_figures returns ISO strings; _local_time wants a
+            # datetime, and an unparseable one must not stop the warning.
+            try:
+                when = _local_time(datetime.fromisoformat(start), "%d %b %Y %H:%M")
+            except (TypeError, ValueError):
+                when = str(start)
+            vpp_log(f"[VPP] Axle have settled the {when} event but no payment figure has "
+                    f"reached the ledger, so the earnings shown are short. Open your Axle "
+                    f"account page to refresh the sign-in link, or import the figures by "
+                    f"hand.", "WARNING")
+
+        # Drop anything that has since been paid, so a later recurrence warns again.
+        for start in list(seen):
+            if start not in missing:
+                seen.discard(start)
 
     def _scan_axle_mail(self):
         """Import any Axle settlement mail sitting in the local Mail store.
