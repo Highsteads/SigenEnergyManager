@@ -9,8 +9,8 @@
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
 #              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0)
-# Date:        12-09-2026 18:10
-# Version:     5.103.0
+# Date:        12-09-2026 22:20
+# Version:     5.103.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1483,6 +1483,7 @@ class Plugin(indigo.PluginBase):
         self._log_bank_first_setting()
         self._log_tariff_override_setting()
         self._log_saving_session_auto_join_setting()
+        self._log_axle_account_setting()
 
         # Auto-update check (best-effort, daily-cached, fully silent on failure).
         try:
@@ -11090,6 +11091,36 @@ class Plugin(indigo.PluginBase):
         # hour. Ticking "opt in automatically" at 18:55 for a 19:00 session has to
         # act now, and a settings save is exactly when the owner expects it to.
         self.store["last_saving_sessions"] = 0.0
+        # Same reasoning for the Axle account read: ticking the box is the moment
+        # the owner expects it to look, and waiting out the rest of a six-hour
+        # window would leave a feature that appears to do nothing for most of an
+        # evening. Costs one extra read of a page we already read six-hourly.
+        self.store["last_account_poll"] = 0.0
+        self._log_axle_account_setting()
+
+    def _log_axle_account_setting(self):
+        """Say whether the plugin is reading the Axle account directly.
+
+        At every start and every save, for the same reason the tariff override and
+        the saving-session auto-join announce themselves: this one reaches OUTSIDE
+        the house and reads the owner's mail to find its sign-in link. A capability
+        like that being on should never be something you have to open a dialog to
+        discover.
+        """
+        try:
+            if not _as_bool(self.pluginPrefs.get("axleReadAccount"), False):
+                return
+            # event=True: an INFO line that must reach the EVENT log. The v5.96.0
+            # rule sends ordinary VPP narration to the plugin's own file because
+            # it grows per event and CliveS does not want it; this fires only at a
+            # start or a save, and an armed capability that reads the owner's mail
+            # is precisely the thing he should not have to go looking for. It is
+            # NOT a warning — an armed state working as configured is not a fault.
+            vpp_log("[VPP] Reading the Axle account directly is ON - the plugin borrows "
+                    "the seven-day sign-in link from Axle's own emails; nothing is stored.",
+                    event=True)
+        except Exception as exc:
+            self.logger.debug(f"[VPP] Axle account setting log skipped: {exc}")
 
     def _log_saving_session_auto_join_setting(self):
         """Say whether the plugin will opt in on the owner's behalf. Start and every save.
