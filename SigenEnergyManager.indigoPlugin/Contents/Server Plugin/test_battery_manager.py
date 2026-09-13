@@ -107,6 +107,7 @@ def _make_snapshot(
     flood_prev_target_soc=0.0,
     dawn_target_pct=DAWN_TARGET,
     weekday_kwh=22.0,
+    monday_kwh=22.0,
     saturday_kwh=30.0,
     sunday_kwh=30.0,
     bias_factor=1.0,
@@ -164,6 +165,7 @@ def _make_snapshot(
         now                    = _now(hour=now_hour),
         vpp_active             = vpp_active,
         weekday_kwh            = weekday_kwh,
+        monday_kwh             = monday_kwh,
         saturday_kwh           = saturday_kwh,
         sunday_kwh             = sunday_kwh,
         saving_session_active  = saving_session_active,
@@ -748,7 +750,8 @@ class TestFloodPrevention(unittest.TestCase):
     """Tests for overnight flood prevention pre-drain logic (v4.4).
 
     Constants: threshold=55%, target=40%, forecast_mult=3.0x
-    Daily need pinned to 22.0 kWh via weekday_kwh / saturday_kwh / sunday_kwh = 22.0.
+    Daily need pinned to 22.0 kWh on EVERY day type — weekday_kwh / monday_kwh /
+    saturday_kwh / sunday_kwh all 22.0 — so the assertions are calendar-proof.
     Flood prevention fires when: tomorrow_solar >= 3 * 22.0 = 66.0 kWh.
     sunny_tomorrow = 70.0 kWh  (well above 3x threshold, pinned need avoids day-of-week fragility)
     poor_tomorrow  = 20.0 kWh  (below 3x threshold)
@@ -769,7 +772,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -819,7 +822,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow, # day-after looks great, irrelevant
             now_hour               = 0,                   # 00:25-ish — post-midnight
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
             dawn_times             = {today_str: _now(hour=6)},  # dawn is later today
         )
         decision = self.bm.evaluate(snapshot)
@@ -841,7 +844,7 @@ class TestFloodPrevention(unittest.TestCase):
             vpp_tomorrow_kwh       = 4.0,          # 1h × 4kW
             now_hour               = 22,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -862,7 +865,7 @@ class TestFloodPrevention(unittest.TestCase):
             vpp_tomorrow_kwh       = 8.0,          # 2h × 4kW VPP scheduled tomorrow
             now_hour               = 22,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -881,7 +884,7 @@ class TestFloodPrevention(unittest.TestCase):
             vpp_tomorrow_kwh       = 0.0,
             now_hour               = 0,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
             dawn_times             = {today_str: _now(hour=6)},
         )
         decision = self.bm.evaluate(snapshot)
@@ -899,7 +902,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.poor_tomorrow,   # day-after irrelevant when dawn is today
             now_hour               = 0,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
             dawn_times             = {today_str: _now(hour=6)},
         )
         decision = self.bm.evaluate(snapshot)
@@ -964,7 +967,7 @@ class TestFloodPrevention(unittest.TestCase):
             now_hour               = 22,
             dawn_target_pct        = 50.0,   # storm raised floor
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -994,7 +997,7 @@ class TestFloodPrevention(unittest.TestCase):
             now_hour               = 22,
             max_export_kw          = 3.6,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -1012,7 +1015,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
         preview  = self.bm.compute_flood_preview(snapshot)
@@ -1041,7 +1044,7 @@ class TestFloodPrevention(unittest.TestCase):
                 tomorrow_str: _tomorrow_dawn(hour=6),
             },
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
         preview  = self.bm.compute_flood_preview(snapshot)
@@ -1061,7 +1064,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow, # day-after looks great, irrelevant
             now_hour               = 1,                   # 01:45-ish — post-midnight
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
             dawn_times             = {today_str: _now(hour=6)},
         )
         decision = self.bm.evaluate(snapshot)
@@ -1083,7 +1086,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 22,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         preview = self.bm.compute_flood_preview(snapshot)
 
@@ -1105,7 +1108,7 @@ class TestFloodPrevention(unittest.TestCase):
             corrected_tomorrow_kwh = self.sunny_tomorrow,
             now_hour               = 23,
             weekday_kwh            = 22.0,
-            saturday_kwh            = 22.0, sunday_kwh            = 22.0,
+            monday_kwh            = 22.0, saturday_kwh            = 22.0, sunday_kwh            = 22.0,
         )
         decision = self.bm.evaluate(snapshot)
 
@@ -1475,7 +1478,7 @@ class TestSurplusConservatism(unittest.TestCase):
         # balance used the 30 kWh weekend need against a hard-coded 22).
         snapshot = _make_snapshot(soc_pct=50.0, now_hour=20,
                                   corrected_tomorrow_kwh=60.0,
-                                  weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
+                                  weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
         balance = bm._calculate_24h_balance(snapshot)
         # battery(17.52) + remaining_solar(0, night) - need(22) = -4.48:
         # negative despite 60 kWh forecast tomorrow — deliberately so.
@@ -1523,7 +1526,7 @@ class TestFloodContinuationGuards(unittest.TestCase):
         # start before a completely sunless day. Zero demand now fails the gate.
         snapshot = _make_snapshot(
             soc_pct=70.0, now_hour=22, export_enabled=True,
-            weekday_kwh=0.0, saturday_kwh=0.0, sunday_kwh=0.0,
+            weekday_kwh=0.0, monday_kwh=0.0, saturday_kwh=0.0, sunday_kwh=0.0,
             corrected_today_kwh=0.5, corrected_tomorrow_kwh=0.5,
         )
         preview = self.bm.compute_flood_preview(snapshot)
@@ -1543,7 +1546,7 @@ class TestFloodContinuationGuards(unittest.TestCase):
             soc_pct=70.0, now_hour=1, export_active=True,
             flood_prev_target_soc=40.0, export_enabled=True,
             corrected_today_kwh=70.0, corrected_tomorrow_kwh=70.0,
-            saturday_kwh=22.0, sunday_kwh=22.0,   # calendar-proof: need is 22 on any run day
+            monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0,   # calendar-proof: need is 22 on any run day
         )
         d = self.bm._check_overrides(snapshot)
         self.assertIsNotNone(d)
@@ -2284,7 +2287,7 @@ class TestSavingSessionOverride(unittest.TestCase):
         # which test_a_flat_battery_refuses_and_says_why already covers.
         snap = _make_snapshot(soc_pct=95.0, export_enabled=True,
                               saving_session_active=True, now_hour=20,
-                              weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
+                              weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
         self.assertEqual(self.mgr.evaluate(snap).action, ACTION_SAVING_SESSION)
 
     def test_export_disabled_stands_the_session_down(self):
@@ -2435,7 +2438,7 @@ class TestExportFeedback(unittest.TestCase):
     def test_measured_need_is_used_so_far_plus_the_profile_remainder(self):
         # 14:00 local: 20 of 48 flat slots remain -> need = 12 + 20/48 * 22 = 21.17
         snap = _make_snapshot(soc_pct=50.0, now_hour=13, home_today_kwh=12.0,
-                              weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
+                              weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
         bal  = self.bm._calculate_24h_balance(snap)
         local_slot = snap.now.astimezone(__import__("zoneinfo").ZoneInfo("Europe/London"))
         remaining  = (48 - (local_slot.hour * 2 + (1 if local_slot.minute >= 30 else 0))) / 48.0
@@ -2446,7 +2449,7 @@ class TestExportFeedback(unittest.TestCase):
     def test_partial_or_unknown_measurement_keeps_the_whole_day_figure(self):
         for kw in ({"home_today_kwh": None}, {"home_today_kwh": 12.0, "home_today_partial": True}):
             bal = self.bm._calculate_24h_balance(_make_snapshot(
-                soc_pct=50.0, now_hour=13, weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0, **kw))
+                soc_pct=50.0, now_hour=13, weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0, **kw))
             self.assertFalse(bal.need_today_measured)
             self.assertIsNone(bal.need_today_used_kwh)
             self.assertEqual(bal.need_24h_kwh, 22.0)
@@ -2455,7 +2458,7 @@ class TestExportFeedback(unittest.TestCase):
         """Every pre-5.90 test still holds because the defaults are inert: this
         pins that a default snapshot reports no tracking and no measured need."""
         bal = self.bm._calculate_24h_balance(_make_snapshot(soc_pct=50.0, now_hour=20,
-                                                            weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0))
+                                                            weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0))
         self.assertEqual(bal.pv_tracking_factor, 1.0)
         self.assertFalse(bal.need_today_measured)
         self.assertAlmostEqual(bal.surplus_kwh, 17.52 - 22.0, places=1)
@@ -2465,7 +2468,7 @@ class TestExportFeedback(unittest.TestCase):
         # A sufficient evening (battery high, tomorrow well covered) reaches the
         # DEFAULT branch, whose reason is the line CliveS reads every day.
         kw = dict(soc_pct=85.0, now_hour=20, corrected_tomorrow_kwh=40.0,
-                  weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
+                  weekday_kwh=22.0, monday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0)
         plain = self.bm.evaluate(_make_snapshot(**kw))
         self.assertTrue(plain.reason.startswith("24h sufficient"), plain.reason)
         self.assertNotIn("solar tracking", plain.reason)

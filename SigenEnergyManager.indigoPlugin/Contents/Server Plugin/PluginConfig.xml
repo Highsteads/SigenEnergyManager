@@ -166,7 +166,10 @@
         <Label>Battery health cutoff floor (%, default 1):</Label>
     </Field>
     <Field id="weekdayKwh" type="textfield" defaultValue="22.0">
-        <Label>Weekday daily consumption (kWh Mon-Fri, default 22):</Label>
+        <Label>Weekday daily consumption (kWh Tue-Fri, default 22):</Label>
+    </Field>
+    <Field id="mondayKwh" type="textfield" defaultValue="22.0">
+        <Label>Monday daily consumption (kWh, default 22):</Label>
     </Field>
     <Field id="saturdayKwh" type="textfield" defaultValue="30.0">
         <Label>Saturday daily consumption (kWh, default 30):</Label>
@@ -175,7 +178,7 @@
         <Label>Sunday daily consumption (kWh, default 30):</Label>
     </Field>
     <Field id="label_dailyKwh_info" type="label" fontSize="small">
-        <Label>Leave these alone unless you want to override them. The plugin measures what the house actually gets through, half hour by half hour, over a rolling nine weeks, and works the three figures out for itself. Saturday and Sunday get their own because they are rarely the same day: measured here, Saturday runs about 2.6 kWh above Sunday. A value more than 1 kWh from the default is read as you meaning it, and auto-calibration then leaves that day alone.</Label>
+        <Label>Leave these alone unless you want to override them. The plugin measures what the house actually gets through, half hour by half hour, over a rolling nine weeks, and works the four figures out for itself. Monday, Saturday and Sunday get their own because they are rarely like the rest of the week: measured here, Saturday runs about 2.6 kWh above Sunday and Monday about 1.3 kWh above Tuesday to Friday. A value more than 1 kWh from the default is read as you meaning it, and auto-calibration then leaves that day alone.</Label>
     </Field>
 
     <Field id="separator_away" type="separator"/>

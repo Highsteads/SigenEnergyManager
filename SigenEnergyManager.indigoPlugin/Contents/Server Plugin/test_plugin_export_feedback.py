@@ -190,14 +190,14 @@ class TestTrackingAccumulators(_Tmp):
 
 
 class TestPerDayUplifts(_Tmp):
-    """v5.104.0: Saturday and Sunday are measured separately.
+    """v5.104.0 / v5.105.0: Monday, Saturday and Sunday are measured separately.
 
-    The fixture gives them DIFFERENT values on purpose. The old one used a
-    single weekend figure, which cannot tell a split model from a blended one —
-    every assertion would have passed on either.
+    Every day in the fixture gets a DIFFERENT value on purpose. A fixture that
+    gives two buckets the same number cannot tell a split model from a blended
+    one — every assertion would pass on either.
     """
 
-    def _history(self, p, weekday_kwh, sat_kwh, sun_kwh, days=42,
+    def _history(self, p, base_kwh, mon_kwh, sat_kwh, sun_kwh, days=120,
                  partial_days=(), partial_kwh=5.0):
         rows = []
         today = datetime.strptime(D1, "%Y-%m-%d")
@@ -207,101 +207,151 @@ class TestPerDayUplifts(_Tmp):
             partial = ds in partial_days
             if partial:
                 kwh = partial_kwh
+            elif d.weekday() == 0:
+                kwh = mon_kwh
             elif d.weekday() == 5:
                 kwh = sat_kwh
             elif d.weekday() == 6:
                 kwh = sun_kwh
             else:
-                kwh = weekday_kwh
+                kwh = base_kwh
             rows.append({"date": ds, "home_kwh": kwh, "energy_partial": partial})
         with open(os.path.join(p.data_dir, "daily_history.json"), "w", encoding="utf-8") as fh:
             json.dump(rows, fh)
 
-    def test_the_two_days_get_their_own_measured_ratio(self):
+    def test_each_day_gets_its_own_measured_ratio(self):
         p = _mk(self.tmp)
-        # The real shape here: Saturday well above Sunday, Sunday just above a weekday.
-        self._history(p, 21.0, 24.7, 22.1)
+        # The real shape here: Saturday highest, Monday and Sunday close but
+        # deliberately NOT equal, Tue-Fri the base.
+        self._history(p, 20.8, 22.1, 24.7, 22.3)
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
-            sat, sun = p._measured_day_uplifts()
-        self.assertAlmostEqual(sat, round(24.7 / 21.0, 3), places=3)
-        self.assertAlmostEqual(sun, round(22.1 / 21.0, 3), places=3)
-        self.assertGreater(sat, sun)
+            mon, sat, sun = p._measured_day_uplifts()
+        self.assertAlmostEqual(mon, round(22.1 / 20.8, 3), places=3)
+        self.assertAlmostEqual(sat, round(24.7 / 20.8, 3), places=3)
+        self.assertAlmostEqual(sun, round(22.3 / 20.8, 3), places=3)
+
+    def test_the_base_is_tuefri_and_excludes_the_split_days(self):
+        """Measuring against a mean a day belongs to makes the ratios move each other."""
+        p = _mk(self.tmp)
+        self._history(p, 20.0, 30.0, 30.0, 30.0)   # every split day far above the base
+        with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
+            mon, sat, sun = p._measured_day_uplifts()
+        # Against a Tue-Fri base of 20.0 that is 1.5 for each, the clamp ceiling.
+        # Against a Mon-Fri base it would be 30/22 = 1.36, and against an all-week
+        # base 30/24.3 = 1.24 — so the value proves which mean was used.
+        for u in (mon, sat, sun):
+            self.assertEqual(u, 1.5)
 
     def test_the_reported_bug_does_not_recur(self):
-        """A blended figure split the real gap down the middle."""
+        """A blended figure split each real gap down the middle."""
         p = _mk(self.tmp)
-        self._history(p, 21.0, 24.7, 22.1)
+        self._history(p, 20.76, 22.09, 24.72, 22.05)   # the measured 90-day shape
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
-            sat, sun = p._measured_day_uplifts()
-        blended = ((24.7 + 22.1) / 2.0) / 21.0
-        wd, sat_s, sun_s = plugin._need_scales(sat, sun)
-        _, blend_s, _    = plugin._need_scales(blended, blended)
+            mon, sat, sun = p._measured_day_uplifts()
         P = 21.5
-        # The blended model over-states Sunday and under-states Saturday. Both
-        # errors must shrink, and the direction of each is what is pinned.
-        self.assertGreater(P * blend_s, P * sun_s)
-        self.assertLess(P * blend_s,    P * sat_s)
+        wd, mon_s, sat_s, sun_s = plugin._need_scales(mon, sat, sun)
+        # Monday must sit ABOVE the Tue-Fri figure, and Saturday above Sunday.
+        self.assertGreater(P * mon_s, P * wd)
+        self.assertGreater(P * sat_s, P * sun_s)
+        # and the old single weekday figure sat between Monday and Tue-Fri
+        _, blend_s, _, _ = plugin._need_scales(1.0, sat, sun)
+        self.assertLess(P * blend_s, P * mon_s)
 
     def test_each_day_is_clamped_on_its_own(self):
         p = _mk(self.tmp)
-        # An absurd Saturday must not drag Sunday's figure with it.
-        self._history(p, 10.0, 40.0, 10.5)
+        # An absurd Saturday must not drag the other two with it.
+        self._history(p, 10.0, 10.5, 40.0, 10.2)
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
-            sat, sun = p._measured_day_uplifts()
+            mon, sat, sun = p._measured_day_uplifts()
         self.assertEqual(sat, 1.5)
-        self.assertEqual(sun, 1.05)
+        self.assertEqual(mon, 1.05)
+        self.assertEqual(sun, 1.02)
 
     def test_too_little_history_uses_each_default(self):
         p = _mk(self.tmp)
-        self._history(p, 21.2, 24.7, 22.1, days=9)
+        self._history(p, 20.8, 22.1, 24.7, 22.3, days=9)
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
             self.assertEqual(p._measured_day_uplifts(),
-                             (plugin.SATURDAY_UPLIFT_DEFAULT, plugin.SUNDAY_UPLIFT_DEFAULT))
+                             (plugin.MONDAY_UPLIFT_DEFAULT,
+                              plugin.SATURDAY_UPLIFT_DEFAULT,
+                              plugin.SUNDAY_UPLIFT_DEFAULT))
         q = _mk(self.tmp)
         os.remove(os.path.join(self.tmp, "daily_history.json"))
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
             self.assertEqual(q._measured_day_uplifts(),
-                             (plugin.SATURDAY_UPLIFT_DEFAULT, plugin.SUNDAY_UPLIFT_DEFAULT))
+                             (plugin.MONDAY_UPLIFT_DEFAULT,
+                              plugin.SATURDAY_UPLIFT_DEFAULT,
+                              plugin.SUNDAY_UPLIFT_DEFAULT))
+
+    def test_a_day_with_too_few_samples_falls_back_alone(self):
+        """Splitting a day out costs sample size — a thin one must not guess."""
+        p = _mk(self.tmp)
+        base = datetime.strptime(D1, "%Y-%m-%d")
+        # Drop all but three Mondays; Saturday and Sunday keep a full set.
+        thin = [(base - timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(1, 121)
+                if (base - timedelta(days=i)).weekday() == 0][3:]
+        self._history(p, 20.8, 22.1, 24.7, 22.3, partial_days=thin)
+        with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
+            mon, sat, sun = p._measured_day_uplifts()
+        self.assertEqual(mon, plugin.MONDAY_UPLIFT_DEFAULT)
+        self.assertAlmostEqual(sat, round(24.7 / 20.8, 3), places=3)
+        self.assertAlmostEqual(sun, round(22.3 / 20.8, 3), places=3)
 
     def test_partial_days_are_left_out_and_the_value_is_cached_per_day(self):
         p = _mk(self.tmp)
         base = datetime.strptime(D1, "%Y-%m-%d")
         partial = [(base - timedelta(days=i)).strftime("%Y-%m-%d")
-                   for i in range(1, 43) if (base - timedelta(days=i)).weekday() == 5]
+                   for i in range(1, 121) if (base - timedelta(days=i)).weekday() == 5]
         # Every Saturday is partial at 5 kWh. Left out, Saturday has too few real
-        # days and falls back to its default while Sunday still measures 22/20.
+        # days and falls back to its default while the others still measure.
         # Counted, Saturday would clamp at 0.9 — so the exclusion is what is pinned.
-        self._history(p, 20.0, 24.0, 22.0, partial_days=partial)
+        self._history(p, 20.0, 22.0, 24.0, 21.0, partial_days=partial)
         with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log") as lg:
-            sat, sun = p._measured_day_uplifts()
+            mon, sat, sun = p._measured_day_uplifts()
             self.assertEqual(sat, plugin.SATURDAY_UPLIFT_DEFAULT)
-            self.assertAlmostEqual(sun, 1.10, places=3)
+            self.assertAlmostEqual(mon, 1.10, places=3)
+            self.assertAlmostEqual(sun, 1.05, places=3)
             self.assertEqual(lg.call_count, 1)
-            self._history(p, 20.0, 20.0, 20.0)            # file changes, cache does not
-            self.assertEqual(p._measured_day_uplifts(), (sat, sun))
+            self._history(p, 20.0, 20.0, 20.0, 20.0)      # file changes, cache does not
+            self.assertEqual(p._measured_day_uplifts(), (mon, sat, sun))
             self.assertEqual(lg.call_count, 1)
 
+    def test_the_uplift_window_is_wider_than_the_profile_window(self):
+        # Splitting days out costs sample size; the ratio is stable enough to
+        # afford a longer window, and the level is not.
+        self.assertGreater(plugin.DAY_UPLIFT_WINDOW_DAYS, plugin.PROFILE_WINDOW_DAYS)
+        self.assertEqual(plugin.DAY_UPLIFT_WINDOW_DAYS % 7, 0)
+
     def test_need_scales_keep_the_week_averaging_the_profile(self):
-        wd, sat, sun = plugin._need_scales(1.18, 1.05)
-        self.assertAlmostEqual((5 * wd + sat + sun) / 7.0, 1.0, places=3)
+        wd, mon, sat, sun = plugin._need_scales(1.06, 1.18, 1.05)
+        self.assertAlmostEqual((4 * wd + mon + sat + sun) / 7.0, 1.0, places=3)
+        self.assertAlmostEqual(mon / wd, 1.06, places=3)
         self.assertAlmostEqual(sat / wd, 1.18, places=3)
         self.assertAlmostEqual(sun / wd, 1.05, places=3)
 
-    def test_equal_uplifts_reproduce_the_old_two_bucket_answer_exactly(self):
-        # The v5.90.0 algebra was wd = 7 / (5 + 2u). Passing one figure twice
-        # must still give it, or the upgrade silently moves everyone's numbers.
-        for u in (1.0, 1.10, 1.30):
-            wd, sat, sun = plugin._need_scales(u, u)
-            self.assertAlmostEqual(wd, 7.0 / (5.0 + 2.0 * u), places=4)
-            self.assertEqual(sat, sun)
-        self.assertEqual(plugin._need_scales(1.0, 1.0), (1.0, 1.0, 1.0))
-        self.assertEqual(plugin._need_scales("garbage", "garbage"), (1.0, 1.0, 1.0))
+    def test_flat_uplifts_reproduce_the_flat_answer_exactly(self):
+        self.assertEqual(plugin._need_scales(1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 1.0))
+        self.assertEqual(plugin._need_scales("x", "y", "z"), (1.0, 1.0, 1.0, 1.0))
+
+    def test_pulling_monday_out_cannot_move_saturday(self):
+        """The point of a reference bucket that is in none of the ratios."""
+        p = _mk(self.tmp)
+        self._history(p, 20.8, 22.1, 24.7, 22.3)
+        with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
+            _, sat_a, sun_a = p._measured_day_uplifts()
+        q = _mk(self.tmp)
+        # A wildly different Monday, everything else untouched.
+        self._history(q, 20.8, 28.0, 24.7, 22.3)
+        with patch.object(plugin, "_local_today_str", return_value=D1), patch.object(plugin, "log"):
+            _, sat_b, sun_b = q._measured_day_uplifts()
+        self.assertEqual((sat_a, sun_a), (sat_b, sun_b))
 
 
 class TestSiteConfigPublishesTheManagersFigures(_Tmp):
     """v5.90.1: sigen_site_config.json must carry the SAME need figures the manager
     uses, or the optimiser's evening message quotes a number 0.9 kWh off the
-    plugin's own in the same sentence (05-Sep-2026). v5.104.0: three of them."""
+    plugin's own in the same sentence (05-Sep-2026). v5.105.0: four of them."""
 
     def _write(self, p):
         written = {}
@@ -317,45 +367,64 @@ class TestSiteConfigPublishesTheManagersFigures(_Tmp):
         p.latest_rates_data = {}
         p._dawn_target_pct = lambda: 15.0
         p.store["consumption_profile"] = [0.5] * 48                  # 24 kWh blended
-        p.store["day_uplifts"]     = [1.18, 1.05]
+        p.store["day_uplifts"]     = [1.06, 1.18, 1.05]
         p.store["day_uplift_date"] = D1
         return p
 
     def test_profile_is_split_with_the_same_scales_the_manager_uses(self):
         cons = self._write(self._plugin())
-        wd, sat, sun = plugin._need_scales(1.18, 1.05)
-        self.assertAlmostEqual(cons["daily_kwh_weekday"],  round(24.0 * wd,  2), places=2)
-        self.assertAlmostEqual(cons["daily_kwh_saturday"], round(24.0 * sat, 2), places=2)
-        self.assertAlmostEqual(cons["daily_kwh_sunday"],   round(24.0 * sun, 2), places=2)
+        wd, mon, sat, sun = plugin._need_scales(1.06, 1.18, 1.05)
+        for key, scale in (("tuefri", wd), ("monday", mon),
+                           ("saturday", sat), ("sunday", sun)):
+            self.assertAlmostEqual(cons[f"daily_kwh_{key}"], round(24.0 * scale, 2), places=2)
+            self.assertAlmostEqual(sum(cons["hourly_kwh"][key].values()), 24.0 * scale, places=1)
+        self.assertEqual(cons["monday_multiplier"],   1.06)
         self.assertEqual(cons["saturday_multiplier"], 1.18)
         self.assertEqual(cons["sunday_multiplier"],   1.05)
-        for key, scale in (("weekday", wd), ("saturday", sat), ("sunday", sun)):
-            self.assertAlmostEqual(sum(cons["hourly_kwh"][key].values()), 24.0 * scale, places=1)
         # the week still averages the profile the figures came from
         self.assertAlmostEqual(
-            (5 * cons["daily_kwh_weekday"] + cons["daily_kwh_saturday"]
-             + cons["daily_kwh_sunday"]) / 7.0, 24.0, places=1)
+            (4 * cons["daily_kwh_tuefri"] + cons["daily_kwh_monday"]
+             + cons["daily_kwh_saturday"] + cons["daily_kwh_sunday"]) / 7.0, 24.0, places=1)
 
-    def test_saturday_and_sunday_are_actually_different(self):
+    def test_the_four_buckets_are_actually_different(self):
         cons = self._write(self._plugin())
+        vals = [cons[f"daily_kwh_{k}"] for k in ("tuefri", "monday", "saturday", "sunday")]
+        self.assertEqual(len(set(vals)), 4, f"buckets are not distinct: {vals}")
         self.assertGreater(cons["daily_kwh_saturday"], cons["daily_kwh_sunday"])
-        self.assertNotEqual(cons["hourly_kwh"]["saturday"], cons["hourly_kwh"]["sunday"])
+        self.assertGreater(cons["daily_kwh_monday"],   cons["daily_kwh_tuefri"])
+        h = cons["hourly_kwh"]
+        self.assertNotEqual(h["monday"], h["tuefri"])
+        self.assertNotEqual(h["saturday"], h["sunday"])
 
-    def test_the_blended_weekend_key_is_kept_for_an_older_optimiser(self):
-        # openmeteo_battery_optimiser.py before v3.22 asks for 'weekend' by name,
-        # and a config file missing the key it reads sends it to the Octopus
-        # grid-only fallback, which under-counts a solar house by about half.
+    def test_the_legacy_keys_are_kept_as_UNBIASED_blends(self):
+        """An older optimiser asks for weekday/weekend by name.
+
+        A config file missing the key it reads sends it to the Octopus grid-only
+        fallback, which under-counts a solar house by about half. Publishing the
+        blends rather than one of the buckets also keeps such a reader correct
+        over the week instead of merely working.
+        """
         cons = self._write(self._plugin())
+        self.assertIn("weekday", cons["hourly_kwh"])
         self.assertIn("weekend", cons["hourly_kwh"])
+        self.assertAlmostEqual(cons["daily_kwh_weekday"],
+                               (cons["daily_kwh_monday"] + 4 * cons["daily_kwh_tuefri"]) / 5.0,
+                               places=1)
         self.assertAlmostEqual(cons["daily_kwh_weekend"],
                                (cons["daily_kwh_saturday"] + cons["daily_kwh_sunday"]) / 2.0,
                                places=1)
-        self.assertAlmostEqual(sum(cons["hourly_kwh"]["weekend"].values()),
-                               cons["daily_kwh_weekend"], places=1)
+        for key in ("weekday", "weekend"):
+            self.assertAlmostEqual(sum(cons["hourly_kwh"][key].values()),
+                                   cons[f"daily_kwh_{key}"], places=1)
+        # and an old reader taking 5 weekdays + 2 weekend days still gets the week
+        self.assertAlmostEqual(
+            (5 * cons["daily_kwh_weekday"] + 2 * cons["daily_kwh_weekend"]) / 7.0,
+            24.0, places=1)
 
-    def test_the_window_length_is_published_so_a_reader_knows_the_basis(self):
-        self.assertEqual(self._write(self._plugin())["window_days"],
-                         plugin.PROFILE_WINDOW_DAYS)
+    def test_both_window_lengths_are_published_so_a_reader_knows_the_basis(self):
+        cons = self._write(self._plugin())
+        self.assertEqual(cons["window_days"], plugin.PROFILE_WINDOW_DAYS)
+        self.assertEqual(cons["uplift_window_days"], plugin.DAY_UPLIFT_WINDOW_DAYS)
 
 
 if __name__ == "__main__":

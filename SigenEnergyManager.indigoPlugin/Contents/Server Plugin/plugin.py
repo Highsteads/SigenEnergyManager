@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0)
-# Date:        13-09-2026 22:45
-# Version:     5.104.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.105.0)
+# Date:        13-09-2026 23:20
+# Version:     5.105.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -337,20 +337,39 @@ PV_TRACKING_EXPORT_CAP_FRACTION = 0.95
 PV_TRACKING_RECORD_ROWS         = 2000   # intraday_pv_tracking.json ring, ~80 days of hours
 # v5.90.0 — the weekend uplift is MEASURED from daily_history.json (was a hard-coded
 # 1.30; measured here 1.10 over 26 weekends). Default until there is enough history.
-# Saturday and Sunday are not one day. Measured here over the 90 days to
-# 13-Sep-2026: Saturday 24.72 kWh, Sunday 22.05, against a Mon-Fri mean of
-# 21.03 — a 2.6 kWh gap that a single "weekend" figure of 22.9 split down the
-# middle, over-stating every Sunday by 0.85 kWh and under-stating every
-# Saturday by 1.82. These defaults are starting points for a house with no
-# history yet, not this one's measured values; `_measured_day_uplifts()`
-# replaces them as soon as there is enough data.
+# Four day types, not two. Measured here over the 90 days to 13-Sep-2026:
+# Saturday 24.72 kWh, Monday 22.09, Sunday 22.05, against a Tue-Fri mean of
+# 20.76. A single "weekend" figure of 22.9 split the 2.6 kWh Saturday/Sunday
+# gap down the middle, and a single "weekday" figure buried a Monday that runs
+# 1.3 kWh above the rest of the working week.
+#
+# Monday is not noise: the uplift measures 1.061 / 1.064 / 1.065 / 1.070 over
+# 63 / 90 / 120 / all days of history, and the difference from Tue-Fri grows
+# more significant with every extra sample (t = 2.18, 2.89, 3.48, 3.59). A
+# ratio that barely moves as the window widens is a real effect, which is also
+# what licenses the longer uplift window below.
+#
+# These defaults are starting points for a house with no history yet, not this
+# one's measured values; `_measured_day_uplifts()` replaces them as soon as
+# there is enough data.
+MONDAY_UPLIFT_DEFAULT           = 1.06
 SATURDAY_UPLIFT_DEFAULT         = 1.15
 SUNDAY_UPLIFT_DEFAULT           = 1.05
-# Same window as the consumption profile, so the uplift and the shape it
-# scales describe the same period.
-WEEKEND_UPLIFT_WINDOW_DAYS      = PROFILE_WINDOW_DAYS
-WEEKEND_UPLIFT_MIN_WEEKDAYS     = 10
-WEEKEND_UPLIFT_MIN_WEEKEND_DAYS = 4
+
+# The uplifts get their OWN, longer window — 18 whole weeks against the
+# profile's 9. They are measuring different things and want different spans.
+# The profile is a LEVEL and has to be current, so it tracks the house as it is
+# now. An uplift is a RATIO between day types, it reflects the household's
+# weekly rhythm rather than the season, and the measurement above shows it
+# barely moves as the window widens. Splitting a day out of a bucket costs
+# sample size — at 63 days there are only 9 Mondays and the mean carries a
+# standard error of +/-0.53 kWh, against +/-0.22 for the 36 Tue-Fri days — so a
+# ratio estimated on the short window would trade a 1.3 kWh systematic error
+# for a needlessly noisy one. 18 weeks roughly halves that noise and, because
+# the ratio is stable, costs nothing in responsiveness.
+DAY_UPLIFT_WINDOW_DAYS          = 126   # 18 whole weeks
+DAY_UPLIFT_MIN_BASE_DAYS        = 20    # Tue-Fri days needed for a reference at all
+DAY_UPLIFT_MIN_DAYS             = 6     # of that particular day, before its own uplift is used
 STORM_WATCH_INTERVAL = 7200  # 2 hours
 # Octopus announces a new Saving Session at most a few times a day (usually the evening
 # before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
@@ -447,17 +466,19 @@ def _as_int(value, fallback):
         return fallback
 
 
-def _need_scales(sat_uplift, sun_uplift):
-    """(weekday_scale, saturday_scale, sunday_scale) for a blended daily profile P.
+def _need_scales(mon_uplift, sat_uplift, sun_uplift):
+    """(tuefri_scale, monday_scale, saturday_scale, sunday_scale) for a profile P.
 
-    P is the mean over ALL days, so the three figures must be chosen to put the
-    WEEK back where P says it is:
-        5*wd + wd*us + wd*uu = 7   ->   wd = 7 / (5 + us + uu)
-    with saturday = wd * us and sunday = wd * uu.
+    P is the blended mean over ALL days, so the four figures must be chosen to
+    put the WEEK back where P says it is:
+        4*wd + wd*um + wd*us + wd*uu = 7   ->   wd = 7 / (4 + um + us + uu)
+    with monday = wd * um, saturday = wd * us, sunday = wd * uu.
 
-    v5.104.0 made this three-way. It was (weekday, weekend) from v5.90.0, which
-    is the same algebra with us == uu — so a caller that has only one weekend
-    figure can still pass it twice and get the old answer exactly.
+    Tue-Fri is the reference bucket and therefore carries no uplift of its own.
+    That is what makes the three ratios independent of each other: pulling
+    Monday out cannot move Saturday, because neither is measured against a mean
+    the other belongs to. v5.105.0 — v5.104.0 was the same algebra over three
+    buckets, and v5.90.0 over two.
     """
     def _clamp(u):
         try:
@@ -465,9 +486,9 @@ def _need_scales(sat_uplift, sun_uplift):
         except (TypeError, ValueError):
             v = 1.0
         return max(0.5, min(2.0, v))
-    us, uu = _clamp(sat_uplift), _clamp(sun_uplift)
-    wd = 7.0 / (5.0 + us + uu)
-    return round(wd, 4), round(wd * us, 4), round(wd * uu, 4)
+    um, us, uu = _clamp(mon_uplift), _clamp(sat_uplift), _clamp(sun_uplift)
+    wd = 7.0 / (4.0 + um + us + uu)
+    return round(wd, 4), round(wd * um, 4), round(wd * us, 4), round(wd * uu, 4)
 
 
 def _num_state(key, value, dp):
@@ -1460,6 +1481,16 @@ class Plugin(indigo.PluginBase):
         # and Indigo writes back only what the dialog holds — so the first time
         # the user opened Configure and saved, a stored override would have been
         # dropped and the fallback would have had nothing to read.
+        # v5.105.0: `weekdayKwh` now means Tue-Fri, and Monday has its own field.
+        # An existing weekday override is carried onto Monday so the upgrade does
+        # not quietly hand Monday back to auto-calibration.
+        if not self.pluginPrefs.get("mondayKwh"):
+            _wd = self.pluginPrefs.get("weekdayKwh")
+            if _wd not in (None, "") and abs(_as_float(_wd, 22.0) - 22.0) > 1.0:
+                self.pluginPrefs["mondayKwh"] = str(_wd)
+                log(f"[Migration] weekdayKwh {_wd} carried over to mondayKwh — Monday is "
+                    f"its own figure now, so set it apart in Configure if your Monday differs")
+
         if not self.pluginPrefs.get("saturdayKwh") and not self.pluginPrefs.get("sundayKwh"):
             _legacy = self.pluginPrefs.get("weekendKwh")
             # Only a real override is worth carrying. The stored default means the
@@ -1655,10 +1686,13 @@ class Plugin(indigo.PluginBase):
             # as the weekday and sum x uplift as the weekend, so the optimiser's
             # need figure sat 0.9 kWh above the plugin's own in the same message.
             if hasattr(self, "store"):
-                _sat_u, _sun_u = self._measured_day_uplifts()
+                _mon_u, _sat_u, _sun_u = self._measured_day_uplifts()
             else:
+                _mon_u = MONDAY_UPLIFT_DEFAULT
                 _sat_u, _sun_u = SATURDAY_UPLIFT_DEFAULT, SUNDAY_UPLIFT_DEFAULT
-            _wd_scale, _sat_scale, _sun_scale = _need_scales(_sat_u, _sun_u)
+            _tf_scale, _mon_scale, _sat_scale, _sun_scale = _need_scales(
+                _mon_u, _sat_u, _sun_u)
+            _total = sum(profile_48)
 
             def _hourly(scale):
                 return {
@@ -1666,31 +1700,44 @@ class Plugin(indigo.PluginBase):
                     for h in range(24)
                 }
 
-            # v5.104.0: saturday and sunday are published separately. `weekend`
-            # is KEPT, as their mean, because an older copy of
-            # openmeteo_battery_optimiser.py asks for it by name and a config
+            def _blend(a, b, wa=1.0, wb=1.0):
+                return {k: round((a[k] * wa + b[k] * wb) / (wa + wb), 4) for k in a}
+
+            # The four real buckets are monday / tuefri / saturday / sunday.
+            # `weekday` and `weekend` are KEPT as the Mon-Fri and Sat-Sun blends
+            # they used to mean, because an older copy of
+            # openmeteo_battery_optimiser.py asks for them by name and a config
             # file that silently lost the key it reads would send that script to
             # its Octopus-grid-only fallback — which under-counts a solar house
             # by about half, and warns about it in a log nobody reads at 20:00.
-            hourly_wd  = _hourly(_wd_scale)
+            # Publishing them as BLENDS rather than as one of the buckets keeps
+            # such a reader unbiased over the week instead of merely working.
+            hourly_tf  = _hourly(_tf_scale)
+            hourly_mon = _hourly(_mon_scale)
             hourly_sat = _hourly(_sat_scale)
             hourly_sun = _hourly(_sun_scale)
-            hourly_we  = {k: round((hourly_sat[k] + hourly_sun[k]) / 2.0, 4)
-                          for k in hourly_sat}
+            hourly_wd  = _blend(hourly_mon, hourly_tf, 1.0, 4.0)   # Mon-Fri, legacy
+            hourly_we  = _blend(hourly_sat, hourly_sun)            # Sat-Sun, legacy
             consumption_block = {
                 "source":            "sigen_inverter_48slot",
-                "daily_kwh_weekday":  round(sum(profile_48) * _wd_scale,  2),
-                "daily_kwh_saturday": round(sum(profile_48) * _sat_scale, 2),
-                "daily_kwh_sunday":   round(sum(profile_48) * _sun_scale, 2),
-                "daily_kwh_weekend":  round(sum(profile_48) * (_sat_scale + _sun_scale) / 2.0, 2),
+                "daily_kwh_tuefri":   round(_total * _tf_scale,  2),
+                "daily_kwh_monday":   round(_total * _mon_scale, 2),
+                "daily_kwh_saturday": round(_total * _sat_scale, 2),
+                "daily_kwh_sunday":   round(_total * _sun_scale, 2),
+                "daily_kwh_weekday":  round(_total * (_mon_scale + 4 * _tf_scale) / 5.0, 2),
+                "daily_kwh_weekend":  round(_total * (_sat_scale + _sun_scale) / 2.0, 2),
+                "monday_multiplier":   round(_mon_u, 3),
                 "saturday_multiplier": round(_sat_u, 3),
                 "sunday_multiplier":   round(_sun_u, 3),
                 "weekend_multiplier":  round((_sat_u + _sun_u) / 2.0, 3),
                 "window_days":         PROFILE_WINDOW_DAYS,
+                "uplift_window_days":  DAY_UPLIFT_WINDOW_DAYS,
                 "hourly_kwh": {
-                    "weekday":  hourly_wd,
+                    "tuefri":   hourly_tf,
+                    "monday":   hourly_mon,
                     "saturday": hourly_sat,
                     "sunday":   hourly_sun,
+                    "weekday":  hourly_wd,
                     "weekend":  hourly_we,
                 },
             }
@@ -4073,36 +4120,44 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[Tracking] recorder skipped: {exc}")
 
     def _measured_day_uplifts(self):
-        """(saturday_uplift, sunday_uplift) against the Mon-Fri mean of daily house use.
+        """(monday, saturday, sunday) uplifts against the Tue-Fri mean of daily house use.
 
-        Measured from daily_history.json over the last PROFILE_WINDOW_DAYS and
-        cached per local day.
+        Measured from daily_history.json over DAY_UPLIFT_WINDOW_DAYS and cached
+        per local day.
 
-        v5.104.0 measures the two weekend days SEPARATELY. One blended figure
-        had been splitting a real 2.6 kWh gap down the middle — over the 90 days
-        to 13-Sep-2026 Saturday ran 24.72 kWh and Sunday 22.05 against a Mon-Fri
-        mean of 21.03, so the single 22.9 kWh weekend number over-stated every
-        Sunday by 0.85 kWh and under-stated every Saturday by 1.82.
+        **Tue-Fri is the reference and is deliberately not one of the returned
+        ratios.** Measuring each special day against a mean it is itself part of
+        makes the ratios move each other — pull Monday out and every other
+        figure shifts, for no reason to do with that day. Against a clean base
+        the three are independent.
 
-        Each falls back to its own default with too little history, and each is
-        clamped to [0.9, 1.5] independently — a quiet Sunday must not be able to
-        drag Saturday's figure down with it, which is exactly what the blended
-        version did. Days flagged partial (a missed midnight boundary) are left
-        out.
+        v5.105.0 added Monday. Over the 90 days to 13-Sep-2026 it ran 22.09 kWh
+        against a Tue-Fri mean of 20.76, and that 1.3 kWh sat inside a single
+        weekday figure. It is a real effect rather than a thin sample: the ratio
+        measures 1.061 / 1.064 / 1.065 / 1.070 over 63 / 90 / 120 / all days.
+        v5.104.0 split Saturday from Sunday for the same reason.
+
+        Each day falls back to its own default with too little history, and each
+        is clamped to [0.9, 1.5] independently — a quiet Sunday must not be able
+        to drag Saturday's figure with it, which is exactly what the single
+        blended weekend uplift did. Days flagged partial (a missed midnight
+        boundary) are left out.
         """
         today = _local_today_str()
         if (self.store.get("day_uplift_date") == today
                 and self.store.get("day_uplifts")):
             return tuple(self.store["day_uplifts"])
 
-        sat_u, sun_u = SATURDAY_UPLIFT_DEFAULT, SUNDAY_UPLIFT_DEFAULT
-        wd, sat, sun = [], [], []
+        mon_u = MONDAY_UPLIFT_DEFAULT
+        sat_u = SATURDAY_UPLIFT_DEFAULT
+        sun_u = SUNDAY_UPLIFT_DEFAULT
+        base, mon, sat, sun = [], [], [], []
         try:
             path = os.path.join(self.data_dir, "daily_history.json")
             with open(path, "r", encoding="utf-8") as fh:
                 records = json.load(fh) or []
             cutoff = (datetime.strptime(today, "%Y-%m-%d")
-                      - timedelta(days=WEEKEND_UPLIFT_WINDOW_DAYS)).strftime("%Y-%m-%d")
+                      - timedelta(days=DAY_UPLIFT_WINDOW_DAYS)).strftime("%Y-%m-%d")
             for r in records:
                 d = str(r.get("date") or "")
                 if d < cutoff or d >= today or r.get("energy_partial"):
@@ -4117,32 +4172,45 @@ class Plugin(indigo.PluginBase):
                     dow = datetime.strptime(d, "%Y-%m-%d").weekday()
                 except ValueError:
                     continue
-                (sat if dow == 5 else sun if dow == 6 else wd).append(h)
+                if dow == 0:
+                    mon.append(h)
+                elif dow == 5:
+                    sat.append(h)
+                elif dow == 6:
+                    sun.append(h)
+                else:
+                    base.append(h)
 
-            if len(wd) >= WEEKEND_UPLIFT_MIN_WEEKDAYS:
-                m_wd = sum(wd) / len(wd)
-                if m_wd > 0.0:
-                    if len(sat) >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
-                        sat_u = max(0.9, min(1.5, (sum(sat) / len(sat)) / m_wd))
-                    if len(sun) >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
-                        sun_u = max(0.9, min(1.5, (sum(sun) / len(sun)) / m_wd))
+            if len(base) >= DAY_UPLIFT_MIN_BASE_DAYS:
+                m_base = sum(base) / len(base)
+                if m_base > 0.0:
+                    for samples, name in ((mon, "mon"), (sat, "sat"), (sun, "sun")):
+                        if len(samples) >= DAY_UPLIFT_MIN_DAYS:
+                            u = max(0.9, min(1.5, (sum(samples) / len(samples)) / m_base))
+                            if name == "mon":
+                                mon_u = u
+                            elif name == "sat":
+                                sat_u = u
+                            else:
+                                sun_u = u
         except Exception as exc:
             self.logger.debug(f"[Profile] day uplifts not measured: {exc}")
 
-        sat_u, sun_u = round(sat_u, 3), round(sun_u, 3)
-        if list(self.store.get("day_uplifts") or []) != [sat_u, sun_u]:
-            if wd and (sat or sun):
-                m_wd = sum(wd) / len(wd)
-                log(f"[Profile] Day uplifts measured over {WEEKEND_UPLIFT_WINDOW_DAYS} days — "
-                    f"Mon-Fri mean {m_wd:.1f} kWh from {len(wd)} days, "
+        mon_u, sat_u, sun_u = round(mon_u, 3), round(sat_u, 3), round(sun_u, 3)
+        if list(self.store.get("day_uplifts") or []) != [mon_u, sat_u, sun_u]:
+            if base and (mon or sat or sun):
+                m_base = sum(base) / len(base)
+                log(f"[Profile] Day uplifts measured over {DAY_UPLIFT_WINDOW_DAYS} days — "
+                    f"Tue-Fri mean {m_base:.1f} kWh from {len(base)} days, "
+                    f"Monday x{mon_u:.2f} ({len(mon)} days), "
                     f"Saturday x{sat_u:.2f} ({len(sat)} days), "
                     f"Sunday x{sun_u:.2f} ({len(sun)} days)")
             else:
-                log(f"[Profile] Day uplifts are the defaults — Saturday x{sat_u:.2f}, "
-                    f"Sunday x{sun_u:.2f} (not enough history yet)")
-        self.store["day_uplifts"]     = [sat_u, sun_u]
+                log(f"[Profile] Day uplifts are the defaults — Monday x{mon_u:.2f}, "
+                    f"Saturday x{sat_u:.2f}, Sunday x{sun_u:.2f} (not enough history yet)")
+        self.store["day_uplifts"]     = [mon_u, sat_u, sun_u]
         self.store["day_uplift_date"] = today
-        return sat_u, sun_u
+        return mon_u, sat_u, sun_u
 
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
         """Construct the immutable snapshot passed to manager.evaluate()."""
@@ -4164,26 +4232,34 @@ class Plugin(indigo.PluginBase):
         # rather than silently reverting to auto-calibration on upgrade.
         _weekend_pref = _as_float(prefs.get("weekendKwh"), 30.0)
         weekday_pref  = _as_float(prefs.get("weekdayKwh"),  22.0)
+        # v5.105.0: Monday falls back to the Tue-Fri pref, so a user who had
+        # overridden the weekday figure keeps that override on Monday too.
+        monday_pref   = _as_float(prefs.get("mondayKwh"),   weekday_pref)
         saturday_pref = _as_float(prefs.get("saturdayKwh"), _weekend_pref)
         sunday_pref   = _as_float(prefs.get("sundayKwh"),   _weekend_pref)
         if live_daily >= 5.0:    # plausibility floor — ignore wildly low partial profiles
             weekday_user_override  = abs(weekday_pref  - 22.0) > 1.0
+            monday_user_override   = abs(monday_pref   - 22.0) > 1.0
             saturday_user_override = abs(saturday_pref - 30.0) > 1.0
             sunday_user_override   = abs(sunday_pref   - 30.0) > 1.0
             # v5.90.0: the uplift is MEASURED (was a hard-coded 1.30 — 1.30 charged
             # ~28 kWh against every Saturday when the measured mean was 23.4).
-            # v5.104.0: measured PER WEEKEND DAY. The profile sum is a blend over
-            # all days, so the three figures are scaled to put the WEEK back where
-            # the profile says it is — see _need_scales(). v5.78.0's rule stands:
-            # no uplift while the house is empty, because an uplift models people
-            # at home on a Saturday and there are none.
+            # v5.104.0 / v5.105.0: measured PER DAY TYPE against a Tue-Fri base.
+            # The profile sum is a blend over all days, so the four figures are
+            # scaled to put the WEEK back where the profile says it is — see
+            # _need_scales(). v5.78.0's rule stands: no uplift while the house is
+            # empty, because an uplift models people at home on a Saturday and
+            # there are none.
             if self.store.get("away_active"):
-                sat_uplift = sun_uplift = 1.0
+                mon_uplift = sat_uplift = sun_uplift = 1.0
             else:
-                sat_uplift, sun_uplift = self._measured_day_uplifts()
-            wd_scale, sat_scale, sun_scale = _need_scales(sat_uplift, sun_uplift)
+                mon_uplift, sat_uplift, sun_uplift = self._measured_day_uplifts()
+            wd_scale, mon_scale, sat_scale, sun_scale = _need_scales(
+                mon_uplift, sat_uplift, sun_uplift)
             if not weekday_user_override:
                 weekday_pref  = round(live_daily * wd_scale,  1)
+            if not monday_user_override:
+                monday_pref   = round(live_daily * mon_scale, 1)
             if not saturday_user_override:
                 saturday_pref = round(live_daily * sat_scale, 1)
             if not sunday_user_override:
@@ -4209,6 +4285,7 @@ class Plugin(indigo.PluginBase):
             inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
             export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), DEFAULT_EXPORT_RATE_P),
             weekday_kwh        = weekday_pref,
+            monday_kwh         = monday_pref,
             saturday_kwh       = saturday_pref,
             sunday_kwh         = sunday_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),

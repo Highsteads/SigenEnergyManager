@@ -86,21 +86,61 @@ class TestDayMapping(unittest.TestCase):
     """One owner for "which figure belongs to which day"."""
 
     def _snap(self):
+        # Four DISTINCT values, so the mapping cannot pass by coincidence.
         return ManagerSnapshot(current_soc_pct=50.0, weekday_kwh=20.8,
-                               saturday_kwh=24.7, sunday_kwh=22.1)
+                               monday_kwh=22.1, saturday_kwh=24.7, sunday_kwh=22.3)
 
     def test_every_day_gets_its_own_figure(self):
         s = self._snap()
-        for idx in range(5):
-            self.assertEqual(need_for_weekday(s, idx), 20.8, f"weekday index {idx}")
-        self.assertEqual(need_for_weekday(s, 5), 24.7)
-        self.assertEqual(need_for_weekday(s, 6), 22.1)
+        self.assertEqual(need_for_weekday(s, 0), 22.1)          # Monday
+        for idx in range(1, 5):
+            self.assertEqual(need_for_weekday(s, idx), 20.8, f"Tue-Fri index {idx}")
+        self.assertEqual(need_for_weekday(s, 5), 24.7)          # Saturday
+        self.assertEqual(need_for_weekday(s, 6), 22.3)          # Sunday
 
     def test_the_reported_bug_does_not_recur(self):
-        # Saturday and Sunday must not be the same number. A blended model
-        # returns one figure for both, and that is what this pins out.
+        # The three split days must each differ from the Tue-Fri base and from
+        # each other. A blended model returns one figure for several of them,
+        # and that is what this pins out.
         s = self._snap()
-        self.assertNotEqual(need_for_weekday(s, 5), need_for_weekday(s, 6))
+        figures = [need_for_weekday(s, i) for i in (0, 1, 5, 6)]
+        self.assertEqual(len(set(figures)), 4, f"days share a figure: {figures}")
+
+    def test_monday_is_not_lumped_in_with_the_rest_of_the_working_week(self):
+        s = self._snap()
+        self.assertNotEqual(need_for_weekday(s, 0), need_for_weekday(s, 1))
+
+
+class TestEveryDayTypeIsCovered(unittest.TestCase):
+    """A day type added to the model and not to the fixtures is silently untested.
+
+    v5.105.0 added monday_kwh and two flood-prevention tests began failing on the
+    dataclass DEFAULT, because they pinned the other three by hand and had no way
+    to know a fourth had appeared. These fail loudly instead.
+    """
+
+    def _day_fields(self):
+        return sorted(f for f in ManagerSnapshot.__dataclass_fields__
+                      if f.endswith("_kwh") and f in
+                      ("weekday_kwh", "monday_kwh", "saturday_kwh", "sunday_kwh"))
+
+    def test_need_for_weekday_reaches_every_day_field(self):
+        # Give each field a value only it can produce, then walk the week and
+        # check all four come back. A field no index maps to is dead config.
+        marks = {f: float(100 + i) for i, f in enumerate(self._day_fields())}
+        snap = ManagerSnapshot(current_soc_pct=50.0, **marks)
+        seen = {need_for_weekday(snap, i) for i in range(7)}
+        self.assertEqual(seen, set(marks.values()),
+                         "a declared day figure is never returned for any weekday")
+
+    def test_the_battery_manager_fixture_pins_every_day_type(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "test_battery_manager.py"), encoding="utf-8").read()
+        head = src[:src.index("def _make_snapshot") + 2000]
+        for field in self._day_fields():
+            self.assertIn(f"{field}=", head,
+                          f"_make_snapshot does not take {field} — tests that pin the "
+                          f"other days will silently use the dataclass default for it")
 
 
 class TestRollingWindow(unittest.TestCase):

@@ -191,10 +191,13 @@ def need_for_weekday(snapshot, weekday_index):
     """The expected daily house load for a Python weekday index (Mon=0 .. Sun=6).
 
     The single owner of "which figure belongs to which day". v5.104.0 split the
-    old two-bucket weekday/weekend model into three, and this exists so that
-    split lives in exactly one place — the previous mapping was written out
-    inline at three separate call sites.
+    old two-bucket weekday/weekend model into three and v5.105.0 pulled Monday
+    out as the fourth, and this exists so that mapping lives in exactly one
+    place — it used to be written out inline at three separate call sites, and
+    it has now changed twice without either of them needing to be found again.
     """
+    if weekday_index == 0:
+        return snapshot.monday_kwh
     if weekday_index == 5:
         return snapshot.saturday_kwh
     if weekday_index == 6:
@@ -510,14 +513,17 @@ class ManagerSnapshot:
     export_rate_p:      float = 12.0     # live export unit rate (p/kWh), for advisory revenue
 
     # Daily consumption estimates (24h sufficiency model)
-    # v5.104.0: Saturday and Sunday are separate. They were one "weekend"
-    # figure until 13-Sep-2026, and they are 2.6 kWh apart here (Saturday
-    # 24.72, Sunday 22.05 over 90 days) — so the single number over-stated
-    # every Sunday and under-stated every Saturday by a similar margin.
+    # Four day types. There was one "weekday" and one "weekend" figure until
+    # 13-Sep-2026, and each buried a real difference: Saturday and Sunday are
+    # 2.6 kWh apart (24.72 against 22.05 over 90 days), and Monday runs 1.3 kWh
+    # above the rest of the working week (22.09 against a Tue-Fri mean of
+    # 20.76). Tue-Fri is the reference bucket the other three are measured
+    # against — see _need_scales() in plugin.py.
     # Read these through need_for_weekday(), never by hand: the mapping from a
     # weekday index to a figure is the kind of thing that ends up written out
     # in four places and fixed in three.
-    weekday_kwh:        float = 22.0     # Mon-Fri daily load
+    weekday_kwh:        float = 22.0     # Tue-Fri daily load — the reference bucket
+    monday_kwh:         float = 23.0     # Monday — washing and the week restarting
     saturday_kwh:       float = 30.0     # Saturday (washing, cooking, oven)
     sunday_kwh:         float = 28.0     # Sunday — busier than a weekday, quieter than Saturday
 
