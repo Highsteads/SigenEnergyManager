@@ -61,6 +61,7 @@ def _mk(prefs=None, variables=None):
     p.store = {
         "home_profile_watts_sum": [0.0] * 48,
         "home_profile_count":     [0] * 48,
+        "home_profile_days":      {},
         "away_profile_watts_sum": [0.0] * 48,
         "away_profile_count":     [0] * 48,
         "away_active":  False,

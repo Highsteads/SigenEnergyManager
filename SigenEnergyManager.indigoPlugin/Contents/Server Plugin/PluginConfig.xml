@@ -168,8 +168,14 @@
     <Field id="weekdayKwh" type="textfield" defaultValue="22.0">
         <Label>Weekday daily consumption (kWh Mon-Fri, default 22):</Label>
     </Field>
-    <Field id="weekendKwh" type="textfield" defaultValue="30.0">
-        <Label>Weekend daily consumption (kWh Sat-Sun, default 30):</Label>
+    <Field id="saturdayKwh" type="textfield" defaultValue="30.0">
+        <Label>Saturday daily consumption (kWh, default 30):</Label>
+    </Field>
+    <Field id="sundayKwh" type="textfield" defaultValue="30.0">
+        <Label>Sunday daily consumption (kWh, default 30):</Label>
+    </Field>
+    <Field id="label_dailyKwh_info" type="label" fontSize="small">
+        <Label>Leave these alone unless you want to override them. The plugin measures what the house actually gets through, half hour by half hour, over a rolling nine weeks, and works the three figures out for itself. Saturday and Sunday get their own because they are rarely the same day: measured here, Saturday runs about 2.6 kWh above Sunday. A value more than 1 kWh from the default is read as you meaning it, and auto-calibration then leaves that day alone.</Label>
     </Field>
 
     <Field id="separator_away" type="separator"/>

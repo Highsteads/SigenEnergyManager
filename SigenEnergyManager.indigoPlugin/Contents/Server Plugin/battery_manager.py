@@ -187,6 +187,21 @@ except ImportError:
 # Decision action constants
 # ============================================================
 
+def need_for_weekday(snapshot, weekday_index):
+    """The expected daily house load for a Python weekday index (Mon=0 .. Sun=6).
+
+    The single owner of "which figure belongs to which day". v5.104.0 split the
+    old two-bucket weekday/weekend model into three, and this exists so that
+    split lives in exactly one place — the previous mapping was written out
+    inline at three separate call sites.
+    """
+    if weekday_index == 5:
+        return snapshot.saturday_kwh
+    if weekday_index == 6:
+        return snapshot.sunday_kwh
+    return snapshot.weekday_kwh
+
+
 ACTION_SELF_CONSUMPTION = "self_consumption"   # default: battery covers home load
 ACTION_START_IMPORT     = "start_import"        # begin charging from grid now
 ACTION_STOP_IMPORT      = "stop_import"         # charging complete - return to self_consumption
@@ -495,8 +510,16 @@ class ManagerSnapshot:
     export_rate_p:      float = 12.0     # live export unit rate (p/kWh), for advisory revenue
 
     # Daily consumption estimates (24h sufficiency model)
+    # v5.104.0: Saturday and Sunday are separate. They were one "weekend"
+    # figure until 13-Sep-2026, and they are 2.6 kWh apart here (Saturday
+    # 24.72, Sunday 22.05 over 90 days) — so the single number over-stated
+    # every Sunday and under-stated every Saturday by a similar margin.
+    # Read these through need_for_weekday(), never by hand: the mapping from a
+    # weekday index to a figure is the kind of thing that ends up written out
+    # in four places and fixed in three.
     weekday_kwh:        float = 22.0     # Mon-Fri daily load
-    weekend_kwh:        float = 30.0     # Sat-Sun daily load (washing, cooking, oven)
+    saturday_kwh:       float = 30.0     # Saturday (washing, cooking, oven)
+    sunday_kwh:         float = 28.0     # Sunday — busier than a weekday, quieter than Saturday
 
     # Live inverter readings
     pv_watts:               int   = 0
@@ -1206,11 +1229,11 @@ class BatteryManager:
 
         # ── Daily consumption estimate (today and tomorrow) ─────────────────
         day_of_week       = local_now.weekday()       # 0=Mon … 5=Sat, 6=Sun
-        need_24h_kwh      = snapshot.weekend_kwh if day_of_week >= 5 else snapshot.weekday_kwh
+        need_24h_kwh      = need_for_weekday(snapshot, day_of_week)
 
         tomorrow_date     = local_now.date() + timedelta(days=1)
         tomorrow_weekday  = tomorrow_date.weekday()
-        tomorrow_need_kwh = snapshot.weekend_kwh if tomorrow_weekday >= 5 else snapshot.weekday_kwh
+        tomorrow_need_kwh = need_for_weekday(snapshot, tomorrow_weekday)
 
         # ── Find next dawn (forward-scan prevents BST/UTC date mismatch) ────
         # dawn_times is keyed by LOCAL date, so scan from local_now.date(), not the

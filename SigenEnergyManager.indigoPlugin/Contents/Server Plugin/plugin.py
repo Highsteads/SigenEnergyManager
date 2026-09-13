@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0)
-# Date:        12-09-2026 23:20
-# Version:     5.103.3
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0)
+# Date:        13-09-2026 22:45
+# Version:     5.104.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -176,6 +176,7 @@ from battery_manager  import (
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     pv_tracking_factor as _pv_tracking_factor,
+    need_for_weekday as _need_for_weekday,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
     SOLAR_OVERFLOW_CAP_DEADBAND_W,
     SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
@@ -219,9 +220,33 @@ ACTION_MODE_TOKEN = {
 }
 
 # Minimum inverter readings required per half-hourly slot before we trust the
-# accumulated average over the default profile.  5 readings = ~5 days of data
-# in that time-slot (one reading per day during that 30-min window).
+# accumulated average over the default profile.
+# CAUTION (v5.104.0): the original comment here read "5 readings = ~5 days of
+# data in that time-slot (one reading per day during that 30-min window)". That
+# stopped being true when the poll got faster. MODBUS_POLL_INTERVAL is 10 s and
+# the measured rate is ~147 readings per slot per DAY (counted off the dated
+# tarballs in data_backup/, 30-Aug to 13-Sep-2026), so five readings is about
+# one minute of one day. The guard is now only a "has this slot ever been fed"
+# check, which is all the LIFETIME accumulator needs. The rolling window below
+# counts DAYS instead, because a window seeded from a single day would swing the
+# whole plan to whatever yesterday happened to be.
 HOME_PROFILE_MIN_READINGS = 5
+
+# --- Rolling consumption window (v5.104.0) -------------------------------
+# The lifetime accumulator never forgot anything: 442,295 readings banked since
+# go-live in March 2026, no decay, no window. Measured on 13-Sep-2026 it was
+# accurate to ~1%, but only because the house's decline had been gradual — a
+# real step change would have taken ~63 days to be HALF absorbed, and that
+# horizon lengthened by a day for every day that passed. The window fixes the
+# mechanism rather than the number.
+#
+# 63 days, not 60, is deliberate: it is exactly NINE WEEKS, so the window holds
+# nine of every weekday and the blended profile carries no day-of-week
+# composition bias. A flat 60 would hold nine of some days and eight of others,
+# which tilts the blend by roughly 0.04 kWh given the 2.6 kWh Saturday/Sunday
+# spread measured here. Small, and free to avoid.
+PROFILE_WINDOW_DAYS     = 63    # 9 whole weeks
+PROFILE_MIN_WINDOW_DAYS = 14    # before the window outranks the lifetime mean
 
 # --- Away mode (v5.78.0) -------------------------------------------------
 # An empty house draws a completely different load, and the occupied profile
@@ -312,8 +337,18 @@ PV_TRACKING_EXPORT_CAP_FRACTION = 0.95
 PV_TRACKING_RECORD_ROWS         = 2000   # intraday_pv_tracking.json ring, ~80 days of hours
 # v5.90.0 — the weekend uplift is MEASURED from daily_history.json (was a hard-coded
 # 1.30; measured here 1.10 over 26 weekends). Default until there is enough history.
-WEEKEND_UPLIFT_DEFAULT          = 1.10
-WEEKEND_UPLIFT_WINDOW_DAYS      = 56
+# Saturday and Sunday are not one day. Measured here over the 90 days to
+# 13-Sep-2026: Saturday 24.72 kWh, Sunday 22.05, against a Mon-Fri mean of
+# 21.03 — a 2.6 kWh gap that a single "weekend" figure of 22.9 split down the
+# middle, over-stating every Sunday by 0.85 kWh and under-stating every
+# Saturday by 1.82. These defaults are starting points for a house with no
+# history yet, not this one's measured values; `_measured_day_uplifts()`
+# replaces them as soon as there is enough data.
+SATURDAY_UPLIFT_DEFAULT         = 1.15
+SUNDAY_UPLIFT_DEFAULT           = 1.05
+# Same window as the consumption profile, so the uplift and the shape it
+# scales describe the same period.
+WEEKEND_UPLIFT_WINDOW_DAYS      = PROFILE_WINDOW_DAYS
 WEEKEND_UPLIFT_MIN_WEEKDAYS     = 10
 WEEKEND_UPLIFT_MIN_WEEKEND_DAYS = 4
 STORM_WATCH_INTERVAL = 7200  # 2 hours
@@ -412,17 +447,27 @@ def _as_int(value, fallback):
         return fallback
 
 
-def _need_scales(uplift):
-    """(weekday_scale, weekend_scale) so that a blended daily profile P gives
-    weekday = P * wd and weekend = P * wd * uplift with the WEEK still averaging P:
-    5*wd + 2*wd*u = 7  ->  wd = 7 / (5 + 2u). v5.90.0."""
-    try:
-        u = float(uplift)
-    except (TypeError, ValueError):
-        u = 1.0
-    u  = max(0.5, min(2.0, u))
-    wd = 7.0 / (5.0 + 2.0 * u)
-    return round(wd, 4), round(wd * u, 4)
+def _need_scales(sat_uplift, sun_uplift):
+    """(weekday_scale, saturday_scale, sunday_scale) for a blended daily profile P.
+
+    P is the mean over ALL days, so the three figures must be chosen to put the
+    WEEK back where P says it is:
+        5*wd + wd*us + wd*uu = 7   ->   wd = 7 / (5 + us + uu)
+    with saturday = wd * us and sunday = wd * uu.
+
+    v5.104.0 made this three-way. It was (weekday, weekend) from v5.90.0, which
+    is the same algebra with us == uu — so a caller that has only one weekend
+    figure can still pass it twice and get the old answer exactly.
+    """
+    def _clamp(u):
+        try:
+            v = float(u)
+        except (TypeError, ValueError):
+            v = 1.0
+        return max(0.5, min(2.0, v))
+    us, uu = _clamp(sat_uplift), _clamp(sun_uplift)
+    wd = 7.0 / (5.0 + us + uu)
+    return round(wd, 4), round(wd * us, 4), round(wd * uu, 4)
 
 
 def _num_state(key, value, dp):
@@ -1224,8 +1269,8 @@ class Plugin(indigo.PluginBase):
         self.store["pv_track_ratio"]        = None
         self.store["pv_track_last_hour"]    = None
         self.store["need_today_kwh"]        = None
-        self.store["weekend_uplift"]        = None
-        self.store["weekend_uplift_date"]   = ""
+        self.store["day_uplifts"]           = None   # [saturday, sunday] vs the Mon-Fri mean
+        self.store["day_uplift_date"]       = ""
 
         # VPP state machine
         self.store["vpp_state"]            = VPP_IDLE
@@ -1370,8 +1415,16 @@ class Plugin(indigo.PluginBase):
 
         # Long-lived home-load profile accumulators (persist across days; never reset at midnight)
         # Built from real homePowerWatts inverter readings, one reading per Modbus poll.
+        # v5.104.0: these are now the FALLBACK and the long-run reference. The
+        # figure the plugin plans against comes from home_profile_days below.
         self.store["home_profile_watts_sum"] = [0.0] * 48
         self.store["home_profile_count"]     = [0]   * 48
+
+        # Rolling window: {"YYYY-MM-DD": {"sum": [48 floats], "count": [48 ints]}},
+        # pruned to PROFILE_WINDOW_DAYS whenever a new day opens. Occupied days
+        # only — see _accumulate_home_profile for why the away profile keeps the
+        # lifetime accumulator instead.
+        self.store["home_profile_days"]      = {}
 
         # Away-load profile — the same accumulators again, fed only on days the
         # house is empty, so the two never contaminate each other.
@@ -1401,6 +1454,25 @@ class Plugin(indigo.PluginBase):
                 f"[Migration] dawnSocTarget raised from {_dawn_target:.0f}% to 15% "
                 f"(minimum recommended to buffer above 10% health floor)"
             )
+        # v5.104.0: the single `weekendKwh` override becomes one per weekend day.
+        # Carried over here rather than left to the fallback in
+        # _build_manager_snapshot, because the field is gone from PluginConfig.xml
+        # and Indigo writes back only what the dialog holds — so the first time
+        # the user opened Configure and saved, a stored override would have been
+        # dropped and the fallback would have had nothing to read.
+        if not self.pluginPrefs.get("saturdayKwh") and not self.pluginPrefs.get("sundayKwh"):
+            _legacy = self.pluginPrefs.get("weekendKwh")
+            # Only a real override is worth carrying. The stored default means the
+            # user never touched it, auto-calibration owns the figure either way,
+            # and copying it across would only produce a startup line telling
+            # someone to reconsider a setting they have never set.
+            if _legacy not in (None, "") and abs(_as_float(_legacy, 30.0) - 30.0) > 1.0:
+                self.pluginPrefs["saturdayKwh"] = str(_legacy)
+                self.pluginPrefs["sundayKwh"]   = str(_legacy)
+                log(f"[Migration] weekendKwh {_legacy} carried over to both "
+                    f"saturdayKwh and sundayKwh — set them apart in Configure if "
+                    f"your Saturday and Sunday differ (they usually do)")
+
         # (The v5.9 pollInterval 60/120 -> 10s migration was DELETED in v5.43:
         # it had no one-shot gate, so a user deliberately choosing the
         # still-offered 60s/120s ConfigUI options got silently reverted to 10s
@@ -1582,27 +1654,44 @@ class Plugin(indigo.PluginBase):
             # so the week still averages the profile. v5.90.0 published the raw sum
             # as the weekday and sum x uplift as the weekend, so the optimiser's
             # need figure sat 0.9 kWh above the plugin's own in the same message.
-            _uplift = (self._measured_weekend_uplift()
-                       if hasattr(self, "store") else WEEKEND_UPLIFT_DEFAULT)
-            _wd_scale, _we_scale = _need_scales(_uplift)
-            hourly_wd = {
-                str(h): round((profile_48[2 * h] + profile_48[2 * h + 1]) * _wd_scale, 4)
-                for h in range(24)
-            }
-            hourly_we = {
-                str(h): round((profile_48[2 * h] + profile_48[2 * h + 1]) * _we_scale, 4)
-                for h in range(24)
-            }
-            daily_wd = round(sum(profile_48) * _wd_scale, 2)
-            daily_we = round(sum(profile_48) * _we_scale, 2)
+            if hasattr(self, "store"):
+                _sat_u, _sun_u = self._measured_day_uplifts()
+            else:
+                _sat_u, _sun_u = SATURDAY_UPLIFT_DEFAULT, SUNDAY_UPLIFT_DEFAULT
+            _wd_scale, _sat_scale, _sun_scale = _need_scales(_sat_u, _sun_u)
+
+            def _hourly(scale):
+                return {
+                    str(h): round((profile_48[2 * h] + profile_48[2 * h + 1]) * scale, 4)
+                    for h in range(24)
+                }
+
+            # v5.104.0: saturday and sunday are published separately. `weekend`
+            # is KEPT, as their mean, because an older copy of
+            # openmeteo_battery_optimiser.py asks for it by name and a config
+            # file that silently lost the key it reads would send that script to
+            # its Octopus-grid-only fallback — which under-counts a solar house
+            # by about half, and warns about it in a log nobody reads at 20:00.
+            hourly_wd  = _hourly(_wd_scale)
+            hourly_sat = _hourly(_sat_scale)
+            hourly_sun = _hourly(_sun_scale)
+            hourly_we  = {k: round((hourly_sat[k] + hourly_sun[k]) / 2.0, 4)
+                          for k in hourly_sat}
             consumption_block = {
-                "source":           "sigen_inverter_48slot",
-                "daily_kwh_weekday": daily_wd,
-                "daily_kwh_weekend": daily_we,
-                "weekend_multiplier": round(_uplift, 3),
+                "source":            "sigen_inverter_48slot",
+                "daily_kwh_weekday":  round(sum(profile_48) * _wd_scale,  2),
+                "daily_kwh_saturday": round(sum(profile_48) * _sat_scale, 2),
+                "daily_kwh_sunday":   round(sum(profile_48) * _sun_scale, 2),
+                "daily_kwh_weekend":  round(sum(profile_48) * (_sat_scale + _sun_scale) / 2.0, 2),
+                "saturday_multiplier": round(_sat_u, 3),
+                "sunday_multiplier":   round(_sun_u, 3),
+                "weekend_multiplier":  round((_sat_u + _sun_u) / 2.0, 3),
+                "window_days":         PROFILE_WINDOW_DAYS,
                 "hourly_kwh": {
-                    "weekday": hourly_wd,
-                    "weekend": hourly_we,
+                    "weekday":  hourly_wd,
+                    "saturday": hourly_sat,
+                    "sunday":   hourly_sun,
+                    "weekend":  hourly_we,
                 },
             }
 
@@ -3983,26 +4072,37 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[Tracking] recorder skipped: {exc}")
 
-    def _measured_weekend_uplift(self):
-        """Weekend / weekday ratio of daily house use, measured from daily_history.json
-        over the last WEEKEND_UPLIFT_WINDOW_DAYS and cached per local day.
+    def _measured_day_uplifts(self):
+        """(saturday_uplift, sunday_uplift) against the Mon-Fri mean of daily house use.
 
-        Replaces a hard-coded 1.30 that charged ~28 kWh against every Saturday when
-        the measured weekend mean here was 23.4 kWh (26 weekends to 05-Sep-2026).
-        Falls back to WEEKEND_UPLIFT_DEFAULT with too little history; clamped to
-        [0.9, 1.5]. Days flagged partial (a missed boundary) are left out.
+        Measured from daily_history.json over the last PROFILE_WINDOW_DAYS and
+        cached per local day.
+
+        v5.104.0 measures the two weekend days SEPARATELY. One blended figure
+        had been splitting a real 2.6 kWh gap down the middle — over the 90 days
+        to 13-Sep-2026 Saturday ran 24.72 kWh and Sunday 22.05 against a Mon-Fri
+        mean of 21.03, so the single 22.9 kWh weekend number over-stated every
+        Sunday by 0.85 kWh and under-stated every Saturday by 1.82.
+
+        Each falls back to its own default with too little history, and each is
+        clamped to [0.9, 1.5] independently — a quiet Sunday must not be able to
+        drag Saturday's figure down with it, which is exactly what the blended
+        version did. Days flagged partial (a missed midnight boundary) are left
+        out.
         """
         today = _local_today_str()
-        if self.store.get("weekend_uplift_date") == today and self.store.get("weekend_uplift"):
-            return float(self.store["weekend_uplift"])
-        uplift, n_wd, n_we, m_wd, m_we = WEEKEND_UPLIFT_DEFAULT, 0, 0, 0.0, 0.0
+        if (self.store.get("day_uplift_date") == today
+                and self.store.get("day_uplifts")):
+            return tuple(self.store["day_uplifts"])
+
+        sat_u, sun_u = SATURDAY_UPLIFT_DEFAULT, SUNDAY_UPLIFT_DEFAULT
+        wd, sat, sun = [], [], []
         try:
             path = os.path.join(self.data_dir, "daily_history.json")
             with open(path, "r", encoding="utf-8") as fh:
                 records = json.load(fh) or []
             cutoff = (datetime.strptime(today, "%Y-%m-%d")
                       - timedelta(days=WEEKEND_UPLIFT_WINDOW_DAYS)).strftime("%Y-%m-%d")
-            wd, we = [], []
             for r in records:
                 d = str(r.get("date") or "")
                 if d < cutoff or d >= today or r.get("energy_partial"):
@@ -4014,28 +4114,35 @@ class Plugin(indigo.PluginBase):
                 if h < 2.0:
                     continue
                 try:
-                    is_weekend = datetime.strptime(d, "%Y-%m-%d").weekday() >= 5
+                    dow = datetime.strptime(d, "%Y-%m-%d").weekday()
                 except ValueError:
                     continue
-                (we if is_weekend else wd).append(h)
-            n_wd, n_we = len(wd), len(we)
-            if n_wd >= WEEKEND_UPLIFT_MIN_WEEKDAYS and n_we >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
-                m_wd, m_we = sum(wd) / n_wd, sum(we) / n_we
+                (sat if dow == 5 else sun if dow == 6 else wd).append(h)
+
+            if len(wd) >= WEEKEND_UPLIFT_MIN_WEEKDAYS:
+                m_wd = sum(wd) / len(wd)
                 if m_wd > 0.0:
-                    uplift = max(0.9, min(1.5, m_we / m_wd))
+                    if len(sat) >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
+                        sat_u = max(0.9, min(1.5, (sum(sat) / len(sat)) / m_wd))
+                    if len(sun) >= WEEKEND_UPLIFT_MIN_WEEKEND_DAYS:
+                        sun_u = max(0.9, min(1.5, (sum(sun) / len(sun)) / m_wd))
         except Exception as exc:
-            self.logger.debug(f"[Profile] weekend uplift not measured: {exc}")
-        uplift = round(uplift, 3)
-        if self.store.get("weekend_uplift") != uplift:
-            if n_wd and n_we and m_wd:
-                log(f"[Profile] Weekend uplift {uplift:.2f}, measured from {n_wd} weekdays "
-                    f"(mean {m_wd:.1f} kWh) and {n_we} weekend days (mean {m_we:.1f} kWh)")
+            self.logger.debug(f"[Profile] day uplifts not measured: {exc}")
+
+        sat_u, sun_u = round(sat_u, 3), round(sun_u, 3)
+        if list(self.store.get("day_uplifts") or []) != [sat_u, sun_u]:
+            if wd and (sat or sun):
+                m_wd = sum(wd) / len(wd)
+                log(f"[Profile] Day uplifts measured over {WEEKEND_UPLIFT_WINDOW_DAYS} days — "
+                    f"Mon-Fri mean {m_wd:.1f} kWh from {len(wd)} days, "
+                    f"Saturday x{sat_u:.2f} ({len(sat)} days), "
+                    f"Sunday x{sun_u:.2f} ({len(sun)} days)")
             else:
-                log(f"[Profile] Weekend uplift {uplift:.2f} (the default — fewer than "
-                    f"{WEEKEND_UPLIFT_MIN_WEEKEND_DAYS} weekend days of history yet)")
-        self.store["weekend_uplift"]      = uplift
-        self.store["weekend_uplift_date"] = today
-        return uplift
+                log(f"[Profile] Day uplifts are the defaults — Saturday x{sat_u:.2f}, "
+                    f"Sunday x{sun_u:.2f} (not enough history yet)")
+        self.store["day_uplifts"]     = [sat_u, sun_u]
+        self.store["day_uplift_date"] = today
+        return sat_u, sun_u
 
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
         """Construct the immutable snapshot passed to manager.evaluate()."""
@@ -4052,24 +4159,35 @@ class Plugin(indigo.PluginBase):
 
         profile      = self.store.get("consumption_profile", []) or []
         live_daily   = sum(profile) if len(profile) == 48 else 0.0
-        weekday_pref = _as_float(prefs.get("weekdayKwh"), 22.0)
-        weekend_pref = _as_float(prefs.get("weekendKwh"), 30.0)
+        # v5.104.0: `weekendKwh` is the FALLBACK for the two new per-day prefs, so
+        # a user who had overridden the weekend keeps that override on both days
+        # rather than silently reverting to auto-calibration on upgrade.
+        _weekend_pref = _as_float(prefs.get("weekendKwh"), 30.0)
+        weekday_pref  = _as_float(prefs.get("weekdayKwh"),  22.0)
+        saturday_pref = _as_float(prefs.get("saturdayKwh"), _weekend_pref)
+        sunday_pref   = _as_float(prefs.get("sundayKwh"),   _weekend_pref)
         if live_daily >= 5.0:    # plausibility floor — ignore wildly low partial profiles
-            weekday_user_override = abs(weekday_pref - 22.0) > 1.0
-            weekend_user_override = abs(weekend_pref - 30.0) > 1.0
-            # v5.90.0: the uplift is MEASURED (was a hard-coded 1.30 — the true
-            # figure here is ~1.10, and 1.30 charged ~28 kWh against every Saturday
-            # when the measured mean was 23.4). The profile sum is a blend over all
-            # days, so weekday and weekend are scaled so the WEEK still averages the
-            # profile: wd = 7P / (5 + 2u), we = wd * u. v5.78.0's rule stands: no
-            # uplift while the house is empty — it models people at home on a
-            # Saturday, and there are none.
-            uplift = 1.0 if self.store.get("away_active") else self._measured_weekend_uplift()
-            wd_scale, we_scale = _need_scales(uplift)
+            weekday_user_override  = abs(weekday_pref  - 22.0) > 1.0
+            saturday_user_override = abs(saturday_pref - 30.0) > 1.0
+            sunday_user_override   = abs(sunday_pref   - 30.0) > 1.0
+            # v5.90.0: the uplift is MEASURED (was a hard-coded 1.30 — 1.30 charged
+            # ~28 kWh against every Saturday when the measured mean was 23.4).
+            # v5.104.0: measured PER WEEKEND DAY. The profile sum is a blend over
+            # all days, so the three figures are scaled to put the WEEK back where
+            # the profile says it is — see _need_scales(). v5.78.0's rule stands:
+            # no uplift while the house is empty, because an uplift models people
+            # at home on a Saturday and there are none.
+            if self.store.get("away_active"):
+                sat_uplift = sun_uplift = 1.0
+            else:
+                sat_uplift, sun_uplift = self._measured_day_uplifts()
+            wd_scale, sat_scale, sun_scale = _need_scales(sat_uplift, sun_uplift)
             if not weekday_user_override:
-                weekday_pref = round(live_daily * wd_scale, 1)
-            if not weekend_user_override:
-                weekend_pref = round(live_daily * we_scale, 1)
+                weekday_pref  = round(live_daily * wd_scale,  1)
+            if not saturday_user_override:
+                saturday_pref = round(live_daily * sat_scale, 1)
+            if not sunday_user_override:
+                sunday_pref   = round(live_daily * sun_scale, 1)
 
         # Octopus Saving Session — a JOINED window live right now, from the cache the
         # hourly poll leaves behind (never a network call on the manager cycle).
@@ -4091,7 +4209,8 @@ class Plugin(indigo.PluginBase):
             inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
             export_rate_p      = _as_float((self.latest_rates_data or {}).get("export_rate_p"), DEFAULT_EXPORT_RATE_P),
             weekday_kwh        = weekday_pref,
-            weekend_kwh        = weekend_pref,
+            saturday_kwh       = saturday_pref,
+            sunday_kwh         = sunday_pref,
             pv_watts                = int(self.latest_inverter_data.get("pvPowerWatts", 0)),
             house_load_watts        = int(self.latest_inverter_data.get("homePowerWatts", 0)),
             export_active           = self.store["export_active"],
@@ -6293,6 +6412,73 @@ class Plugin(indigo.PluginBase):
         self.store[f"{prefix}_profile_watts_sum"][slot] += home_watts
         self.store[f"{prefix}_profile_count"][slot]     += 1
 
+        # v5.104.0: the same reading again, filed under its own day, so the
+        # planning profile can be a rolling window instead of a mean that never
+        # forgets anything.
+        #
+        # Occupied days ONLY. The away profile deliberately banks rare data —
+        # this house was empty for six weeks in the whole of 2025 — so a window
+        # would throw away the last trip long before the next one, and with a
+        # minimum of PROFILE_MIN_WINDOW_DAYS it could never engage for a
+        # fortnight away. An empty house has no drift to track; that is the
+        # whole thing a window is for.
+        if prefix == "away":
+            return
+        days = self.store.setdefault("home_profile_days", {})
+        key  = now.strftime("%Y-%m-%d")
+        day  = days.get(key)
+        if day is None:
+            day = {"sum": [0.0] * 48, "count": [0] * 48}
+            days[key] = day
+            self._prune_profile_days()
+        day["sum"][slot]   += home_watts
+        day["count"][slot] += 1
+
+    def _prune_profile_days(self):
+        """Drop day buckets that have fallen out of the rolling window.
+
+        Pruned BY DATE, not by keeping the newest N buckets. A week-long outage
+        should leave a week-shaped hole that expires on schedule, not reach an
+        extra week further back to make the count up — stale readings are the
+        one thing the window exists to shed. The cost is that an outage briefly
+        unbalances the day-of-week mix the 9-week span is chosen to keep even.
+        Called when a new day opens, so once a day rather than every poll.
+        """
+        days = self.store.setdefault("home_profile_days", {})
+        if not days:
+            return
+        cutoff = (datetime.now() - timedelta(days=PROFILE_WINDOW_DAYS)).strftime("%Y-%m-%d")
+        stale  = [d for d in days if d < cutoff]
+        for d in stale:
+            del days[d]
+        if stale:
+            self.logger.debug(
+                f"[Profile] Rolling window dropped {len(stale)} day(s) older than "
+                f"{cutoff}; {len(days)} day(s) retained"
+            )
+
+    def _windowed_profile_totals(self):
+        """(watts_sum[48], reading_count[48], day_count[48]) over the rolling window.
+
+        day_count is what decides whether a slot is trustworthy, NOT the reading
+        count: at a 10 s poll one day alone puts ~147 readings in every slot, so
+        a reading-count threshold would let a single day's data speak for the
+        whole window. See the note on HOME_PROFILE_MIN_READINGS.
+        """
+        sums   = [0.0] * 48
+        counts = [0]   * 48
+        days   = [0]   * 48
+        for bucket in self.store.get("home_profile_days", {}).values():
+            b_sum, b_cnt = bucket.get("sum") or [], bucket.get("count") or []
+            if len(b_sum) != 48 or len(b_cnt) != 48:
+                continue
+            for i in range(48):
+                if b_cnt[i]:
+                    sums[i]   += b_sum[i]
+                    counts[i] += b_cnt[i]
+                    days[i]   += 1
+        return sums, counts, days
+
     def _refresh_consumption_profile(self, force=False):
         # v5.45.0: reads the profile accumulators + writes the store — locked
         # (no network; the accumulators are fed by the locked modbus merge).
@@ -6326,23 +6512,50 @@ class Plugin(indigo.PluginBase):
                 watts_sum = self.store["home_profile_watts_sum"]
                 counts    = self.store["home_profile_count"]
                 min_reads = HOME_PROFILE_MIN_READINGS
-            profile   = []
-            real_slots = 0
+            # v5.104.0: three sources per slot, in order — the rolling window
+            # first, the lifetime accumulator second, the default shape last.
+            # The lifetime figure is kept as the middle rung on purpose: it is
+            # what makes the upgrade seamless. Until the window has
+            # PROFILE_MIN_WINDOW_DAYS of its own the old number serves, so the
+            # plan does not jump on the day this ships and does not swing to
+            # whatever the last 24 hours happened to look like.
+            if away:
+                win_sum, win_cnt, win_days = [0.0] * 48, [0] * 48, [0] * 48
+            else:
+                win_sum, win_cnt, win_days = self._windowed_profile_totals()
+
+            profile     = []
+            window_slots = 0
+            real_slots   = 0
             for i in range(48):
-                if counts[i] >= min_reads:
-                    avg_watts = watts_sum[i] / counts[i]
-                    profile.append(round(avg_watts * 0.5 / 1000.0, 4))
+                if win_days[i] >= PROFILE_MIN_WINDOW_DAYS and win_cnt[i] > 0:
+                    profile.append(round((win_sum[i] / win_cnt[i]) * 0.5 / 1000.0, 4))
+                    window_slots += 1
+                    real_slots   += 1
+                elif counts[i] >= min_reads:
+                    profile.append(round((watts_sum[i] / counts[i]) * 0.5 / 1000.0, 4))
                     real_slots += 1
                 else:
                     profile.append(default[i])
 
             self.store["consumption_profile"] = profile
-            daily_kwh = sum(profile)
+            daily_kwh    = sum(profile)
+            retained_days = len(self.store.get("home_profile_days", {}))
+            if away:
+                source = "the away accumulator (no window — an empty house has no drift to track)"
+            elif window_slots == 48:
+                source = f"the rolling {PROFILE_WINDOW_DAYS}-day window ({retained_days} days held)"
+            elif window_slots:
+                source = (f"{window_slots}/48 slots from the rolling window "
+                          f"({retained_days} days held), the rest from the lifetime mean")
+            else:
+                source = (f"the lifetime mean — the window has {retained_days} day(s), "
+                          f"and needs {PROFILE_MIN_WINDOW_DAYS} before it is trusted")
             log(
                 f"[Profile] {'Away' if away else 'Occupied'} consumption profile "
                 f"updated from inverter data — daily: {daily_kwh:.1f} kWh  "
                 f"({real_slots}/48 slots from real data, "
-                f"{48 - real_slots} using default)"
+                f"{48 - real_slots} using default) — {source}"
             )
             # v5.15: republish sigen_site_config.json so the optimiser
             # script picks up the freshly-calibrated profile on its next run.
@@ -6371,6 +6584,15 @@ class Plugin(indigo.PluginBase):
             # and the away accumulators start empty — no migration needed.
             "away_watts_sum": self.store["away_profile_watts_sum"],
             "away_count":     self.store["away_profile_count"],
+            # v5.104.0. A new key, so a file written by <= 5.103.x simply lacks
+            # it, the window starts empty and the lifetime mean above carries
+            # the plan until it fills — no migration, no discontinuity.
+            # Sums are rounded to 1 dp purely to keep the file readable; they
+            # run to millions of watt-readings and the last decimal is noise.
+            "days": {
+                d: {"sum": [round(v, 1) for v in b["sum"]], "count": list(b["count"])}
+                for d, b in self.store.get("home_profile_days", {}).items()
+            },
             "saved_at":  datetime.now().isoformat(),
         }
         try:
@@ -6397,6 +6619,19 @@ class Plugin(indigo.PluginBase):
             counts    = data.get("count", [])
             away_sum  = data.get("away_watts_sum", [])
             away_cnt  = data.get("away_count", [])
+            days      = data.get("days") or {}
+            restored  = {}
+            for d, b in days.items():
+                try:
+                    b_sum = [float(v) for v in (b.get("sum") or [])]
+                    b_cnt = [int(v)   for v in (b.get("count") or [])]
+                except (TypeError, ValueError):
+                    continue
+                if len(b_sum) == 48 and len(b_cnt) == 48:
+                    restored[str(d)] = {"sum": b_sum, "count": b_cnt}
+            self.store["home_profile_days"] = restored
+            if restored:
+                self._prune_profile_days()
             if len(away_sum) == 48 and len(away_cnt) == 48:
                 self.store["away_profile_watts_sum"] = [float(v) for v in away_sum]
                 self.store["away_profile_count"]     = [int(v)   for v in away_cnt]
@@ -6412,7 +6647,8 @@ class Plugin(indigo.PluginBase):
                 away_real  = sum(1 for c in away_cnt if c >= AWAY_PROFILE_MIN_READINGS)
                 self.logger.info(
                     f"Home load profile restored — {real_slots}/48 slots from real "
-                    f"data ({away_real}/48 away)"
+                    f"data ({away_real}/48 away), rolling window holds "
+                    f"{len(self.store['home_profile_days'])}/{PROFILE_WINDOW_DAYS} days"
                     + ("  [house is currently EMPTY]" if self.store["away_active"] else "")
                 )
         except Exception as e:
@@ -9220,8 +9456,7 @@ class Plugin(indigo.PluginBase):
         except Exception:
             _local_now = snapshot.now
         _tomorrow_weekday  = (_local_now.date() + timedelta(days=1)).weekday()
-        _tomorrow_need_kwh = (snapshot.weekend_kwh if _tomorrow_weekday >= 5
-                              else snapshot.weekday_kwh)
+        _tomorrow_need_kwh = _need_for_weekday(snapshot, _tomorrow_weekday)
         _tomorrow_solar_kwh = snapshot.corrected_tomorrow_kwh
 
         # currentAction and currentMode deliberately keep their existing tokens — seven

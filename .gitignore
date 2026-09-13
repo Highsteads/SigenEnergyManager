@@ -28,3 +28,6 @@ AGENTS.md
 # experiments/agile_trading/ (08-Sep-2026) is the offline Agile trading
 # controller: it never imports indigo, opens Modbus or sends a command.
 experiments/
+
+# Test runner caches — never belong in the bundle or the repo
+.pytest_cache/

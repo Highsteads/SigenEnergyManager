@@ -126,7 +126,7 @@ def _snap(slots, now_off, dawn_off=17.0, soc=40.0, today_rate_p=None,
         export_enabled=False, tariff=tariff, forecast_p50={},
         dawn_times=dawn_times, consumption_profile=[0.30] * 48,
         now=_base() + timedelta(hours=now_off),
-        weekday_kwh=22.0, weekend_kwh=22.0, inverter_max_kw=10.0,
+        weekday_kwh=22.0, saturday_kwh=22.0, sunday_kwh=22.0, inverter_max_kw=10.0,
         corrected_tomorrow_kwh=tomorrow_kwh,
     )
 
