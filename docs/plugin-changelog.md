@@ -15,6 +15,121 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.106.0 — 15-09-2026
+
+**THE BIAS FEEDBACK LOOP HAD BEEN DEAD SINCE 5-SEP, AND THE CORRECTION WAS SCALING A
+FALLING FORECAST UP.** Raised by CliveS asking why 14-Sep peaked at 90.3% SOC against a 95%
+target after a 41 kWh forecast delivered 36.43 kWh. Four faults; the first is the root.
+
+### 1. `record_accuracy` was graded against a counter the inverter had already reset
+
+`_check_midnight_impl` passed `self.store["pv_daily_kwh"]` — the live mirror of the
+inverter's own daily accumulator. The inverter resets it at ITS midnight, and the task runs
+at 00:00:0x, by which time a poll has copied the zero in. **9 of the 10 days to 14-Sep-2026
+recorded `actual_kwh: 0.0`.**
+
+The damage is not the obvious one. `_compute_correction_bands` filters `0.1 < factor`, so a
+zero never reached a band — it STARVED it. The window is the last 60 RECORDS, so a run of
+zeros pushes real samples off the end. On 15-Sep the 40 kWh band held twelve samples, **every
+one dated 17-Jul to 31-Aug**, and returned x1.0428 over a September measuring **0.888**
+(489.3 kWh forecast against 434.5 actual across 14 days). The correction was scaling a
+falling forecast UP, and nothing in the logs said anything was wrong.
+
+- Now reads `_energy_day_totals(yesterday)["pv"]` — anchor[next day] − anchor[day], settled
+  and exact, and the same figure `_write_daily_history` uses four lines later.
+- A missing or zero total SKIPS the record with a WARNING. A zero is what broke this; it can
+  never be the repair.
+- New `OpenMeteoForecast.repair_zero_actuals(lookup)`, called once at startup against
+  `Plugin._settled_pv_for_date` (a cached index of `daily_history.json`, partial days
+  excluded — grading a forecast against a projection is the same class of error). Repaired
+  records carry `"repaired": True`.
+- **MEASURED against the live file before shipping: 9 records repairable, all 9 repaired, and
+  the 40 kWh band moves 1.0428 -> 0.98.** That turns 14-Sep's raw 40.4 kWh from a corrected
+  41.9 into 39.5, against a measured 36.43.
+- **A median band needs a MAJORITY of the window to turn before it moves at all.** Six
+  repaired days against twelve summer ones move it not at all. Pinned by its own test,
+  because it sets how fast this fix can possibly work — it is necessary and is not instant.
+
+### 2. The small -> big promotion had no hysteresis
+
+v5.79.0 shipped the hold; the 05-Sep-2026 fix made the classification re-derive in BOTH
+directions, correctly (a one-way arm-to-small latch had held 04-Sep for its whole length
+while it clipped for 101 minutes). That symmetry introduced the mirror fault.
+
+14-Sep armed SMALL at 08:00 on a raw 37.4 kWh. The 08:50 fetch read 40.7, which cleared the
+40.0 threshold **by 0.7 kWh**. The hold released at 08:52 after 47 minutes and 0.001 kWh
+withheld, and 14.9 kWh went to the grid between 09:30 and 15:00 with the battery capped at
+~1.1 kW by the overflow pacing.
+
+**MEASURED from six days of plugin logs (10-15 Sep 2026, 06:00-15:00): the raw forecast
+wanders a median 5.7 kWh across a morning (max 9.0), and its largest single upward step is a
+median 3.0 kWh (max 7.4).** 0.7 kWh is noise, and only a margin can tell noise from a
+revision — the same lesson that moved this gate off a 1.0 kWh margin in the first place.
+
+`BANK_FIRST_PROMOTE_MARGIN_KWH = 5.0`, **one-sided by design**: promotion needs the margin,
+demotion to small stays immediate. Holding export back is the cheap error (clip-boundary
+minutes have been 0 on every held day here); selling early costs 13-18p on every kWh. 04-Sep's
+genuine 31.0 -> 46.0 revision still promotes, because 46.0 clears 40.0 + 5.0. Six days is a
+thin sample — revisit against a fuller season. 3/3 mutations killed.
+
+### 3. The pacing shadow ran ZERO times between 31-Aug and 15-Sep
+
+`_record_solar_overflow_shadow` guarded itself with `abs(live_target - 90.0) > 0.01: return`.
+The instinct was right — never label a different comparison 90/95 — with no handling of the
+consequence: the experiment it guarded was the argument for moving the live target to 95, so
+the moment that argument WON, the guard fired on every tick for ever.
+
+`samples: 0` on every daily record from 1-Sep, **with no reason recorded**, while the block
+published the hardcoded literals `live_target_pct: 90.0` / `shadow_target_pct: 95.0` — a
+comparison that was not being made, described with numbers that were no longer true.
+
+- Both targets are now READ. New `solarOverflowShadowTargetSoc` pref (default 90.0), so the
+  live 95 is graded against 90 rather than against itself.
+- Equal targets are not a fault but must not read as one: `skipped_reason` is recorded and
+  surfaced by the menu, so a zero-sample day says which kind of zero it is.
+- **The delta's sign is derived from the pair.** `max(0, live - shadow)` was only correct
+  while live was the LOOSER target; once live moved to 95 it could only ever produce 0.0, so
+  a working shadow would have recorded a run of honest-looking zeroes.
+
+### 4. `classified_small` / `classified_from_kwh` described 23:59, not the classification
+
+Both were read at midnight from the latch and from `latest_forecast_data` as they then stood.
+14-Sep filed as `classified_small: false, classified_from_kwh: 41.3` — neither the verdict
+that governed the morning nor the number it was reached from. Added
+`first_classified_small`, `first_classified_from_kwh`, `first_classified_local` and
+`promoted_local`; the menu prefers them and marks a promoted day `*`. The old keys stay,
+named for what they actually are.
+
+### NOT DONE, deliberately — both measured first
+
+- **The 40 kWh threshold was NOT raised to 45.** The bank-first spec's pre-registered
+  criterion is that clip-boundary minutes mean the threshold is too HIGH. There are **123 of
+  them across 15 recorded days, 101 on 04-Sep alone** — the data says down, not up. Raising it
+  would have held 04-Sep, which clipped for 101 minutes with the battery already full.
+- **Stage 3's arming latch was NOT shipped.** Replayed over the 15 days of recorded
+  telemetry it arms on **13 of 15 days — 100% of the days whose measured peak 30-minute
+  surplus exceeded 4 kW (criterion: >=90%) and 0% of those below (criterion: <10%)**. It
+  passes its ship criterion and would have changed nothing, including on 14-Sep, whose peak
+  surplus was 6.55 kW. A no-op that looks like a fix is worse than an absent one. The real
+  discriminator in the data is peak surplus — the two worst finishes (13-Sep 91.1%, 14-Sep
+  90.3%) are the two lowest big-day surpluses at 5.30 and 6.55 kW, against 8.92-11.64 for the
+  three that finished 94-98% — but five big days cannot set a threshold. Left for the booked
+  28-Sep review, which now has honest telemetry to read.
+
+### Also — OctoPoints are an eighth of a penny
+
+Octopus states it on its own Octoplus page: 800 OctoPoints = £1. A session at 85 points/kWh
+therefore pays **10.6p/kWh**, not the pounds an Axle dispatch pays. `OCTOPOINTS_PER_PENNY`
+and `octopoints_to_pence()` in `octopus_api.py`, imported by `battery_manager` rather than
+re-declared. Every human-facing site prices it: the Pushover reads "about 11p a unit on top
+of the usual 12p", and the Saving Session decision reason carries the rate and the cash. The
+branch's economics are otherwise unchanged and were already sound — it exports only when the
+engine's own `import_needed` says tomorrow is covered without buying.
+
+1472 -> 1491 tests.
+
+---
+
 ## v5.101.0 — 10-09-2026
 
 **THE POWER-CUT RESERVE IS KEPT ON AGILE, THROUGH THE BLOCK PLANNER.** The decision CliveS took

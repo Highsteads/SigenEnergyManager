@@ -165,6 +165,7 @@ try:
         TARIFF_IGO, TARIFF_IFLUX, TARIFF_AGILE,
         TARIFF_FLEXIBLE,
         TARIFF_WINDOWS,
+        OCTOPOINTS_PER_PENNY,
     )
 except ImportError:
     # Allow standalone testing without Indigo environment
@@ -175,6 +176,10 @@ except ImportError:
     TARIFF_IFLUX    = "iflux"
     TARIFF_AGILE    = "agile"
     TARIFF_FLEXIBLE = "flexible"
+    # Imported, not re-derived, for the same reason london_time is: a second copy
+    # of a conversion rate is how two places end up disagreeing about money. The
+    # fallback exists only so this module still imports without Indigo present.
+    OCTOPOINTS_PER_PENNY = 8.0
     TARIFF_WINDOWS  = {
         "go":    {"cheap_start": "23:30", "cheap_end": "04:30"},   # 23:30-04:30 (5h) — live GO-FIX product (region F, verified 05-Jul-2026)
         "flux":  {"cheap_start": "02:00", "cheap_end": "05:00"},
@@ -397,6 +402,12 @@ SOLAR_OVERFLOW_MIN_DWELL_MIN  = 10.0
 # exported, 1.53 kWh clipped, ends 91.1%; 90% target -> 46.6 kWh exported, NOTHING
 # clipped, ends 90.8%. Three-tenths of a point of finish for 1.6 kWh of export.
 SOLAR_OVERFLOW_TARGET_SOC_PCT = 90.0
+# The alternative target the log-only pacing shadow grades the live one against.
+# Only meaningful while it DIFFERS from the live target: the shadow measures the
+# export a stricter target forgoes, so comparing a target with itself measures
+# nothing. 90.0 is the old live default, which makes the shadow answer "what is
+# the 95% target costing in export?" for anyone who has moved to 95.
+SOLAR_OVERFLOW_SHADOW_TARGET_SOC_PCT = 90.0
 # Dull-day guard. If pacing to the target would leave the battery below this at dusk,
 # the day is too weak to give kWh away — revert to the old 100% pacing and keep them.
 SOLAR_OVERFLOW_MIN_END_SOC_PCT = 80.0
@@ -475,6 +486,18 @@ SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT = 95.0
 # never restricts a legitimate setting.
 SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX = 97.0
 SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX = 80.0
+
+# Hysteresis on the small -> big promotion (v5.106.0). A day already classified
+# small is only released once the raw forecast clears the threshold by this much.
+# MEASURED from six days of plugin logs, 10-15 Sep 2026, 06:00-15:00: the raw
+# forecast wanders a median 5.7 kWh across a morning (max 9.0) and its largest
+# single upward step is a median 3.0 kWh (max 7.4). A bare threshold therefore
+# cannot tell a revision from a wobble — on 14-Sep-2026 a 0.7 kWh overshoot
+# released the hold at 08:52 on a day that finished 4.3 kWh BELOW its pre-jump
+# forecast. Six days is a thin sample; revisit it against a fuller season.
+# One-sided deliberately: demotion to small stays immediate, because holding
+# export back is the cheap error and selling early is the expensive one.
+BANK_FIRST_PROMOTE_MARGIN_KWH = 5.0
 
 
 # ============================================================
@@ -582,6 +605,12 @@ class ManagerSnapshot:
     # the 12p export rate alone.
     saving_session_active:   bool  = False
     saving_session_hours:    float = 1.0
+    # v5.106.0. OctoPoints per kWh for the live session, so the decision can PRICE
+    # itself. One point is an eighth of a penny (octopus.energy/octoplus/), so the
+    # 61-85 points/kWh seen on this account is 7.6-10.6p/kWh — worth taking when
+    # tomorrow is already covered, and nowhere near an Axle dispatch. 0 = unknown,
+    # which is reported as unknown and never as free.
+    saving_session_points_kwh: float = 0.0
 
     # Octopus Weekend Happy Hour: True only while a BOOKED (joined) free-electricity
     # window is live and the feature is enabled. plugin.py owns that test.
@@ -1028,10 +1057,22 @@ class BatteryManager:
                 import_needed       = balance.import_needed,
             )
             if kwh > 0:
+                # v5.106.0: say what the hour is WORTH. The reason line used to give
+                # a kWh and a reserve and no price at all, so a session could not be
+                # judged after the fact and read, to a human, as though it paid like
+                # the Axle branch above it. One OctoPoint is an eighth of a penny.
+                bonus_p = snapshot.saving_session_points_kwh / OCTOPOINTS_PER_PENNY
+                rate_str = (
+                    f"about {bonus_p + snapshot.export_rate_p:.0f}p/kWh "
+                    f"({snapshot.export_rate_p:.0f}p export plus {bonus_p:.0f}p bonus), "
+                    f"roughly £{kwh * (bonus_p + snapshot.export_rate_p) / 100.0:.2f}"
+                    if snapshot.saving_session_points_kwh > 0 else
+                    "value unknown — Octopus did not publish a points rate for it")
                 return Decision(
                     action = ACTION_SAVING_SESSION,
                     reason = (f"Octopus Saving Session — exporting up to {kwh:.1f} kWh "
-                              f"above baseline (dawn projection {balance.battery_at_dawn_kwh:.1f} kWh "
+                              f"above baseline at {rate_str} "
+                              f"(dawn projection {balance.battery_at_dawn_kwh:.1f} kWh "
                               f"vs {reserve_pct:.0f}% reserve"
                               + (f", holding {snapshot.vpp_today_kwh:.1f} kWh for Axle"
                                  if snapshot.vpp_today_kwh > 0 else "")

@@ -438,6 +438,71 @@ class OpenMeteoForecast:
         self._morning_forecast_date = None
         self._save_morning_baseline()
 
+    def repair_zero_actuals(self, lookup):
+        """Replace `actual_kwh == 0` records with the settled total, where one exists.
+
+        v5.106.0. Until this release the midnight task paired the morning baseline
+        with `store["pv_daily_kwh"]`, the live mirror of the inverter's own daily
+        accumulator — which the inverter had already reset. The record therefore
+        read 0.0 kWh on any day whose first post-midnight poll landed first, which
+        was nearly all of them: 9 of the 10 days to 14-Sep-2026, and 9 of the
+        147 records in the live file.
+
+        Those zeros were never included in a band: `_compute_correction_bands`
+        requires `0.1 < factor`. The damage is subtler and worse — the calibration
+        window is the last 60 RECORDS, so a run of zeros pushes real samples out of
+        it. On 15-Sep-2026 the 40 kWh band held twelve samples, every one dated
+        17-Jul to 31-Aug, so it returned x1.05 while September measured 0.888. The
+        correction was scaling a falling forecast UP.
+
+        Repairing in place rather than discarding keeps the window's shape: the
+        days happened and their forecasts were graded, only the actual was lost.
+
+        Args:
+            lookup: callable(date_str) -> actual PV kWh for that day, or None when
+                    the day cannot be settled. Anything <= 0 is treated as None —
+                    a zero is what we are here to remove, so it can never be the
+                    repair.
+
+        Returns:
+            int — how many records were repaired (0 when there was nothing to do).
+        """
+        records = self._load_accuracy_records()
+        if not records:
+            return 0
+
+        repaired = 0
+        for rec in records:
+            if float(rec.get("actual_kwh") or 0.0) > 0.0:
+                continue
+            forecast = float(rec.get("forecast_kwh") or 0.0)
+            if forecast <= 0.0:
+                continue          # nothing to divide by — leave it alone
+            try:
+                actual = lookup(rec.get("date"))
+            except Exception as exc:
+                self.logger.debug(
+                    f"[OpenMeteo] Repair lookup failed for {rec.get('date')}: {exc}")
+                continue
+            if actual is None or float(actual) <= 0.0:
+                continue
+            rec["actual_kwh"] = round(float(actual), 2)
+            rec["factor"]     = round(float(actual) / forecast, 4)
+            rec["repaired"]   = True     # auditable — says the pair was reconstructed
+            repaired += 1
+
+        if not repaired:
+            return 0
+
+        self._save_accuracy_records(records)
+        self._correction_factor = self._compute_correction_factor(records)
+        self._correction_bands  = self._compute_correction_bands(records)
+        self.logger.info(
+            f"[OpenMeteo] Repaired {repaired} accuracy record(s) that had lost their "
+            "actual PV total to the midnight counter reset — bias bands recomputed")
+        self._log_bands("Repaired")
+        return repaired
+
     def load_correction_factor(self):
         """Load and compute correction factor + bands from saved accuracy records.
 

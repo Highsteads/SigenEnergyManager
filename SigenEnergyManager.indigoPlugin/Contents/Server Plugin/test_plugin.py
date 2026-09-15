@@ -115,24 +115,69 @@ class TestConfigCoercion(unittest.TestCase):
 
 
 class TestSolarOverflowShadow(unittest.TestCase):
-    """The 90%/95% and tariff comparison must remain reporting-only."""
+    """The SOC-target and tariff comparison must remain reporting-only."""
 
-    def test_pacing_shadow_accumulates_only_the_export_delta(self):
+    @staticmethod
+    def _shadow_plugin(live_pct, shadow_pct, live_export_kw, shadow_export_kw):
         p = plugin.Plugin.__new__(plugin.Plugin)
-        p.pluginPrefs = {"solarOverflowShadowEnabled": True}
-        p.store = {"shadow_95_export_foregone_kwh": 0.0, "shadow_95_samples": 0}
+        p.pluginPrefs = {"solarOverflowShadowEnabled": True,
+                         "solarOverflowShadowTargetSoc": shadow_pct}
+        p.store = {"shadow_95_export_foregone_kwh": 0.0, "shadow_95_samples": 0,
+                   "shadow_skip_reason": ""}
         p.logger = MagicMock()
         p.manager = MagicMock()
         p.manager._calculate_24h_balance.return_value = object()
-        p.manager._check_solar_overflow.return_value = types.SimpleNamespace(export_kw=1.5)
-        snap = types.SimpleNamespace(storm_active=False, solar_overflow_target_pct=90.0)
-        live = types.SimpleNamespace(action=plugin.ACTION_SOLAR_OVERFLOW, export_kw=2.5)
+        p.manager._check_solar_overflow.return_value = types.SimpleNamespace(
+            export_kw=shadow_export_kw)
+        snap = types.SimpleNamespace(storm_active=False,
+                                     solar_overflow_target_pct=live_pct)
+        live = types.SimpleNamespace(action=plugin.ACTION_SOLAR_OVERFLOW,
+                                     export_kw=live_export_kw)
+        return p, snap, live
+
+    def test_pacing_shadow_accumulates_only_the_export_delta(self):
+        # Live 90 is the LOOSER target, so it exports more and the stricter 95
+        # shadow is the one withholding.
+        p, snap, live = self._shadow_plugin(90.0, 95.0, 2.5, 1.5)
 
         p._record_solar_overflow_shadow(snap, live)
 
         self.assertEqual(p.store["shadow_95_samples"], 1)
         self.assertAlmostEqual(p.store["shadow_95_export_foregone_kwh"], 1.0 / 60.0)
         self.assertEqual(snap.solar_overflow_target_pct, 90.0)  # copy, never mutate live snapshot
+
+    def test_delta_is_signed_from_the_targets_not_from_live_being_looser(self):
+        """v5.106.0. Live 95 vs a 90 shadow: the SHADOW is now the looser one.
+
+        Before v5.106.0 the delta was `live - shadow` clamped at zero, which is
+        only correct while live is the looser target. Once the live target moved
+        to 95 that expression could only ever produce 0.0, so a working shadow
+        would have recorded a run of honest-looking zeroes.
+        """
+        p, snap, live = self._shadow_plugin(95.0, 90.0, 1.5, 2.5)
+
+        p._record_solar_overflow_shadow(snap, live)
+
+        self.assertEqual(p.store["shadow_95_samples"], 1)
+        self.assertAlmostEqual(p.store["shadow_95_export_foregone_kwh"], 1.0 / 60.0)
+
+    def test_equal_targets_record_a_reason_instead_of_a_silent_zero(self):
+        """The fault this replaces: no samples, no explanation, for a fortnight."""
+        p, snap, live = self._shadow_plugin(95.0, 95.0, 2.5, 1.5)
+
+        p._record_solar_overflow_shadow(snap, live)
+
+        self.assertEqual(p.store["shadow_95_samples"], 0)
+        self.assertIn("equals the live target", p.store["shadow_skip_reason"])
+
+    def test_a_live_target_away_from_ninety_no_longer_kills_the_experiment(self):
+        """The exact regression: live 95 used to fail `abs(live - 90) > 0.01`."""
+        p, snap, live = self._shadow_plugin(95.0, 90.0, 2.5, 1.5)
+
+        p._record_solar_overflow_shadow(snap, live)
+
+        self.assertEqual(p.store["shadow_95_samples"], 1)
+        self.assertEqual(p.store["shadow_skip_reason"], "")
 
     def test_tariff_baseline_requires_complete_price_coverage(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2456,13 +2501,32 @@ class TestCheckSavingSessions(unittest.TestCase):
         self.assertEqual(len(stub.sent), 2)
         self.assertEqual(stub.saved, 1)   # one persist covers both, not one each
 
-    def test_message_carries_points_and_additive_framing(self):
+    def test_message_prices_the_session_in_pence_not_octopoints(self):
+        """v5.106.0. The alert must say what the hour is WORTH, in money.
+
+        It used to publish the raw OctoPoints figure ("120 Octopoints/kWh"),
+        which reads to a person like a large number and is 15p — one point is an
+        eighth of a penny, per octopus.energy/octoplus/. That framing is how a
+        Saving Session gets taken for an Axle dispatch, which pays roughly ten
+        times as much. Standing rule: every number arrives with what it means.
+        """
         stub = self._Stub({"has_joined": True,
                             "events": [self._event("1", self._future(), points=120)]})
         self._check(stub)
         body = stub.sent[0][1]
-        self.assertIn("120", body)
-        self.assertIn("on top of", body)   # the correction this Phase 1 build exists for
+        self.assertIn("15p a unit", body)         # 120 / 8
+        self.assertIn("on top of", body)          # the correction Phase 1 exists for
+        self.assertNotIn("Octopoints", body)      # never the raw points on their own
+        self.assertNotIn("120", body)
+
+    def test_message_names_the_export_rate_it_is_added_to(self):
+        """A bonus is meaningless without the rate it tops up."""
+        stub = self._Stub({"has_joined": True,
+                            "events": [self._event("1", self._future(), points=120)]})
+        self._check(stub)
+        body = stub.sent[0][1]
+        self.assertIn("12p", body)                # the default export rate
+        self.assertIn("27p a unit", body)         # 15 + 12, the figure that decides it
 
 
 class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
@@ -4251,6 +4315,86 @@ class TestBankFirstMetrics(unittest.TestCase):
 
     def _record(self, stub, decision, snap, soc_pct=56.9):
         plugin.Plugin._record_bank_first_metrics(stub, snap, decision, soc_pct)
+
+    # ── promotion hysteresis (v5.106.0) ────────────────────────────────────
+    def _reclassify(self, first_kwh, then_kwh, bank_max=40.0):
+        """Latch the day from `first_kwh`, then feed it `then_kwh`. Returns the latch."""
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": first_kwh,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=first_kwh,
+                                                      bank_max=bank_max))
+        st.latest_forecast_data["todayKwh"] = then_kwh
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=then_kwh,
+                                                      bank_max=bank_max))
+        return st.store["bank_first_small_latched"]
+
+    def test_a_small_day_is_not_promoted_by_a_forecast_wobble(self):
+        """The live fault of 14-Sep-2026, replayed.
+
+        Armed SMALL at 08:00 on a raw 37.4 kWh. The 08:50 fetch read 40.7, which
+        cleared the 40.0 threshold by 0.7 and released the hold at 08:52. The day
+        delivered 36.43 kWh — below even the pre-jump figure — exported 14.9 kWh
+        between 09:30 and 15:00 and peaked at 90.3% against a 95% target.
+
+        0.7 kWh is well inside the forecast's own morning wander (median 5.7 kWh
+        over 10-15 Sep 2026), so it is noise and must not release anything.
+        """
+        self.assertTrue(self._reclassify(37.4, 40.7),
+                        "a 0.7 kWh overshoot is noise, not a revision")
+
+    def test_a_real_revision_still_promotes_the_day(self):
+        """The live fault of 04-Sep-2026 must stay fixed.
+
+        The overnight fetch read 31.0 kWh and armed the day SMALL; it was later
+        revised to 46.0, a genuinely big day that spent 101 minutes clipping at
+        the DNO cap with the battery full. 46.0 clears 40.0 + 5.0, so it still
+        promotes — the margin buys the wobble case without reopening this one.
+        """
+        self.assertFalse(self._reclassify(31.0, 46.0),
+                         "a 6 kWh revision is a revision and must release export")
+
+    def test_promotion_needs_the_whole_margin_not_part_of_it(self):
+        self.assertTrue(self._reclassify(37.4, 44.9))     # 4.9 over — still held
+        self.assertFalse(self._reclassify(37.4, 45.0))    # 5.0 over — released
+
+    def test_the_first_classification_of_the_day_is_kept(self):
+        """v5.106.0. The record must carry the verdict that governed the morning.
+
+        On 14-Sep-2026 the day was classified SMALL at 08:00 on a raw 37.4 kWh
+        and promoted at 08:52. The daily record filed it as
+        `classified_small: false, classified_from_kwh: 41.3` — the latch and the
+        forecast as they stood at 23:59, neither of which decided anything.
+        """
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=37.4))
+        st.latest_forecast_data["todayKwh"] = 46.0
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=46.0))
+
+        self.assertTrue(st.store["bank_first_first_class_small"])
+        self.assertAlmostEqual(st.store["bank_first_first_class_kwh"], 37.4)
+        self.assertFalse(st.store["bank_first_small_latched"])   # promoted, correctly
+        self.assertTrue(st.store["bank_first_promoted_local"])   # and the time is kept
+
+    def test_a_day_never_promoted_records_no_promotion_time(self):
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=37.4))
+        st.latest_forecast_data["todayKwh"] = 40.7        # the 14-Sep wobble
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=40.7))
+
+        self.assertTrue(st.store["bank_first_small_latched"])
+        self.assertEqual(st.store["bank_first_promoted_local"], "")
+
+    def test_demotion_to_small_stays_immediate(self):
+        """One-sided by design: holding export back is the cheap error."""
+        self.assertTrue(self._reclassify(41.0, 39.9),
+                        "a big day falling below the threshold must hold at once")
+
+    def test_the_margin_scales_with_the_configured_threshold(self):
+        # Threshold 45 -> promotion at 50, so 47.0 must not release.
+        self.assertTrue(self._reclassify(37.4, 47.0, bank_max=45.0))
+        self.assertFalse(self._reclassify(37.4, 50.0, bank_max=45.0))
 
     # ── the day latch ──────────────────────────────────────────────────────
     def test_a_complete_forecast_below_the_threshold_latches_the_day_small(self):

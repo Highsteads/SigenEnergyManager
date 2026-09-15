@@ -78,6 +78,26 @@ FINANCIALS_STALE_WARN_AGE  = 7200 # 2h - warn once when served financials are ol
 SAVING_SESSION_TURN_DOWN   = "TURN_DOWN"           # use LESS  -> exporting earns
 SAVING_SESSION_TURN_UP     = "TURN_UP"             # use MORE  -> exporting is BACKWARDS
 SAVING_SESSION_HAPPY_HOUR  = "WEEKEND_HAPPY_HOUR"  # FREE power -> exporting wastes it
+# OctoPoints are not pence. Octopus states the rate on its own Octoplus page as
+# "800 Octopoints = £1", so ONE POINT IS AN EIGHTH OF A PENNY. Checked against
+# octopus.energy/octoplus/ on 15-Sep-2026.
+#
+# This matters far more than the arithmetic suggests. A session here pays 61-85
+# points/kWh, i.e. 7.6-10.6p/kWh, NOT the pounds-per-kWh an Axle dispatch pays —
+# and a bare "85 Octopoints/kWh" in an alert reads to a human like a big number.
+# Anything shown to a person prices it in pence; the raw points figure is never
+# published on its own.
+OCTOPOINTS_PER_PENNY = 8.0
+
+
+def octopoints_to_pence(points):
+    """Convert an OctoPoints figure to pence. Returns 0.0 on anything unusable."""
+    try:
+        return float(points) / OCTOPOINTS_PER_PENNY
+    except (TypeError, ValueError):
+        return 0.0
+
+
 SAVING_SESSIONS_CACHE_TTL     = 1800  # 30 min - new events are announced at most a few times/day
 SAVING_SESSIONS_NEG_CACHE_TTL = 300   # 5 min - debounce failures (this is a non-urgent poll)
 

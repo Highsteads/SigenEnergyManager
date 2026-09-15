@@ -13,6 +13,7 @@
 #       module under test.
 
 import io
+import json
 import os
 import sys
 import openmeteo_forecast
@@ -619,6 +620,109 @@ class TestOptimiserFileIsolation(unittest.TestCase):
         import openmeteo_forecast as omf
         self.assertNotIn("Perceptive Automation", omf.OPTIMISER_FORECAST_FILE,
                          "the module constant must be re-pointed for the whole test module")
+
+
+class TestRepairZeroActuals(unittest.TestCase):
+    """v5.106.0 — reconstruct accuracy records that lost their actual PV total.
+
+    Until this release the midnight task paired the morning baseline with the
+    live mirror of the inverter's daily accumulator, which the inverter had
+    already reset. 9 of the 10 days to 14-Sep-2026 recorded actual_kwh = 0.0.
+
+    They never reached a band (`0.1 < factor` filters them) so nothing looked
+    broken. What they did instead was push real samples out of the 60-record
+    calibration window: on 15-Sep-2026 the 40 kWh band held twelve samples, all
+    dated 17-Jul to 31-Aug, so it returned x1.05 over a September measuring
+    0.888 — scaling a falling forecast UP.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="openmeteo_repair_")
+        self.f = OpenMeteoForecast(data_dir=self._tmp, latitude=51.5007, longitude=-0.1246,
+                                   optimiser_file=os.path.join(self._tmp, "openmeteo_forecast.json"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _seed(self, records):
+        self.f._save_accuracy_records(records)
+
+    def test_a_zero_record_is_repaired_from_the_settled_total(self):
+        self._seed([_rec("2026-09-13", 42.7, 0.0)])
+        n = self.f.repair_zero_actuals(lambda d: 41.21 if d == "2026-09-13" else None)
+        self.assertEqual(n, 1)
+        rec = self.f._load_accuracy_records()[0]
+        self.assertAlmostEqual(rec["actual_kwh"], 41.21)
+        self.assertAlmostEqual(rec["factor"], round(41.21 / 42.7, 4))
+        self.assertTrue(rec["repaired"])          # auditable, not silently rewritten
+
+    def test_a_good_record_is_left_exactly_alone(self):
+        self._seed([_rec("2026-09-07", 28.2, 22.85)])
+        before = json.loads(json.dumps(self.f._load_accuracy_records()))
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: 99.0), 0)
+        self.assertEqual(self.f._load_accuracy_records(), before)
+
+    def test_an_unsettleable_day_stays_zero_rather_than_guessing(self):
+        """A missing day is not a dark day. Leaving it out keeps the bands honest."""
+        self._seed([_rec("2026-09-05", 43.9, 0.0)])
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: None), 0)
+        self.assertEqual(self.f._load_accuracy_records()[0]["actual_kwh"], 0.0)
+
+    def test_a_zero_from_the_lookup_can_never_be_the_repair(self):
+        """Zero is the bug. Writing it back would look like a successful repair."""
+        self._seed([_rec("2026-09-05", 43.9, 0.0)])
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: 0.0), 0)
+
+    def test_a_raising_lookup_does_not_abandon_the_remaining_days(self):
+        def lookup(day):
+            if day == "2026-09-05":
+                raise RuntimeError("history unreadable")
+            return 37.5
+        self._seed([_rec("2026-09-05", 43.9, 0.0), _rec("2026-09-06", 34.3, 0.0)])
+        self.assertEqual(self.f.repair_zero_actuals(lookup), 1)
+
+    def test_repair_turns_the_band_it_was_starving(self):
+        """The whole point: the band must stop scaling a falling forecast UP.
+
+        Eight July samples over-delivering, then nine September days that
+        under-delivered but recorded zero — the shape of the live file on
+        15-Sep-2026. Before the repair the band can only see the summer.
+
+        Replayed against the real file that day the 40 kWh band moved
+        1.0428 -> 0.98, which turns yesterday's raw 40.4 kWh from a corrected
+        41.9 into 39.5 against a measured 36.43.
+        """
+        recs  = [_rec(f"2026-07-{d:02d}", 40.0, 46.0) for d in range(1, 9)]
+        recs += [_rec(f"2026-09-{d:02d}", 40.0, 0.0) for d in range(1, 10)]
+        self._seed(recs)
+        before = dict(self.f._compute_correction_bands(self.f._load_accuracy_records()))
+
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: 35.0), 9)
+
+        band40 = dict(self.f._correction_bands)[40.0]
+        self.assertGreater(before[40.0], 1.0, "precondition: it was scaling UP")
+        self.assertLess(band40, 1.0,
+                        "a band whose majority now under-delivers must scale DOWN")
+
+    def test_a_minority_of_repaired_days_cannot_move_a_median_band(self):
+        """Worth pinning, because it sets how fast this fix can possibly work.
+
+        The band factor is a MEDIAN, so recovering a handful of days changes
+        nothing until they outnumber the samples already there. Six repaired
+        September days against twelve summer ones leave the median untouched —
+        the repair is necessary and is not, on its own, instant.
+        """
+        recs  = [_rec(f"2026-07-{d:02d}", 40.0, 46.0) for d in range(1, 13)]
+        recs += [_rec(f"2026-09-{d:02d}", 40.0, 0.0) for d in range(1, 7)]
+        self._seed(recs)
+
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: 35.0), 6)
+
+        self.assertAlmostEqual(dict(self.f._correction_bands)[40.0], 1.15, places=2)
+
+    def test_nothing_to_repair_is_not_an_error(self):
+        self.assertEqual(self.f.repair_zero_actuals(lambda d: 30.0), 0)
 
 
 if __name__ == "__main__":

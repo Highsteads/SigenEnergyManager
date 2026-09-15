@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.105.0)
-# Date:        13-09-2026 23:20
-# Version:     5.105.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.106.0)
+# Date:        15-09-2026 09:40
+# Version:     5.106.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -160,6 +160,7 @@ from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               GAS_KWH_PER_M3)
 from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
+from octopus_api      import octopoints_to_pence as _points_to_pence
 # The ONE Europe/London implementation. Imported, never re-declared: copies are
 # what put two sites an hour out in the first place, and there is no version of
 # "just this once" that does not end up as copy number six.
@@ -178,9 +179,11 @@ from battery_manager  import (
     pv_tracking_factor as _pv_tracking_factor,
     need_for_weekday as _need_for_weekday,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
+    SOLAR_OVERFLOW_SHADOW_TARGET_SOC_PCT,
     SOLAR_OVERFLOW_CAP_DEADBAND_W,
     SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH, SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
     SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX, SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX,
+    BANK_FIRST_PROMOTE_MARGIN_KWH,
 )
 from axle_api      import AxleAPI
 from storm_watch   import check_storm_level
@@ -1367,6 +1370,7 @@ class Plugin(indigo.PluginBase):
         # Log-only 95% pacing counterfactual — never read by a control path.
         self.store["shadow_95_export_foregone_kwh"] = 0.0
         self.store["shadow_95_samples"]             = 0
+        self.store["shadow_skip_reason"]            = ""
 
         # ── Bank-first export hold (v5.79.0) ────────────────────────────────
         # A one-way day latch: set only from a COMPLETE forecast, and only ever to
@@ -1376,6 +1380,10 @@ class Plugin(indigo.PluginBase):
         # export, the cost of releasing a day that turns out small is the whole
         # point of the feature.
         self.store["bank_first_small_latched"]  = False
+        self.store["bank_first_first_class_kwh"]   = None
+        self.store["bank_first_first_class_small"] = None
+        self.store["bank_first_first_class_local"] = ""
+        self.store["bank_first_promoted_local"]    = ""
         self.store["bank_first_latch_date"]     = ""
         # Daily measurement. Counted in manager ticks, which are one a minute.
         self.store["bank_first_blocked_samples"]   = 0
@@ -1514,6 +1522,14 @@ class Plugin(indigo.PluginBase):
         self._init_timeseries_db()
         if self.forecast:
             self.forecast.load_correction_factor()
+            # v5.106.0: reconstruct any accuracy record whose actual PV was lost to
+            # the inverter's midnight counter reset (see _check_midnight_impl). The
+            # settled total is in daily_history.json, so the pairing can be redone
+            # exactly. One-shot in effect — a repaired record is never zero again.
+            try:
+                self.forecast.repair_zero_actuals(self._settled_pv_for_date)
+            except Exception as exc:
+                self.logger.warning(f"[Forecast] Accuracy repair skipped: {exc}")
         # Pre-populate latest_forecast_data from disk cache so the first manager
         # evaluation has forecast data available (disk cache was loaded in
         # OpenMeteoForecast.__init__; this propagates it into plugin.py's dict).
@@ -3281,6 +3297,40 @@ class Plugin(indigo.PluginBase):
             "sources":          dict(t.get("sources") or {}),
         }
 
+    def _settled_pv_for_date(self, date_str):
+        """Settled PV kWh for one past day, read from daily_history.json.
+
+        v5.106.0, for repair_zero_actuals. The daily record is written from
+        _energy_day_totals, i.e. the difference of two boundary anchors, so it is
+        the figure the accuracy record should have been paired with all along.
+
+        The file is read ONCE per call sequence and held on the instance: the
+        repair asks for up to 365 dates, and re-reading a never-pruned history
+        file for each of them would turn a startup task into a stall.
+
+        Returns None when the day is absent or unusable, never 0.0 — a zero here
+        is indistinguishable from the bug being repaired.
+        """
+        index = getattr(self, "_settled_pv_index", None)
+        if index is None:
+            index = {}
+            path  = os.path.join(self.data_dir, "daily_history.json")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for rec in json.load(f) or []:
+                        day = rec.get("date")
+                        pv  = rec.get("pv_kwh")
+                        # A partial day was never anchored on both boundaries, so
+                        # its PV is a projection. Grading a forecast against a
+                        # guess is the failure this whole repair exists to undo.
+                        if day and pv is not None and not rec.get("energy_partial"):
+                            index[str(day)] = float(pv)
+            except (OSError, ValueError, TypeError) as exc:
+                self.logger.debug(f"[Forecast] Cannot index daily history: {exc}")
+            self._settled_pv_index = index
+        value = index.get(str(date_str))
+        return value if (value is not None and value > 0.0) else None
+
     def _energy_day_totals(self, date_str):
         """The six figures for `date_str`, for the daily record.
 
@@ -3602,6 +3652,10 @@ class Plugin(indigo.PluginBase):
                 ("bank_first_first_arm_local",   ""),
                 ("bank_first_peak_surplus_kw",   0.0),
                 ("bank_first_small_latched",     False),
+                ("bank_first_first_class_kwh",   None),
+                ("bank_first_first_class_small", None),
+                ("bank_first_first_class_local", ""),
+                ("bank_first_promoted_local",    ""),
             ):
                 store.setdefault(_key, _default)
 
@@ -3612,6 +3666,14 @@ class Plugin(indigo.PluginBase):
             if store.get("bank_first_latch_date") != today_str:
                 store["bank_first_latch_date"]    = today_str
                 store["bank_first_small_latched"] = False
+                # The day's own first verdict, cleared with the latch it describes.
+                # Leaving these behind would file yesterday's classification against
+                # today, which is the shape of bug this block already carries a
+                # paragraph about.
+                store["bank_first_first_class_kwh"]   = None
+                store["bank_first_first_class_small"] = None
+                store["bank_first_first_class_local"] = ""
+                store["bank_first_promoted_local"]    = ""
             max_kwh = min(float(snapshot.solar_overflow_bank_first_max_kwh or 0.0),
                           SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
             status  = str(self.latest_forecast_data.get("forecastStatus", ""))
@@ -3631,9 +3693,60 @@ class Plugin(indigo.PluginBase):
             # or wrong-day fetch leaves the stored value exactly where it was — that
             # is what stops one bad reading deciding the afternoon — but any COMPLETE
             # fetch for today, in either direction, updates it.
+            #
+            # v5.106.0 — AND THE SYMMETRY INTRODUCED THE MIRROR FAULT. Promotion
+            # now needs a MARGIN; demotion still does not.
+            #
+            # 14-Sep-2026: the day armed SMALL at 08:00 on a raw 37.4 kWh, the
+            # 08:50 fetch read 40.7, that cleared the 40.0 threshold by 0.7, the
+            # hold released at 08:52 after 47 minutes and 0.001 kWh withheld, and
+            # 14.9 kWh went to the grid between 09:30 and 15:00 while the battery
+            # was capped at ~1.1 kW. The day delivered 36.43 kWh — below even the
+            # pre-jump figure — and peaked at 90.3% against a 95% target.
+            #
+            # A threshold with no margin is being asked to resolve a difference
+            # smaller than the signal's own noise. MEASURED from six days of
+            # plugin logs (10-15 Sep 2026, 06:00-15:00): the raw forecast wanders
+            # a median 5.7 kWh across the morning, max 9.0, and its largest single
+            # upward step is a median 3.0 kWh, max 7.4. So 0.7 kWh is noise, and
+            # ONLY a margin can tell it from a revision. Same lesson as the one
+            # that moved this gate off a 1.0 kWh margin in the first place.
+            #
+            # One-sided, because the errors are: holding export on a day that
+            # turns out big costs a little late export, and on this estate
+            # clip_boundary_minutes has been 0 on every held day. Releasing it on
+            # a day that turns out small costs 13-18p on every kWh sold and bought
+            # back. Demotion therefore stays immediate — the cheap direction needs
+            # no evidence — and 04-Sep's genuine 31.0 -> 46.0 revision still
+            # promotes, because 46.0 clears 40.0 + 5.0.
             if (max_kwh > 0.0 and status.upper().startswith("OK")
                     and fc_date == today_str and raw_kwh > 0.0):
-                store["bank_first_small_latched"] = raw_kwh < max_kwh
+                was_small = bool(store.get("bank_first_small_latched", False))
+                promote_at = max_kwh + BANK_FIRST_PROMOTE_MARGIN_KWH
+                if was_small:
+                    # Already holding: only a forecast clear of the noise releases it.
+                    still_small = raw_kwh < promote_at
+                else:
+                    still_small = raw_kwh < max_kwh
+                if was_small and not still_small:
+                    store["bank_first_promoted_local"] = local_now.strftime("%H:%M")
+                    log(f"[BankFirst] Day reclassified as big — forecast {raw_kwh:.1f} kWh "
+                        f"clears the {max_kwh:.0f} kWh threshold by more than the "
+                        f"{BANK_FIRST_PROMOTE_MARGIN_KWH:.0f} kWh the forecast normally "
+                        f"wanders in a morning, so daytime export is released")
+                # v5.106.0: keep the FIRST classification of the day and the forecast
+                # it was made from. The daily record used to publish only the latch as
+                # it stood at 23:59 plus latest_forecast_data's todayKwh at that same
+                # moment, under the names `classified_small` and `classified_from_kwh`
+                # — so a day classified small at 08:00 on 37.4 kWh and promoted at
+                # 08:52 was filed as "classified_small: false, classified_from_kwh:
+                # 41.3", which is neither the verdict that governed the morning nor
+                # the number it was reached from. 14-Sep-2026 read exactly that way.
+                if store.get("bank_first_first_class_kwh") is None:
+                    store["bank_first_first_class_kwh"]   = round(raw_kwh, 2)
+                    store["bank_first_first_class_small"] = still_small
+                    store["bank_first_first_class_local"] = local_now.strftime("%H:%M")
+                store["bank_first_small_latched"] = still_small
 
             # ── 2. the hold ─────────────────────────────────────────────────
             if getattr(decision, "bank_first_holding", False):
@@ -3695,31 +3808,75 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[BankFirst] metrics sample skipped: {exc!r}")
 
+    def _shadow_target_pct(self):
+        """The SOC target the pacing shadow compares the LIVE target against.
+
+        v5.106.0. Defaults to SOLAR_OVERFLOW_SHADOW_TARGET_SOC_PCT and is only
+        meaningful when it differs from the live target — see
+        _record_solar_overflow_shadow for why that is now checked rather than
+        assumed.
+        """
+        return _as_float(self.pluginPrefs.get("solarOverflowShadowTargetSoc"),
+                         SOLAR_OVERFLOW_SHADOW_TARGET_SOC_PCT)
+
     def _record_solar_overflow_shadow(self, snapshot, live_decision):
-        """Accumulate a 95%-target pacing estimate without changing control.
+        """Accumulate an alternative-target pacing estimate without changing control.
 
         The physics, sufficiency and DNO gates are deliberately identical to the
         live decision.  Only the charge pacing target changes.  The delta is an
         estimate of export foregone / charge retained during this one-minute
         evaluation interval; it is not an assertion about end-of-day SOC or PV
         curtailment, both of which depend on later weather and inverter behaviour.
+
+        v5.106.0 — THIS RAN ZERO TIMES BETWEEN 31-Aug AND 15-Sep-2026. It was
+        written as a fixed 90-versus-95 experiment and guarded with
+        `abs(live_target - 90.0) > 0.01: return`, which was the right instinct
+        (never label a different comparison 90/95) with no handling of the
+        obvious consequence: the experiment it guarded was the argument for
+        moving the live target to 95, so the moment that argument WON, the guard
+        fired on every tick for ever. `samples` sat at 0 on every daily record
+        from 1-Sep onward and nothing said why, while the block went on
+        reporting the hardcoded literals `live_target_pct: 90.0` /
+        `shadow_target_pct: 95.0` — a comparison that was not being made,
+        described with numbers that were no longer true.
+
+        So the pair is now read, not assumed, and the skip reason is recorded.
+        A shadow equal to the live target is not an experiment and is reported
+        as such rather than silently producing zeroes.
         """
+        self.store["shadow_skip_reason"] = ""
         if not bool(self.pluginPrefs.get("solarOverflowShadowEnabled", True)):
+            self.store["shadow_skip_reason"] = "disabled in Configure"
             return
         if snapshot.storm_active or live_decision.action != ACTION_SOLAR_OVERFLOW:
-            return
-        # This experiment is explicitly 90% versus 95%. If the owner changes
-        # the live preference, do not silently label a different comparison 90/95.
-        if abs(float(snapshot.solar_overflow_target_pct) - 90.0) > 0.01:
+            return          # not a skip worth reporting — most ticks are not overflow
+        live_pct   = float(snapshot.solar_overflow_target_pct)
+        shadow_pct = float(self._shadow_target_pct())
+        if abs(live_pct - shadow_pct) <= 0.01:
+            # Not a fault, but it must not read as one. Without this the block is
+            # indistinguishable from the bug above: zero samples, no explanation.
+            self.store["shadow_skip_reason"] = (
+                f"shadow target {shadow_pct:.0f}% equals the live target — "
+                "nothing to compare")
             return
         try:
             balance = self.manager._calculate_24h_balance(snapshot)
             shadow_snapshot = copy.copy(snapshot)
-            shadow_snapshot.solar_overflow_target_pct = 95.0
+            shadow_snapshot.solar_overflow_target_pct = shadow_pct
             shadow = self.manager._check_solar_overflow(shadow_snapshot, balance)
             if shadow is None:
+                self.store["shadow_skip_reason"] = "shadow pacing returned no decision"
                 return
-            export_delta_kw = max(0.0, float(live_decision.export_kw) - float(shadow.export_kw))
+            # Sign convention, stated because it inverted when the live target
+            # moved: the LOWER SOC target is the one that exports more, so the
+            # foregone export is always (looser export - stricter export). Taking
+            # `live - shadow` was only correct while live was the looser of the
+            # two, and would have clamped silently to 0.0 for ever once it wasn't.
+            live_kw   = float(live_decision.export_kw)
+            shadow_kw = float(shadow.export_kw)
+            looser_kw, stricter_kw = ((live_kw, shadow_kw) if live_pct < shadow_pct
+                                      else (shadow_kw, live_kw))
+            export_delta_kw = max(0.0, looser_kw - stricter_kw)
             self.store["shadow_95_export_foregone_kwh"] += (
                 export_delta_kw * MANAGER_EVAL_INTERVAL / 3600.0
             )
@@ -3727,7 +3884,8 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             # Analysis must be invisible to the control path if an unexpected
             # forecast/input shape occurs.
-            self.logger.debug(f"[Shadow] 90/95 pacing sample skipped: {exc!r}")
+            self.store["shadow_skip_reason"] = f"sample raised {exc!r}"
+            self.logger.debug(f"[Shadow] pacing sample skipped: {exc!r}")
 
     def _publish_flood_preview(self, snapshot, decision):
         """Write sigen_flood_preview.json so openmeteo_battery_optimiser.py can report
@@ -4275,6 +4433,7 @@ class Plugin(indigo.PluginBase):
             capacity_kwh       = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
             saving_session_active = _ss_window is not None,
             saving_session_hours  = float((_ss_window or {}).get("hours", 1.0)),
+            saving_session_points_kwh = float((_ss_window or {}).get("points", 0) or 0),
             happy_hour_active     = _hh_window is not None,
             happy_hour_hours      = float((_hh_window or {}).get("hours", 1.0)),
             efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
@@ -5159,7 +5318,8 @@ class Plugin(indigo.PluginBase):
                     start = start_at.astimezone(tz) if tz else start_at
                     log(f"[SavingSessions] Opted in to {code} "
                         f"({start.strftime('%a %d %b, %H:%M')}, "
-                        f"{event.get('reward_per_kwh_points', 0)} pts/kWh) automatically.")
+                        f"about {_points_to_pence(event.get('reward_per_kwh_points', 0)):.0f}p/kWh "
+                        f"bonus) automatically.")
             elif result.get("permanent"):
                 refused.add(str(code))
                 log(f"[SavingSessions] Could not opt in to {code} and will not try "
@@ -5283,11 +5443,28 @@ class Plugin(indigo.PluginBase):
                 title = ("Octopus Happy Hour booked" if joined
                          else "Octopus Happy Hour available")
             else:
+                # v5.106.0: price it. "85 Octopoints/kWh" reads like a lot and is
+                # about 11p — an eighth of a penny a point, per Octopus's own
+                # Octoplus page. Saying so is the standing plain-English rule
+                # (every number arrives with what it means), and it is also the
+                # difference between this and an Axle dispatch, which pays around
+                # ten times as much and is the thing it gets mistaken for.
+                bonus_p     = _points_to_pence(points)
+                # getattr, because this poll can run before the first rates fetch has
+                # populated latest_rates_data — and an alert that raises is an alert
+                # that never arrives.
+                export_p    = _as_float(
+                    (getattr(self, "latest_rates_data", None) or {}).get("export_rate_p"),
+                    DEFAULT_EXPORT_RATE_P) or DEFAULT_EXPORT_RATE_P
+                total_p     = bonus_p + export_p
                 body = (
                     f"Octopus Saving Session: {when}"
                     + (f" ({duration_h:.1f}h)" if duration_h else "")
-                    + f". Extra export above your usual baseline earns {points} "
-                    "Octopoints/kWh on top of the normal export rate."
+                    + f". Exporting more than usual in that hour earns about "
+                      f"{bonus_p:.0f}p a unit on top of the usual {export_p:.0f}p, "
+                      f"so roughly {total_p:.0f}p a unit. That is worth having but it "
+                      f"is nothing like an Axle event, so the battery is only used "
+                      f"for it once tomorrow is already covered."
                     + ("" if joined else
                        " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
                        "the battery will not be driven for it.")
@@ -5300,7 +5477,8 @@ class Plugin(indigo.PluginBase):
                          else "Octopus Saving Session - opt in to earn")
             self._send_pushover(title, body, priority="0")
             log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
-                f"{direction}, {points} pts/kWh, opted in: {'YES' if joined else 'NO'}"
+                f"{direction}, {points} pts/kWh (~{_points_to_pence(points):.1f}p/kWh), "
+                f"opted in: {'YES' if joined else 'NO'}"
                 + ("" if turn_down else " — battery NOT driven (not a turn-down)"),
                 level="INFO" if joined else "WARNING")
             new_ids.append(event_id)
@@ -8772,8 +8950,33 @@ class Plugin(indigo.PluginBase):
         # on yesterday's FIRST complete fetch (day-ahead), and record_accuracy
         # skips if the baseline's date doesn't match — no capture call here
         # (capturing at midnight fed it a same-day hindcast, v5.43 fix).
+        #
+        # v5.106.0: the ACTUAL comes from the settled boundary totals, NEVER from
+        # store["pv_daily_kwh"]. That store key mirrors the inverter's own daily
+        # accumulator, which the inverter resets at its midnight — and this task
+        # runs at 00:00:0x, after a poll has already copied the reset zero in. So
+        # every record written here read 0.0 kWh: 9 of the 10 days to 14-Sep-2026. _compute_correction_bands filters
+        # `0.1 < factor`, so the zeros never poisoned the bands — they STARVED
+        # them, which is worse for being invisible. The 40 kWh band was still
+        # fitted on twelve July/August samples on 15-Sep, returning x1.05 on a
+        # month measuring 0.888, so the correction pushed a falling forecast UP.
+        # _energy_day_totals is anchor[next day] - anchor[day], settled and exact.
         if self.forecast:
-            self.forecast.record_accuracy(self.store["pv_daily_kwh"], date_str=yesterday)
+            _acc_pv = None
+            try:
+                _acc_pv = self._energy_day_totals(yesterday).get("pv")
+            except Exception as exc:
+                self.logger.warning(
+                    f"[Forecast] Settled PV for {yesterday} unavailable ({exc}) — "
+                    "skipping the accuracy record rather than writing a wrong one")
+            # A missing or zero total is not evidence of a dark day. Skipping keeps
+            # the bands on real samples; recording a zero is what broke this.
+            if _acc_pv is not None and float(_acc_pv) > 0.0:
+                self.forecast.record_accuracy(float(_acc_pv), date_str=yesterday)
+            else:
+                log(f"[Forecast] No settled PV total for {yesterday} — accuracy "
+                    "record skipped (the bias bands keep their existing samples)",
+                    level="WARNING")
 
         # Write daily history — every record kept, no cap since v5.7
         self._write_daily_history(yesterday)
@@ -8985,6 +9188,9 @@ class Plugin(indigo.PluginBase):
             end_soc_pct = None
         shadow_export = round(float(self.store.get("shadow_95_export_foregone_kwh", 0.0)), 3)
         shadow_samples = int(self.store.get("shadow_95_samples", 0) or 0)
+        _shadow_live_pct = _as_float(self.pluginPrefs.get("solarOverflowTargetSoc"),
+                                     SOLAR_OVERFLOW_TARGET_SOC_PCT)
+        _shadow_pct      = self._shadow_target_pct()
         _bf_threshold = min(_as_float(self.pluginPrefs.get("solarOverflowBankFirstMaxKwh"),
                                       SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH),
                             SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
@@ -9021,24 +9227,43 @@ class Plugin(indigo.PluginBase):
             "vpp_event":  self.store.get("had_vpp_today", False),
             "solar_overflow_shadow": {
                 "enabled": bool(self.pluginPrefs.get("solarOverflowShadowEnabled", True)),
-                "live_target_pct": 90.0,
-                "shadow_target_pct": 95.0,
+                # v5.106.0: READ, never literals. These were hardcoded 90.0/95.0 and
+                # went on being written after the live target moved to 95 on
+                # 31-Aug-2026, so every record for a fortnight named a comparison
+                # that was not happening. A record about a setting has to read the
+                # setting.
+                "live_target_pct":   round(_shadow_live_pct, 1),
+                "shadow_target_pct": round(_shadow_pct, 1),
                 "samples": shadow_samples,
-                # Positive = export available at 90% but withheld by a 95% pace.
+                # Positive = export the LOWER of the two targets would have made and
+                # the higher one withholds. Direction is derived from the pair above,
+                # not fixed, so it stays true whichever way the targets sit.
                 "estimated_export_foregone_kwh": shadow_export,
+                # Why a zero-sample day was zero. Without it a dead experiment and a
+                # day with no overflow at all look exactly alike.
+                "skipped_reason": str(self.store.get("shadow_skip_reason") or ""),
                 "observed_end_soc_pct": end_soc_pct,
                 "observed_evening_import_kwh": shadow_tariff["evening_import_kwh"],
                 "tariff_baseline": shadow_tariff,
             },
             # Separate from solar_overflow_shadow above, deliberately: that block is a
-            # specific 90-vs-95 pacing experiment with hardcoded labels, and folding a
-            # second question into it would make both reports lie.
+            # pacing experiment between two SOC targets, and folding a second question
+            # into it would make both reports lie.
             "bank_first": {
                 "mode":                  "live",
                 "threshold_kwh":         _bf_threshold,
                 "gate_soc_pct":          _bf_gate,
-                "classified_small":      bool(self.store.get("bank_first_small_latched", False)),
-                "classified_from_kwh":   round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
+                # BOTH of these describe 23:59, which is why they are named for it
+                # now. They are the last state of the latch, not the verdict that
+                # governed the day — see _record_bank_first_metrics.
+                "classified_small":          bool(self.store.get("bank_first_small_latched", False)),
+                "classified_from_kwh":       round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
+                # The verdict that actually governed the morning, and the forecast it
+                # was reached from. v5.106.0 — absent on rows written before it.
+                "first_classified_small":    self.store.get("bank_first_first_class_small"),
+                "first_classified_from_kwh": self.store.get("bank_first_first_class_kwh"),
+                "first_classified_local":    self.store.get("bank_first_first_class_local") or None,
+                "promoted_local":            self.store.get("bank_first_promoted_local") or None,
                 "forecast_status":       str(self.latest_forecast_data.get("forecastStatus", "")),
                 "blocked_samples":       int(self.store.get("bank_first_blocked_samples", 0)),
                 "first_block_local":     self.store.get("bank_first_first_block_local") or None,
@@ -9082,6 +9307,7 @@ class Plugin(indigo.PluginBase):
         self.store["had_vpp_today"]      = False
         self.store["shadow_95_export_foregone_kwh"] = 0.0
         self.store["shadow_95_samples"]             = 0
+        self.store["shadow_skip_reason"]            = ""
         # Bank-first daily counters. The LATCH is not reset here — it is keyed on the
         # local date inside _record_bank_first_metrics, so it clears itself on the
         # first tick of the new day whether or not midnight recording ran.
@@ -10809,7 +11035,13 @@ class Plugin(indigo.PluginBase):
         return True
 
     def menuShowSolarOverflowShadow(self):
-        """Log recent log-only 90%/95% pacing and tariff-baseline evidence."""
+        """Log recent log-only SOC-target pacing and tariff-baseline evidence.
+
+        v5.106.0: the header and every row name the targets the record itself
+        carries. The old wording said "90% live vs 95%" whatever the file held,
+        which read as a live experiment for the fortnight the experiment was
+        dead.
+        """
         path = os.path.join(self.data_dir, "daily_history.json")
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -10822,7 +11054,7 @@ class Plugin(indigo.PluginBase):
         if not rows:
             log("[Shadow] No completed-day comparison available yet — first row is written at midnight")
             return True
-        log(f"[Shadow] 90% live vs 95% pacing / Tracker vs Agile baseline ({len(rows)} days)")
+        log(f"[Shadow] SOC-target pacing / Tracker vs Agile baseline ({len(rows)} days)")
         for row in reversed(rows):
             s = row["solar_overflow_shadow"]
             tariff = s.get("tariff_baseline", {})
@@ -10833,10 +11065,23 @@ class Plugin(indigo.PluginBase):
             costs = (f"Tracker £{tracker:.2f} / Agile £{agile:.2f}"
                      if tracker is not None and agile is not None else
                      f"tariff coverage incomplete ({tariff.get('missing_price_slots', 0)} import slots)")
+            samples = int(s.get("samples", 0) or 0)
+            live_pct   = s.get("live_target_pct")
+            shadow_pct = s.get("shadow_target_pct")
+            pair = (f"{live_pct:g}% live vs {shadow_pct:g}%"
+                    if live_pct is not None and shadow_pct is not None else "targets not recorded")
+            # A zero-sample day must say which kind of zero it is. Rows written
+            # before v5.106.0 carry no reason and are marked as such rather than
+            # reported as a clean nothing-to-report.
+            if samples:
+                verdict = (f"the stricter target withheld ~{export:.2f}kWh of export")
+            else:
+                reason = str(s.get("skipped_reason") or "")
+                verdict = ("no comparison ran — " + reason if reason else
+                           "no comparison ran (no reason recorded — pre-v5.106.0 row)")
             log(
-                f"[Shadow] {row.get('date', '?')}: samples={s.get('samples', 0)} "
-                f"95% would retain/export-withhold ~{export:.2f}kWh; "
-                f"end SOC={soc if soc is not None else '?'}%; "
+                f"[Shadow] {row.get('date', '?')}: {pair}, samples={samples}; "
+                f"{verdict}; end SOC={soc if soc is not None else '?'}%; "
                 f"evening import={s.get('observed_evening_import_kwh', 0):.2f}kWh; {costs}"
             )
         log("[Shadow] Tariff figures hold import timing constant; they are not an Agile battery-dispatch forecast.")
@@ -10867,9 +11112,19 @@ class Plugin(indigo.PluginBase):
         for row in reversed(rows):
             b = row["bank_first"]
             held = int(b.get("minutes_held", 0))
+            # v5.106.0: the FIRST classification and the forecast it was made from,
+            # falling back to the 23:59 pair on rows written before those existed.
+            # The midnight values describe the end of the day, so a day held all
+            # morning and promoted at tea time printed as "no" and read as a day
+            # the hold never touched.
+            _first_small = b.get("first_classified_small")
+            _small = _first_small if _first_small is not None else b.get("classified_small")
+            _fcst  = b.get("first_classified_from_kwh")
+            if _fcst is None:
+                _fcst = b.get("classified_from_kwh", 0.0)
             log(f"[BankFirst] {row.get('date', '?'):<10} "
-                f"{float(b.get('classified_from_kwh', 0.0)):5.1f}  "
-                f"{'yes' if b.get('classified_small') else 'no ':<5} "
+                f"{float(_fcst or 0.0):5.1f}  "
+                f"{('yes' + ('*' if b.get('promoted_local') else '')) if _small else 'no ':<5} "
                 f"{held // 60}h{held % 60:02d}m  "
                 f"{float(b.get('export_withheld_kwh', 0.0)):7.2f}  "
                 f"{float(b.get('peak_soc_pct', 0.0)):6.1f}  "
@@ -10886,6 +11141,12 @@ class Plugin(indigo.PluginBase):
             log(f"[BankFirst] {_clip} clip-boundary minutes across {len(rows)} days — solar "
                 f"was being thrown away with the battery full. Lower the kWh threshold.",
                 level="WARNING")
+        _promoted = [r["date"] for r in rows if r["bank_first"].get("promoted_local")]
+        if _promoted:
+            log(f"[BankFirst] Held then released as the forecast rose on {len(_promoted)} "
+                f"day(s) ({', '.join(_promoted)}) — marked * above. Since v5.106.0 that "
+                f"needs the forecast to clear the threshold by "
+                f"{BANK_FIRST_PROMOTE_MARGIN_KWH:.0f} kWh, not by any amount.")
         return True
 
     def menuShowTariffRates(self):
@@ -10976,7 +11237,8 @@ class Plugin(indigo.PluginBase):
             log(f"[SavingSessions]   {start.strftime('%a %d %b %H:%M')}"
                 f"-{end.strftime('%H:%M')}  "
                 f"{(e.get('direction') or 'UNKNOWN').replace('_', ' ').title():<18} "
-                f"{e.get('reward_per_kwh_points', 0)} pts/kWh  "
+                f"{e.get('reward_per_kwh_points', 0)} pts/kWh "
+                f"(~{_points_to_pence(e.get('reward_per_kwh_points', 0)):.1f}p/kWh)  "
                 f"{'OPTED IN' if e.get('joined') else 'not opted in'}"
                 + (f"  [{e['capacity']}]" if e.get("capacity") else ""))
         refused = self.store.get("saving_sessions_join_refused") or []
@@ -12072,6 +12334,10 @@ class Plugin(indigo.PluginBase):
                             f"inverter's own daily counters on the first read")
                 for _bf_key, _bf_default in (
                     ("bank_first_small_latched",     False),
+                ("bank_first_first_class_kwh",   None),
+                ("bank_first_first_class_small", None),
+                ("bank_first_first_class_local", ""),
+                ("bank_first_promoted_local",    ""),
                     ("bank_first_latch_date",        ""),
                     ("bank_first_blocked_samples",   0),
                     ("bank_first_withheld_kwh",      0.0),
