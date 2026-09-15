@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.106.0)
-# Date:        15-09-2026 09:40
-# Version:     5.106.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.106.1)
+# Date:        15-09-2026 10:15
+# Version:     5.106.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 import copy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ============================================================
@@ -5207,7 +5207,8 @@ class Plugin(indigo.PluginBase):
 
         body = (f"Octopus Weekend Happy Hour: {when}"
                 + (f" ({duration_h:.1f}h)" if duration_h else "")
-                + " — free electricity for the hour.")
+                + " — free electricity for the hour."
+                + self._happy_hour_expiry_note())
 
         if joined:
             enabled = _as_bool(self.pluginPrefs.get("happyHourImport"), False)
@@ -5237,6 +5238,29 @@ class Plugin(indigo.PluginBase):
                     "there if it lets you. Each successful Power Down earns towards one.")
         return (body + f"  Octopus's API reports {tokens} tokens — book it in the app "
                 "and the battery will charge itself free for that hour.")
+
+    @staticmethod
+    def _happy_hour_expiry_note(today=None):
+        """" Use them by X or lose them", while that is still true and not before.
+
+        v5.106.1. Octopus's own Weekend Happy Hours page (read 15-Sep-2026) says the
+        scheme runs "until 1st November" and that you must "use them all by 1st
+        November, or they'll disappear". A banked hour is not banked indefinitely, and
+        a token earned in late October may have nowhere to go — which is worth knowing
+        when the whole point of running a Power Down is the hour it pays for.
+
+        Dated deliberately, so it stops saying itself once the date has passed rather
+        than nagging for ever about a promotion that has ended. THE DATE IS A VENDOR
+        PROMOTION AND WILL ROT: re-read the page rather than trusting this constant
+        past it, and if Octopus extend the scheme this is the one line to change.
+        """
+        end = date(2026, 11, 1)
+        now = today or date.today()
+        if now >= end:
+            return ""       # the scheme has ended, or been extended and nobody looked
+        days = (end - now).days
+        return ("  Use it by 1 November or it is lost"
+                + (f" — {days} day{'' if days == 1 else 's'} left." if days <= 45 else "."))
 
     def _happy_hour_tokens_required(self):
         """How many tokens booking a Happy Hour costs.
@@ -5443,12 +5467,23 @@ class Plugin(indigo.PluginBase):
                 title = ("Octopus Happy Hour booked" if joined
                          else "Octopus Happy Hour available")
             else:
-                # v5.106.0: price it. "85 Octopoints/kWh" reads like a lot and is
-                # about 11p — an eighth of a penny a point, per Octopus's own
-                # Octoplus page. Saying so is the standing plain-English rule
-                # (every number arrives with what it means), and it is also the
-                # difference between this and an Axle dispatch, which pays around
-                # ten times as much and is the thing it gets mistaken for.
+                # v5.106.1 — THE POINTS ARE NOT THE POINT. CliveS, 15-Sep-2026:
+                # "The reason i export at an Octopus Saving Session is it gives me
+                # a 1 hour free token, 2 needed, for an hour of free electricity on
+                # a Saturday or Sunday, the export amount I earn is not the reason
+                # for the export, it is secondary."
+                #
+                # Octopus agree: "if you manage to use less electricity than you'd
+                # normally use in two Power Down sessions, you'll earn one Weekend
+                # Happy Hour" (octopus.energy help article, read 15-Sep-2026). So a
+                # session is worth HALF A FREE HOUR, and the money is change. v5.106.0
+                # led on the pence and closed by comparing it unfavourably with an
+                # Axle event, which is true about the cash and reads as "not worth
+                # bothering with" about the thing that actually matters.
+                #
+                # It also means SUCCEEDING matters more than exporting a lot: a
+                # session that misses the baseline earns no token at all, however
+                # many units went out.
                 bonus_p     = _points_to_pence(points)
                 # getattr, because this poll can run before the first rates fetch has
                 # populated latest_rates_data — and an alert that raises is an alert
@@ -5456,15 +5491,29 @@ class Plugin(indigo.PluginBase):
                 export_p    = _as_float(
                     (getattr(self, "latest_rates_data", None) or {}).get("export_rate_p"),
                     DEFAULT_EXPORT_RATE_P) or DEFAULT_EXPORT_RATE_P
-                total_p     = bonus_p + export_p
+                need     = self._happy_hour_tokens_required()
+                tokens   = self.store.get("happy_hour_tokens")
+                # Only say where he stands if the API actually told us. A guessed
+                # tally about a free hour is worse than none.
+                if tokens is None or need <= 0:
+                    progress = ""
+                elif tokens + 1 >= need:
+                    progress = (f"  Octopus report {tokens} token"
+                                f"{'' if tokens == 1 else 's'}, so getting this one "
+                                f"right should unlock a free hour.")
+                else:
+                    progress = (f"  Octopus report {tokens} token"
+                                f"{'' if tokens == 1 else 's'} and an hour costs "
+                                f"{need}, so this one is a step towards the next.")
                 body = (
                     f"Octopus Saving Session: {when}"
                     + (f" ({duration_h:.1f}h)" if duration_h else "")
-                    + f". Exporting more than usual in that hour earns about "
-                      f"{bonus_p:.0f}p a unit on top of the usual {export_p:.0f}p, "
-                      f"so roughly {total_p:.0f}p a unit. That is worth having but it "
-                      f"is nothing like an Axle event, so the battery is only used "
-                      f"for it once tomorrow is already covered."
+                    + ". Beating your usual use in two of these earns a free hour of "
+                      "electricity at the weekend, which is the real prize — so what "
+                      "matters is winning it, not how much goes out."
+                    + progress
+                    + f" The Octopoints are change on top, about {bonus_p:.0f}p a unit "
+                      f"added to the usual {export_p:.0f}p."
                     + ("" if joined else
                        " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
                        "the battery will not be driven for it.")

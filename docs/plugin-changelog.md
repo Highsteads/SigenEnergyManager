@@ -15,6 +15,42 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.106.1 — 15-09-2026
+
+**THE POINTS ARE NOT THE POINT.** CliveS, the same day v5.106.0 shipped:
+
+> "The reason i export at an Octopus Saving Session is it gives me a 1 hour free token, 2
+> needed, for an hour of free electricity on a Saturday or Sunday, the export amount I earn
+> is not the reason for the export, it is secondary."
+
+Octopus's own help article agrees: *"if you manage to use less electricity than you'd
+normally use in two Power Down sessions, you'll earn one Weekend Happy Hour"* (read
+15-09-2026). So a session is worth **half a free hour**, and the Octopoints are change.
+
+v5.106.0 had corrected a real error — the alert published a raw OctoPoints figure that reads
+like ten times what it is — and then made a second one by treating the corrected number as
+the case for the feature. It closed with "nothing like an Axle event, so the battery is only
+used for it once tomorrow is already covered": true about the cash, and it frames the session
+as barely worth running.
+
+- The alert now leads with the free hour, reports token progress when Octopus supplied a
+  balance (never guessed — `_check_saving_sessions` overwrites the store key from
+  `token_balance` on every fetch, so a seeded store proves nothing), and puts the pence last.
+- The Saving Session decision reason names the token before the rate.
+- **The operative consequence: winning matters more than volume.** A session that misses the
+  baseline earns no token however many kWh went out. Nothing in the dispatch changed here —
+  `saving_session_exportable_kwh` already maximises the export the reserve allows — but the
+  reasoning is now written down where the next reader will find it.
+- New `_happy_hour_expiry_note()`: Octopus run the scheme **until 1 November 2026** and say
+  unused hours "will disappear". Dated, so it counts down inside 45 days and returns "" once
+  the date passes rather than nagging about an ended promotion. **It is a vendor promotion
+  and it will rot — re-read the page rather than trusting the constant past it.**
+
+Also fixed a dead `total_p` local and three f-strings with no placeholders, all introduced by
+v5.106.0 and caught by ruff. 1491 -> 1494 tests.
+
+---
+
 ## v5.106.0 — 15-09-2026
 
 **THE BIAS FEEDBACK LOOP HAD BEEN DEAD SINCE 5-SEP, AND THE CORRECTION WAS SCALING A

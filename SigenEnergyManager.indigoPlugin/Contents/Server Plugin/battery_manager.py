@@ -1057,10 +1057,15 @@ class BatteryManager:
                 import_needed       = balance.import_needed,
             )
             if kwh > 0:
-                # v5.106.0: say what the hour is WORTH. The reason line used to give
-                # a kWh and a reserve and no price at all, so a session could not be
-                # judged after the fact and read, to a human, as though it paid like
-                # the Axle branch above it. One OctoPoint is an eighth of a penny.
+                # v5.106.1: WHY this branch exists, then what it pays. CliveS,
+                # 15-Sep-2026: the export is for the Weekend Happy Hour token — two
+                # successful Power Downs unlock one hour of free electricity — and
+                # "the export amount I earn is not the reason for the export, it is
+                # secondary". Octopus's own help article says the same. The cash is
+                # still logged, because it is the part that can be checked against a
+                # bill, but it is not the case for running the session.
+                #
+                # One OctoPoint is an eighth of a penny (octopus.energy/octoplus/).
                 bonus_p = snapshot.saving_session_points_kwh / OCTOPOINTS_PER_PENNY
                 rate_str = (
                     f"about {bonus_p + snapshot.export_rate_p:.0f}p/kWh "
@@ -1071,7 +1076,8 @@ class BatteryManager:
                 return Decision(
                     action = ACTION_SAVING_SESSION,
                     reason = (f"Octopus Saving Session — exporting up to {kwh:.1f} kWh "
-                              f"above baseline at {rate_str} "
+                              f"above baseline to win the session and its Happy Hour "
+                              f"token; pays {rate_str} "
                               f"(dawn projection {balance.battery_at_dawn_kwh:.1f} kWh "
                               f"vs {reserve_pct:.0f}% reserve"
                               + (f", holding {snapshot.vpp_today_kwh:.1f} kWh for Axle"

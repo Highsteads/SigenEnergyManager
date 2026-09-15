@@ -2430,6 +2430,9 @@ class TestCheckSavingSessions(unittest.TestCase):
         # it with the checkbox absent, which is what proves the default-off path is
         # genuinely inert rather than merely untested.
         _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+        # Real too: the alert reads the Happy Hour token cost to say where this
+        # session leaves you, and a stubbed constant would test the stub.
+        _happy_hour_tokens_required = plugin.Plugin._happy_hour_tokens_required
 
     def _check(self, stub):
         plugin.Plugin._check_saving_sessions(stub)
@@ -2501,32 +2504,83 @@ class TestCheckSavingSessions(unittest.TestCase):
         self.assertEqual(len(stub.sent), 2)
         self.assertEqual(stub.saved, 1)   # one persist covers both, not one each
 
-    def test_message_prices_the_session_in_pence_not_octopoints(self):
-        """v5.106.0. The alert must say what the hour is WORTH, in money.
+    def test_happy_hour_expiry_note_counts_down_and_then_stops(self):
+        """v5.106.1. Octopus: use them by 1 November or they disappear.
 
-        It used to publish the raw OctoPoints figure ("120 Octopoints/kWh"),
-        which reads to a person like a large number and is 15p — one point is an
-        eighth of a penny, per octopus.energy/octoplus/. That framing is how a
-        Saving Session gets taken for an Axle dispatch, which pays roughly ten
-        times as much. Standing rule: every number arrives with what it means.
+        Dated on purpose — a promotion deadline that keeps announcing itself after
+        the promotion has ended is worse than silent, and this one WILL rot.
+        """
+        from datetime import date as _d
+        f = plugin.Plugin._happy_hour_expiry_note
+        self.assertIn("1 November", f(today=_d(2026, 10, 25)))
+        self.assertIn("7 days left", f(today=_d(2026, 10, 25)))
+        self.assertIn("1 day left", f(today=_d(2026, 10, 31)))   # singular
+        self.assertEqual(f(today=_d(2026, 11, 1)), "")           # the day it ends
+        self.assertEqual(f(today=_d(2027, 1, 1)), "")
+        # Far out, the deadline is named but not counted down to.
+        far = f(today=_d(2026, 6, 1))
+        self.assertIn("1 November", far)
+        self.assertNotIn("days left", far)
+
+    def test_message_leads_with_the_free_hour_not_the_money(self):
+        """v5.106.1. CliveS, 15-Sep-2026, on why he runs these at all:
+
+        "The reason i export at an Octopus Saving Session is it gives me a 1 hour
+        free token, 2 needed, for an hour of free electricity on a Saturday or
+        Sunday, the export amount I earn is not the reason for the export, it is
+        secondary."
+
+        Octopus agree — two successful Power Downs unlock one Weekend Happy Hour.
+        v5.106.0 led on the pence and closed by comparing the session unfavourably
+        with an Axle event: true about the cash, and it reads as "not worth
+        bothering with" about the thing that is actually the point.
         """
         stub = self._Stub({"has_joined": True,
                             "events": [self._event("1", self._future(), points=120)]})
         self._check(stub)
         body = stub.sent[0][1]
-        self.assertIn("15p a unit", body)         # 120 / 8
-        self.assertIn("on top of", body)          # the correction Phase 1 exists for
-        self.assertNotIn("Octopoints", body)      # never the raw points on their own
-        self.assertNotIn("120", body)
+        self.assertIn("free hour", body)
+        self.assertNotIn("Axle", body)
+        # The free hour must be named before the money, not tacked on after it.
+        self.assertLess(body.index("free hour"), body.index("Octopoints are change"))
 
-    def test_message_names_the_export_rate_it_is_added_to(self):
-        """A bonus is meaningless without the rate it tops up."""
+    def test_message_prices_the_bonus_in_pence_not_octopoints(self):
+        """Still true, just no longer the headline. One point is an eighth of a penny."""
         stub = self._Stub({"has_joined": True,
                             "events": [self._event("1", self._future(), points=120)]})
         self._check(stub)
         body = stub.sent[0][1]
-        self.assertIn("12p", body)                # the default export rate
-        self.assertIn("27p a unit", body)         # 15 + 12, the figure that decides it
+        self.assertIn("15p a unit", body)         # 120 / 8
+        self.assertIn("12p", body)                # the export rate it is added to
+        self.assertNotIn("120", body)             # never the raw points figure
+
+    def test_token_progress_is_reported_only_when_octopus_supplied_it(self):
+        """A guessed tally about a free hour is worse than none at all.
+
+        The balance comes from the API payload — `_check_saving_sessions` writes the
+        store key from `token_balance` on every fetch — so a test that seeds only the
+        store proves nothing about the live path.
+        """
+        ev = [self._event("1", self._future(), points=120)]
+        quiet = self._Stub({"has_joined": True, "events": ev},
+                           store={"saving_sessions_notified": []})
+        self._check(quiet)
+        self.assertNotIn("token", quiet.sent[0][1])
+
+        known = self._Stub({"has_joined": True, "events": ev, "token_balance": 1},
+                           store={"saving_sessions_notified": []})
+        self._check(known)
+        self.assertIn("1 token", known.sent[0][1])
+        self.assertIn("unlock a free hour", known.sent[0][1])   # 1 + this one >= 2
+
+    def test_token_progress_says_step_when_the_pair_is_not_yet_complete(self):
+        known = self._Stub({"has_joined": True, "token_balance": 0,
+                            "events": [self._event("1", self._future(), points=120)]},
+                           store={"saving_sessions_notified": []})
+        self._check(known)
+        body = known.sent[0][1]
+        self.assertIn("0 tokens", body)
+        self.assertIn("step towards the next", body)
 
 
 class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
