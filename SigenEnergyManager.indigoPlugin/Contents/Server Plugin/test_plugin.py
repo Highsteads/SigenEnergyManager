@@ -7123,5 +7123,122 @@ class TestWarnOnceLatchesSurviveARestart(unittest.TestCase):
             self.assertEqual(p.store[k], set())
 
 
+
+# ======================================================================
+# octopus_sessions.upcoming — the DISPLAY list (15-Sep-2026)
+# ======================================================================
+# `windows` is what the manager drives from, so it is filtered to JOINED
+# turn-downs and happy hours. That makes it unusable for telling a human a
+# session exists and has not been opted into — the session is simply absent,
+# and absence reads as all-clear. `upcoming` is the unfiltered companion.
+
+class TestUpcomingSessionsForDisplay(unittest.TestCase):
+
+    class _Stub:
+        def __init__(self, octopus_data, store=None, prefs=None):
+            self.octopus = MagicMock()
+            self.octopus.get_saving_sessions.return_value = octopus_data
+            self.store       = store if store is not None else {"saving_sessions_notified": []}
+            self.pluginPrefs = prefs if prefs is not None else {}
+            self.logger      = MagicMock()
+            self.sent        = []
+            self.saved       = 0
+
+        def _send_pushover(self, title, body, priority="0"):
+            self.sent.append((title, body, priority))
+
+        def _save_accumulators(self):
+            self.saved += 1
+
+        _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+
+    def _event(self, direction="TURN_DOWN", joined=True, hours=6, event_id="1",
+               points=72, capacity=None):
+        start = datetime.now(timezone.utc) + timedelta(hours=hours)
+        return {"id": event_id, "code": f"E{event_id}", "direction": direction,
+                "joined": joined, "capacity": capacity,
+                "reward_per_kwh_points": points,
+                "start_at": start, "end_at": start + timedelta(hours=1)}
+
+    def _run(self, events):
+        # Mark every event as already announced so the alert loop skips it. These
+        # tests are about the CACHE the page reads, and the alert path has its own
+        # class above — entangling the two would make a Happy Hour test fail over
+        # the wording of a Pushover.
+        store = {"saving_sessions_notified": [str(e["id"]) for e in events]}
+        stub = self._Stub({"has_joined": True, "events": events}, store=store)
+        plugin.Plugin._check_saving_sessions(stub)
+        return stub
+
+    def _ids(self, stub, key):
+        return [str(w.get("id")) for w in (stub.store.get(key) or [])]
+
+    # ---- the whole point of the list ---------------------------------
+    def test_an_unjoined_session_is_in_upcoming_but_not_in_windows(self):
+        stub = self._run([self._event(joined=False)])
+        self.assertIn("1", self._ids(stub, "saving_sessions_upcoming"))
+        self.assertNotIn("1", self._ids(stub, "saving_sessions_windows"))
+
+    def test_a_turn_up_is_in_upcoming_but_not_in_windows(self):
+        stub = self._run([self._event(direction="TURN_UP")])
+        self.assertIn("1", self._ids(stub, "saving_sessions_upcoming"))
+        self.assertNotIn("1", self._ids(stub, "saving_sessions_windows"))
+
+    def test_a_joined_turn_down_is_in_both(self):
+        stub = self._run([self._event()])
+        self.assertIn("1", self._ids(stub, "saving_sessions_upcoming"))
+        self.assertIn("1", self._ids(stub, "saving_sessions_windows"))
+
+    # ---- what each entry carries -------------------------------------
+    def test_the_joined_flag_is_carried_and_is_a_real_bool(self):
+        for joined in (True, False):
+            with self.subTest(joined=joined):
+                stub = self._run([self._event(joined=joined)])
+                row = stub.store["saving_sessions_upcoming"][0]
+                self.assertIs(row["joined"], joined)
+
+    def test_direction_points_and_capacity_are_carried(self):
+        stub = self._run([self._event(direction="WEEKEND_HAPPY_HOUR",
+                                      points=0, capacity="FULL")])
+        row = stub.store["saving_sessions_upcoming"][0]
+        self.assertEqual(row["direction"], "WEEKEND_HAPPY_HOUR")
+        self.assertEqual(row["capacity"], "FULL")
+        self.assertEqual(row["points"], 0)
+
+    def test_start_and_end_are_iso_strings_a_browser_can_parse(self):
+        stub = self._run([self._event()])
+        row = stub.store["saving_sessions_upcoming"][0]
+        for key in ("start", "end"):
+            self.assertIsInstance(row[key], str)
+            # Must survive a round trip, or the page renders "Invalid Date".
+            self.assertIsNotNone(datetime.fromisoformat(row[key]).tzinfo)
+
+    # ---- what must NOT be in it --------------------------------------
+    def test_a_finished_session_is_dropped(self):
+        stub = self._run([self._event(hours=-6)])
+        self.assertEqual(stub.store["saving_sessions_upcoming"], [])
+
+    def test_a_live_session_is_kept(self):
+        # Started half an hour ago, ends in half an hour. This is the case the
+        # banner most needs, so an end-based filter is required — a start-based
+        # one would drop it the moment it began.
+        stub = self._run([self._event(hours=-0.5)])
+        self.assertEqual(len(stub.store["saving_sessions_upcoming"]), 1)
+
+    def test_a_session_beyond_the_horizon_is_dropped(self):
+        stub = self._run([self._event(hours=24 * 30)])
+        self.assertEqual(stub.store["saving_sessions_upcoming"], [])
+
+    def test_a_happy_hour_a_few_days_out_still_shows(self):
+        # The manager's horizon is 2 days; this list runs to 8 so a weekend slot
+        # is visible when it is announced rather than on the morning.
+        stub = self._run([self._event(direction="WEEKEND_HAPPY_HOUR", hours=24 * 4)])
+        self.assertEqual(len(stub.store["saving_sessions_upcoming"]), 1)
+
+    def test_no_events_gives_an_empty_list_not_a_missing_key(self):
+        stub = self._run([])
+        self.assertEqual(stub.store["saving_sessions_upcoming"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

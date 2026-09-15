@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.107.0)
-# Date:        15-09-2026 11:05
-# Version:     5.107.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.108.0)
+# Date:        15-09-2026 14:40
+# Version:     5.108.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1350,6 +1350,12 @@ class Plugin(indigo.PluginBase):
         self.store["last_saving_sessions"]      = 0.0   # time.time() of last poll
         self.store["saving_sessions_notified"]  = []    # event ids already Pushover'd
         self.store["saving_sessions_windows"]   = []    # joined windows, cached for the manager
+        # EVERY announced session, joined or not, for DISPLAY only. The windows
+        # cache above is what the manager drives from, so it is deliberately
+        # filtered to joined turn-downs and happy hours — which makes it useless
+        # for telling anyone that a session exists and has NOT been opted into,
+        # the one case a human most needs to see. Nothing drives off this list.
+        self.store["saving_sessions_upcoming"]  = []
         # Event codes Octopus PERMANENTLY refused to let us join (full, ineligible).
         # A transient failure is deliberately NOT recorded, so it retries next poll;
         # only a refusal retrying cannot fix earns a place here, which is what stops
@@ -2296,6 +2302,12 @@ class Plugin(indigo.PluginBase):
                     # nothing at all.
                     "windows":    store.get("saving_sessions_windows") or [],
                     "next_start": store.get("saving_sessions_next_start"),
+                    # Everything announced, joined or not, for display. A reader
+                    # that shows only `windows` cannot say "there is a session
+                    # tonight and you are NOT in it", because an un-joined
+                    # session is absent from that list entirely — the absent-state
+                    # trap, where silence reads as all-clear.
+                    "upcoming":   store.get("saving_sessions_upcoming") or [],
                 },
                 "hourly_forecast": hourly,
             }
@@ -5728,6 +5740,24 @@ class Plugin(indigo.PluginBase):
             # filters to the one it drives. One cache means the freshness logic
             # cannot diverge between the two features.
             and e.get("direction") in (SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR)
+        ]
+
+        # The DISPLAY list: no joined filter and no direction filter, because a
+        # session you are not in and a Power Up you cannot help with are both
+        # things a person needs told about. A longer horizon than the manager's
+        # two days so a weekend Happy Hour shows when it is announced.
+        display_horizon = now_utc + timedelta(days=8)
+        self.store["saving_sessions_upcoming"] = [
+            {"id":        e.get("id"),
+             "start":     e["start_at"].isoformat(),
+             "end":       e["end_at"].isoformat(),
+             "points":    e.get("reward_per_kwh_points", 0),
+             "direction": e.get("direction"),
+             "joined":    bool(e.get("joined")),
+             "capacity":  e.get("capacity")}
+            for e in (data.get("events") or [])
+            if e.get("start_at") and e.get("end_at") and e["end_at"] > now_utc
+            and e["start_at"] < display_horizon
         ]
 
         if new_ids:
