@@ -279,6 +279,12 @@ It only ever joins a Power Down, never a Power Up (which wants you to use MORE) 
     <Field id="label_happyHourTokensRequired_info" type="label">
         <Label>What Octopus charges for one booking. It is not exposed by their API and cannot be worked out from your history, so it lives here — if they change it, change this rather than waiting for a plugin release. Set 0 to stop the alerts mentioning tokens at all.</Label>
     </Field>
+    <Field id="happyHourUsableHours" type="textfield" defaultValue="">
+        <Label>Happy Hours you expect to use (blank = all of them):</Label>
+    </Field>
+    <Field id="label_happyHourUsableHours_info" type="label">
+        <Label>Stops the plugin opting you in to a session whose token you could never spend. A Power Down is worth doing for the free hour it pays towards, so once you hold enough tokens for every hour you will realistically use, another session only costs you battery and sells units at a loss. The plugin already knows how many hours COULD be booked before the scheme ends, counting two per remaining weekend, and will never let this number exceed that. But that ceiling is generous and will rarely stop anything, so if you only intend to spend an hour when solar is poor, put the number you actually expect to use here. It also refuses any session too late in October for Octopus to score it in time to book a weekend. Leave it blank and only the calendar limits apply.</Label>
+    </Field>
     <Field id="label_happyhour_info" type="label" fontSize="small">
         <Label>A Happy Hour is an hour of FREE electricity you book on the Octopus site, earned by two successful Power Down sessions. With this ticked, the battery grid-charges at full inverter power for that hour so the free energy is banked rather than wasted.
 

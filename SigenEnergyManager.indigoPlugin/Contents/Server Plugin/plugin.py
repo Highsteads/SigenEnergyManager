@@ -8,9 +8,9 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.106.1)
-# Date:        15-09-2026 10:15
-# Version:     5.106.1
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.107.0)
+# Date:        15-09-2026 11:05
+# Version:     5.107.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -161,6 +161,32 @@ from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIF
                               GAS_KWH_PER_M3)
 from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
 from octopus_api      import octopoints_to_pence as _points_to_pence
+
+# ── Weekend Happy Hour scheme (v5.107.0) ─────────────────────────────────────
+# All three are VENDOR FACTS read off Octopus's own pages on 15-09-2026 and all
+# three will rot. Re-read the pages rather than trusting these; they are
+# constants and not prefs because a change on Octopus's side is a release, not
+# something an owner should have to discover and type in.
+#
+#   octopus.energy/saving-sessions/weekend-happy-hours/
+#   octopus.energy/help-and-faqs/articles/how-to-earn-weekend-happy-hours/
+#
+# The end date is EXCLUSIVE here even though Octopus write "use them all by 1st
+# November", and 1 November 2026 is itself a Sunday. The wording is ambiguous
+# ("until 1st November" elsewhere on the same site) and the two readings fail in
+# opposite directions: assume it counts and be wrong, and a token is earned that
+# can never be spent — which is the exact thing this guard exists to prevent.
+# Assume it does not and be wrong, and the worst case is one cautious refusal.
+HAPPY_HOUR_SCHEME_END        = date(2026, 11, 1)
+# "You can use up to two per weekend."
+HAPPY_HOUR_MAX_PER_WEEKEND   = 2
+# "Results from your Power Down sessions will take about three working days to
+# update, after which they'll count towards your Weekend Happy Hour tally." Three
+# working days is five calendar days in the worst case (a Thursday session lands
+# the following Tuesday), and a booking also has to be made before the weekend —
+# "bookings open towards the end of the week" — so this is deliberately the
+# pessimistic reading. A token that arrives too late to book is not a token.
+HAPPY_HOUR_SETTLEMENT_DAYS   = 5
 # The ONE Europe/London implementation. Imported, never re-declared: copies are
 # what put two sites an hour out in the first place, and there is no version of
 # "just this once" that does not end up as copy number six.
@@ -1329,6 +1355,11 @@ class Plugin(indigo.PluginBase):
         # only a refusal retrying cannot fix earns a place here, which is what stops
         # an hourly re-attempt for the life of the plugin.
         self.store["saving_sessions_join_refused"] = []
+        # Warn-once latch for the token-budget refusal, so a session we decline for
+        # the whole week says so once rather than hourly. Not persisted on purpose:
+        # it is chatter suppression, not state, and one repeat after a restart is a
+        # fair price for not carrying another key.
+        self.store["saving_sessions_budget_logged"] = ""
         # Happy Hour token balance, reported verbatim by the API. None means NOT
         # REPORTED, which is deliberately distinct from 0 — a missing balance must
         # never be shown as "you have none".
@@ -5240,6 +5271,103 @@ class Plugin(indigo.PluginBase):
                 "and the battery will charge itself free for that hour.")
 
     @staticmethod
+    def happy_hour_slots_left(from_day,
+                              scheme_end=None,
+                              max_per_weekend=None):
+        """How many Happy Hours could still be USED, counting from `from_day` on.
+
+        v5.107.0. Pure and static so it can be tested without a plugin, an Indigo
+        or a clock. Counts weekend DAYS in [from_day, scheme_end), groups them into
+        distinct weekends, and allows `max_per_weekend` in each.
+
+        A Saturday and the Sunday after it are ONE weekend for this purpose, and the
+        grouping is by the Saturday's date because that says so plainly. (An ISO
+        week number would in fact give the same answer — ISO weeks run Monday to
+        Sunday, so a Saturday and the next day always share one. A comment here
+        previously claimed otherwise; a mutation swapping the two proved it wrong,
+        which is the sort of thing mutation testing is actually for.)
+        """
+        end   = scheme_end or HAPPY_HOUR_SCHEME_END
+        per   = HAPPY_HOUR_MAX_PER_WEEKEND if max_per_weekend is None else max_per_weekend
+        # Belt and braces: the `while day < end` below already yields 0 for a
+        # from_day at or past the end, so this is a cheap exit and not a
+        # separate rule. A mutation relaxing it to `>` changes nothing.
+        if from_day >= end or per <= 0:
+            return 0
+        weekends = set()
+        day = from_day
+        while day < end:
+            if day.weekday() >= 5:                       # Saturday or Sunday
+                # Name the weekend by its Saturday, so Sat and the next Sun agree.
+                weekends.add(day - timedelta(days=day.weekday() - 5))
+            day += timedelta(days=1)
+        return len(weekends) * per
+
+    def _happy_hour_token_verdict(self, session_start_local, now_local=None):
+        """(worth_joining, reason) for a session starting on `session_start_local`.
+
+        v5.107.0, and the reason CliveS asked for it, 15-09-2026:
+
+            "I intend to leave the free hour slots until we have a low solar day as
+             topping up when solar is good defeats the object, it takes 2 tokens for
+             1 happy hour and these need to be used by 1 november so can you make
+             sure i do not have a saving session if the number of tokens would be
+             too many to use before the 1 november"
+
+        A token that cannot become an hour he will use is not a benefit, and the
+        session that earns it spends battery and exports units at a net loss. So the
+        guard is on JOINING: refuse before committing the account, because the join
+        is one-way.
+
+        Three ways a token can be worthless, checked in order of certainty:
+
+        1. The scheme has ended. Nothing to weigh.
+        2. This session settles too late to reach a remaining weekend. Octopus take
+           about three working days to score a session and bookings open late in the
+           week, so a session in the last days of October earns nothing usable.
+        3. He already holds enough tokens for every hour he expects to use.
+
+        (3) is the one that needs his judgement rather than arithmetic. The slot
+        COUNT is derivable — seven weekends at two hours each is fourteen — but he
+        has said he will only spend an hour on a low-solar weekend day, and how many
+        of those there will be between now and November is weather, not a rule. So
+        `happyHourUsableHours` lets him state the realistic figure, and the derived
+        maximum is the default, which makes this leg inert until he sets one. It is
+        capped at the derived maximum either way: he cannot use more hours than
+        exist, whatever he types.
+        """
+        today  = now_local or date.today()
+        need   = self._happy_hour_tokens_required()
+        tokens = self.store.get("happy_hour_tokens")
+
+        if today >= HAPPY_HOUR_SCHEME_END:
+            return False, ("the Weekend Happy Hour scheme ended on "
+                           f"{HAPPY_HOUR_SCHEME_END.strftime('%-d %B %Y')}, so a token "
+                           "earned now buys nothing")
+
+        credited = session_start_local + timedelta(days=HAPPY_HOUR_SETTLEMENT_DAYS)
+        if self.happy_hour_slots_left(credited) <= 0:
+            return False, (f"Octopus take about {HAPPY_HOUR_SETTLEMENT_DAYS} days to score "
+                           "a session, so this one's token would arrive too late to book "
+                           "a weekend hour before the scheme ends")
+
+        # A token cost of 0 means the accrual rule is switched off; there is then no
+        # arithmetic to do and no grounds to refuse.
+        if need <= 0 or tokens is None:
+            return True, ""
+
+        derived = self.happy_hour_slots_left(today)
+        stated  = _as_float(self.pluginPrefs.get("happyHourUsableHours"), 0.0)
+        budget  = int(min(derived, stated)) if stated > 0 else derived
+        if tokens >= budget * need:
+            hours_held = int(tokens // need)
+            return False, (f"you already hold {tokens} token{'' if tokens == 1 else 's'} "
+                           f"({hours_held} free hour{'' if hours_held == 1 else 's'}) and "
+                           f"only {budget} hour{'' if budget == 1 else 's'} can still be "
+                           "used before the scheme ends, so another one would be wasted")
+        return True, ""
+
+    @staticmethod
     def _happy_hour_expiry_note(today=None):
         """" Use them by X or lose them", while that is still true and not before.
 
@@ -5326,6 +5454,28 @@ class Plugin(indigo.PluginBase):
                 log(f"[SavingSessions] {code} is full, so it cannot be joined.",
                     level="WARNING")
                 refused.add(str(code))
+                continue
+
+            # v5.107.0: would the token this earns ever be usable? A Power Down is
+            # run for the Weekend Happy Hour it pays towards, and an hour that
+            # cannot be spent before the scheme ends is worth nothing — while the
+            # session itself spends battery and sells units at a net loss. Checked
+            # BEFORE the join because the join is one-way.
+            #
+            # Deliberately NOT added to `refused`: that set is for permanent
+            # refusals by Octopus, and this verdict changes as tokens are spent and
+            # as the calendar moves. Re-asked every poll instead.
+            _tz    = _london_tz()
+            _start = (start_at.astimezone(_tz) if _tz else start_at).date()
+            # `now_utc` is the caller's clock, already passed in. Reading date.today()
+            # here instead would make every test of this guard depend on the real
+            # calendar and start failing of its own accord on 1 November 2026.
+            _today = (now_utc.astimezone(_tz) if _tz else now_utc).date()
+            _worth, _why = self._happy_hour_token_verdict(_start, now_local=_today)
+            if not _worth:
+                if self.store.get("saving_sessions_budget_logged") != str(code):
+                    self.store["saving_sessions_budget_logged"] = str(code)
+                    log(f"[SavingSessions] Not joining {code} — {_why}.")
                 continue
 
             try:
@@ -5493,6 +5643,15 @@ class Plugin(indigo.PluginBase):
                     DEFAULT_EXPORT_RATE_P) or DEFAULT_EXPORT_RATE_P
                 need     = self._happy_hour_tokens_required()
                 tokens   = self.store.get("happy_hour_tokens")
+                # Only meaningful for a turn-down we are not already in, and only
+                # when auto-join is armed: if he joins these by hand, the decision
+                # is his and the plugin has no business calling it a bad one.
+                skip_why = ""
+                if (turn_down and not joined
+                        and _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False)):
+                    _sd = (start_local.date() if hasattr(start_local, "date") else start_local)
+                    _ok, _why = self._happy_hour_token_verdict(_sd)
+                    skip_why = "" if _ok else _why
                 # Only say where he stands if the API actually told us. A guessed
                 # tally about a free hour is worse than none.
                 if tokens is None or need <= 0:
@@ -5514,9 +5673,15 @@ class Plugin(indigo.PluginBase):
                     + progress
                     + f" The Octopoints are change on top, about {bonus_p:.0f}p a unit "
                       f"added to the usual {export_p:.0f}p."
+                    # v5.107.0: do not tell him to go and join something the plugin
+                    # has just decided is not worth joining. The verdict is pure and
+                    # cheap, so it is re-asked here rather than carried in state, and
+                    # the two can therefore never disagree.
                     + ("" if joined else
-                       " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
-                       "the battery will not be driven for it.")
+                       (f"  Not worth opting in to: {skip_why}."
+                        if skip_why else
+                        " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
+                        "the battery will not be driven for it."))
                     + ("" if turn_down else
                        f"  This is a {direction.replace('_', ' ').title()} session, not a "
                        "turn-down — the battery is NOT driven for it. A Power Up wants you "

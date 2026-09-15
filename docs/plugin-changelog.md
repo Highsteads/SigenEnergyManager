@@ -15,6 +15,89 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.107.0 — 15-09-2026
+
+**DO NOT EARN A TOKEN THAT CANNOT BECOME AN HOUR HE WILL USE.** CliveS:
+
+> "I intend to leave the free hour slots until we have a low solar day as topping up when
+> solar is good defeats the object, it takes 2 tokens for 1 happy hour and these need to be
+> used by 1 november so can you make sure i do not have a saving session if the number of
+> tokens would be too many to use before the 1 november"
+
+A Power Down is run for the Weekend Happy Hour it pays towards (v5.106.1). Octopus end the
+scheme on **1 November 2026** and unused hours are lost, so past a certain point another
+session earns a worthless token while spending battery and selling units at a net loss.
+
+### The guard
+
+`_happy_hour_token_verdict(session_start, now_local)` returns `(worth, reason)`, checked in
+`_auto_join_saving_sessions` **before** the join, because the join is one-way. Three legs, in
+order of certainty:
+
+1. **The scheme has ended.** Nothing to weigh.
+2. **This session settles too late.** Octopus take about three working days to score a
+   session and bookings close before the weekend, so `HAPPY_HOUR_SETTLEMENT_DAYS = 5`
+   (calendar, the pessimistic reading) is added to the start and the result must still reach
+   a weekend inside the scheme.
+3. **He already holds enough tokens.** `happy_hour_slots_left(day)` counts weekend days in
+   `[day, end)`, groups them by their Saturday and allows `HAPPY_HOUR_MAX_PER_WEEKEND = 2`.
+
+Leg 3 needs his judgement, not arithmetic. The derived ceiling from 15-Sep is **7 weekends x
+2 = 14 hours**, which will never bind, and he will only spend an hour on a low-solar weekend
+day — how many of those there will be is weather. So `happyHourUsableHours` states the
+realistic figure and is **capped at the derived maximum**, whatever is typed. Blank leaves
+only the calendar legs active, so the feature is inert until he opts into it.
+
+`HAPPY_HOUR_SCHEME_END` is **exclusive**, though 1 November 2026 is itself a Sunday and
+Octopus write "use them all by 1st November". The wording is ambiguous and the two readings
+fail in opposite directions: assume it counts and be wrong, and a token is earned that can
+never be spent — the exact thing this exists to prevent. Assume it does not and the worst
+case is one cautious refusal.
+
+A budget refusal is **never** added to `saving_sessions_join_refused`: that set is for
+Octopus refusing permanently, whereas this verdict changes as tokens are spent and as the
+calendar moves. It is re-asked every poll, with a warn-once latch so a declined session says
+so once rather than hourly.
+
+### The alert had to be taught to agree with it
+
+The alert loop and the join loop are separate, so the same Pushover would have announced a
+session the plugin had just declined AND told him to opt in by hand. It now reports the
+refusal instead. The verdict is pure, so it is re-asked rather than carried in state and the
+two cannot drift apart. **A session joined by hand with auto-join off is never second-guessed
+— that decision is his.**
+
+### Mutation testing, and what it actually found
+
+Six deliberate breakages. Three killed, and the three survivors were the useful part:
+
+- **Replacing the entire guard call with `(True, "")` survived.** The budget tests exercised
+  the helper directly and nothing asserted the join ever asks it — testing the logic is not
+  testing the dispatched path. Three wiring tests added; the mutation now fails.
+- Relaxing the `from_day >= end` early return to `>` survived, and is **equivalent** — the
+  `while day < end` loop already returns 0. Noted in place so the next reader does not think
+  it load-bearing.
+- Swapping the Saturday grouping for ISO weeks survived, and is **also equivalent**: ISO
+  weeks run Monday to Sunday, so a Saturday and the next day always share one. The comment
+  justifying the Saturday anchor claimed otherwise and **was simply wrong** — corrected.
+
+### Also
+
+`TestAutoJoinSavingSessions` was anchored to `datetime.now()`. Since the join now consults a
+real calendar deadline, that suite would have begun failing by itself on 1 November 2026 —
+every event "in six hours" past the scheme end, every join correctly refused, nothing to do
+with the code under test. It runs on a fixed `NOW` of 15-09-2026, and the auto-join derives
+the local day from the `now_utc` it was already given rather than reading the clock itself.
+
+Also: aliasing a `@staticmethod` into a test stub as a bare class attribute rebinds it as an
+instance method, so the stub arrived as the first positional argument and failed as a
+TypeError on a date comparison that said nothing about the cause. `staticmethod()` round the
+alias.
+
+1494 -> 1511 tests.
+
+---
+
 ## v5.106.1 — 15-09-2026
 
 **THE POINTS ARE NOT THE POINT.** CliveS, the same day v5.106.0 shipped:

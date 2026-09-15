@@ -2433,6 +2433,14 @@ class TestCheckSavingSessions(unittest.TestCase):
         # Real too: the alert reads the Happy Hour token cost to say where this
         # session leaves you, and a stubbed constant would test the stub.
         _happy_hour_tokens_required = plugin.Plugin._happy_hour_tokens_required
+        # Real too, and this one decides whether the account is committed at all —
+        # a stub here would mean every auto-join test ran without the guard.
+        _happy_hour_token_verdict = plugin.Plugin._happy_hour_token_verdict
+        # staticmethod() is required: aliasing a @staticmethod as a bare class
+        # attribute rebinds it as an INSTANCE method, so the stub arrives as the
+        # first positional argument. It fails as a TypeError on a date compare,
+        # which says nothing at all about the cause.
+        happy_hour_slots_left     = staticmethod(plugin.Plugin.happy_hour_slots_left)
 
     def _check(self, stub):
         plugin.Plugin._check_saving_sessions(stub)
@@ -2521,6 +2529,36 @@ class TestCheckSavingSessions(unittest.TestCase):
         far = f(today=_d(2026, 6, 1))
         self.assertIn("1 November", far)
         self.assertNotIn("days left", far)
+
+    def test_the_alert_does_not_contradict_a_budget_refusal(self):
+        """v5.107.0. If the plugin declined to join, do not tell him to go and join.
+
+        The alert loop and the join loop are separate, so without this the same
+        Pushover would announce a session the plugin had just decided was worthless
+        AND instruct him to opt in to it by hand.
+        """
+        ev = self._event("1", self._future(), points=120)
+        ev["direction"] = "TURN_DOWN"
+        stub = self._Stub({"has_joined": True, "token_balance": 4, "events": [ev]},
+                          prefs={"savingSessionAutoJoin": True,
+                                 "happyHourUsableHours": "2"})
+        stub.octopus.join_saving_session_event.return_value = {
+            "ok": False, "already": False, "permanent": False, "reason": "unused"}
+        self._check(stub)
+        body = stub.sent[0][1]
+        self.assertIn("Not worth opting in to", body)
+        self.assertNotIn("join it in the Octopus app", body)
+
+    def test_a_hand_joined_session_is_never_second_guessed(self):
+        """With auto-join OFF the decision is his, so the plugin keeps its opinion."""
+        ev = self._event("1", self._future(), points=120)
+        ev["direction"] = "TURN_DOWN"
+        stub = self._Stub({"has_joined": True, "token_balance": 4, "events": [ev]},
+                          prefs={"happyHourUsableHours": "2"})
+        self._check(stub)
+        body = stub.sent[0][1]
+        self.assertNotIn("Not worth opting in to", body)
+        self.assertIn("join it in the Octopus app", body)
 
     def test_message_leads_with_the_free_hour_not_the_money(self):
         """v5.106.1. CliveS, 15-Sep-2026, on why he runs these at all:
@@ -6391,11 +6429,141 @@ class TestSavingSessionClaimsTheDriverState(unittest.TestCase):
 # WHICH events may be joined are the load-bearing part of this feature, and
 # every one of them is asserted here from both sides.
 
+class TestHappyHourTokenBudget(unittest.TestCase):
+    """v5.107.0 — do not earn a token that cannot become an hour he will use.
+
+    CliveS, 15-09-2026: "I intend to leave the free hour slots until we have a low
+    solar day as topping up when solar is good defeats the object, it takes 2 tokens
+    for 1 happy hour and these need to be used by 1 november so can you make sure i
+    do not have a saving session if the number of tokens would be too many to use
+    before the 1 november"
+
+    Every date here is explicit. The scheme's end is a real calendar fact and a test
+    that reads the clock would change its own verdict as the deadline approached.
+    """
+
+    from datetime import date as _date
+
+    def _plugin(self, tokens=None, prefs=None):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.store = {"happy_hour_tokens": tokens}
+        p.pluginPrefs = prefs or {}
+        p.logger = MagicMock()
+        return p
+
+    # ── the slot count ─────────────────────────────────────────────────────
+    def test_slots_counts_two_per_remaining_weekend(self):
+        # Tue 15 Sep 2026 -> weekends of 19/20, 26/27 Sep, 3/4, 10/11, 17/18,
+        # 24/25 Oct and Sat 31 Oct = 7 weekends, 2 hours each.
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 9, 15)), 14)
+
+    def test_a_saturday_and_the_sunday_after_it_are_one_weekend(self):
+        # Sat 31 Oct and Sun 1 Nov must never count as two, and 1 Nov is excluded
+        # anyway. From Fri 30 Oct only that Saturday remains: one weekend, 2 hours.
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 10, 30)), 2)
+
+    def test_the_end_date_is_exclusive(self):
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 11, 1)), 0)
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 12, 1)), 0)
+
+    # ── the verdict ────────────────────────────────────────────────────────
+    def test_a_session_is_worth_joining_with_room_to_spare(self):
+        p = self._plugin(tokens=3)
+        worth, why = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                                 now_local=self._date(2026, 9, 15))
+        self.assertTrue(worth, why)
+
+    def test_the_exact_case_clives_asked_for(self):
+        """Enough tokens already for every hour he expects to use -> refuse.
+
+        He states the realistic figure, because the derived maximum (14 hours over
+        7 weekends) never binds and he will only spend an hour on a low-solar day.
+        Two hours wanted = 4 tokens; holding 4, another is waste.
+        """
+        p = self._plugin(tokens=4, prefs={"happyHourUsableHours": "2"})
+        worth, why = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                                 now_local=self._date(2026, 9, 15))
+        self.assertFalse(worth)
+        self.assertIn("already hold 4 tokens", why)
+        self.assertIn("2 hours", why)
+
+    def test_one_token_short_of_the_budget_still_joins(self):
+        p = self._plugin(tokens=3, prefs={"happyHourUsableHours": "2"})
+        worth, _ = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                               now_local=self._date(2026, 9, 15))
+        self.assertTrue(worth)
+
+    def test_a_stated_budget_can_never_exceed_the_slots_that_exist(self):
+        """Typing 50 does not conjure weekends.
+
+        From Tue 20 Oct only the 24/25 Oct weekend and Sat 31 Oct remain — two
+        weekends, four hours — so a stated 50 is capped at 4 and eight tokens are
+        already too many. The session itself is on the 21st, which still settles in
+        time, so this exercises the budget leg and not the deadline one.
+        """
+        p = self._plugin(tokens=8, prefs={"happyHourUsableHours": "50"})
+        worth, why = p._happy_hour_token_verdict(self._date(2026, 10, 21),
+                                                 now_local=self._date(2026, 10, 20))
+        self.assertFalse(worth)
+        self.assertIn("4 hours", why)
+        self.assertIn("already hold 8 tokens", why)
+
+    def test_a_session_settling_too_late_is_refused_whatever_the_balance(self):
+        """Octopus take about 3 working days, and bookings close before the weekend.
+
+        A session on 29 Oct credits around 3 Nov, after the scheme has ended.
+        """
+        p = self._plugin(tokens=0)
+        worth, why = p._happy_hour_token_verdict(self._date(2026, 10, 29),
+                                                 now_local=self._date(2026, 10, 25))
+        self.assertFalse(worth)
+        self.assertIn("too late", why)
+
+    def test_after_the_scheme_ends_nothing_is_worth_joining(self):
+        p = self._plugin(tokens=0)
+        worth, why = p._happy_hour_token_verdict(self._date(2026, 11, 5),
+                                                 now_local=self._date(2026, 11, 2))
+        self.assertFalse(worth)
+        self.assertIn("ended", why)
+
+    def test_an_unknown_balance_never_refuses(self):
+        """Octopus not reporting a balance is not evidence of a full one.
+
+        Refusing on a missing number would silently stop joining sessions for a
+        reason nobody could see — the failure this whole release keeps meeting.
+        """
+        p = self._plugin(tokens=None, prefs={"happyHourUsableHours": "1"})
+        worth, _ = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                               now_local=self._date(2026, 9, 15))
+        self.assertTrue(worth)
+
+    def test_a_zero_token_cost_disables_the_arithmetic_not_the_joining(self):
+        p = self._plugin(tokens=99, prefs={"happyHourTokensRequired": "0",
+                                           "happyHourUsableHours": "1"})
+        worth, _ = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                               now_local=self._date(2026, 9, 15))
+        self.assertTrue(worth)
+
+    def test_a_garbled_budget_falls_back_to_the_derived_maximum(self):
+        p = self._plugin(tokens=4, prefs={"happyHourUsableHours": "not a number"})
+        worth, _ = p._happy_hour_token_verdict(self._date(2026, 9, 20),
+                                               now_local=self._date(2026, 9, 15))
+        self.assertTrue(worth, "4 tokens against a derived 14 hours is not a refusal")
+
+
 class TestAutoJoinSavingSessions(unittest.TestCase):
 
     TURN_DOWN  = "TURN_DOWN"
     TURN_UP    = "TURN_UP"
     HAPPY_HOUR = "WEEKEND_HAPPY_HOUR"
+
+    # A FIXED clock, not datetime.now(). Since v5.107.0 the join consults the
+    # Weekend Happy Hour deadline, so a suite anchored to the real calendar would
+    # have begun failing by itself on 1 November 2026 — every event "in six hours"
+    # past the scheme end, every join correctly refused, and nothing about it to do
+    # with the code under test. Mid-September keeps the offsets meaning what they
+    # have always meant. See [[feedback_test_fixtures_anchored_to_real_today]].
+    NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 
     class _Stub:
         def __init__(self, prefs=None, store=None, result=None):
@@ -6411,22 +6579,66 @@ class TestAutoJoinSavingSessions(unittest.TestCase):
         def _save_accumulators(self):
             self.saved += 1
 
-        _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+        _auto_join_saving_sessions  = plugin.Plugin._auto_join_saving_sessions
+        # The REAL guard. Stubbing it would mean every test below ran without the
+        # one check that decides whether the account gets committed.
+        _happy_hour_token_verdict   = plugin.Plugin._happy_hour_token_verdict
+        _happy_hour_tokens_required = plugin.Plugin._happy_hour_tokens_required
+        # staticmethod() required — see the note in TestCheckSavingSessions.
+        happy_hour_slots_left       = staticmethod(plugin.Plugin.happy_hour_slots_left)
 
     def _event(self, direction="TURN_DOWN", joined=False, hours=6,
                code="E1", capacity=None):
         return {"id": "1", "code": code, "direction": direction, "joined": joined,
                 "capacity": capacity, "reward_per_kwh_points": 76,
-                "start_at": datetime.now(timezone.utc) + timedelta(hours=hours),
-                "end_at":   datetime.now(timezone.utc) + timedelta(hours=hours + 1)}
+                "start_at": self.NOW + timedelta(hours=hours),
+                "end_at":   self.NOW + timedelta(hours=hours + 1)}
 
-    def _run(self, events, prefs=None, store=None, result=None):
+    def _run(self, events, prefs=None, store=None, result=None, now=None):
         stub = self._Stub(prefs=prefs if prefs is not None else {"savingSessionAutoJoin": True},
                           store=store, result=result)
-        stub._auto_join_saving_sessions({"events": events}, datetime.now(timezone.utc))
+        stub._auto_join_saving_sessions({"events": events}, now or self.NOW)
         return stub
 
     # ---- the switch --------------------------------------------------
+    def test_the_join_actually_consults_the_token_budget(self):
+        """v5.107.0. The WIRING, not the arithmetic.
+
+        A mutation replacing the whole guard call with `(True, "")` survived the
+        budget tests untouched: they exercise the helper directly, and nothing
+        asserted that the join ever asks it. Testing the logic is not testing the
+        dispatched path.
+        """
+        ev = self._event()
+        stub = self._run([ev],
+                         prefs={"savingSessionAutoJoin": True,
+                                "happyHourUsableHours": "2"},
+                         store={"happy_hour_tokens": 4})   # two hours' worth already
+        stub.octopus.join_saving_session_event.assert_not_called()
+        self.assertFalse(ev.get("joined"))
+
+    def test_a_refusal_on_budget_is_never_remembered_as_permanent(self):
+        """It changes as tokens are spent and as the calendar moves.
+
+        `saving_sessions_join_refused` is for Octopus saying no for good. Filing a
+        budget refusal there would stop the session being reconsidered after he
+        books an hour and frees the tokens up.
+        """
+        stub = self._run([self._event()],
+                         prefs={"savingSessionAutoJoin": True,
+                                "happyHourUsableHours": "2"},
+                         store={"happy_hour_tokens": 4})
+        self.assertEqual(stub.store.get("saving_sessions_join_refused", []), [])
+
+    def test_a_session_still_joins_when_the_tokens_are_needed(self):
+        ev = self._event()
+        stub = self._run([ev],
+                         prefs={"savingSessionAutoJoin": True,
+                                "happyHourUsableHours": "4"},
+                         store={"happy_hour_tokens": 4})   # wants 8, holds 4
+        stub.octopus.join_saving_session_event.assert_called_once()
+        self.assertTrue(ev.get("joined"))
+
     def test_off_by_default_joins_nothing(self):
         stub = self._run([self._event()], prefs={})
         stub.octopus.join_saving_session_event.assert_not_called()
