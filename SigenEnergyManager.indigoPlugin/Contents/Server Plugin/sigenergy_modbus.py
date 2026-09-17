@@ -1578,6 +1578,72 @@ class SigenergyModbus:
         self.logger.info("Returning to local EMS control")
         return self.disable_remote_ems()
 
+    def read_remote_ems_enabled(self):
+        """Fresh Remote EMS enable readback (40029), or None if unavailable."""
+        if not self._connected:
+            return None
+        raw = self._read_uint16(HOLD_REMOTE_EMS_ENABLE)
+        return bool(raw) if raw in (0, 1) else None
+
+    def read_battery_soc(self):
+        """Read PLANT_BATTERY_SOC (30014) on its own. Returns percent or None.
+
+        read_all() already returns this, and every existing consumer should keep
+        using that — one tiered cycle is far cheaper than a read per caller.
+        This exists for the one caller that needs an SOC with a TIMESTAMP IT CAN
+        DEFEND: the Flux supervisor leases each decision against an observation
+        that flux_execution refuses once it is ten seconds old, and a tiered cycle
+        that takes ~7 s to run routinely hands back a figure already older than
+        that. One throttled transaction, taken only inside a Flux window, is the
+        difference between holding control and surrendering it every other tick.
+
+        Deliberately NOT cached and deliberately NOT merged into the slow cache:
+        the whole point is that the caller knows exactly when this value was read.
+        """
+        if not self._connected:
+            return None
+        raw = self._read_uint16(PLANT_BATTERY_SOC)
+        if raw is None:
+            return None
+        return round(raw / 10.0, 1)
+
+    def read_power_flows(self):
+        """SOC and the three live power figures in one go, or None.
+
+        {"batterySoc", "pvPowerWatts", "batteryPowerWatts", "gridPowerWatts",
+         "homePowerWatts"} — three throttled transactions, no caching.
+
+        read_all() returns the same figures, but as part of a tiered cycle that
+        takes several seconds and is served partly from cache. This is for the one
+        caller that must be able to say exactly WHEN each figure was read: the
+        Flux supervisor sizes a grid charge against spare site import capacity,
+        which is the site limit less what the house is drawing at that moment, and
+        a cached house figure would size it against a house that has since
+        switched the oven on.
+
+        Returns None if any part fails — a partial answer here would be a
+        fabricated headroom.
+        """
+        if not self._connected:
+            return None
+        soc = self._read_uint16(PLANT_BATTERY_SOC)
+        if soc is None:
+            return None
+        pair = decode_s32_pair(self._read_block_u16(PLANT_PV_POWER, 4))
+        if pair is None:
+            return None
+        grid = self._read_int32(PLANT_GRID_ACTIVE_POWER)
+        if grid is None:
+            return None
+        pv, batt = max(0, pair[0]), pair[1]
+        return {
+            "batterySoc":        round(soc / 10.0, 1),
+            "pvPowerWatts":      pv,
+            "batteryPowerWatts": batt,
+            "gridPowerWatts":    grid,
+            "homePowerWatts":    max(0, pv + grid - batt),
+        }
+
     def read_ems_mode(self):
         """Read current HOLD_REMOTE_EMS_MODE (40031). Returns int or None."""
         if not self._connected:
@@ -1627,6 +1693,57 @@ class SigenergyModbus:
     # ================================================================
     # ESS SOC Limits (V2.6+ registers)
     # ================================================================
+
+    def set_backup_soc(self, soc_pct):
+        """Set the ESS backup reserve SOC (register 40046).
+
+        On-grid the battery stops discharging at this SOC in every mode,
+        including a forced Remote EMS export (hardware-verified 17-Sep-2026:
+        mode 5 with export headroom held the battery at 0 W below it, and
+        discharged 1.8 kW above it). OFF-grid it does not apply — the battery
+        runs down to the discharge cutoff (40048) instead. So an economic floor
+        written HERE can never lock energy away during a power cut, which the
+        absolute cutoff can.
+        """
+        if not (0.0 <= soc_pct <= 100.0):
+            self.logger.error(f"Invalid backup SOC: {soc_pct}% (must be 0-100)")
+            return False
+        raw_value = int(round(soc_pct * 10))
+        self.logger.info(f"Setting ESS backup reserve: {soc_pct:.1f}% (raw={raw_value})")
+        success = self._write_single_register(HOLD_ESS_BACKUP_SOC, raw_value)
+        if not success:
+            self.logger.error(f"Failed to set backup reserve to {soc_pct:.1f}%")
+        return success
+
+    def read_backup_soc(self):
+        """Read the ESS backup reserve SOC from register 40046. % or None."""
+        if not self._connected:
+            return None
+        raw = self._read_uint16(HOLD_ESS_BACKUP_SOC)
+        if raw is None:
+            return None
+        return raw / 10.0
+
+    def set_grid_import_limit(self, watts):
+        """Set the whole-site grid import cap (registers 40040-40041), in watts.
+
+        Measured at the meter, house included (hardware-verified 17-Sep-2026:
+        a 10 kW grid charge held grid import at 1.0 kW, then 3.0 kW, with the
+        house still supplied). The inverter can only shed its own charging, so
+        this caps what the battery adds; it never cuts household loads.
+        4294967295 means unlimited.
+        """
+        if type(watts) is not int or not 0 <= watts <= 4294967295:
+            self.logger.error(f"Invalid grid import limit: {watts!r}")
+            return False
+        self.logger.info(f"Setting grid import limit: {watts} W")
+        return self._write_uint32_registers(HOLD_GRID_MAX_IMPORT_LIMIT, watts)
+
+    def read_grid_import_limit(self):
+        """Read the whole-site grid import cap in watts, or None."""
+        if not self._connected:
+            return None
+        return self._read_uint32(HOLD_GRID_MAX_IMPORT_LIMIT)
 
     def set_discharge_cutoff(self, soc_pct):
         """Set ESS minimum discharge SOC (register 40048).

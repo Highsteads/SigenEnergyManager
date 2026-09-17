@@ -2430,6 +2430,7 @@ class TestCheckSavingSessions(unittest.TestCase):
         # it with the checkbox absent, which is what proves the default-off path is
         # genuinely inert rather than merely untested.
         _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+        _saving_session_for_us = plugin.Plugin._saving_session_for_us
         # Real too: the alert reads the Happy Hour token cost to say where this
         # session leaves you, and a stubbed constant would test the stub.
         _happy_hour_tokens_required = plugin.Plugin._happy_hour_tokens_required
@@ -2445,9 +2446,10 @@ class TestCheckSavingSessions(unittest.TestCase):
     def _check(self, stub):
         plugin.Plugin._check_saving_sessions(stub)
 
-    def _event(self, event_id, start_at, end_at=None, points=800):
+    def _event(self, event_id, start_at, end_at=None, points=800, direction="TURN_DOWN"):
         return {"id": event_id, "code": f"E{event_id}", "start_at": start_at,
-                "end_at": end_at, "reward_per_kwh_points": points}
+                "end_at": end_at, "reward_per_kwh_points": points,
+                "direction": direction}
 
     def _future(self, hours=24):
         return datetime.now(timezone.utc) + timedelta(hours=hours)
@@ -2546,8 +2548,8 @@ class TestCheckSavingSessions(unittest.TestCase):
             "ok": False, "already": False, "permanent": False, "reason": "unused"}
         self._check(stub)
         body = stub.sent[0][1]
-        self.assertIn("Not worth opting in to", body)
-        self.assertNotIn("join it in the Octopus app", body)
+        self.assertIn("has not joined it, because", body)
+        self.assertNotIn("Join it in the Octopus app", body)
 
     def test_a_hand_joined_session_is_never_second_guessed(self):
         """With auto-join OFF the decision is his, so the plugin keeps its opinion."""
@@ -2557,8 +2559,8 @@ class TestCheckSavingSessions(unittest.TestCase):
                           prefs={"happyHourUsableHours": "2"})
         self._check(stub)
         body = stub.sent[0][1]
-        self.assertNotIn("Not worth opting in to", body)
-        self.assertIn("join it in the Octopus app", body)
+        self.assertNotIn("has not joined it, because", body)
+        self.assertIn("Join it in the Octopus app", body)
 
     def test_message_leads_with_the_free_hour_not_the_money(self):
         """v5.106.1. CliveS, 15-Sep-2026, on why he runs these at all:
@@ -2589,7 +2591,7 @@ class TestCheckSavingSessions(unittest.TestCase):
         self._check(stub)
         body = stub.sent[0][1]
         self.assertIn("15p a unit", body)         # 120 / 8
-        self.assertIn("12p", body)                # the export rate it is added to
+        self.assertIn("added to what the export itself earns", body)
         self.assertNotIn("120", body)             # never the raw points figure
 
     def test_token_progress_is_reported_only_when_octopus_supplied_it(self):
@@ -2619,6 +2621,78 @@ class TestCheckSavingSessions(unittest.TestCase):
         body = known.sent[0][1]
         self.assertIn("0 tokens", body)
         self.assertIn("step towards the next", body)
+
+
+class TestSavingSessionPushoverWording(unittest.TestCase):
+    """v5.109.4. CliveS, 17-Sep-2026: fix the wording. Plain English, ASCII, people's
+    times, and never an instruction he cannot act on."""
+
+    def _run(self, store=None, prefs=None, hours=6, join_result=None, capacity=None):
+        from zoneinfo import ZoneInfo
+        T = TestCheckSavingSessions
+        now = datetime.now(timezone.utc)
+        start = (now + timedelta(days=1)).astimezone(ZoneInfo("Europe/London")).replace(
+            hour=18, minute=0, second=0, microsecond=0)
+        ev = T._event(T, "7", start.astimezone(timezone.utc),
+                      start.astimezone(timezone.utc) + timedelta(hours=1), points=68)
+        ev["capacity"] = capacity
+        stub = T._Stub({"has_joined": True, "token_balance": 1, "events": [ev]},
+                       store=store, prefs=prefs)
+        stub._saving_session_for_us = lambda e: True
+        if join_result is not None:
+            stub.octopus.join_saving_session_event.return_value = join_result
+        plugin.Plugin._check_saving_sessions(stub)
+        return stub
+
+    def test_times_and_day_read_as_a_person_says_them(self):
+        stub = self._run()
+        title, body, _ = stub.sent[0]
+        self.assertIn("tomorrow from 6pm to 7pm", body)
+        self.assertNotIn("18:00", body)
+        self.assertTrue(title.startswith("Saving Session tomorrow"))
+
+    def test_body_is_ascii_sentences_without_dumps(self):
+        for prefs in ({}, {"savingSessionAutoJoin": True}):
+            with self.subTest(prefs=prefs):
+                stub = self._run(prefs=prefs, join_result={
+                    "ok": False, "already": False, "permanent": False, "reason": "net"})
+                title, body, _ = stub.sent[0]
+                for text in (title, body):
+                    text.encode("ascii")
+                    self.assertNotIn("|", text)
+                    self.assertNotIn("=", text)
+                    self.assertNotIn("NOT OPTED IN", text)
+                self.assertTrue(body.endswith("."))
+
+    def test_a_session_this_account_cannot_join_is_not_pushed(self):
+        for kw in ({"store": {"saving_sessions_notified": [],
+                              "saving_sessions_join_refused": ["E7"]}},
+                   {"capacity": "FULL"}):
+            with self.subTest(kw=kw):
+                stub = self._run(**kw)
+                self.assertEqual(stub.sent, [])
+                self.assertIn("7", stub.store["saving_sessions_notified"])
+
+    def test_auto_join_that_failed_briefly_does_not_send_him_to_the_app(self):
+        stub = self._run(prefs={"savingSessionAutoJoin": True}, join_result={
+            "ok": False, "already": False, "permanent": False, "reason": "net"})
+        title, body, _ = stub.sent[0]
+        self.assertIn("try again within the hour", body)
+        self.assertNotIn("Octopus app", body)
+
+    def test_joined_says_so_in_the_title(self):
+        stub = self._run(prefs={"savingSessionAutoJoin": True, "savingSessionExport": True})
+        title, body, _ = stub.sent[0]
+        self.assertTrue(title.endswith("you are in"))
+        self.assertIn("the battery will export for it", body)
+
+    def test_clock_words(self):
+        from datetime import datetime as dt
+        self.assertEqual(plugin._clock_words(dt(2026, 9, 17, 18, 0)), "6pm")
+        self.assertEqual(plugin._clock_words(dt(2026, 9, 17, 16, 30)), "4:30pm")
+        self.assertEqual(plugin._clock_words(dt(2026, 9, 17, 12, 0)), "midday")
+        self.assertEqual(plugin._clock_words(dt(2026, 9, 17, 0, 0)), "midnight")
+        self.assertEqual(plugin._clock_words(dt(2026, 9, 17, 9, 0)), "9am")
 
 
 class TestSavingSessionsDedupeIdTypes(unittest.TestCase):
@@ -3014,7 +3088,7 @@ class TestVppShortfallAlert(unittest.TestCase):
         p = self._p(soc_pct=5.0)
         p._send_pushover.side_effect = RuntimeError("pushover down")
         p._start_vpp_precharge(self._event())
-        p._vpp_transition.assert_called_once_with(plugin.VPP_PRE_CHARGING)
+        p._vpp_transition.assert_called_once_with(plugin.VPP_PRE_CHARGING, preempted=True)
 
     def test_cutoff_is_still_set_when_short(self):
         """The hardware discharge floor is what actually stops the export early
@@ -6072,12 +6146,13 @@ class TestRatesFollowActiveTariff(unittest.TestCase):
         # is the whole bug. Assert the source calls it exactly twice.
         src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "plugin.py"), encoding="utf-8").read()
-        # THREE call sites as of v5.98.2: _build_tariff_data, the status log line,
-        # and _update_tariff_device. This count is deliberately exact — it went from
-        # 2 to 3 and the guard caught it, which is the point of pinning it.
-        self.assertEqual(src.count("self._rates_for_tariff("), 3,
-                         "_build_tariff_data, the status line and the tariff device "
-                         "must all use the helper")
+        # FOUR call sites as of v5.109.0: _build_tariff_data, the status log line,
+        # _update_tariff_device and get_dashboard_data (which read the Tracker
+        # bucket on Flux until the post-deployment fix). Deliberately exact — it
+        # went 2 -> 3 -> 4 and the guard caught each, which is the point of it.
+        self.assertEqual(src.count("self._rates_for_tariff("), 4,
+                         "_build_tariff_data, the status line, the tariff device "
+                         "and the dashboard must all use the helper")
         self.assertNotIn('tracker    = monitored.get("tracker", {})', src,
                          "the status line must not read the Tracker bucket directly")
 
@@ -6551,6 +6626,89 @@ class TestHappyHourTokenBudget(unittest.TestCase):
         self.assertTrue(worth, "4 tokens against a derived 14 hours is not a refusal")
 
 
+class TestSessionsForOtherRegionsStaySilent(unittest.TestCase):
+    """CliveS, 17-Sep-2026: "if it does not concern us then we don't need to be told."
+
+    EVENT_77 (6pm, regions 8-12) produced a push, a warning and an amber Dashboards
+    chip for an account in region F (6) that Octopus refused to let join.
+    """
+    NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+
+    def _stub(self, store=None, region_id=6):
+        stub = TestCheckSavingSessions._Stub({}, store=store,
+                                             prefs={"savingSessionAutoJoin": True})
+        stub.octopus.saving_session_region_id = region_id
+        stub.octopus.join_saving_session_event.return_value = {
+            "ok": False, "already": False, "permanent": True,
+            "reason": "Octopus refused (OE-1308): Account's region is outside of the "
+                      "target regions for this event."}
+        return stub
+
+    def _event(self, code, regions, hours=5, joined=False):
+        start = datetime.now(timezone.utc) + timedelta(hours=hours)
+        return {"id": code[-2:], "code": code, "start_at": start,
+                "end_at": start + timedelta(hours=1), "reward_per_kwh_points": 68,
+                "direction": "TURN_DOWN", "joined": joined, "capacity": "AVAILABLE",
+                "target_regions": regions}
+
+    def _run(self, stub, events):
+        stub.octopus.get_saving_sessions.return_value = {
+            "has_joined": True, "events": events, "token_balance": 1}
+        plugin.Plugin._check_saving_sessions(stub)
+        return stub
+
+    def test_another_regions_session_sends_nothing_and_is_not_displayed(self):
+        stub = self._run(self._stub(), [self._event("EVENT_77", [8, 9, 10, 11, 12])])
+        self.assertEqual(stub.sent, [])
+        stub.octopus.join_saving_session_event.assert_not_called()
+        self.assertEqual(stub.store["saving_sessions_upcoming"], [])
+        self.assertEqual(stub.store["saving_sessions_next_start"], "")
+
+    def test_our_regions_session_is_still_announced_and_shown(self):
+        stub = self._stub()
+        stub.octopus.join_saving_session_event.return_value = {
+            "ok": False, "already": False, "permanent": False, "reason": "network"}
+        self._run(stub, [self._event("EVENT_76", [3, 4, 5, 6, 7])])
+        self.assertEqual(len(stub.sent), 1)
+        self.assertEqual(len(stub.store["saving_sessions_upcoming"]), 1)
+
+    def test_an_all_regions_or_unlisted_session_counts_as_ours(self):
+        for regions in ([], None):
+            with self.subTest(regions=regions):
+                stub = self._stub()
+                stub.octopus.join_saving_session_event.return_value = {
+                    "ok": False, "already": False, "permanent": False, "reason": "x"}
+                self._run(stub, [self._event("EVENT_80", regions)])
+                self.assertEqual(len(stub.store["saving_sessions_upcoming"]), 1)
+
+    def test_an_unknown_account_region_never_hides_a_session(self):
+        stub = self._stub(region_id=None)
+        stub.octopus.join_saving_session_event.return_value = {
+            "ok": False, "already": False, "permanent": False, "reason": "x"}
+        self._run(stub, [self._event("EVENT_77", [8, 9])])
+        self.assertEqual(len(stub.store["saving_sessions_upcoming"]), 1)
+
+    def test_a_region_refusal_is_remembered_and_then_silent(self):
+        """Octopus is the last word: if it refuses on region, stop announcing it."""
+        stub = self._stub()
+        ev = self._event("EVENT_90", [6, 7])       # list says ours; Octopus says not
+        plugin.Plugin._auto_join_saving_sessions(stub, {"events": [ev]},
+                                                 datetime.now(timezone.utc))
+        self.assertIn("EVENT_90", stub.store["saving_sessions_not_our_region"])
+        stub.store["saving_sessions_notified"] = []
+        self._run(stub, [ev])
+        self.assertEqual(stub.sent, [])
+        self.assertEqual(stub.store["saving_sessions_upcoming"], [])
+
+    def test_region_ids_parse_and_region_f_is_six(self):
+        import octopus_api
+        self.assertEqual(octopus_api._region_ids([{"regionId": 9}, {"regionId": 8}]), [8, 9])
+        self.assertEqual(octopus_api._region_ids([]), [])
+        self.assertIsNone(octopus_api._region_ids(None))
+        self.assertEqual(octopus_api.GSP_REGION_IDS["F"], 6)
+        self.assertEqual(octopus_api.GSP_REGION_IDS["P"], 14)
+
+
 class TestAutoJoinSavingSessions(unittest.TestCase):
 
     TURN_DOWN  = "TURN_DOWN"
@@ -6580,6 +6738,7 @@ class TestAutoJoinSavingSessions(unittest.TestCase):
             self.saved += 1
 
         _auto_join_saving_sessions  = plugin.Plugin._auto_join_saving_sessions
+        _saving_session_for_us      = plugin.Plugin._saving_session_for_us
         # The REAL guard. Stubbing it would mean every test below ran without the
         # one check that decides whether the account gets committed.
         _happy_hour_token_verdict   = plugin.Plugin._happy_hour_token_verdict
@@ -7151,6 +7310,7 @@ class TestUpcomingSessionsForDisplay(unittest.TestCase):
             self.saved += 1
 
         _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
+        _saving_session_for_us = plugin.Plugin._saving_session_for_us
 
     def _event(self, direction="TURN_DOWN", joined=True, hours=6, event_id="1",
                points=72, capacity=None):

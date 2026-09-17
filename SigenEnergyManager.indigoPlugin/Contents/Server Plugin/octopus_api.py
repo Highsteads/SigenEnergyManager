@@ -162,6 +162,17 @@ TARIFF_PRODUCT_PREFIXES = {
     TARIFF_FLEXIBLE: ("VAR-", "FLEX-", "SILVER-FLEX"),
 }
 
+# EXPORT product prefixes. Deliberately a SEPARATE table from the import one:
+# adding "FLUX-EXPORT" to TARIFF_PRODUCT_PREFIXES would let an export agreement be
+# returned as the house's import tariff on any account whose import MPAN is not
+# configured. Longest prefix wins, so AGILE-OUTGOING is never read as OUTGOING.
+EXPORT_PRODUCT_PREFIXES = {
+    TARIFF_FLUX:  ("FLUX-EXPORT",),
+    TARIFF_IFLUX: ("INTELLI-FLUX-EXPORT",),
+    "agile_outgoing": ("AGILE-OUTGOING",),
+    "outgoing":       ("OUTGOING",),
+}
+
 # Time-of-use windows, LOCAL time (Europe/London), 24h.
 #
 # FALLBACK ONLY as of v5.60.0 — _get_tou_rates now DERIVES the window from the live rates and
@@ -192,6 +203,62 @@ def _safe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _half_hourly_unit_rates(raw):
+    """Kraken HalfHourlyTariff unitRates as [{valid_from, valid_to, value_inc_vat}].
+
+    The same keys the REST rate endpoints use, so one reader serves both. Rows
+    with an unreadable price are dropped; an open-ended row keeps valid_to None.
+    """
+    out = []
+    for row in raw or []:
+        if not isinstance(row, dict):
+            continue
+        p = _safe_float(row.get("value"))
+        if p is None or not row.get("validFrom"):
+            continue
+        out.append({"valid_from": str(row.get("validFrom")),
+                    "valid_to":   str(row["validTo"]) if row.get("validTo") else None,
+                    "value_inc_vat": p})
+    return out
+
+
+def _rate_in_force(rates, when_utc):
+    """The price of the row covering `when_utc`, or None. Absent is not zero."""
+    for row in rates or []:
+        try:
+            start = datetime.fromisoformat(str(row["valid_from"]).replace("Z", "+00:00"))
+            end = row.get("valid_to")
+            end = datetime.fromisoformat(str(end).replace("Z", "+00:00")) if end else None
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start.tzinfo is None or (end is not None and end.tzinfo is None):
+            continue
+        if start <= when_utc and (end is None or when_utc < end):
+            return row["value_inc_vat"]
+    return None
+
+
+# Octopus's numeric region ids, in GSP-group letter order skipping I and O.
+# Not published anywhere we can read; confirmed against this account 17-Sep-2026:
+# all 13 region-listed sessions it had joined included 6, and the one Octopus
+# refused with "Account's region is outside of the target regions" (EVENT_77,
+# regions 8-12) did not. Region F = 6.
+GSP_REGION_IDS = {letter: n for n, letter in enumerate("ABCDEFGHJKLMNP", start=1)}
+
+
+def _region_ids(raw):
+    """targetRegion [{regionId: n}, ...] -> sorted ints; None if absent/unreadable."""
+    if raw is None or not isinstance(raw, list):
+        return None
+    out = []
+    for item in raw:
+        try:
+            out.append(int((item or {}).get("regionId")))
+        except (TypeError, ValueError, AttributeError):
+            return None
+    return sorted(out)
 
 
 class OctopusAPI:
@@ -836,7 +903,8 @@ class OctopusAPI:
                 "  balance"
                 "  electricityAgreements(active: true) { meterPoint { mpan } tariff { __typename"
                 "    ...on StandardTariff   { tariffCode displayName standingCharge unitRate }"
-                "    ...on HalfHourlyTariff { tariffCode displayName standingCharge } } }"
+                "    ...on HalfHourlyTariff { tariffCode displayName standingCharge"
+                "        unitRates { validFrom validTo value } } } }"
                 "  gasAgreements(active: true) { tariff { __typename"
                 "    ...on GasTariffType { tariffCode displayName standingCharge unitRate } } }"
                 "}}"
@@ -900,21 +968,35 @@ class OctopusAPI:
                 is_export = False
             elif self.export_mpan and mpan == self.export_mpan:
                 is_export = True
-            elif "OUTGOING" in code.upper():
+            elif "OUTGOING" in code.upper() or "EXPORT" in code.upper():
+                # FLUX-EXPORT / INTELLI-FLUX-EXPORT carry no OUTGOING in the code.
                 is_export = True
             else:
                 is_export = False
+            # A HalfHourlyTariff (Flux, Agile, Go...) has no single unitRate, only
+            # dated unitRates. Until v5.110.0 the query did not ask for them, so on
+            # Flux both unit_p values came back None and the published
+            # elec_unit_rate_p / export_rate_p froze at their last Tracker and
+            # Outgoing values. unit_p is now the rate in force at fetch time, and
+            # the dated list is carried for anyone who needs the bands.
+            unit_rates = _half_hourly_unit_rates(t.get("unitRates"))
+            unit_p = _safe_float(t.get("unitRate"))
+            if unit_p is None and unit_rates:
+                unit_p = _rate_in_force(unit_rates, datetime.now(timezone.utc))
             # First active agreement wins (active:true should return one each).
             if is_export:
                 if result["export"] is None:
                     result["export"] = {
-                        "unit_p":       _safe_float(t.get("unitRate")),
+                        "unit_p":       unit_p,
+                        "unit_rates":   unit_rates,
+                        "tariff_code":  code,
                         "display_name": t.get("displayName"),
                     }
             elif result["elec"] is None:
                 result["elec"] = {
                     "standing_p":   _safe_float(t.get("standingCharge")),
-                    "unit_p":       _safe_float(t.get("unitRate")),
+                    "unit_p":       unit_p,
+                    "unit_rates":   unit_rates,
                     "tariff_code":  code,
                     "display_name": t.get("displayName"),
                 }
@@ -999,7 +1081,7 @@ class OctopusAPI:
                 "  account(accountNumber: $a) { hasJoinedCampaign tokenBalance"
                 "    joinedEvents { eventId } }"
                 "  events { id code startAt endAt eventType capacityStatus"
-                "           rewardPerKwhInOctoPoints }"
+                "           rewardPerKwhInOctoPoints targetRegion { regionId } }"
                 "}}"
             ),
             "variables": {"a": self.account_id},
@@ -1113,6 +1195,11 @@ class OctopusAPI:
                 # a full one is worse than saying nothing. Absent -> None, meaning
                 # unknown rather than available.
                 "capacity":              e.get("capacityStatus") or None,
+                # The regions a session is OPEN to, as Octopus region numbers. An
+                # empty list means every region (Weekend Happy Hours arrive that
+                # way). None means the field was not in the reply, which is
+                # UNKNOWN and never read as "not for us".
+                "target_regions":        _region_ids(e.get("targetRegion")),
             })
         events.sort(key=lambda ev: ev["start_at"])
 
@@ -1122,6 +1209,11 @@ class OctopusAPI:
         self._saving_sessions_cache_at = now
         self._saving_sessions_neg_at   = 0.0
         return result
+
+    @property
+    def saving_session_region_id(self):
+        """This account's Octopus region number, or None if the region is unknown."""
+        return GSP_REGION_IDS.get(str(self.region or "").strip().upper()[:1])
 
     def join_saving_session_event(self, event_code):
         """Opt this account in to ONE Saving Sessions event. Returns a result dict.
@@ -1858,6 +1950,140 @@ class OctopusAPI:
             # Remove first 2 (E, 1R) and last 1 (region)
             return "-".join(parts[2:-1])
         return tariff_code
+
+    def get_account_agreements(self, force=False):
+        """Both live agreements from ONE account response, with their evidence.
+
+        Returns {} on any failure, or:
+            {"fetched_at": epoch, "import": {...} or {}, "export": {...} or {},
+             "import_valid_to": iso or "", "export_valid_to": iso or ""}
+
+        Each side carries tariff_key, tariff_code, product_code and mpan.
+
+        THREE RULES, and all three exist because the alternative silently arms
+        trading on evidence that is not evidence:
+
+        1. **One response, one timestamp.** The proof ages with the ACCOUNT fetch
+           that produced it, not with whatever else happened to succeed. Public
+           prices refreshing does not make an account agreement current.
+        2. **Live agreements only** — `_live_agreement`, never the display
+           fallback that hands back the last agreement in the list.
+        3. **This site's meters, unambiguously.** A configured MPAN is the only
+           one that can prove anything; without one, the answer must be a single
+           unmistakable meter point, because an account can hold several
+           properties and another property's tariff says nothing about the
+           battery being controlled here.
+        """
+        if not self.api_key or not self.account_id:
+            return {}
+        now = time.time()
+        cached = self._rates_cache.get("account_agreements")
+        if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
+            return cached["data"]
+        try:
+            data = self._api_get(f"{OCTOPUS_API_BASE}/accounts/{self.account_id}",
+                                 authenticated=True)
+        except OctopusApiError as e:
+            self.logger.warning(f"Account agreement lookup failed: {e}")
+            return {}
+        except Exception as e:
+            self.logger.warning(f"Account agreement lookup error: {e}")
+            return {}
+        if not data:
+            return {}
+
+        points = [point for prop in data.get("properties", [])
+                  for point in prop.get("electricity_meter_points", [])]
+
+        def _pick(wanted_mpan, want_export):
+            """(agreement, mpan) for one side, or (None, "") when ambiguous."""
+            hits = []
+            for point in points:
+                mpan = point.get("mpan")
+                if wanted_mpan:
+                    if mpan != wanted_mpan:
+                        continue
+                elif bool(point.get("is_export")) != want_export:
+                    continue
+                live = self._live_agreement(point.get("agreements", []))
+                if live:
+                    hits.append((live, mpan or ""))
+            # Exactly one, or it is not proof of anything about this site.
+            return hits[0] if len(hits) == 1 else (None, "")
+
+        # getattr: this is reachable on a partially built client (fixtures set
+        # only what they need), and a missing configured MPAN must read as "none
+        # configured" rather than raise.
+        imp_ag, imp_mpan = _pick(getattr(self, "mpan", "") or "", False)
+        exp_ag, exp_mpan = _pick(getattr(self, "export_mpan", "") or "", True)
+
+        # valid_FROM matters as much as valid_to: a day BEFORE the agreement
+        # started was billed on the previous tariff, and valuing it at today's
+        # bands would rewrite history. The switch to Flux is a date, not a mood.
+        result = {"fetched_at": now, "import": {}, "export": {},
+                  "import_valid_to": "", "export_valid_to": "",
+                  "import_valid_from": "", "export_valid_from": ""}
+        if imp_ag:
+            info = self._classify_tariff_code(imp_ag.get("tariff_code", ""))
+            result["import"] = dict(info, mpan=imp_mpan)
+            result["import_valid_to"]   = str(imp_ag.get("valid_to") or "")
+            result["import_valid_from"] = str(imp_ag.get("valid_from") or "")
+        if exp_ag:
+            info = self._classify_export_tariff_code(exp_ag.get("tariff_code", ""))
+            if info.get("tariff_key") != TARIFF_UNKNOWN:
+                result["export"] = dict(info, mpan=exp_mpan)
+                result["export_valid_to"]   = str(exp_ag.get("valid_to") or "")
+                result["export_valid_from"] = str(exp_ag.get("valid_from") or "")
+
+        self._rates_cache["account_agreements"] = {"data": result, "cached_at": now}
+        return result
+
+    def get_export_agreement(self, force=False):
+        """The ACCOUNT's live export agreement alone. {} when unknown or ambiguous.
+
+        Thin wrapper over get_account_agreements, kept because the export side is
+        asked for on its own; it carries `fetched_at` so a caller can tell proof
+        from a memory of proof.
+        """
+        both = self.get_account_agreements(force=force)
+        export = dict(both.get("export") or {})
+        if export:
+            export["fetched_at"] = both.get("fetched_at")
+        return export
+
+    @staticmethod
+    def _live_agreement(agreements):
+        """Exactly one dated agreement in force now; no display fallback."""
+        now = datetime.now(timezone.utc)
+        live = []
+        for ag in agreements or []:
+            try:
+                start = datetime.fromisoformat(str(ag["valid_from"]).replace("Z", "+00:00"))
+                if start.tzinfo is None or start > now:
+                    continue
+                end = ag.get("valid_to")
+                if end:
+                    end = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+                    if end.tzinfo is None or end <= now:
+                        continue
+                live.append(ag)
+            except (KeyError, ValueError, TypeError):
+                continue
+        return live[0] if len(live) == 1 else None
+
+    def _classify_export_tariff_code(self, tariff_code):
+        """Classify an EXPORT tariff code. Longest matching prefix wins."""
+        product = self._product_from_tariff_code(tariff_code).upper()
+        best_key, best_len = TARIFF_UNKNOWN, -1
+        for key, prefixes in EXPORT_PRODUCT_PREFIXES.items():
+            for prefix in prefixes:
+                if product.startswith(prefix) and len(prefix) > best_len:
+                    best_key, best_len = key, len(prefix)
+        return {
+            "tariff_key":   best_key,
+            "tariff_code":  tariff_code,
+            "product_code": product,
+        }
 
     @staticmethod
     def _active_agreement(agreements):

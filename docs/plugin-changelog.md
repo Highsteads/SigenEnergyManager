@@ -15,6 +15,342 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.110.0 — 17-09-2026
+
+**Also in 5.110.0 — two faults found watching the first live Flux peak (Claude, Flux session):**
+
+- **The peak export dropped to zero every tick.** The planned discharge limit moves with PV, so the
+  target differed each tick and `FluxExecutor.step` ran a full `_apply`, which neutralises first
+  (both limits 0, mode 2). Sampled 16:08-16:10: mode 5 at 3.9 kW, then mode 2 with 0/0, then mode 5
+  again. Same mode and same cutoffs with new power now adjusts the two limits in place and
+  re-verifies; any unacknowledged write falls back to the full apply. After the fix mode stayed 5.
+- **Solar overflow held Flux off the peak** (see v5.109.5 below; installed in this build).
+- **The export limit chased live PV, then handed the peak back.** `_export_plan` sized the discharge
+  limit to "export cap less live PV surplus", so it moved every tick, and read ZERO whenever the roof
+  alone filled the cap — which `plan()` treats as nothing worth selling, so Flux handed back and
+  re-claimed (16:43-16:46). The limit is now full battery power in export, and the inverter's own
+  grid export cap (40038, 4 kW) holds the meter: in Remote EMS discharge it is hardware-enforced
+  (11-Sep Axle event: 4.7 kW from the battery, 4.05 kW peak at the grid). The review replay test now
+  models that cap instead of an unlimited drain.
+
+- **The clean end of a window logged as a fault.** A renewal issued in the last seconds is refused
+  because its lease may not outlive the window — correct, and it happens at 19:00 and 05:00 every
+  day. It logged "The inverter did not acknowledge the export command" at WARNING (live 19:00:33).
+  A decision whose window has already ended now says so plainly at INFO; a refusal INSIDE the window
+  still warns.
+
+Also observed live, and acceptable as they stand: a plugin restart mid-export leaves mode 5 running
+until startup reconciles to the baseline, and Flux re-claims about 90 s later (16:12-16:14); pausing
+the manager mid-export released the claim before the pause wrote self-consumption (16:17:55). The
+window closed on its own at 19:00 and the inverter went back to self-consumption with the reserve at
+20% and the cutoff at 1%; the battery finished at 71.4%.
+
+**FLUX IMPORT PRICED BY BAND, AND EVERY TIER PUBLISHED.** CliveS, the day the account moved to paired
+Flux (agreements valid from 00:00 BST 17-Sep-2026): everything before the change stays as it was,
+everything after uses Flux, and the Costs page must show all three import and three export prices with
+their hours.
+
+What was wrong on the first Flux day:
+- **Import had no weighting.** `rate_today_p` came from the Tracker bucket, which is empty on Flux, so
+  every consumer fell back to the tariffMonitor `rateToday` — the band live at the moment of reading.
+  The same kWh were valued at 14.6p, 24.4p or 34.1p depending on when the page was loaded. Export was
+  already weighted (5.109.x); import now uses the same code.
+- **The Kraken ledger query never asked for `unitRates`.** Flux comes back as `HalfHourlyTariff` with no
+  `unitRate`, so `fin.elec.unit_p` and `fin.export.unit_p` were None and `elec_unit_rate_p` (24.7275)
+  and `export_rate_p`/`export_rate` (12.0) froze. FLUX-EXPORT codes carry no OUTGOING either, so export
+  classification now also accepts EXPORT in the code.
+- `elec_tariff_name`/`export_tariff_name`/`gas_tariff_name` had no writer (still SILVER-25-04-11 and
+  OUTGOING). `tracker_rate_today` held 26.21 for ever, and the morning brief read it out.
+- Tomorrow's surplus revenue used the export band live NOW (27.7p during the peak).
+
+Changes:
+- `_banded_rate_for_day(side, date)` → (pence, reason), one implementation for `import` and `export`
+  (`_BAND_SIDES` maps each to its slots key, halfhourly column and agreement valid_from).
+  `_export_rate_for_day_p` / `_import_rate_for_day_p` are thin wrappers; all the existing refusals
+  (not banded, before agreement, partial coverage, unreadable row) hold for both.
+- `_banded_rate_and_basis` adds basis **"time-average"** when the day is banded and nothing flowed that
+  way: the money is zero either way, but a row with no rate reads as "rate missing".
+- Daily record: `rate_today_p` = weighted import on banded days (Tracker days unchanged) + `import_rate_basis`.
+- Live today card (`get_dashboard_data`, `_cost_vars_economics`) values today's kWh at
+  `_live_rates_today_p` — today's own weighting — while `solar.export_rate_p` stays the rate now.
+- `_band_tiers(side)` → distinct prices cheapest first with LOCAL windows, a band over midnight joined
+  into one window, `current` flags; [] unless the whole day tiles. `_tariff_sides_payload` adds
+  `tariff.import_side` / `tariff.export_side` {name, tariff_code, banded, now_p, tiers, valid_from}.
+- `get_account_financials`: queries HalfHourlyTariff `unitRates`; `unit_p` = rate in force; carries
+  `unit_rates` + `tariff_code` on both sides. `_write_cost_variables` re-reads the band at write time
+  (the ledger is cached 30 min) and writes the three tariff-name variables.
+- `_write_tariff_schedule_variables`: `tracker_rate_today/tomorrow` = "n/a" and
+  `tracker_fetch_status` = "not on Tracker" when the active tariff is not Tracker; new
+  `export_rates_today_json` (billed export slots overlapping today).
+
+Not changed, deliberately: settled rows still price Octopus's day total at the row's (now weighted)
+rate; history before 17-Sep is untouched.
+
+15 new tests (import weighting, column separation, pre-agreement day, time-average, tiers incl. the
+midnight join and current flag, gap → no tiers, payload, Flux ledger parse). Sabotage checked: pointing
+import at the export column and disabling the midnight join each turn tests red.
+**1857 tests, 0 failures; ruff clean.** Installed after the 19:00 peak, as 5.109.5 was planned to be.
+
+---
+
+## v5.109.5 — 17-09-2026
+
+**ON FLUX, BANK TO 100% ONCE THE REST OF THE DAY CANNOT CLIP.** CliveS: *"surely it would be
+better to bank the extra solar into the battery to get it to 100% if the 95% is reached earlier than
+to sell it at 9.5p as that would reduce the amount ... topped up overnight at 14p plus."* Right on
+Flux: export before 16:00 earns 9.7p; a banked kWh displaces a 14.6p cheap-window kWh (about 15.5p
+with losses), and the peak cannot absorb it — at 95% the spare already exceeds the 12 kWh the 4 kW
+cap allows in 16:00-19:00. The standing 95% rule was about CLIPPING (July, Tracker), which is only a
+risk while forecast PV can still exceed house + export cap.
+
+- `BatteryManager._flux_clip_risk_passed()`: standard Flux only; every remaining hour today of
+  `forecast_p50` x `bias_factor_today` x `pv_tracking_factor`, grossed up by
+  `FLUX_CLIP_GUST_FACTOR` (1.25, a CHOSEN margin for hourly means hiding cloud bursts, not
+  measured), must fit under that hour's profile house use + `max_export_kw`. No forecast, no
+  profile (house taken as 0) or any error -> False.
+- When True (and not a storm), the overflow pacing target becomes 100%; reason gains
+  "(Flux: no clip risk left today, banking to full)". The physics gate is unchanged.
+- Memory rule `feedback_battery_target_soc_is_90_not_100` updated with CliveS's decision.
+
+**Found live in the first Flux peak and fixed in the same release: solar overflow held Flux off for
+the whole window.** An overflow export engaged at 14:24 and `_flux_other_owner()` counted
+`solar_overflow_active` as an owner, so from 16:00 the supervisor stood down every tick, logging
+nothing, with the battery at 96% and only PV going out. Inside the peak (`_flux_peak_now()`:
+armed and 16:00-19:00 local) overflow is no longer an owner; the Flux export mode sends PV first,
+so nothing is lost. The supervisor now logs "Standing aside: <owner>" and "No longer standing
+aside" when that changes.
+
+10 new tests; **1861 tests, 0 failures; ruff clean.** Installed at about 16:07 to rescue the first peak, which the owner bug was blocking.
+
+---
+
+## v5.109.4 — 17-09-2026
+
+**THE SAVING SESSION PUSHOVER, REWRITTEN TO THE NOTIFICATION RULES.** The 12:50 push said "NOT
+OPTED IN — join it in the Octopus app, or it pays nothing" about EVENT_77, which Octopus had just
+refused to let this account join; it also carried em-dashes, "18:00-19:00 (1.0h)" and a capitalised
+shout.
+
+- The body is sentences, ASCII only (`_ascii_plain`), times via `_clock_words` ("6pm", "4:30pm",
+  "midday") and `_session_day_words` ("tonight", "tomorrow", "on Saturday 20 September").
+- The title carries the answer: "you are in", "join it in the Octopus app", "not worth joining",
+  "joining shortly", "not one for the battery".
+- Only asks him to act when he can: auto-join ON with a transient failure says the plugin will
+  try again within the hour; a budget refusal says why it was not joined; only auto-join OFF sends
+  him to the app. A session this account CANNOT join (join refused permanently, or capacity FULL)
+  is not pushed at all, logged at INFO and marked notified.
+- The "opted in: NO" log line is WARNING only when he must act.
+- An unknown direction is no longer described as a Power Up. The Happy Hour body is ASCII-cleaned
+  too. The export-rate figure is dropped: on Flux the rate depends on the band, so "added to what
+  the export itself earns" is the true statement.
+
+6 new tests, 4 updated; **1836 tests, 0 failures; ruff clean.**
+
+---
+
+## v5.109.3 — 17-09-2026
+
+**ON FLUX, THE SOLAR OVERFLOW CHARGE IS PACED TO 16:00, NOT DUSK.** CliveS asked whether the
+export policy was the best on Flux; it was not. The overflow pacing (v3.8) was built for a flat
+12p export, where WHEN a kWh leaves makes no difference. On Flux a kWh exported before 16:00 earns
+9.7p; held, it sells for 27.7p (about 21p after the 94% round trip and 5p wear) or saves 34p of peak
+import. Pacing to dusk let the battery reach the peak lower than it needed to be, having sold the
+difference at 9.7p.
+
+- `BatteryManager._overflow_pacing_hours()` returns hours to 16:00 local on standard Flux before
+  16:00 (never beyond dusk), else hours to dusk. `required_charge_kw` divides by that. The physics
+  gate is untouched — it still decides WHETHER a day overflows, to dusk — so only the RATE changes
+  and a day that cannot fill the battery behaves exactly as before. Intelligent Flux keeps dusk
+  (different windows). Fails to dusk on any error. `FLUX_PEAK_START_HOUR = 16`.
+- The decision reason gains "paced to the 4pm Flux peak (N h)".
+- The gain is capped by the 4 kW export limit (at most 12 kWh in the peak, PV included) — probably
+  under £1 on a sunny day; the daily Flux report and the 28-Sep bank-first review (now re-scoped
+  to judge the gate on Flux prices, question 6) measure it rather than trusting that estimate.
+
+4 new tests incl. a BST check; **1830 tests, 0 failures; ruff clean.**
+
+---
+
+## v5.109.2 — 17-09-2026
+
+**ANOTHER REGION'S SAVING SESSION IS NOT NEWS.** CliveS: *"if it does not concern us then we
+don't need to be told."* EVENT_77_170926 (6pm, regions 8-12) produced a "NOT OPTED IN, join
+it" Pushover, a WARNING and an amber Dashboards chip for this region-F account, and the
+auto-join got OE-1308 "Account's region is outside of the target regions for this event".
+
+- The session query now selects `targetRegion { regionId }` (introspected live: a non-null
+  list of `TargetRegionType`; Weekend Happy Hours come back `[]`, meaning everywhere).
+  Parsed to `event["target_regions"]`; absent -> None (unknown).
+- `GSP_REGION_IDS` maps the GSP letter to Octopus's number (A=1 ... P=14, skipping I and O).
+  Not documented; confirmed on this account — all 13 region-listed sessions it joined
+  include 6, and the refused EVENT_77 does not. Region F = 6.
+- `_saving_session_for_us(event)` is False only when we KNOW: ours is not in a non-empty
+  list, or Octopus has refused a join on region grounds (`saving_sessions_not_our_region`,
+  persisted). Unknown region or no list counts as ours, so a feed change cannot silence a
+  real session. Applied to auto-join, the announcement loop, `saving_sessions_next_start`
+  and the `octopus_sessions.upcoming` display list, which is what Dashboards reads — so the
+  Dashboards chip and row need no change of their own.
+- A region refusal on an event whose list said it was ours logs one WARNING naming the
+  mismatch, since that would mean the numbering is wrong.
+
+6 new tests; **1826 tests, 0 failures; ruff clean.** Live check of the new query: region id
+6, 77 events, EVENT_77 regions [8-12].
+
+---
+
+## v5.109.1 — 17-09-2026
+
+**FLUX'S FLOORS MOVE OFF THE ABSOLUTE CUTOFF, AND THE SITE LIMIT BECOMES A HARDWARE CAP.**
+Supervised commissioning on the live inverter, manager paused throughout:
+
+- **40040 (grid import cap) is enforced at the meter.** Mode 3, charge limit 10 kW: grid
+  import held at 1.00 kW, then 3.00 kW, house still supplied. The battery absorbs the cap.
+  In mode 3 PV read 0 W — grid-first charging stops solar, so a stuck mode 3 costs a day's
+  generation (irrelevant at 02:00-05:00, noted for comms loss).
+- **No watchdog.** 3.5 minutes with no Modbus traffic: mode 3 and the cap both held.
+- **40046 (backup reserve) stops a forced export on-grid.** Mode 5, 40048 at 1%: with the
+  reserve 0.6% BELOW SOC and PV at 2.5 kW, the battery discharged 1.8 kW; with it 2.0%
+  ABOVE SOC and PV 2.3-2.8 kW (2 kW of export headroom) the battery held 0 W for six
+  minutes. The vendor manual says it does not apply off-grid, where 40048 governs.
+
+So `_FluxRawDriver.set/read_discharge_cutoff` now address **40046**, and
+`_policy_discharge_floor_pct` (reserve + commitments) is written there by the verify pass,
+the teardowns, the VPP restore and the disengage path — **only while Flux is armed**, so an
+unarmed install keeps its installer's reserve. `_absolute_cutoff_pct()` owns **40048**:
+health floor, or a live flood-prevention target, and nothing economic. The VPP dispatch
+floor stays on 40048 as before (its night dawn floor is unchanged pre-Flux behaviour).
+With the site limit verified and Flux armed, the verify pass asserts 40040 to it.
+
+**The first plan after a restart no longer uses Tracker.** The first manager tick ran
+before the first Octopus refresh, so `_build_tariff_data` fell back to Tracker — live on
+Flux the trace read `tariff=tracker` after each of today's three restarts. The hardware
+ACTION now waits for the tariff (`TARIFF_WAIT_S`, 300 s); evaluation, Flux pre-emption and
+the device state still run, and after the wait it acts as before so an Octopus outage
+cannot stop the battery being managed.
+
+Result: a lost connection mid-export leaves the reserve on 40046 — grid-tied discharge
+still stops there, and a power cut that follows can use the whole battery. Stale
+source-count guard in `test_plugin.py` (3 -> 4 `_rates_for_tariff` calls, from the
+dashboard fix) corrected. **1820 tests, 0 failures; ruff clean.**
+
+---
+
+## v5.109.0 — 17-09-2026
+
+**THE NATIVE OCTOPUS FLUX CONTROLLER, AND THE FLAT 12p THAT HAD BEEN REPORTING EVERY
+EXPORT.** CliveS: *"We are now live on Flux incoming and Outgoing so please liase with
+Claude and implement the change over."* Built as a two-agent draft in an isolated
+worktree — Claude Code wrote the planner and the plugin integration, ChatGPT Astra/Codex
+wrote the acknowledged executor, then reviewed the integration and corrected the final
+call paths. Three review rounds; every finding was checked against the real call
+ordering before it was called fixed, and two of my own round-3 completion claims were
+wrong and are corrected below.
+
+**Three new modules.** `flux_strategy.py` is the planner: pure stdlib, no Indigo, no
+network, no clock of its own, so a whole Flux day runs in milliseconds under test.
+`flux_execution.py` (Codex) holds a durable journalled claim on the inverter and verifies
+every register it writes. The `plugin.py` Flux section joins them — builds the planner's
+inputs from live state, decides who owns the inverter, and leases each decision.
+
+**The charge is a chronological budget, not a daily total.** A half-hourly simulation
+from 05:00 to the NEXT 02:00 works out the least energy the battery must hold at the end
+of the cheap window to carry the house and every committed grid event without dipping
+below the reserve — PV serving the house directly before anything reaches the battery,
+both power limits binding per step, one-way efficiencies whose product is the configured
+round trip. A day-total subtraction nets a sunny afternoon against a six o'clock
+breakfast and buys nothing; there is a test that pins exactly that pair.
+
+**Household demand and event commitments are energy, not buffers.** A flat 20% reserve,
+no 2 kWh contingency anywhere. Axle windows and joined Octopus sessions become
+`EventCommitment` records reserved from the moment they are ANNOUNCED — announcement is
+when the cheap window needs to start buying, so it deliberately does NOT stand Flux down.
+Overlapping commitments are combined by the union of their demand, never the sum: two
+schemes can pay for the same exported kWh and the house exports it once. One exported kWh
+earns the ordinary tariff revenue AND any event payment, both real, neither double
+counted, and an event reward is never added to the export price that decides a
+discretionary trade.
+
+**Two floors, because one is wrong.** The household floor (reserve plus commitments) is
+what the house may not eat into; the export floor adds the whole forecast household need
+to the next cheap window and is what a discretionary sale may not sell through. A single
+floor protecting all future household consumption FROM the household would leave the
+battery full and the house importing at the day rate.
+
+**One owner for the hardware discharge floor.** `_policy_discharge_floor_pct()` is now
+the single source for register 40048 and every writer reads it — the verify pass, the
+export teardown, the flood-prevention reset, the VPP raise and restore, the pause/sleep
+disengage, the scheduled import and the Flux release baseline. Before this each wrote
+`batteryHealthCutoff` directly, so the verify pass pulled the floor back to 1% within a
+minute of Flux handing back. Flood prevention may raise that floor but may not drain
+through it. Storm reaches the planner only: it raises a software dawn target and never
+writes the register, and a storm floor written to hardware is one nothing would lower.
+
+**A dispatch is never reserved against itself.** Axle writes the discharge cutoff ONCE,
+at PRE_CHARGING, thirty minutes before the window and while the state is still ANNOUNCED
+— so the event is passed explicitly into the floor calculation, its own allocation is
+removed as union(all) minus union(serving), and only an unserved overlap tail stays
+reserved. Flux releases BEFORE that cutoff write, and the following transition is marked
+pre-empted so it cannot restore an older baseline over the new floor. The shortfall
+warning quotes the floor actually installed.
+
+**Startup no longer disarms a backstop it has not read about.** `_init_modules` lifted
+both power limits and the charge cutoff to 100% immediately after connecting. After a
+crash in mode 3 with a cutoff at 80%, that removed the only thing stopping an unattended
+charge to full, before the claim journal had been read. Those three writes are skipped
+whenever a claim needs recovery. A preference save replaces `self.modbus`, which stranded
+an existing executor on a dead adapter; `FluxExecutor.rebind()` swaps it with validation
+and requires fresh reconciliation.
+
+**Proof, not a probe.** Trading arms only on the ACCOUNT's own agreements — both sides,
+from one response carrying its own timestamp, each live now rather than the last in the
+list, on the configured meter or a single unambiguous one. Fresh public prices can no
+longer keep stale account proof alive, a failed account read clears the evidence rather
+than leaving it standing, and the rates come from the BILLED product code, never from
+`_probe_product_by_prefix`, which returns the most recently launched product and on a
+re-versioned tariff is not what the house pays.
+
+**EXPORT WAS STILL BEING REPORTED AT A FLAT 12p, AND NOTHING HAD EVER POPULATED IT.**
+`latest_rates_data["export_rate_p"]` had no writer anywhere in the plugin, so the
+dashboard, the manager snapshot, the VPP revenue estimate and every daily history record
+fell back to `DEFAULT_EXPORT_RATE_P` — correct while the account was on Outgoing at a flat
+12p, wrong the day it moved to paired Flux. It is now published every rates refresh from
+`_export_rate_now_p()`, which reads the account's own export schedule. And a day's
+exports are valued at the bands they were actually sold in: `_export_rate_for_day_p()`
+weights the published bands by the half-hourly export the plugin already logs, because the
+same day's export is worth two and a half times as much at 17:00 as at 03:00. It returns
+None rather than guessing — for a flat tariff, a missing series or a day with nothing
+exported — and each record carries `export_rate_basis` so a reader can tell an exact
+figure from an approximate one.
+
+**TWO MORE FAULTS FOUND THE DAY THE ACCOUNT WENT LIVE.** `_rates_for_tariff` fell through
+to the Tracker bucket for every time-of-use tariff, so live on Flux the status line and the
+tariff device both read "Nonep" — a TOU bucket holds cheap/standard/peak and none of them
+is `today_p`. It now reports the band in force, compared in LOCAL wall time, with the
+wrapping iFlux window handled. And register **40048 is absolute — the inverter honours it
+off-grid** — so the 20% economic floor would have locked ~7 kWh away during the very power
+cut the reserve exists for. `_policy_discharge_floor_pct()` now drops to the health floor
+during a VERIFIED outage (two sources must agree: the `power_cut_started_at` flag, which
+only a genuine Off-grid status can set, and a fresh live reading that still says off-grid),
+nothing economic can raise it back, and the outage is the highest-priority owner so the Flux
+claim is released before the lowered floor is written. Backup reserve belongs on 40046,
+which is set to 20%; `batteryHealthCutoff` stays 1%, which is what makes the release mean
+anything. **If the host loses comms the plugin cannot release the floor at all — there is
+no hardware watchdog.**
+
+**Everything refuses rather than guesses.** Either switch off, commissioning not signed
+off, the account unproven or stale, rates missing or non-contiguous or averaged across a
+product change or on a different clock, the forecast not covering the hours the decision
+turns on, the profile malformed or a week old, SOC or flows stale or stamped in the
+future, any input NaN or infinite or a bool where a number belongs, the site import limit
+unverified, or no spare site import capacity. All produce a logged defer and no write.
+
+**1812 tests** (planner 80, supervisor 157, Codex's executor 24 and independent review contract 29). Ruff clean, PluginConfig parses, version consistency
+green. **Ships with `fluxEnabled`, `fluxCommissioned` and `fluxSiteImportVerified` all
+false** — it does nothing whatever until a person ticks them, and the commissioning
+checklist is `docs/flux-controller.md`. No hardware watchdog exists and none is claimed;
+the comms-loss behaviour of this inverter is unmeasured, and that is a supervised test on
+the checklist, not a software gap.
+
 ## v5.107.0 — 15-09-2026
 
 **DO NOT EARN A TOKEN THAT CANNOT BECOME AN HOUR HE WILL USE.** CliveS:
@@ -1501,7 +1837,7 @@ negative are different facts — [[feedback_absent_state_is_never_a_match]], hit
 time in an auth reply rather than a device state.
 
 Live-verified after the restart, through the SHIPPED file: account block resolves,
-`hasJoinedCampaign=True`, 36 joined events, signed-up meter point 1591059073620. Tests
+`hasJoinedCampaign=True`, 36 joined events, signed-up meter point 1234567890123. Tests
 897 → 903, and both fixes mutation-tested — reverting the header turns the suite red (1
 failure), reverting the guard turns it red (3) — each sabotage asserted to have applied and
 each restore verified byte-identical, with `__pycache__` cleared before every run.

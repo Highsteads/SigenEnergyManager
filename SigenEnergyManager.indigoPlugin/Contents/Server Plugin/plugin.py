@@ -8,9 +8,16 @@
 # Author:      CliveS & Claude Fable 5 (5.67.0); Claude Opus 5 (5.68-5.69, 5.71.1,
 #              5.72.0, 5.75.0, 5.78.0-5.78.1); Claude Sonnet 5 (5.80.0); Claude Opus 5 (5.80.1, 5.81.0-5.88.0);
 #              Claude Fable 5.1 (5.89.0-5.90.2); Claude Opus 5 (5.91.0-5.99.2); Claude Sonnet 5 (5.99.3);
-#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.108.0)
-# Date:        15-09-2026 14:40
-# Version:     5.108.0
+#              Claude Fable 5.1 (5.100.0-5.101.0); Claude Opus 5 (5.102.0, 5.103.0, 5.104.0-5.108.0);
+#              Claude Opus 5 & ChatGPT Astra/Codex (5.109.0 — native Flux controller)
+#              Claude Opus 5 (5.109.1 — Flux floors on the backup reserve, site import cap)
+#              Claude Opus 5 (5.109.2 — Saving Sessions for other regions stay silent)
+#              Claude Opus 5 (5.109.3 — daytime solar paced to be full by the 4pm Flux peak)
+#              Claude Opus 5 (5.109.4 — Saving Session Pushover in plain English)
+#              Claude Opus 5 (5.109.5 — on Flux, bank to 100% once the day cannot clip)
+#              Claude Opus 5 (5.110.0 — Flux import priced by band; every tier published)
+# Date:        17-09-2026
+# Version:     5.110.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -23,6 +30,7 @@
 import indigo
 import json
 import os
+import math
 import sqlite3
 import sys
 import threading
@@ -158,6 +166,7 @@ from daily_energy import (DailyEnergy, readings_from_data, recovery_from_data,
                           local_midnight_epoch, KEYS as ENERGY_KEYS)
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
+                              TARIFF_FLUX, TARIFF_GO, TARIFF_IGO, TARIFF_IFLUX,
                               GAS_KWH_PER_M3)
 from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
 from octopus_api      import octopoints_to_pence as _points_to_pence
@@ -219,6 +228,27 @@ from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
 import vpp_ledger as _vpp_ledger
 import axle_email as _axle_email
 import axle_account as _axle_account
+
+# ── Octopus Flux (draft, off by default) ─────────────────────────────────────
+# Two modules, imported together and guarded together. flux_strategy decides;
+# flux_execution carries the decision out and owns the durable claim. Neither is
+# reachable unless the owner has ticked BOTH the feature switch and the
+# commissioning gate, so a missing module can only ever mean "the feature stays
+# off" — never a plugin that will not start.
+try:
+    import flux_strategy as _flux_strategy
+    from flux_execution import (FluxExecutor as _FluxExecutor, FluxTarget as _FluxTarget,
+                                MAX_OBSERVATION_AGE_S as _FLUX_MAX_OBSERVATION_AGE_S)
+    FLUX_AVAILABLE = True
+except Exception as _flux_import_exc:       # noqa: BLE001 — a broken half must not stop the plugin
+    _flux_strategy  = None
+    _FluxExecutor   = None
+    _FluxTarget     = None
+    _FLUX_MAX_OBSERVATION_AGE_S = 60
+    FLUX_AVAILABLE  = False
+    FLUX_IMPORT_ERROR = repr(_flux_import_exc)
+else:
+    FLUX_IMPORT_ERROR = ""
 
 # ============================================================
 # Constants
@@ -306,6 +336,35 @@ OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
 COST_SETTLE_INTERVAL      = 21600 # 6 hours - backfill settled whole-house costs into daily_history
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
+
+# --- Octopus Flux supervisor (draft) -------------------------------------
+# There is deliberately NO re-assert interval. An earlier draft skipped the
+# executor for 60 s when the command had not changed, to spare the throttled
+# bus — and a skip longer than the observation lease leaves the executor holding
+# a decision whose reading has expired, with nothing on the inverter enforcing
+# it. The target is renewed every tick from a fresh observation instead; the
+# executor's renewal path is read-back only when the command is unchanged, which
+# is what makes that affordable.
+# Take a fresh SOC if the cached observation is older than six seconds, leaving
+# the rest of the executor's observation budget for throttled, verified IO.
+FLUX_OBSERVATION_MAX_AGE_S = 6.0
+# This is observation freshness at commit, not a physical hardware watchdog.
+FLUX_OBSERVATION_LEASE_S   = _FLUX_MAX_OBSERVATION_AGE_S
+# After being pre-empted by a manual action, a VPP window, a storm or anything
+# else that outranks Flux, the supervisor stays out for at least this long AND
+# until the pre-empting condition has been clear for FLUX_RECLAIM_TICKS
+# consecutive ticks. One tick of a flag flickering clear must not be enough to
+# take the inverter back off somebody who is still using it.
+# How old the ACCOUNT evidence may be. The agreements come from the account
+# endpoint and change perhaps twice a year, so six hours is generous — but it
+# must have been fetched, and recently. Public prices refreshing is not evidence
+# that the house is still on the tariff those prices belong to.
+FLUX_ACCOUNT_EVIDENCE_MAX_AGE_S = 6 * 3600
+FLUX_PREEMPT_COOLDOWN_S    = 300
+FLUX_RECLAIM_TICKS         = 3
+# There is deliberately no give-up timeout for an unconfirmed claim. An earlier
+# draft had one; it worked by telling the executor an external supervisor had
+# taken over, which is a lie when nothing has. See _flux_note_pending.
 # Backstop grace past the stored window end before the MANAGER force-ends an
 # over-running VPP export (v5.62.0). The primary path stops at end+2min on a
 # 60s poll, so 15 min leaves it ample room to do its job first; anything still
@@ -1152,6 +1211,46 @@ def _london_today():
     return _london_now().date()
 
 
+def _tou_band_now(tou, now_local=None):
+    """Which band a time-of-use tariff is in right now: "cheap" | "peak" | "standard".
+
+    Compared in LOCAL wall time, because that is what the windows are quoted in —
+    octopus_api derives `cheap_start`/`cheap_end` from the published rates and
+    stores them as local "HH:MM". Comparing a UTC clock against them would be an
+    hour out for the eight months of BST, which is the mistake the Go window
+    carried from v5.47.0 to v5.60.0.
+
+    A window that wraps past midnight (Go's 00:30-05:30 does not, but iFlux's
+    19:00-16:00 does) is handled by the wrap branch rather than a naive
+    start <= t < end.
+    """
+    if not tou:
+        return "standard"
+    local = now_local or _london_now()
+    hhmm  = local.strftime("%H:%M")
+
+    def _inside(start, end):
+        if not start or not end or start == end:
+            return False
+        return (start <= hhmm < end) if start < end else (hhmm >= start or hhmm < end)
+
+    if _inside(tou.get("peak_start"), tou.get("peak_end")):
+        return "peak"
+    if _inside(tou.get("cheap_start"), tou.get("cheap_end")):
+        return "cheap"
+    return "standard"
+
+
+def _tou_rate_now_p(tou, now_local=None):
+    """The published price a time-of-use tariff charges right now, or None.
+
+    None when that band has no published price — absent, not zero and not
+    another band's price.
+    """
+    band = _tou_band_now(tou, now_local)
+    return (tou or {}).get({"peak": "peak_p", "cheap": "cheap_p"}.get(band, "standard_p"))
+
+
 def _local_time(dt, fmt="%H:%M"):
     """Format a UTC-aware datetime in Europe/London local time (BST/GMT).
 
@@ -1204,6 +1303,131 @@ def _snapshot_in_window(rec, event, slack_mins=15):
         return True
     slack = slack_mins * 60.0
     return -slack <= elapsed <= duration_hrs * 3600.0 + slack
+
+
+def _clock_words(dt):
+    """6pm, 6:30pm, midday, midnight: a time as a person says it."""
+    if dt.hour == 12 and dt.minute == 0:
+        return "midday"
+    if dt.hour == 0 and dt.minute == 0:
+        return "midnight"
+    hour = dt.hour % 12 or 12
+    suffix = "am" if dt.hour < 12 else "pm"
+    return f"{hour}{suffix}" if dt.minute == 0 else f"{hour}:{dt.minute:02d}{suffix}"
+
+
+def _session_day_words(start_local, now_utc):
+    """today / tonight / tomorrow / on Saturday 20 September."""
+    try:
+        today = now_utc.astimezone(start_local.tzinfo).date() if start_local.tzinfo else now_utc.date()
+        days = (start_local.date() - today).days
+    except Exception:                                    # noqa: BLE001
+        days = None
+    if days == 0:
+        return "tonight" if start_local.hour >= 17 else "today"
+    if days == 1:
+        return "tomorrow"
+    return f"on {start_local.strftime('%A')} {start_local.day} {start_local.strftime('%B')}"
+
+
+def _session_span_words(start_local, end_local):
+    if end_local is None:
+        return f"at {_clock_words(start_local)}"
+    return f"from {_clock_words(start_local)} to {_clock_words(end_local)}"
+
+
+def _ascii_plain(text):
+    """Pushover bodies are ASCII (standing rule): swap the usual offenders."""
+    for bad, good in (("\u2014", ", "), ("\u2013", " to "), ("\u2019", "'"),
+                      ("\u2018", "'"), ("\u201c", '"'), ("\u201d", '"'),
+                      ("\u00a3", "GBP "), ("\u00b0", " degrees")):
+        text = text.replace(bad, good)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+# How long the manager waits after startup for the first tariff before planning
+# with the Tracker fallback (v5.109.1).
+TARIFF_WAIT_S = 300
+
+
+class _FluxRawDriver:
+    """The exact surface flux_execution asks a raw driver for, and nothing else.
+
+    A thin named adapter rather than handing the executor `self.modbus` directly,
+    for three reasons:
+
+      * `inverter_max_w` is a plugin PREFERENCE, not a register. The executor
+        validates every power figure against it, so it has to come from somewhere,
+        and reading it from the driver keeps the executor free of plugin state.
+      * `set_charge_limit(watts, quiet=False)` logs and read-back-verifies by
+        default. The executor does its own read-back on every write, so this
+        adapter passes quiet=True and lets the executor be the one that decides
+        what "confirmed" means. One verifier, not two.
+      * it is the seam the tests drive. Everything below here is a real Modbus
+        transaction; everything above it can be exercised on a fake.
+
+    Every method coerces to a real bool, because the executor tests `is True` and
+    a driver that returns a truthy non-bool would be read as a failed write.
+    """
+
+    def __init__(self, modbus, prefs):
+        self._modbus = modbus
+        self._prefs  = prefs
+
+    @property
+    def inverter_max_w(self):
+        return int(_as_float(self._prefs.get("inverterMaxKw"), 10.0) * 1000)
+
+    # --- writes -------------------------------------------------------
+    def set_charge_limit(self, watts):
+        return bool(self._modbus.set_charge_limit(int(watts), quiet=True))
+
+    def set_discharge_limit(self, watts):
+        return bool(self._modbus.set_discharge_limit(int(watts)))
+
+    def set_charge_cutoff(self, pct):
+        return bool(self._modbus.set_charge_cutoff(float(pct)))
+
+    def set_discharge_cutoff(self, pct):
+        # THE FLOOR GOES ON THE BACKUP RESERVE (40046), NOT THE CUTOFF (40048).
+        # Both stop a grid-tied discharge (hardware-verified 17-Sep-2026, forced
+        # export included), but only 40048 still applies off-grid. There is no
+        # hardware watchdog, so whatever floor Flux last wrote survives a lost
+        # connection — on 40048 that would lock the house out of its own battery
+        # in a power cut that followed; on 40046 the battery stays fully usable.
+        return bool(self._modbus.set_backup_soc(float(pct)))
+
+    def set_remote_ems_mode(self, mode):
+        return bool(self._modbus.set_remote_ems_mode(int(mode)))
+
+    def enable_remote_ems(self):
+        return bool(self._modbus.enable_remote_ems())
+
+    # --- reads --------------------------------------------------------
+    def read_ems_mode(self):
+        return self._modbus.read_ems_mode()
+
+    def read_charge_limit(self):
+        return self._modbus.read_charge_limit()
+
+    def read_discharge_limit(self):
+        return self._modbus.read_discharge_limit()
+
+    def read_charge_cutoff(self):
+        return self._modbus.read_charge_cutoff()
+
+    def read_discharge_cutoff(self):
+        return self._modbus.read_backup_soc()
+
+    def read_remote_ems_enabled(self):
+        """Register 40029 — is Remote EMS switched on at all.
+
+        The executor checks this as well as the mode, and it is worth having:
+        mode 0x03 written while Remote EMS is DISABLED reads back perfectly and
+        does nothing, which is the shape of failure that looks like a working
+        charge in every log line until the SOC does not move.
+        """
+        return self._modbus.read_remote_ems_enabled()
 
 
 class Plugin(indigo.PluginBase):
@@ -1361,6 +1585,7 @@ class Plugin(indigo.PluginBase):
         # only a refusal retrying cannot fix earns a place here, which is what stops
         # an hourly re-attempt for the life of the plugin.
         self.store["saving_sessions_join_refused"] = []
+        self.store["saving_sessions_not_our_region"] = []
         # Warn-once latch for the token-budget refusal, so a session we decline for
         # the whole week says so once rather than hourly. Not persisted on purpose:
         # it is chatter suppression, not state, and one repeat after a restart is a
@@ -1447,6 +1672,23 @@ class Plugin(indigo.PluginBase):
         # runs the stuck-mode recovery, which returns the inverter to
         # self-consumption anyway, so a stale True would be noise.
         self.store["vpp_handback_pending"] = False
+
+        # --- Octopus Flux supervisor (draft) ---------------------------------
+        # NONE of this is persisted. The durable claim on the hardware belongs to
+        # flux_execution's journal, which is the one record that survives a
+        # restart; a second copy of ownership in the accumulators file could only
+        # ever disagree with it. Everything here is this process's own view.
+        self.flux_executor            = None
+        self.store["flux_decision"]      = None   # last FluxDecision object
+        self.store["flux_applied_key"]   = None   # control_key of what is on the inverter
+        self.store["flux_last_step"]     = 0.0    # when step() last ran
+        self.store["flux_last_result"]   = ""     # applied / released / pending / supervisor
+        self.store["flux_owner_reason"]  = ""     # who outranks us right now
+        self.store["flux_preempted_at"]  = 0.0
+        self.store["flux_clear_ticks"]   = 0
+        self.store["flux_pending_since"] = 0.0
+        self.store["flux_status"]        = "off"
+        self.store["flux_note_logged"]   = ""
 
         # Ledger-freshness bookkeeping. last_ledger_check starts at 0.0 so the
         # first tick after a restart checks immediately rather than waiting out
@@ -1889,6 +2131,16 @@ class Plugin(indigo.PluginBase):
 
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
+        # Give the inverter up BEFORE anything else stops. The executor's journal
+        # survives this process, so a claim left standing is a claim the next
+        # start has to reconcile against hardware it cannot see the history of —
+        # and the set_self_consumption below would otherwise be a write made over
+        # the top of a live claim.
+        try:
+            with self._state_lock:
+                self._flux_release("the plugin is shutting down")
+        except Exception as exc:
+            log(f"[Flux] Release on shutdown failed: {exc!r}", level="WARNING")
         if self.web_dashboard:
             try:
                 self.web_dashboard.stop()
@@ -1922,6 +2174,15 @@ class Plugin(indigo.PluginBase):
     # on next poll cycle; we only need to restart the web dashboard.
     def prepare_to_sleep(self):
         log("Mac going to sleep — returning inverter to self-consumption and stopping dashboard")
+        # Same reasoning as shutdown, and more urgent: a sleeping Mac stops
+        # calling step() altogether, and nothing in the executor is a hardware
+        # timer. A Flux mode left running into a four-hour sleep would run for
+        # four hours.
+        try:
+            with self._state_lock:
+                self._flux_release("the Mac is going to sleep")
+        except Exception as exc:
+            log(f"[Flux] Release before sleep failed: {exc!r}", level="WARNING")
         if self.web_dashboard:
             try:
                 self.web_dashboard.stop()
@@ -1978,7 +2239,8 @@ class Plugin(indigo.PluginBase):
                 dec    = self.latest_decision
 
             tariff_info = rates.get("tariff_info", {})
-            tracker     = rates.get("tracker", {})
+            active_today_p, active_tomorrow_p = self._rates_for_tariff(
+                tariff_info.get("tariff_key", TARIFF_TRACKER), rates)
 
             pv_w   = int(inv.get("pvPowerWatts",     0))
             bat_w  = int(inv.get("batteryPowerWatts", 0))
@@ -2031,7 +2293,22 @@ class Plugin(indigo.PluginBase):
                     export_rate_p = rates_export
             except (TypeError, ValueError):
                 pass
-            tomorrow_revenue_gbp = round(tomorrow_surplus * export_rate_p / 100.0, 2)
+            # On a banded export tariff the surplus is midday sun, so it is valued
+            # at the band covering noon tomorrow, not whichever band is live now
+            # (at 17:00 that was the 27.7p peak, overstating it nearly threefold).
+            surplus_rate_p = export_rate_p
+            if self._export_tariff_is_banded():
+                try:
+                    _noon = _london_localise(datetime.combine(
+                        _london_today() + timedelta(days=1), datetime.min.time())
+                        .replace(hour=12))
+                    _band = (self._flux_export_band_p(_noon.astimezone(timezone.utc))
+                             if _noon is not None else None)
+                    if _band is not None:
+                        surplus_rate_p = _band
+                except Exception:                       # noqa: BLE001
+                    pass
+            tomorrow_revenue_gbp = round(tomorrow_surplus * surplus_rate_p / 100.0, 2)
 
             # ---- Today's economics ----
             # All four numbers — actual import cost, export revenue, what the
@@ -2043,7 +2320,7 @@ class Plugin(indigo.PluginBase):
             # ~30 minutes after a plugin restart.
             import_rate_p = None
             try:
-                r = float(tracker.get("today_p") or 0.0)
+                r = float(active_today_p or 0.0)
                 if r > 0:
                     import_rate_p = r
             except (TypeError, ValueError):
@@ -2070,12 +2347,18 @@ class Plugin(indigo.PluginBase):
                 except (TypeError, ValueError, KeyError):
                     pass
 
+            # v5.110.0: on a banded tariff TODAY's kWh are valued at the bands
+            # they moved in. The rates above are the band live NOW, which is the
+            # right thing to display and the wrong thing to multiply a whole
+            # day's kWh by.
+            import_rate_p, today_export_rate_p = self._live_rates_today_p(
+                import_rate_p, export_rate_p)
             today_econ = self._compute_daily_economics(
                 home_kwh      = home_kwh,
                 import_kwh    = import_kwh,
                 export_kwh    = float(store.get("grid_export_daily_kwh", 0.0)),
                 import_rate_p = import_rate_p,
-                export_rate_p = export_rate_p,
+                export_rate_p = today_export_rate_p,
             )
             yesterday_econ, yesterday_date = self._yesterday_economics(
                 export_rate_p          = export_rate_p,
@@ -2094,7 +2377,7 @@ class Plugin(indigo.PluginBase):
             try:
                 whole_house = self._whole_house_summary(
                     import_rate_p = import_rate_p,
-                    export_rate_p = export_rate_p,
+                    export_rate_p = today_export_rate_p,
                 )
             except Exception as exc:
                 self.logger.debug(f"[WholeHouse] summary failed: {exc}")
@@ -2215,8 +2498,13 @@ class Plugin(indigo.PluginBase):
                 "tariff": {
                     "name":         tariff_info.get("display_name", "Unknown"),
                     "product_code": tariff_info.get("product_code", ""),
-                    "today_p":      tracker.get("today_p"),
-                    "tomorrow_p":   tracker.get("tomorrow_p"),
+                    "today_p":      active_today_p,
+                    "tomorrow_p":   active_tomorrow_p,
+                    # v5.110.0: every band on each side with the local times it
+                    # runs, so a page can show the whole tariff rather than one
+                    # number. Empty tiers mean a flat side: use today_p /
+                    # export_rate_p as before.
+                    **self._tariff_sides_payload(export_rate_p),
                 },
                 "today_summary": {
                     "pv_kwh":     round(store.get("pv_daily_kwh",          0.0), 2),
@@ -2966,6 +3254,18 @@ class Plugin(indigo.PluginBase):
             self._refresh_forecast()
             self.store["last_forecast"] = now
 
+        # 2b. Octopus Flux supervisor (draft, off by default). Runs on EVERY tick
+        # and BEFORE the manager, deliberately:
+        #   * before, so that within one tick Flux has already claimed or let go
+        #     by the time the manager looks at the inverter — the manager must
+        #     never act on registers a claim is about to change, and must never
+        #     have its own act pass fight a live claim;
+        #   * every tick rather than on the manager's 60 s cadence, because
+        #     letting go has to be prompt. Taking control is rate-limited inside
+        #     the supervisor's own stand-down rules; giving it up is not.
+        # Costs nothing when the feature is off: one preference read and a return.
+        self._flux_supervisor_tick()
+
         # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
         if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
             self._evaluate_manager()
@@ -3595,10 +3895,61 @@ class Plugin(indigo.PluginBase):
         self._log_manager_decision(decision, snapshot, soc_pct)
         self._note_import_hold(decision)
 
-        # 7. Verify persistent inverter registers haven't drifted before acting
+        # 7 + 8. Verify and act — UNLESS the Flux supervisor is holding the
+        # inverter. This is the whole of the "no overlay that fights the old
+        # manager" rule, and it is one branch on purpose.
+        #
+        # Both of the passes below would fight a live Flux claim, in different
+        # ways and within a minute of each other:
+        #   * _verify_ems_registers reads back the mode and the two power limits,
+        #     compares them against what the STORE flags imply, and "corrects"
+        #     anything else. A Flux charge (0x03 with a sized limit) looks exactly
+        #     like drift to it, because no store flag says otherwise;
+        #   * _act_on_decision's anti-oscillation hold would keep re-driving its
+        #     own idea of the import, and its SELF_CONSUMPTION branch would issue
+        #     a hand-back nobody asked for.
+        # So while Flux owns the registers the manager still EVALUATES — the
+        # decision, the device state, the shadow metrics and the logs all carry on
+        # — and simply does not touch the hardware. The moment Flux lets go, the
+        # next evaluation acts as it always did, including the stuck-mode recovery
+        # that puts a strange mode back to self consumption.
+        if self._flux_owns_control():
+            # Somebody may have taken priority since the supervisor last looked —
+            # a VPP window opening, a storm landing, an import starting. Release
+            # HERE, inside the same locked evaluation, rather than leaving it to
+            # the next supervisor tick: a paid export window must not wait a tick
+            # plus a manager cycle (up to 70 seconds of it) for Flux to notice.
+            owner = self._flux_other_owner()
+            if owner:
+                self._flux_release(f"pre-empted by {owner}", preempted=True)
+            if self._flux_owns_control():
+                self.store["manager_hands_off_reason"] = (
+                    "the Flux supervisor holds the inverter")
+                self._update_manager_device(decision, snapshot)
+                self._publish_flood_preview(snapshot, decision)
+                return
+        self.store["manager_hands_off_reason"] = ""
         self._verify_ems_registers()
+        # 8a. NO TARIFF YET. Straight after a restart the first manager tick runs
+        #    before the first Octopus refresh, and _build_tariff_data then falls
+        #    back to Tracker — so on Flux (or Go, or Agile) the first plan of every
+        #    restart was a flat-rate plan (seen live 17-Sep-2026: "tariff=tracker"
+        #    at 11:23, 11:25 and 12:50, each a restart). Everything above still runs (Flux pre-emption,
+        #    the device state); only the hardware ACTION waits for the tariff, up to
+        #    TARIFF_WAIT_S; after that, carry on as before rather than never
+        #    managing the battery because Octopus is down.
+        if not (self.latest_rates_data or {}).get("tariff_info"):
+            waited_since = self.store.get("tariff_wait_since")
+            if waited_since is None:
+                self.store["tariff_wait_since"] = waited_since = time.time()
+                log("[Manager] Waiting for the first Octopus tariff refresh before "
+                    "acting, so the first plan after a restart uses the real tariff.")
+            if time.time() - waited_since < TARIFF_WAIT_S:
+                self._update_manager_device(decision, snapshot)
+                return
+        else:
+            self.store["tariff_wait_since"] = None
 
-        # 8. Act
         self._act_on_decision(decision)
 
         # 9. Push device state
@@ -5454,6 +5805,8 @@ class Plugin(indigo.PluginBase):
                 continue
             if event.get("joined"):
                 continue                      # already in — nothing to do
+            if not self._saving_session_for_us(event):
+                continue                      # not open to our region; say nothing
             if event.get("direction") != SAVING_SESSION_TURN_DOWN:
                 continue                      # see the docstring: turn-downs only
             if start_at <= now_utc:
@@ -5508,8 +5861,19 @@ class Plugin(indigo.PluginBase):
                         f"bonus) automatically.")
             elif result.get("permanent"):
                 refused.add(str(code))
-                log(f"[SavingSessions] Could not opt in to {code} and will not try "
-                    f"again: {result.get('reason')}", level="WARNING")
+                if "region" in str(result.get("reason", "")).lower():
+                    # Octopus says it is not for us, although the event's own region
+                    # list said it was. Remember it so nothing announces it, and say
+                    # once that the two disagree — the region numbering may be wrong.
+                    not_ours = [str(x) for x in (self.store.get("saving_sessions_not_our_region") or [])]
+                    if str(code) not in not_ours:
+                        self.store["saving_sessions_not_our_region"] = (not_ours + [str(code)])[-200:]
+                    log(f"[SavingSessions] {code} is not open to this account's region, "
+                        f"although its region list suggested it was — check the Octopus "
+                        f"region setting: {result.get('reason')}", level="WARNING")
+                else:
+                    log(f"[SavingSessions] Could not opt in to {code} and will not try "
+                        f"again: {result.get('reason')}", level="WARNING")
             else:
                 # Transient — a network blip, a rate limit, an expired token. NOT
                 # recorded, so the next poll tries again.
@@ -5525,6 +5889,27 @@ class Plugin(indigo.PluginBase):
             # joined to a session nothing will act on and have no way to know.
             log("[SavingSessions] Opted in, but 'drive the battery' is switched off, "
                 "so the export will not be driven for it.", level="WARNING")
+
+    def _saving_session_for_us(self, event):
+        """False only when we KNOW this session is not open to this account's region.
+
+        CliveS, 17-Sep-2026: "if it does not concern us then we don't need to be
+        told." Octopus run sessions for a subset of regions and the feed carries all
+        of them; on 17-Sep a 6pm session for regions 8-12 produced a "NOT OPTED IN,
+        join it" push, a warning, and an amber Dashboards chip for something this
+        account could not join. Known when the event lists its regions and ours is
+        not among them, or when Octopus has already refused a join on region grounds.
+        Unknown (no region list, region not configured) counts as ours, so a feed
+        change can never silence a real session.
+        """
+        code = str(event.get("code") or "")
+        if code and code in {str(x) for x in (self.store.get("saving_sessions_not_our_region") or [])}:
+            return False
+        regions = event.get("target_regions")
+        ours = getattr(self.octopus, "saving_session_region_id", None) if self.octopus else None
+        if not regions or ours is None:
+            return True
+        return ours in regions
 
     def _check_saving_sessions(self):
         """Notify on newly-announced Octopus Saving Sessions events.
@@ -5592,6 +5977,8 @@ class Plugin(indigo.PluginBase):
             start_at = event.get("start_at")
             if not event_id or start_at is None or event_id in notified:
                 continue
+            if not self._saving_session_for_us(event):
+                continue                      # another region's session: not our news
             if start_at <= now_utc:
                 # Already started or in the past — either we've seen it before (and
                 # it's in `notified`) or the plugin only just started watching after
@@ -5625,7 +6012,7 @@ class Plugin(indigo.PluginBase):
                 # noise — it happened on 03-Sep-2026, four pushes for four slots
                 # against a balance that could not pay for one. So the message says
                 # what the reader can actually DO, and nothing else.
-                body = self._happy_hour_alert_body(when, duration_h, event)
+                body = _ascii_plain(self._happy_hour_alert_body(when, duration_h, event))
                 title = ("Octopus Happy Hour booked" if joined
                          else "Octopus Happy Hour available")
             else:
@@ -5646,67 +6033,83 @@ class Plugin(indigo.PluginBase):
                 # It also means SUCCEEDING matters more than exporting a lot: a
                 # session that misses the baseline earns no token at all, however
                 # many units went out.
-                bonus_p     = _points_to_pence(points)
-                # getattr, because this poll can run before the first rates fetch has
-                # populated latest_rates_data — and an alert that raises is an alert
-                # that never arrives.
-                export_p    = _as_float(
-                    (getattr(self, "latest_rates_data", None) or {}).get("export_rate_p"),
-                    DEFAULT_EXPORT_RATE_P) or DEFAULT_EXPORT_RATE_P
+                # v5.109.4 — PLAIN ENGLISH, AND ONLY ASK FOR WHAT HE CAN DO. CliveS,
+                # 17-Sep-2026: the 12:50 push said "NOT OPTED IN — join it in the
+                # Octopus app" about a session Octopus had just refused to let this
+                # account join. The standing notification rules also want sentences,
+                # people's times ("6pm"), no em-dashes and ASCII only.
+                bonus_p  = _points_to_pence(points)
                 need     = self._happy_hour_tokens_required()
                 tokens   = self.store.get("happy_hour_tokens")
-                # Only meaningful for a turn-down we are not already in, and only
-                # when auto-join is armed: if he joins these by hand, the decision
-                # is his and the plugin has no business calling it a bad one.
+                auto_on  = _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False)
+                code     = str(event.get("code") or "")
+                refused  = code and code in {str(x) for x in
+                                             (self.store.get("saving_sessions_join_refused") or [])}
                 skip_why = ""
-                if (turn_down and not joined
-                        and _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False)):
+                if turn_down and not joined and auto_on:
                     _sd = (start_local.date() if hasattr(start_local, "date") else start_local)
                     _ok, _why = self._happy_hour_token_verdict(_sd)
                     skip_why = "" if _ok else _why
-                # Only say where he stands if the API actually told us. A guessed
-                # tally about a free hour is worse than none.
-                if tokens is None or need <= 0:
-                    progress = ""
-                elif tokens + 1 >= need:
-                    progress = (f"  Octopus report {tokens} token"
-                                f"{'' if tokens == 1 else 's'}, so getting this one "
-                                f"right should unlock a free hour.")
+                if not joined and (refused or event.get("capacity") == "FULL"):
+                    # Cannot be joined at all, so it does not concern us: no push.
+                    log(f"[SavingSessions] {code or event_id} ({when}) cannot be joined "
+                        f"by this account, so it is not announced.")
+                    new_ids.append(event_id)
+                    continue
+                day   = _session_day_words(start_local, now_utc)
+                span  = _session_span_words(start_local, end_local)
+                parts = [f"Octopus have announced a Saving Session {day} {span}."]
+                if not turn_down:
+                    if direction == "TURN_UP":
+                        parts.append("It is a Power Up session, which wants you to use "
+                                     "more rather than less, so the battery is not run "
+                                     "for it.")
+                    else:
+                        parts.append("Octopus did not say which way this session runs, "
+                                     "so the battery is not run for it.")
+                    title = f"Saving Session {day}: not one for the battery"
+                elif joined:
+                    if _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
+                        parts.append("You are in it, and the battery will export for it.")
+                    else:
+                        parts.append("You are in it, but exporting for sessions is "
+                                     "switched off in the plugin, so the battery will not "
+                                     "be run for it.")
+                    title = f"Saving Session {day}: you are in"
+                elif skip_why:
+                    parts.append(f"The plugin has not joined it, because {skip_why}.")
+                    title = f"Saving Session {day}: not worth joining"
+                elif auto_on:
+                    parts.append("The plugin could not join it just now and will try "
+                                 "again within the hour.")
+                    title = f"Saving Session {day}: joining shortly"
                 else:
-                    progress = (f"  Octopus report {tokens} token"
-                                f"{'' if tokens == 1 else 's'} and an hour costs "
-                                f"{need}, so this one is a step towards the next.")
-                body = (
-                    f"Octopus Saving Session: {when}"
-                    + (f" ({duration_h:.1f}h)" if duration_h else "")
-                    + ". Beating your usual use in two of these earns a free hour of "
-                      "electricity at the weekend, which is the real prize — so what "
-                      "matters is winning it, not how much goes out."
-                    + progress
-                    + f" The Octopoints are change on top, about {bonus_p:.0f}p a unit "
-                      f"added to the usual {export_p:.0f}p."
-                    # v5.107.0: do not tell him to go and join something the plugin
-                    # has just decided is not worth joining. The verdict is pure and
-                    # cheap, so it is re-asked here rather than carried in state, and
-                    # the two can therefore never disagree.
-                    + ("" if joined else
-                       (f"  Not worth opting in to: {skip_why}."
-                        if skip_why else
-                        " NOT OPTED IN — join it in the Octopus app, or it pays nothing and "
-                        "the battery will not be driven for it."))
-                    + ("" if turn_down else
-                       f"  This is a {direction.replace('_', ' ').title()} session, not a "
-                       "turn-down — the battery is NOT driven for it. A Power Up wants you "
-                       "to USE more.")
-                )
-                title = ("Octopus Saving Session announced" if joined
-                         else "Octopus Saving Session - opt in to earn")
+                    parts.append("You are not in it yet. Join it in the Octopus app, or it "
+                                 "earns nothing and the battery will not be run for it.")
+                    title = f"Saving Session {day}: join it in the Octopus app"
+                if turn_down and not skip_why:
+                    parts.append("Beating your usual use in two of these earns a free hour "
+                                 "of electricity at the weekend, so winning it matters more "
+                                 "than how much goes out.")
+                    # Only say where he stands if the API actually told us.
+                    if tokens is not None and need > 0:
+                        plural = "" if tokens == 1 else "s"
+                        if tokens + 1 >= need:
+                            parts.append(f"Octopus report {tokens} token{plural}, so "
+                                         "winning this one should unlock a free hour.")
+                        else:
+                            parts.append(f"Octopus report {tokens} token{plural} and an "
+                                         f"hour costs {need}, so this one is a step "
+                                         "towards the next.")
+                    parts.append(f"The Octopoints are change on top, about {bonus_p:.0f}p "
+                                 "a unit added to what the export itself earns.")
+                body = _ascii_plain(" ".join(parts))
             self._send_pushover(title, body, priority="0")
             log(f"[SavingSessions] New event {event.get('code') or event_id}: {when}, "
                 f"{direction}, {points} pts/kWh (~{_points_to_pence(points):.1f}p/kWh), "
                 f"opted in: {'YES' if joined else 'NO'}"
                 + ("" if turn_down else " — battery NOT driven (not a turn-down)"),
-                level="INFO" if joined else "WARNING")
+                level="WARNING" if title.endswith("join it in the Octopus app") else "INFO")
             new_ids.append(event_id)
 
         # Cache the JOINED upcoming/live windows for the manager cycle. The manager
@@ -5714,7 +6117,8 @@ class Plugin(indigo.PluginBase):
         # every action callback behind it), so the hourly poll leaves it a small
         # plain-data list and _saving_session_window() reads only that.
         upcoming = sorted(e["start_at"] for e in (data.get("events") or [])
-                          if e.get("start_at") and e["start_at"] > now_utc)
+                          if e.get("start_at") and e["start_at"] > now_utc
+                          and self._saving_session_for_us(e))
         # Deliberately NOT filtered on `joined` — the whole point is to be polling
         # often enough to notice an opt-in made shortly before the window.
         self.store["saving_sessions_next_start"] = (
@@ -5758,6 +6162,8 @@ class Plugin(indigo.PluginBase):
             for e in (data.get("events") or [])
             if e.get("start_at") and e.get("end_at") and e["end_at"] > now_utc
             and e["start_at"] < display_horizon
+            # ...but not another region's session: that is not news for this house.
+            and self._saving_session_for_us(e)
         ]
 
         if new_ids:
@@ -5924,6 +6330,16 @@ class Plugin(indigo.PluginBase):
             # Agile has 48 prices a day, so "today's rate" is the slot in force right
             # now (octopus_api fills it). There is no single tomorrow rate.
             return rates.get(TARIFF_AGILE, {}).get("today_p"), None
+        if tariff_key in (TARIFF_GO, TARIFF_IGO, TARIFF_FLUX, TARIFF_IFLUX):
+            # A TIME-OF-USE tariff has no single "today's rate" either — it has
+            # bands. These buckets hold cheap_p / standard_p / peak_p and the
+            # local window strings, and NONE of them is called today_p, so the
+            # Tracker fall-through below returned None for every one: live on
+            # Flux the status line and the tariff device both read "Nonep".
+            # The rate in force NOW is the honest answer, the same choice Agile
+            # already makes. No tomorrow figure: the bands repeat daily and a
+            # second number would only invite the question of which band it is.
+            return _tou_rate_now_p(rates.get(tariff_key, {})), None
         tracker = rates.get(TARIFF_TRACKER, {})
         return tracker.get("today_p"), tracker.get("tomorrow_p")
 
@@ -6048,9 +6464,17 @@ class Plugin(indigo.PluginBase):
                     # Set hardware floor so battery stops automatically at target SOC.
                     # Plugin resets this cutoff on return to self-consumption.
                     if decision.target_soc_pct > 0:
-                        self.modbus.set_discharge_cutoff(decision.target_soc_pct)
-                        self._set_flood_prev_target(decision.target_soc_pct)
-                        log(f"[Manager] Discharge cutoff set to {decision.target_soc_pct:.0f}% "
+                        # Never below the policy floor. Flood prevention drains the
+                        # battery to make room for tomorrow's sun, which is worth
+                        # money; the reserve is there for a power cut, which is
+                        # not about money. Read the floor BEFORE recording the
+                        # flood target, or the target would be compared with
+                        # itself.
+                        floor  = self._policy_discharge_floor_pct()
+                        target = max(float(decision.target_soc_pct), floor)
+                        self.modbus.set_discharge_cutoff(target)
+                        self._set_flood_prev_target(target)
+                        log(f"[Manager] Discharge cutoff set to {target:.0f}% "
                             f"(flood prevention floor)")
                         self._trigger_event("floodPreventionStarted")
                     self.store["export_active"]      = True
@@ -6127,10 +6551,13 @@ class Plugin(indigo.PluginBase):
                 # Clean up flood prevention cutoff if it was active
                 flood_target = self.store.get("flood_prev_target_soc")
                 if flood_target:
-                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
-                    self.modbus.set_discharge_cutoff(health_floor)
-                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
                     self._set_flood_prev_target(None)
+                    # The policy floor, NOT the bare health floor: while the Flux
+                    # strategy is armed it owns a reserve that must survive an
+                    # export ending. _set_flood_prev_target first, so the floor is
+                    # computed without the target being cleared.
+                    floor = self._write_policy_floors()
+                    log(f"[Manager] Discharge cutoff reset to {floor:.0f}% (policy floor)")
                     self._trigger_event("floodPreventionStopped")
                 self.store["export_active"] = False
                 self._trigger_event("exportStopped")
@@ -6157,11 +6584,10 @@ class Plugin(indigo.PluginBase):
                 # now so it does not act as a hidden floor during daytime operation.
                 flood_target = self.store.get("flood_prev_target_soc")
                 if flood_target:
-                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
-                    self.modbus.set_discharge_cutoff(health_floor)
-                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% "
-                        f"(flood prevention interrupted at dawn)")
                     self._set_flood_prev_target(None)
+                    floor = self._write_policy_floors()
+                    log(f"[Manager] Discharge cutoff reset to {floor:.0f}% "
+                        f"(flood prevention interrupted at dawn)")
                     self._trigger_event("floodPreventionStopped")
                 self.modbus.set_charge_limit(cap_w, quiet=True)
                 if prev_import:
@@ -6240,10 +6666,9 @@ class Plugin(indigo.PluginBase):
                     log("[Manager] Export disabled — returning to self-consumption")
                 self.modbus.set_self_consumption()
                 if flood_target:
-                    health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1)
-                    self.modbus.set_discharge_cutoff(health_floor)
-                    log(f"[Manager] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
                     self._set_flood_prev_target(None)
+                    floor = self._write_policy_floors()
+                    log(f"[Manager] Discharge cutoff reset to {floor:.0f}% (policy floor)")
                     self._trigger_event("floodPreventionStopped")
                 self.store["export_active"] = False
             elif self.store.get("solar_overflow_active"):
@@ -6447,7 +6872,10 @@ class Plugin(indigo.PluginBase):
         # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
         # Skip if flood prevention has temporarily raised the cutoff — it owns it too.
         if not self.store.get("vpp_cutoff_raised") and not self.store.get("flood_prev_target_soc"):
-            expected_cutoff_pct = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+            # ONE owner for this register. This used to read batteryHealthCutoff
+            # directly, so any floor another policy had raised was pulled back to
+            # 1% within a minute of that policy handing over.
+            expected_cutoff_pct = self._absolute_cutoff_pct()
             actual_cutoff_pct   = self.modbus.read_discharge_cutoff()
             if actual_cutoff_pct is not None:
                 if abs(actual_cutoff_pct - expected_cutoff_pct) > 0.5:
@@ -6457,6 +6885,32 @@ class Plugin(indigo.PluginBase):
                         level="WARNING",
                     )
                     self.modbus.set_discharge_cutoff(expected_cutoff_pct)
+
+        # --- Backup reserve (the economic floor, register 40046) ---
+        # Owned only while Flux is armed; see _absolute_cutoff_pct for why the
+        # reserve lives here rather than on 40048. Not gated on the VPP flag: the
+        # VPP floor is on 40048, and this value already excludes an event that is
+        # being dispatched.
+        if self._owns_backup_reserve():
+            expected_backup = self._policy_discharge_floor_pct()
+            actual_backup   = self.modbus.read_backup_soc()
+            if actual_backup is not None and abs(actual_backup - expected_backup) > 0.5:
+                log(f"[Verify] Backup reserve mismatch: inverter={actual_backup:.1f}% "
+                    f"expected={expected_backup:.1f}% — correcting", level="WARNING")
+                self.modbus.set_backup_soc(expected_backup)
+
+        # --- Whole-site grid import cap (registers 40040-41) ---
+        # Asserted only once the site limit is verified. Enforced by the inverter at
+        # the meter, so a load that switches on between Flux decisions trims the
+        # battery charge at once instead of waiting for the next plan.
+        if self._flux_armed() and _as_bool(self.pluginPrefs.get("fluxSiteImportVerified", False)):
+            limit_w = int(_as_float(self.pluginPrefs.get("fluxSiteImportLimitKw"), 0.0) * 1000)
+            if limit_w > 0:
+                actual_w = self.modbus.read_grid_import_limit()
+                if actual_w is not None and abs(actual_w - limit_w) > 100:
+                    log(f"[Verify] Grid import cap mismatch: inverter={actual_w} W "
+                        f"expected={limit_w} W — correcting", level="WARNING")
+                    self.modbus.set_grid_import_limit(limit_w)
 
         # --- Charge cutoff (import backstop, register 40047) ---
         # Raised only while a grid import is active (hardware ceiling in case the
@@ -6671,6 +7125,10 @@ class Plugin(indigo.PluginBase):
 
         if now_utc >= scheduled:
             log("[Manager] Scheduled import window reached - starting import")
+            # This path writes to the inverter straight from the tick, outside
+            # the manager's evaluate, so it needs its own pre-emption: Flux lets
+            # go before the charge command, not after it.
+            self._flux_preempt("a scheduled grid import")
             # v5.65.0: `(target_soc or 100.0)` turned a target of 0.0 into a 100%
             # charge cutoff — and 0.0 is exactly what an intervening completed
             # import leaves behind. The backstop meant to STOP a runaway import
@@ -6704,6 +7162,26 @@ class Plugin(indigo.PluginBase):
         self._update_forecast_device(data)
 
         status   = data.get("forecastStatus", "")
+        # A SUCCESS stamp, separate from store["last_forecast"], which records
+        # when the task last RAN. A forecast that has been failing for six hours
+        # reads as fresh on the attempt stamp, and the Flux planner buys on the
+        # strength of this forecast — so it asks this one.
+        #
+        # It stamps the GENERATION that came back, not the poll: the buckets must
+        # be present AND carry today's local date. A cached payload from
+        # yesterday satisfies "not empty" perfectly well, and dating it today is
+        # how a stale forecast would look current for ever.
+        try:
+            _today_key = _london_today().strftime("%Y-%m-%d")
+            _buckets   = (data or {}).get("_hourly_p50_today") or {}
+            _dated_today = any(str(k).startswith(_today_key) for k in _buckets)
+        except Exception:                                   # noqa: BLE001
+            _dated_today = False
+        if data and "No data" not in status and _dated_today:
+            generated_at = getattr(self.forecast, "_cached_time", None)
+            if (type(generated_at) in (int, float) and math.isfinite(generated_at)
+                    and 0 < generated_at <= time.time()):
+                self.store["forecast_ok_at"] = generated_at
         tmrw_kwh = data.get("correctedTomorrowKwh", 0.0)
 
         if "No data" in status:
@@ -6745,6 +7223,26 @@ class Plugin(indigo.PluginBase):
                 "tariff_info": tariff_info,
                 **monitored,
             }
+            # The paired Flux schedules. Fetched when the controller is armed —
+            # it cannot price a trade without them — AND whenever the ACCOUNT is
+            # detected as Flux, even with the controller switched off, because
+            # REPORTING needs them too: the export rate written to the dashboard
+            # and into every daily history record comes from this schedule, and
+            # without it a live Flux house would go on being told its exports
+            # earned the old flat Outgoing rate.
+            _detected = str((tariff_info or {}).get("detected_key")
+                            or (tariff_info or {}).get("tariff_key") or "")
+            if self._flux_enabled() or _detected == TARIFF_FLUX:
+                self._refresh_flux_rates(force=force)
+
+            # THE EXPORT RATE, PUBLISHED — and published AFTER the schedules it
+            # reads. Nothing ever wrote this key, so every consumer (dashboard,
+            # manager snapshot, VPP revenue, daily history) fell back to the flat
+            # 12p Outgoing rate: correct while the account was on Outgoing, wrong
+            # the day it moved to paired Flux. Published BEFORE the fetch, as it
+            # first was, the first refresh after every restart still quoted 12p,
+            # because the bands it needs had not arrived yet.
+            self.latest_rates_data["export_rate_p"] = self._export_rate_now_p()
 
             self._update_tariff_device(tariff_info, monitored)
             self._write_tariff_schedule_variables(tariff_info, monitored)
@@ -6811,16 +7309,42 @@ class Plugin(indigo.PluginBase):
             # tracker_fetch_status carries the failure signal. tomorrow_p None
             # is NORMAL before ~16:00, and "pending" is the truthful value
             # (yesterday's tomorrow-rate would be actively wrong after midnight).
-            if today_p is not None:
-                writes.append(("tracker_rate_today", f"{today_p:.2f}"))
-            writes.append(("tracker_rate_tomorrow",
-                           f"{tomorrow_p:.2f}" if tomorrow_p is not None else "pending"))
+            on_tracker = str((tariff_info or {}).get("tariff_key") or "") == TARIFF_TRACKER
+            if on_tracker:
+                if today_p is not None:
+                    writes.append(("tracker_rate_today", f"{today_p:.2f}"))
+                writes.append(("tracker_rate_tomorrow",
+                               f"{tomorrow_p:.2f}" if tomorrow_p is not None else "pending"))
+                writes.append(("tracker_fetch_status", "OK"))
+            else:
+                # v5.110.0: off Tracker these two held the last Tracker price for
+                # ever (26.21p on the first Flux day), and the morning brief read
+                # it out as today's price. "n/a" is not a number, so every float()
+                # consumer now sees no price rather than a wrong one.
+                writes.append(("tracker_rate_today", "n/a"))
+                writes.append(("tracker_rate_tomorrow", "n/a"))
+                writes.append(("tracker_fetch_status", "not on Tracker"))
             if sched.get("product_code"):
                 writes.append(("tracker_product_code", sched["product_code"]))
             if tariff_info and tariff_info.get("display_name"):
                 writes.append(("tracker_product_name", tariff_info["display_name"]))
             writes.append(("tracker_last_updated", now_str))
-            writes.append(("tracker_fetch_status", "OK"))
+            # The billed export schedule for today, same slot shape as
+            # elec_rates_today_json, when the export side is banded.
+            if self._export_tariff_is_banded():
+                bounds = self._day_bounds_utc(_local_today_str())
+                if bounds is not None:
+                    exp_today = []
+                    for slot in (self.store.get("flux_export_slots") or []):
+                        try:
+                            s = datetime.fromisoformat(str(slot["valid_from"]).replace("Z", "+00:00"))
+                            e = datetime.fromisoformat(str(slot["valid_to"]).replace("Z", "+00:00"))
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if e > bounds[0] and s < bounds[1]:
+                            exp_today.append(slot)
+                    if exp_today:
+                        writes.append(("export_rates_today_json", json.dumps(exp_today)))
 
             for name, value in writes:
                 var_id = self._ensure_var(name, folder)
@@ -7038,6 +7562,10 @@ class Plugin(indigo.PluginBase):
                     profile.append(default[i])
 
             self.store["consumption_profile"] = profile
+            # Freshness for consumers that plan against it (the Flux supervisor
+            # refuses a profile older than a week — it is rebuilt daily, so an old
+            # one means the rebuild has been failing).
+            self.store["profile_built_at"] = time.time()
             daily_kwh    = sum(profile)
             retained_days = len(self.store.get("home_profile_days", {}))
             if away:
@@ -8003,7 +8531,7 @@ class Plugin(indigo.PluginBase):
             # cutoff to the health floor mid-window, letting a late-detected NIGHT event
             # over-discharge below the dawn reserve.
             self._set_vpp_discharge_cutoff(event, is_daytime=self._event_is_daytime(start_time))
-            self._vpp_transition(VPP_ACTIVE)
+            self._vpp_transition(VPP_ACTIVE, preempted=True)
             self.store["vpp_active"] = True
             self._trigger_event("vppStarted")
 
@@ -8583,6 +9111,15 @@ class Plugin(indigo.PluginBase):
             required_soc = min(100.0, (required_kwh / cap_kwh) * 100.0)
             required_soc = max(required_soc, dawn_target_pct)
 
+        if self._flux_armed():
+            # Match the floor that will actually be installed below. In this
+            # path the event is still ANNOUNCED; it may spend its own allocation.
+            floor_pct = max(dawn_target_pct if not is_daytime else 0.0,
+                            self._policy_discharge_floor_pct(dispatch_event=event))
+            dawn_kwh = cap_kwh * floor_pct / 100.0
+            required_kwh = export_kwh + dawn_kwh
+            required_soc = min(100.0, required_kwh / cap_kwh * 100.0)
+
         # Current battery level
         current_soc  = self.latest_inverter_data.get("batterySoc", 0.0)
         current_kwh  = cap_kwh * current_soc / 100.0
@@ -8593,7 +9130,11 @@ class Plugin(indigo.PluginBase):
         self._set_vpp_discharge_cutoff(event, is_daytime)
 
         if current_kwh >= required_kwh:
-            if is_daytime:
+            if self._flux_armed():
+                vpp_log(f"[VPP] SOC sufficient ({current_soc:.0f}%) for "
+                        f"{export_kwh:.1f} kWh export plus {dawn_kwh:.1f} kWh "
+                        f"protected reserve and later commitments")
+            elif is_daytime:
                 vpp_log(
                     f"[VPP] SOC sufficient ({current_soc:.0f}%, {current_kwh:.1f} kWh) for "
                     f"{duration_hrs:.1f}h export ({export_kwh:.1f} kWh) — daytime, solar will recharge"
@@ -8615,7 +9156,7 @@ class Plugin(indigo.PluginBase):
                 event, current_soc, current_kwh, required_kwh, shortfall, is_daytime
             )
 
-        self._vpp_transition(VPP_PRE_CHARGING)
+        self._vpp_transition(VPP_PRE_CHARGING, preempted=True)
 
     def _alert_vpp_shortfall(self, event, current_soc, current_kwh,
                              required_kwh, shortfall, is_daytime):
@@ -8640,6 +9181,8 @@ class Plugin(indigo.PluginBase):
             window = self._vpp_event_str() or "the next window"
             floor = ("health floor (daytime — solar will recharge)" if is_daytime
                      else "dawn reserve (night event)")
+            if self._flux_armed():
+                floor = "Flux reserve and later event allocations"
             body = (
                 f"Battery short for the {window} VPP window.\n\n"
                 f"SOC {current_soc:.0f}% ({current_kwh:.1f} kWh) against "
@@ -8665,6 +9208,7 @@ class Plugin(indigo.PluginBase):
         Called from _start_vpp_precharge() with the is_daytime flag already
         determined, NOT at announcement time.
         """
+        self._flux_preempt("Axle pre-charge cutoff")
         health_floor    = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
         dawn_target_pct = self._dawn_target_pct()
 
@@ -8675,10 +9219,16 @@ class Plugin(indigo.PluginBase):
             floor_pct = dawn_target_pct
             reason    = "night event — protecting dawn floor"
 
-        floor_pct = max(floor_pct, health_floor)  # never below the health floor
+        # Never below the absolute cutoff. The Flux reserve and every OTHER
+        # commitment go on the backup reserve instead, computed with this event
+        # excluded so the dispatch can spend its own allocation.
+        floor_pct = max(floor_pct, health_floor, self._absolute_cutoff_pct())
 
         if self.modbus:
             self.modbus.set_discharge_cutoff(floor_pct)
+            if self._owns_backup_reserve():
+                self.modbus.set_backup_soc(
+                    self._policy_discharge_floor_pct(dispatch_event=event))
             self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
             vpp_log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
 
@@ -8783,10 +9333,9 @@ class Plugin(indigo.PluginBase):
     def _restore_discharge_cutoff(self):
         """Restore discharge cutoff to the health floor after VPP."""
         if self.modbus:
-            health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
-            self.modbus.set_discharge_cutoff(health_floor)
+            floor = self._write_policy_floors()
             self.store["vpp_cutoff_raised"] = False   # allow verify() to manage cutoff again
-            vpp_log(f"[VPP] Discharge cutoff restored to {health_floor:.0f}%")
+            vpp_log(f"[VPP] Discharge cutoff restored to {floor:.0f}% (policy floor)")
 
     def _disengage_to_safe_baseline(self, reason):
         """Return the inverter to the safe self-consumption baseline AND release any
@@ -8824,9 +9373,13 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 log(f"[{reason}] set_self_consumption failed: {exc}", level="WARNING")
             try:
-                health_floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
-                self.modbus.set_discharge_cutoff(health_floor)
-                log(f"[{reason}] Discharge cutoff reset to {health_floor:.0f}% (health floor)")
+                # Clear the raised floors FIRST: releasing them is the whole point
+                # of this path, and reading the policy floor while they are still
+                # set would hand back the very floor being released.
+                self._set_flood_prev_target(None)
+                self.store["vpp_cutoff_raised"] = False
+                floor = self._write_policy_floors()
+                log(f"[{reason}] Discharge cutoff reset to {floor:.0f}% (policy floor)")
             except Exception as exc:
                 log(f"[{reason}] discharge-cutoff reset failed: {exc}", level="WARNING")
             try:
@@ -8924,9 +9477,20 @@ class Plugin(indigo.PluginBase):
         except Exception as _exc:
             vpp_log(f"[VPP] Summary step failed: {_exc}", level="WARNING")
 
-    def _vpp_transition(self, new_state):
+    def _vpp_transition(self, new_state, preempted=False):
         """Transition VPP state machine to a new state."""
         old_state = self.store["vpp_state"]
+        # Flux lets go BEFORE the state machine's own writes, not after: a paid
+        # window taking the inverter must not find a Flux claim still standing,
+        # and a release discovered a tick later would restore the baseline over
+        # the top of the window's mode.
+        # ANNOUNCED is not a driving state — it writes nothing, and _flux_other_owner
+        # deliberately does not treat it as an owner, because the cheap window is
+        # where the energy for the dispatch gets bought. Pre-empting here would
+        # stand Flux down at announcement and undo that fix from the other side.
+        if (not preempted and new_state not in (VPP_IDLE, VPP_ANNOUNCED)
+                and old_state != new_state):
+            self._flux_preempt(f"an Axle VPP window ({new_state})")
         self.store["vpp_state"] = new_state
         if self.debug:
             vpp_log(f"[VPP] State: {old_state} -> {new_state}")
@@ -9066,6 +9630,9 @@ class Plugin(indigo.PluginBase):
     def _drive_vpp_export(self, now_utc=None):
         """Self-drive the export, re-evaluated each manager tick while a window runs.
 
+        Pre-empts Flux first. A Saving Session reaches here with vpp_state still
+        IDLE, so the state-machine hook alone would not cover it.
+
         Driven by BOTH the VPP state machine (ACTION_VPP_EXPORT) and an Octopus
         Saving Session (ACTION_SAVING_SESSION) — the name is historical.
 
@@ -9089,6 +9656,7 @@ class Plugin(indigo.PluginBase):
         cheap. The grid export is held at the DNO cap by the inverter's
         commissioned export limit in every sub-mode.
         """
+        self._flux_preempt("a driven export window")
         if not self.modbus:
             return
 
@@ -9409,6 +9977,14 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             export_rate_p = DEFAULT_EXPORT_RATE_P
 
+        # On a BANDED export tariff one daily number is only meaningful weighted
+        # by WHEN the kWh went out — the same day's export is worth two and a
+        # half times as much at 17:00 as at 03:00.
+        export_rate_p, export_rate_basis = self._export_rate_and_basis(
+            date_str, export_rate_p)
+        import_rate_p, import_rate_basis = self._import_rate_and_basis(
+            date_str, (self.latest_rates_data or {}).get("tracker", {}).get("today_p"))
+
         # Capture the standing charges + gas unit rate in force on this day, so
         # the whole-house settle values each frozen day at its OWN rates rather
         # than whatever the ledger reads when the settle pass later runs.  A
@@ -9461,8 +10037,17 @@ class Plugin(indigo.PluginBase):
             "peak_soc":   round(self.store["peak_soc"], 1),
             "min_soc":    round(self.store["min_soc"], 1),
             "tariff":     self.latest_rates_data.get("tariff_info", {}).get("tariff_key", "?"),
-            "rate_today_p":   self.latest_rates_data.get("tracker", {}).get("today_p"),
+            # v5.110.0: on a banded import tariff this is the day's imports
+            # weighted by band, as export_rate_p already was. Tracker days keep
+            # the day's single published rate, exactly as before.
+            "rate_today_p":   import_rate_p,
+            "import_rate_basis": import_rate_basis,
             "export_rate_p":  round(export_rate_p, 4),
+            # How that figure was arrived at: "weighted" means the day's own
+            # half-hourly exports were priced against the published bands,
+            # "flat" means one price applied all day. A reader of this history
+            # can tell an exact figure from an approximate one.
+            "export_rate_basis": export_rate_basis,
             "elec_standing_p_day": day_elec_standing_p,
             "gas_unit_p_day":      day_gas_unit_p,
             "gas_standing_p_day":  day_gas_standing_p,
@@ -10430,6 +11015,11 @@ class Plugin(indigo.PluginBase):
                         import_rate_p = r
             except (TypeError, ValueError, KeyError):
                 pass
+        # v5.110.0: the tracker bucket is empty on Flux, so price TODAY by band.
+        if import_rate_p is None:
+            import_rate_p = self._flux_import_band_p() if self._import_tariff_is_banded() else None
+        import_rate_p, today_export_rate_p = self._live_rates_today_p(
+            import_rate_p, export_rate_p)
         periods = self._period_economics_summary(
             export_rate_p          = export_rate_p,
             fallback_import_rate_p = import_rate_p,
@@ -10437,7 +11027,7 @@ class Plugin(indigo.PluginBase):
         try:
             whole_house = self._whole_house_summary(
                 import_rate_p = import_rate_p,
-                export_rate_p = export_rate_p,
+                export_rate_p = today_export_rate_p,
             )
         except Exception as exc:
             self.logger.debug(f"[WholeHouse] summary failed: {exc}")
@@ -10466,9 +11056,26 @@ class Plugin(indigo.PluginBase):
             fin = None
             log(f"[Cost Vars] financials fetch failed: {exc}", level="WARNING")
         if fin:
-            elec = fin.get("elec") or {}
+            elec = dict(fin.get("elec") or {})
             gas  = fin.get("gas") or {}
-            exp  = fin.get("export") or {}
+            exp  = dict(fin.get("export") or {})
+            # v5.110.0: a banded tariff's "unit rate" is the band in force NOW.
+            # The ledger is cached for half an hour, so read the band at write
+            # time rather than trusting the price captured at fetch time.
+            if self._import_tariff_is_banded():
+                _band = self._flux_import_band_p()
+                if _band is not None:
+                    elec["unit_p"] = _band
+            if self._export_tariff_is_banded():
+                _band = self._flux_export_band_p()
+                if _band is not None:
+                    exp["unit_p"] = _band
+            # The three *_tariff_name variables had no writer since the Octopus
+            # script was retired, so they still named Tracker and Outgoing.
+            for _var, _side in (("elec_tariff_name", elec), ("export_tariff_name", exp),
+                                ("gas_tariff_name", gas)):
+                if _side.get("display_name"):
+                    updates.append((_var, str(_side["display_name"])))
             if elec.get("unit_p") is not None:
                 updates.append(("elec_unit_rate_p", f"{float(elec['unit_p']):.4f}"))
             if elec.get("standing_p") is not None:
@@ -10944,6 +11551,1498 @@ class Plugin(indigo.PluginBase):
         return (values, errors)
 
     # ================================================================
+    # Octopus Flux supervisor (DRAFT — off by default)
+    # ================================================================
+    #
+    #   flux_strategy.plan()  decides (pure, stdlib, no clock of its own)
+    #   this section          builds its inputs from live state, decides WHO owns
+    #                         the inverter, leases a decision to the executor
+    #   flux_execution        holds the durable claim, writes and verifies
+    #
+    # TWO RULES ABOVE ALL OTHERS:
+    #
+    #   1. While Flux owns the inverter, the existing manager's verify and act
+    #      passes do not run. Two owners writing the same four registers a minute
+    #      apart is an argument, not a supervisor.
+    #   2. The hardware discharge floor has ONE owner across the whole day —
+    #      _policy_discharge_floor_pct. Flux releasing the inverter must not mean
+    #      releasing the reserve, and every writer of register 40048 reads that
+    #      one function.
+
+    def _flux_enabled(self):
+        """True only when both switches are on and both modules loaded.
+
+        `fluxEnabled` is "I want this"; `fluxCommissioned` is "the behaviour in
+        the activation checklist has been proven on this inverter". A feature
+        switch alone would let an untested hand-back reach a live battery.
+        """
+        if not FLUX_AVAILABLE:
+            return False
+        return (_as_bool(self.pluginPrefs.get("fluxEnabled", False))
+                and _as_bool(self.pluginPrefs.get("fluxCommissioned", False)))
+
+    def _flux_peak_now(self):
+        """True while the Flux strategy is armed and the 16:00-19:00 peak is open."""
+        if not self._flux_armed():
+            return False
+        try:
+            return bool(_flux_strategy.in_window(
+                datetime.now(timezone.utc), _london_tz(),
+                _flux_strategy.FLUX_PEAK_START, _flux_strategy.FLUX_PEAK_END))
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    def _flux_armed(self):
+        """True when the strategy is on, whether or not it holds the inverter.
+
+        The reserve floor applies all day once armed — including the hours Flux
+        deliberately hands back — so this, not _flux_enabled, is what the policy
+        floor asks.
+        """
+        return self._flux_enabled()
+
+    def _flux_journal_path(self):
+        return os.path.join(self.data_dir, "flux_claim.json")
+
+    # ---- the one owner of the hardware discharge floor --------------------
+
+    def _policy_discharge_floor_pct(self, dispatch_event=None):
+        """The lowest SOC policy lets a GRID-TIED discharge reach, whoever is driving.
+
+        Since 17-Sep-2026 this is written to the BACKUP RESERVE (40046), not the
+        absolute cutoff (40048): see _absolute_cutoff_pct. Every writer reads
+        this: the manager's verify pass, the export teardown, the flood-prevention
+        reset, the VPP floor and restore, the pause/sleep disengage, and the Flux
+        release baseline. Before this
+        existed each of them wrote `batteryHealthCutoff` directly, so the moment
+        Flux handed back, the verify pass pulled the hardware floor to 1% and the
+        agreed 20% reserve lasted less than a minute.
+
+        Highest of: the health floor, a live flood-prevention target, and — only
+        while the Flux strategy is armed — the Flux reserve plus whatever energy
+        is already promised to a grid event. Storm is NOT here: it raises a
+        software dawn target, never this register, and a storm floor written to
+        hardware is one nothing would ever lower.
+        """
+        health = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+
+        # THE ONE CASE WHERE THIS FLOOR GOES DOWN RATHER THAN UP.
+        #
+        # Register 40048 is the GLOBAL discharge cutoff: the inverter honours it
+        # off-grid as well as on, so a 20% floor written for economic reasons
+        # locks a fifth of the pack away during the very power cut the reserve
+        # exists for. The house would go dark with 7 kWh in the battery.
+        #
+        # Backup reserve is 40046's job — a separate register, set to 20% here —
+        # and that one is about WITHHOLDING energy while the grid is up. This one
+        # is an absolute limit, so during a verified outage it drops to the health
+        # floor and the emergency is allowed to spend the reserve. Nothing
+        # economic may raise it back: neither a flood-prevention pre-drain target
+        # nor the Flux reserve is worth anything in a blackout.
+        if self._grid_outage_active():
+            return round(max(0.0, min(100.0, health)), 1)
+
+        floor = health
+        flood = self.store.get("flood_prev_target_soc")
+        if flood:
+            floor = max(floor, float(flood))
+        if self._flux_armed():
+            floor = max(floor, self._flux_reserve_floor_pct(dispatch_event=dispatch_event))
+        return round(max(0.0, min(100.0, floor)), 1)
+
+    def _absolute_cutoff_pct(self):
+        """What register 40048 holds: the health floor, or a flood pre-drain target.
+
+        40048 applies OFF-grid as well as on, and nothing can release it while the
+        host is out of touch with the inverter. So no economic reserve lives here
+        any more — the Flux reserve and event commitments go on the backup reserve
+        (40046), which stops grid-tied discharge just the same but steps aside in
+        a power cut. VPP's own dispatch floor is set separately by the VPP code.
+        """
+        health = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+        if self._grid_outage_active():
+            return round(max(0.0, min(100.0, health)), 1)
+        floor = health
+        flood = self.store.get("flood_prev_target_soc")
+        if flood:
+            floor = max(floor, float(flood))
+        return round(max(0.0, min(100.0, floor)), 1)
+
+    def _owns_backup_reserve(self):
+        """The plugin writes 40046 only while the Flux strategy is armed.
+
+        An install that never arms Flux keeps whatever backup reserve its
+        installer set in the app. During a verified outage the register does not
+        apply, so it is left alone and is still correct when the grid returns.
+        """
+        return self._flux_armed() and not self._grid_outage_active()
+
+    def _write_policy_floors(self, dispatch_event=None):
+        """Write both floors: 40048 = absolute cutoff, 40046 = policy reserve.
+
+        Returns the 40048 value written, for the caller's log line.
+        """
+        cutoff = self._absolute_cutoff_pct()
+        self.modbus.set_discharge_cutoff(cutoff)
+        if self._owns_backup_reserve():
+            self.modbus.set_backup_soc(
+                self._policy_discharge_floor_pct(dispatch_event=dispatch_event))
+        return cutoff
+
+    def _grid_outage_active(self):
+        """True only during a FRESH, VERIFIED grid outage. Two sources must agree.
+
+        `power_cut_started_at` is set by _apply_modbus_result on a genuine
+        `Off-grid` status from register 30009 — deliberately not on "any value
+        that is not On-grid", so an unmapped `Unknown (N)` read cannot fire it.
+        That flag alone is not enough here: it survives a poll loop that has died,
+        and this answer lowers a safety floor. So the LIVE reading must still say
+        off-grid, and it must be recent enough to be a reading rather than a
+        memory.
+        """
+        if self.store.get("power_cut_started_at") is None:
+            return False
+        data = self.latest_inverter_data or {}
+        if not str(data.get("gridStatus", "")).startswith("Off-grid"):
+            return False
+        read_at = float(data.get("_read_at") or 0.0)
+        if not read_at:
+            return False
+        poll_s = getattr(self, "modbus_poll_s", MODBUS_POLL_INTERVAL)
+        return (time.time() - read_at) <= (3 * poll_s + 60)
+
+    def _flux_reserve_floor_pct(self, dispatch_event=None):
+        """Flux's own floor: the flat reserve plus committed event energy.
+
+        Committed energy is included because a promised kWh is not spare — but
+        household demand is NOT, because the house must be able to eat its own
+        evening: see flux_strategy.household_floor_pct.
+        """
+        reserve = _as_float(self.pluginPrefs.get("fluxReservePct"),
+                            _flux_strategy.DEFAULT_RESERVE_PCT)
+        capacity = _as_float(self.pluginPrefs.get("batteryCapacityKwh"), 35.04)
+        eff      = max(0.01, _as_float(self.pluginPrefs.get("batteryEfficiency"), 94.0) / 100.0)
+        try:
+            now   = datetime.now(timezone.utc)
+            until = _flux_strategy.next_cheap_start(now, _london_tz())
+            # THE DISPATCH BEING SERVED IS NOT RESERVED AGAINST ITSELF. The VPP
+            # code sets this register once, at PRE_CHARGING — thirty minutes
+            # before the window — and does not touch it again. So a floor that
+            # includes the event's own allocation at that moment blocks the whole
+            # dispatch, and nothing later corrects it. Excluded in both phases;
+            # every OTHER commitment still counts, because those really are
+            # energy that must survive this window.
+            dispatched = self._flux_dispatch_event_ids()
+            # Pre-charge writes the cutoff BEFORE changing ANNOUNCED to
+            # PRE_CHARGING. The caller explicitly identifies that dispatch.
+            if dispatch_event is not None:
+                dispatched.add(str(dispatch_event.get("id") or "axle"))
+            commitments = tuple(c for c in self._flux_commitments() if c.kind == "export")
+            serving = tuple(c for c in commitments if c.event_id in dispatched)
+            # Union(all) minus union(serving) leaves only energy not supplied by
+            # this dispatch, including a later tail of an overlapping session.
+            committed = max(0.0,
+                _flux_strategy.commitment_energy_kwh(commitments, now, until)
+                - _flux_strategy.commitment_energy_kwh(serving, now, until))
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] commitment floor unavailable: {exc!r}")
+            committed = 0.0
+        if committed > 0 and capacity > 0:
+            reserve += (committed / (eff ** 0.5)) / capacity * 100.0
+        return round(min(100.0, max(0.0, reserve)), 1)
+
+    def _flux_dispatch_event_ids(self):
+        """Event ids whose energy is being spent RIGHT NOW by their own owner.
+
+        An owner driving a window manages that window's energy itself, including
+        the floor it sets for it. Reserving the same kWh again on top is how a
+        reservation comes to block the dispatch it was made for.
+
+        Pre-charge counts: it is the VPP code filling the battery for exactly
+        this event, and it is also the only moment the VPP writes the discharge
+        cutoff.
+        """
+        ids = set()
+        if self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE):
+            event = self.store.get("vpp_event") or {}
+            ids.add(str(event.get("id") or "axle"))
+        if self.store.get("saving_session_export_active"):
+            window = self._saving_session_window() or {}
+            ids.add(str(window.get("id") or "session"))
+        return ids
+
+    def _flux_planner_floor_pct(self):
+        """The floor the PLANNER may rely on. Adds storm and power-cut policy.
+
+        Storm belongs here and not in the hardware floor: holding more back than
+        needed is always safe in a plan, and a storm stands Flux down anyway.
+        """
+        floor = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+        flood = self.store.get("flood_prev_target_soc")
+        if flood:
+            floor = max(floor, float(flood))
+        storm_level = str(self.store.get("storm_level", "none") or "none")
+        if storm_level in ("amber", "red"):
+            floor = max(floor, STORM_SOC_AMBER)
+        elif storm_level == "yellow":
+            floor = max(floor, STORM_SOC_YELLOW)
+        if self._power_cut_window_active():
+            floor = max(floor, POWER_CUT_LOCKOUT_MIN_SOC_PCT)
+        return round(min(100.0, max(0.0, floor)), 1)
+
+    def _flux_baseline(self):
+        """What the executor restores on release.
+
+        The discharge floor is the policy floor, so a release does not drop the
+        reserve. The charge ceiling follows any import in flight, so a hand-back
+        mid-import does not cap it short of its target.
+        """
+        inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+        ceiling   = self.store.get("import_charge_cutoff_pct") or 100.0
+        return {
+            "baseline_charge_w":             int(inv_max_w),
+            "baseline_discharge_w":          int(inv_max_w),
+            "baseline_charge_cutoff_pct":    round(min(100.0, float(ceiling)), 1),
+            "baseline_discharge_cutoff_pct": self._policy_discharge_floor_pct(),
+        }
+
+    # ---- executor lifecycle ----------------------------------------------
+
+    def _flux_recovery_pending(self):
+        """True when a durable claim may still be on the inverter.
+
+        Either this process holds one, or a journal from a previous run is on
+        disk. Deliberately cheap and side-effect free: it is read on the startup
+        path, before anything has been reconciled, and it must not itself write
+        or build anything. A missing journal and no executor is the ordinary
+        case for every install that has never armed Flux, and answers False.
+        """
+        ex = getattr(self, "flux_executor", None)
+        if ex is not None and ex.owns_control:
+            return True
+        if not FLUX_AVAILABLE:
+            return False
+        try:
+            return os.path.exists(self._flux_journal_path())
+        except Exception:                              # noqa: BLE001
+            return False
+
+    def _flux_rebind_driver(self):
+        """Point an existing executor at the CURRENT Modbus driver.
+
+        `_init_modules` replaces `self.modbus` on every preference save, so an
+        executor built earlier keeps an adapter wrapping the disconnected old
+        driver. The claim is durable and survives the swap; the socket does not.
+        Re-binding preserves the claim and the obligation to reconcile it, which
+        rebuilding the executor would not — a new one starts from the journal
+        and would have to re-derive what this one already knows.
+        """
+        ex = getattr(self, "flux_executor", None)
+        if ex is None or self.modbus is None or not FLUX_AVAILABLE:
+            return
+        try:
+            adapter = _FluxRawDriver(self.modbus, self.pluginPrefs)
+            # Prove the adapter answers before handing it over. The constructor
+            # only stores two references, so a broken one fails at the first
+            # WRITE otherwise — which is the worst moment to find out.
+            int(adapter.inverter_max_w)
+            ex.rebind(adapter)
+            log("[Flux] The inverter connection was rebuilt; the outstanding claim "
+                "has been re-bound to the new one and still needs reconciling.")
+        except Exception as exc:                       # noqa: BLE001
+            log(f"[Flux] Could not re-bind the claim to the new inverter "
+                f"connection ({exc!r}) — dropping the executor so the next tick "
+                f"rebuilds it from the journal.", level="WARNING")
+            self.flux_executor = None
+
+    def _flux_ensure_executor(self, allow_create=True):
+        """The executor, built lazily, with its baseline kept current.
+
+        `allow_create=False` is used by the disabled path: it will adopt an
+        executor that already exists but will not build one for trading.
+        """
+        if self.modbus is None or not FLUX_AVAILABLE:
+            return None
+        if getattr(self, "flux_executor", None) is None:
+            if not allow_create:
+                return None
+            try:
+                self.flux_executor = _FluxExecutor(
+                    _FluxRawDriver(self.modbus, self.pluginPrefs),
+                    self._flux_journal_path(),
+                    **self._flux_baseline())
+                log("[Flux] Supervisor armed. It takes control only inside the Flux "
+                    "windows, and only when every input it needs is present and fresh.")
+            except Exception as exc:
+                log(f"[Flux] Supervisor could not be armed: {exc!r}. The strategy "
+                    f"stays off and the existing manager keeps the inverter.",
+                    level="ERROR")
+                self.flux_executor = None
+                return None
+        else:
+            try:
+                self.flux_executor.configure_baseline(**self._flux_baseline())
+            except Exception as exc:
+                self.logger.debug(f"[Flux] baseline refresh refused: {exc!r}")
+        return self.flux_executor
+
+    def _flux_owns_control(self):
+        """True while the executor holds the claim. Asked of the executor, never
+        of a local flag — it is the thing that knows whether a write landed."""
+        ex = getattr(self, "flux_executor", None)
+        return bool(ex is not None and ex.owns_control)
+
+    # ---- priority ---------------------------------------------------------
+
+    def _flux_other_owner(self):
+        """Name the owner that outranks Flux, or "". All of them write the same
+        four registers, and all of them are older and worth more than a trade."""
+        if self._grid_outage_active():
+            # First, and above everything. The supervisor tick runs before the
+            # manager in _tick, so releasing here is what puts the claim down
+            # BEFORE the manager's verify pass writes the lowered floor.
+            return "the grid is down and the house is running on the battery"
+        if self.store.get("manager_paused", False):
+            return "the manager is paused"
+        if self.store.get("flux_manual_preempt"):
+            return str(self.store["flux_manual_preempt"])
+        # ANNOUNCED is not an owner. An announced window is a commitment — the
+        # planner reserves its energy and the cheap window is where that energy
+        # gets bought. Standing Flux down at announcement would block the very
+        # charge that funds the dispatch. Ownership starts when the VPP code
+        # begins writing, which is pre-charge.
+        _vpp = self.store.get("vpp_state", VPP_IDLE)
+        if _vpp not in (VPP_IDLE, VPP_ANNOUNCED):
+            return f"an Axle VPP window ({_vpp})"
+        if self.store.get("saving_session_export_active"):
+            return "an Octopus Saving Session"
+        if self.store.get("happy_hour_import_active"):
+            return "a Happy Hour free import"
+        if self.store.get("import_active"):
+            return "the manager has a grid import in flight"
+        if self.store.get("export_active"):
+            return "the manager has an export in flight"
+        if self.store.get("solar_overflow_active") and not self._flux_peak_now():
+            # NOT an owner inside the peak window (v5.109.5, found live 17-Sep-2026:
+            # an overflow export started at 14:24 held Flux off for the whole
+            # 16:00 peak, silently, with the battery at 96%). The Flux export mode
+            # sends PV first anyway, so standing overflow down in the peak loses
+            # nothing and lets the battery's spare energy sell at the peak price.
+            return "solar overflow is running"
+        if self.store.get("flood_prev_target_soc"):
+            return "flood prevention is holding a discharge floor"
+        if self._power_cut_window_active():
+            return "a power-cut lockout is in force"
+        if str(self.store.get("storm_level", "") or "").lower() not in ("", "none", "clear"):
+            return f"a storm warning ({self.store.get('storm_level')})"
+        return ""
+
+    # ---- event commitments ------------------------------------------------
+
+    def _flux_commitments(self):
+        """Energy already promised to somebody else, as EventCommitments.
+
+        An owner flag says "not now"; a commitment says "this many kWh, between
+        these times". Flux needs both — a window announced for 18:00-19:00 has to
+        be reserved from the moment it is announced, not when it starts, or the
+        peak-window export sells the very kWh that window was going to need.
+
+        Two sources, both read from caches the polls leave behind (no network on
+        this path):
+          * Axle — the VPP state machine's own event, while it is announced,
+            pre-charging or active. Sized the way _compute_vpp_reserved_kwh sizes
+            it: the DNO cap for the duration, because that is what the driver
+            exports;
+          * Octopus — joined Saving Sessions of the TURN_DOWN direction, which are
+            the only ones earned by exporting, plus Happy Hour, which is an
+            IMPORT commitment (free power, so leave room for it rather than
+            energy).
+
+        Event rewards are carried but never mixed with tariff prices: Axle pays
+        for dispatch and Octopus pays points, and neither is the Flux export
+        rate. Physical export is counted once; ordinary tariff revenue and a
+        separately earned event payment are separate ledger entries.
+        """
+        if _flux_strategy is None:
+            return ()
+        out = []
+        now = datetime.now(timezone.utc)
+        export_kw = _as_float(self.pluginPrefs.get("maxExportKw"), 4.0)
+
+        vpp_state = self.store.get("vpp_state", VPP_IDLE)
+        event     = self.store.get("vpp_event") or {}
+        if vpp_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING, VPP_ACTIVE) and event:
+            start = event.get("start_time")
+            end   = event.get("end_time")
+            direction = str(event.get("import_export", "export") or "export").lower()
+            if start and end and end > now and direction == "export":
+                hours = max(0.0, (end - start).total_seconds() / 3600.0)
+                out.append(_flux_strategy.EventCommitment(
+                    source="axle", kind="export", start=start, end=end,
+                    energy_kwh=round(export_kw * hours, 3),
+                    announced_at=self.store.get("vpp_announced_at"),
+                    reward_p_per_kwh=None,
+                    event_id=str(event.get("id") or "axle")))
+
+        for window in (self.store.get("saving_sessions_windows") or []):
+            try:
+                start = datetime.fromisoformat(str(window["start"]))
+                end   = datetime.fromisoformat(str(window["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            if end <= now:
+                continue
+            hours = max(0.0, (end - start).total_seconds() / 3600.0)
+            direction = window.get("direction")
+            if direction == SAVING_SESSION_TURN_DOWN:
+                out.append(_flux_strategy.EventCommitment(
+                    source="octopus", kind="export", start=start, end=end,
+                    energy_kwh=round(export_kw * hours, 3),
+                    reward_p_per_kwh=None,
+                    event_id=str(window.get("id") or "session")))
+            elif direction == SAVING_SESSION_HAPPY_HOUR:
+                # Free import: what it needs is EMPTY battery, not full.
+                inv_kw = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
+                out.append(_flux_strategy.EventCommitment(
+                    source="octopus", kind="import", start=start, end=end,
+                    energy_kwh=round(inv_kw * hours, 3),
+                    event_id=str(window.get("id") or "happyhour")))
+        return tuple(out)
+
+    # ---- tariff ------------------------------------------------------------
+
+    def _flux_tariff_verified(self):
+        """(ok, why_not). Proof, from the account, fetched recently. Fails closed.
+
+        Flux is a PAIRED tariff — the cheap overnight import is paid for by the
+        peak export price — so an import agreement alone proves half of it.
+
+        THE EVIDENCE MUST BE FRESH IN ITS OWN RIGHT. Both agreements come from a
+        single account fetch carrying its own timestamp, because the earlier
+        version could be kept alive indefinitely by something else succeeding:
+        the rate refresh held the last good agreement when the account lookup
+        returned nothing, and then stamped the PUBLIC prices as fresh. A house
+        that had left Flux would have gone on trading it, on evidence nothing had
+        re-checked since the day it was gathered.
+
+        `get_current_tariff` is deliberately not consulted: it falls back to the
+        last agreement in the list when none is current, which is right for a
+        display and is not proof. A tariff override proves nothing either way.
+        """
+        evidence = self.store.get("flux_account_evidence") or {}
+        if not evidence:
+            return False, ("the account's agreements have not been read, so neither "
+                           "side of the paired Flux tariff is proven")
+        fetched_at = evidence.get("fetched_at")
+        age = (time.time() - fetched_at) if (type(fetched_at) in (int, float)
+                and math.isfinite(fetched_at) and fetched_at > 0) else None
+        if age is None or age < 0 or age > FLUX_ACCOUNT_EVIDENCE_MAX_AGE_S:
+            return False, ("the account's agreements have not been re-read recently "
+                           "enough to prove what the house is on today")
+        for side in ("import", "export"):
+            valid_to = evidence.get(f"{side}_valid_to")
+            if valid_to:
+                try:
+                    end = datetime.fromisoformat(str(valid_to).replace("Z", "+00:00"))
+                    if end.tzinfo is None or end.timestamp() <= time.time():
+                        return False, f"the account's {side} agreement has expired"
+                except (TypeError, ValueError):
+                    return False, f"the account's {side} agreement expiry is unreadable"
+        imp = evidence.get("import") or {}
+        exp = evidence.get("export") or {}
+        if str(imp.get("tariff_key") or "") != TARIFF_FLUX:
+            return False, (f"the account's import agreement is "
+                           f"'{imp.get('tariff_key') or 'unreadable'}', not Flux")
+        if str(exp.get("tariff_key") or "") != TARIFF_FLUX:
+            return False, (f"the account's export agreement is "
+                           f"'{exp.get('tariff_key') or 'unreadable'}', not the paired "
+                           f"Flux export tariff")
+        return True, ""
+
+    # ---- export pricing (paired Flux is banded, not a flat 12p) -----------
+
+    def _flux_import_band_p(self, when_utc=None):
+        """The published Flux IMPORT price for a given moment, or None."""
+        return self._flux_band_p("flux_import_slots", when_utc)
+
+    def _flux_band_p(self, slots_key, when_utc=None):
+        """The published price on one side of the pair for a moment, or None."""
+        spans = self._flux_rate_spans(slots_key)
+        when = when_utc or datetime.now(timezone.utc)
+        for span in spans:
+            if span.start <= when < span.end:
+                return round(float(span.p), 4)
+        return None
+
+    # Tier names by rank, cheapest first, for a day with that many distinct prices.
+    _TIER_LABELS = {1: ("Standard",), 2: ("Off-peak", "Standard"),
+                    3: ("Off-peak", "Day", "Peak")}
+
+    def _band_tiers(self, side, date_str=None, now_utc=None):
+        """One side's distinct prices for a local day, cheapest first, with the
+        local windows each runs in. [] unless the whole day is published.
+
+        [{"label": "Peak", "p": 34.0999, "windows": [{"start": "16:00",
+          "end": "19:00", "current": False}], "current": False}, ...]
+
+        A band running over midnight is shown as one window ("19:00" to "02:00")
+        rather than two halves of the same band at either end of the page.
+        """
+        if not self._tariff_is_banded(side):
+            return []
+        date_str = date_str or _local_today_str()
+        bounds = self._day_bounds_utc(date_str)
+        spans  = self._flux_rate_spans(self._BAND_SIDES[side][0])
+        if bounds is None or not spans:
+            return []
+        a, b = bounds
+        pieces = sorted((max(s.start, a), min(s.end, b), round(float(s.p), 4))
+                        for s in spans if s.end > a and s.start < b)
+        # Must tile the day exactly: a gap would show an invented window.
+        cursor = a
+        for start, end, _ in pieces:
+            if start > cursor:
+                return []
+            cursor = max(cursor, end)
+        if cursor < b:
+            return []
+        merged = []
+        for start, end, p in pieces:
+            if merged and merged[-1][2] == p and merged[-1][1] >= start:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end), p)
+            else:
+                merged.append((start, end, p))
+        now = now_utc or datetime.now(timezone.utc)
+        windows = [{"start": s, "end": e, "p": p, "current": s <= now < e}
+                   for s, e, p in merged]
+        if len(windows) > 1 and windows[0]["p"] == windows[-1]["p"]:
+            first = windows.pop(0)
+            windows[-1] = {"start": windows[-1]["start"], "end": first["end"],
+                           "p": first["p"],
+                           "current": windows[-1]["current"] or first["current"]}
+        prices = sorted({w["p"] for w in windows})
+        labels = self._TIER_LABELS.get(len(prices)) or tuple(
+            f"Band {i + 1}" for i in range(len(prices)))
+        tiers = []
+        for price, label in zip(prices, labels):
+            own = [w for w in windows if w["p"] == price]
+            own.sort(key=lambda w: _to_london(w["start"]).strftime("%H:%M"))
+            tiers.append({
+                "label":   label,
+                "p":       price,
+                "current": any(w["current"] for w in own),
+                "windows": [{"start":   _to_london(w["start"]).strftime("%H:%M"),
+                             "end":     _to_london(w["end"]).strftime("%H:%M"),
+                             "current": w["current"]} for w in own],
+            })
+        return tiers
+
+    def _tariff_sides_payload(self, export_rate_now_p):
+        """The import and export tariffs, each with its bands, for the dashboards.
+
+        Names come from the account's own agreements (the Kraken ledger), so the
+        page says "Octopus Flux Import", not a product code, and never a tariff
+        the house has left.
+        """
+        try:
+            fin = self.octopus.get_account_financials() if self.octopus else None
+        except Exception:                               # noqa: BLE001
+            fin = None
+        fin = fin or {}
+        evidence = self.store.get("flux_account_evidence") or {}
+        out = {}
+        for side, fin_key, now_fn in (("import", "elec", self._flux_import_band_p),
+                                      ("export", "export", self._flux_export_band_p)):
+            ledger = fin.get(fin_key) or {}
+            agreed = evidence.get(side) or {}
+            tiers  = self._band_tiers(side)
+            now_p  = now_fn() if tiers else None
+            if side == "export" and not tiers:
+                now_p = round(float(export_rate_now_p), 4) if export_rate_now_p else None
+            out[f"{side}_side"] = {
+                "name":         ledger.get("display_name") or "",
+                "tariff_code":  ledger.get("tariff_code") or agreed.get("tariff_code") or "",
+                "banded":       bool(tiers),
+                "now_p":        now_p,
+                "tiers":        tiers,
+                "valid_from":   evidence.get(f"{side}_valid_from") or "",
+            }
+        return out
+
+    def _live_rates_today_p(self, import_fallback_p, export_fallback_p):
+        """(import p, export p) to value TODAY's kWh so far.
+
+        On a banded side that is today's own kWh weighted by band, not the band
+        in force at the moment somebody looks. A flat side returns its fallback
+        untouched.
+        """
+        today = _local_today_str()
+        imp, _ = self._import_rate_and_basis(today, import_fallback_p)
+        exp, _ = self._export_rate_and_basis(today, export_fallback_p)
+        return imp, exp
+
+    def _flux_export_band_p(self, when_utc=None):
+        """The published Flux EXPORT price for a given moment, or None.
+
+        Read from the same account-verified schedule the planner trades on, so
+        the price reported to the dashboards and written into the daily history
+        is the price the account is actually paid.
+        """
+        if _flux_strategy is None:
+            return None
+        spans = self._flux_rate_spans("flux_export_slots")
+        if not spans:
+            return None
+        when = when_utc or datetime.now(timezone.utc)
+        for span in spans:
+            if span.start <= when < span.end:
+                return round(float(span.p), 4)
+        return None
+
+    # ---- banded (time-of-use) pricing, both sides -----------------------
+    # Paired Flux bills BOTH directions by band, so a day's import is only priced
+    # right when each kWh is valued at the band it was bought in. Until v5.110.0
+    # only the export side was weighted; import went on being valued at whatever
+    # band happened to be in force when the page was loaded, so the same morning's
+    # import cost 14.6p at 03:00, 24.4p at noon and 34.1p during the peak.
+    _BAND_SIDES = {
+        "import": ("flux_import_slots", "grid_import_kwh", "import_valid_from"),
+        "export": ("flux_export_slots", "grid_export_kwh", "export_valid_from"),
+    }
+
+    def _tariff_is_banded(self, side):
+        """True when the account's agreement on `side` charges more than one price."""
+        evidence = self.store.get("flux_account_evidence") or {}
+        key = str((evidence.get(side) or {}).get("tariff_key") or "")
+        return key in (TARIFF_FLUX, "iflux")
+
+    def _import_tariff_is_banded(self):
+        """True when the account's import agreement charges more than one price."""
+        return self._tariff_is_banded("import")
+
+    def _export_tariff_is_banded(self):
+        """True when the account's export agreement pays more than one price.
+
+        Flux and Intelligent Flux do. Outgoing at a flat 12p does not, which is
+        why a single number was right for three years and stopped being right
+        the day the export agreement changed.
+        """
+        return self._tariff_is_banded("export")
+
+    def _export_rate_now_p(self):
+        """The export price in force right now. ONE owner for that question.
+
+        Order: the account's banded export schedule, then whatever the rate feed
+        published, then the flat Outgoing default. The default is the last
+        resort and no longer the silent answer — `export_rate_p` was never
+        populated anywhere, so every consumer had been quoting 12p regardless of
+        what the account was on.
+        """
+        if self._export_tariff_is_banded():
+            band = self._flux_export_band_p()
+            if band is not None:
+                return band
+        try:
+            published = float((self.latest_rates_data or {}).get("export_rate_p", 0.0))
+            if published > 0:
+                return published
+        except (TypeError, ValueError):
+            pass
+        return DEFAULT_EXPORT_RATE_P
+
+    def _import_rate_and_basis(self, date_str, fallback_p):
+        """(rate, basis) for one day's imports. Mirror of _export_rate_and_basis."""
+        return self._banded_rate_and_basis("import", date_str, fallback_p)
+
+    def _export_rate_and_basis(self, date_str, fallback_p):
+        """(rate, basis) for one day's exports. ONE owner for that decision.
+
+        `basis` is "weighted" when the day's own half-hourly exports were priced
+        against the published bands, "flat" when a single price genuinely applied
+        all day, and **"estimated"** when the tariff IS banded but the weighting
+        could not be done — no series, a gap in the bands, or a day before the
+        agreement began. That third label matters: calling an unweighted figure
+        "flat" on a banded tariff reads as exact, and it is a guess.
+        """
+        return self._banded_rate_and_basis("export", date_str, fallback_p)
+
+    def _banded_rate_and_basis(self, side, date_str, fallback_p):
+        """(rate, basis) for one side of one day.
+
+        Beyond the three labels above, a banded day on which nothing flowed in
+        that direction is "time-average": the day's bands averaged by the hours
+        each ran. The kWh are zero so the money is unaffected, but a history row
+        with no rate at all reads to every consumer as "rate missing".
+        """
+        try:
+            weighted, reason = self._banded_rate_for_day(side, date_str)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Economics] {side} weighting skipped: {exc!r}")
+            weighted, reason = None, "error"
+        if weighted is not None:
+            return weighted, "weighted"
+        if not self._tariff_is_banded(side):
+            return fallback_p, "flat"
+        if reason == "nothing flowed":
+            mean = self._band_day_mean_p(side, date_str)
+            if mean is not None:
+                return mean, "time-average"
+        return fallback_p, "estimated"
+
+    def _agreement_started(self, side):
+        """When the account's agreement on `side` began, as an aware UTC instant.
+
+        None when unknown — and unknown is not "always". A day before the
+        agreement started was billed on the previous tariff.
+        """
+        raw = str((self.store.get("flux_account_evidence") or {}).get(
+            self._BAND_SIDES[side][2]) or "")
+        if not raw:
+            return None
+        try:
+            started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if started.tzinfo is None:
+            return None
+        return started.astimezone(timezone.utc)
+
+    def _export_agreement_started(self):
+        """When the account's export agreement began, or None."""
+        return self._agreement_started("export")
+
+    def _day_bounds_utc(self, date_str):
+        """[start, end) of a local day as aware UTC instants, or None."""
+        try:
+            day = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return None
+        a = _london_localise(datetime(day.year, day.month, day.day))
+        nxt = day + timedelta(days=1)
+        b = _london_localise(datetime(nxt.year, nxt.month, nxt.day))
+        if a is None or b is None:
+            return None
+        return a.astimezone(timezone.utc), b.astimezone(timezone.utc)
+
+    def _day_is_before_agreement(self, side, date_str):
+        """True when the day began before the banded agreement did."""
+        started = self._agreement_started(side)
+        bounds  = self._day_bounds_utc(date_str)
+        return bool(started is not None and bounds is not None and bounds[0] < started)
+
+    def _band_day_mean_p(self, side, date_str):
+        """The day's bands averaged by how long each ran, or None if not covered."""
+        if not self._tariff_is_banded(side) or self._day_is_before_agreement(side, date_str):
+            return None
+        spans  = self._flux_rate_spans(self._BAND_SIDES[side][0])
+        bounds = self._day_bounds_utc(date_str)
+        if not spans or bounds is None:
+            return None
+        priced = self._export_price_over(bounds[0], bounds[1], spans)
+        return round(priced, 4) if priced is not None else None
+
+    def _export_rate_for_day_p(self, date_str):
+        """A day's exports valued at the bands they were sold in, or None."""
+        return self._banded_rate_for_day("export", date_str)[0]
+
+    def _import_rate_for_day_p(self, date_str):
+        """A day's imports valued at the bands they were bought in, or None."""
+        return self._banded_rate_for_day("import", date_str)[0]
+
+    def _banded_rate_for_day(self, side, date_str):
+        """(weighted pence, reason). The pence are None whenever the answer would
+        not be a measurement, and `reason` says which refusal it was.
+
+        On a banded tariff one daily number is only meaningful weighted by WHEN
+        the kWh moved: the same day's export is worth roughly six times as much
+        at 17:00 as at 03:00, and import costs more than twice as much.
+
+        REFUSES, rather than approximating, whenever:
+          * the tariff on that side is not banded — the caller's flat rate is exact;
+          * the day started before the agreement did. The switch to Flux is a
+            date: 16 September was billed Tracker and Outgoing and must stay so;
+          * any slot that moved energy is not FULLY covered by published bands.
+            Averaging the covered subset and calling it weighted is the failure
+            this guard exists for;
+          * nothing moved in that direction ("nothing flowed").
+
+        Each slot is apportioned across every band it overlaps rather than priced
+        at the band its start falls in. The rows are written by a 30-minute tick,
+        not on the half hour, so a slot beginning at 15:58 straddles the 16:00
+        peak boundary and the two parts are worth very different money.
+
+        `slot_start`/`slot_end` are naive LOCAL wall time (`datetime.now()` in
+        _log_halfhourly_to_db_impl), so they are localised, not stamped as UTC.
+        """
+        if not self._tariff_is_banded(side):
+            return None, "not banded"
+        slots_key, column, _ = self._BAND_SIDES[side]
+        spans = self._flux_rate_spans(slots_key)
+        if not spans:
+            return None, "no bands"
+        if self._day_bounds_utc(date_str) is None:
+            return None, "bad date"
+        if self._day_is_before_agreement(side, date_str):
+            return None, "before agreement"
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        if not os.path.exists(db_path):
+            return None, "no series"
+        con = None
+        try:
+            con = sqlite3.connect(db_path, timeout=5.0)
+            # `column` comes from the fixed _BAND_SIDES table, never from input.
+            rows = con.execute(
+                f"""SELECT slot_start, slot_end, {column}
+                      FROM halfhourly
+                     WHERE slot_start >= ? AND slot_start < ?
+                       AND {column} > 0""",
+                (f"{date_str}T00:00:00", f"{date_str}T23:59:59"),
+            ).fetchall()
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] {side} weighting unavailable: {exc!r}")
+            return None, "no series"
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+        total_kwh = 0.0
+        total_p   = 0.0
+        for slot_start, slot_end, kwh in rows:
+            try:
+                value = float(kwh)
+                a = _london_localise(datetime.strptime(str(slot_start),
+                                                       "%Y-%m-%dT%H:%M:%S"))
+                b = _london_localise(datetime.strptime(str(slot_end),
+                                                       "%Y-%m-%dT%H:%M:%S"))
+            except (TypeError, ValueError):
+                return None, "gap"   # an unreadable row is a gap, not a nothing
+            if a is None or b is None:
+                return None, "gap"
+            a = a.astimezone(timezone.utc)
+            b = b.astimezone(timezone.utc)
+            if value <= 0 or b <= a:
+                continue
+            priced = self._export_price_over(a, b, spans)
+            if priced is None:
+                return None, "gap"   # PARTIAL COVERAGE — refuse the whole day
+            total_kwh += value
+            total_p   += value * priced
+        if total_kwh <= 0:
+            return None, "nothing flowed"
+        return round(total_p / total_kwh, 4), "weighted"
+
+    @staticmethod
+    def _export_price_over(a, b, spans):
+        """Time-weighted export price across [a, b), or None if not fully covered.
+
+        None is the important half: a slot only partly inside a published
+        schedule cannot be priced, and pricing the part that is covered would
+        report an average of a different period from the one asked about.
+        """
+        total_seconds = (b - a).total_seconds()
+        if total_seconds <= 0:
+            return None
+        covered = 0.0
+        value   = 0.0
+        for span in spans:
+            start = max(a, span.start)
+            end   = min(b, span.end)
+            overlap = (end - start).total_seconds()
+            if overlap > 0:
+                covered += overlap
+                value   += float(span.p) * overlap
+        # A second of slack for boundary arithmetic; anything more is a real gap.
+        if covered < total_seconds - 1.0:
+            return None
+        return value / covered
+
+    def _flux_rate_spans(self, key):
+        """Published spans for one side of the pair, from the store.
+
+        The store, not latest_rates_data, because _refresh_octopus_rates rebuilds
+        that dict wholesale every cycle and a Flux fetch that failed on a good
+        cycle would silently drop the last known schedule.
+        """
+        spans = []
+        for slot in (self.store.get(key) or []):
+            try:
+                start = datetime.fromisoformat(str(slot["valid_from"]).replace("Z", "+00:00"))
+                raw_to = slot.get("valid_to")
+                if not raw_to:
+                    continue            # open-ended: a flat tariff, not Flux
+                end = datetime.fromisoformat(str(raw_to).replace("Z", "+00:00"))
+                p   = float(slot["value_inc_vat"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            spans.append(_flux_strategy.RateSpan(start=start, end=end, p=p))
+        return spans
+
+    def _refresh_flux_rates(self, force=False):
+        """Fetch the paired Flux import and export schedules, and the ACCOUNT's
+        export agreement.
+
+        Today and tomorrow both, because every decision looks forward to the next
+        02:00 and the planner requires contiguous price coverage to that point.
+        Last-good data and its timestamp are only replaced on success.
+
+        The export side is new: nothing in this plugin has ever fetched an export
+        tariff, because `export_rate_p` has always fallen back to the flat 12p
+        Outgoing rate. On Flux that would price every sale wrongly.
+        """
+        if not self.octopus or _flux_strategy is None:
+            return
+        try:
+            # FAIL CLOSED. A failed account read CLEARS the evidence rather than
+            # leaving the last one standing: keeping stale proof while stamping
+            # fresh public prices is exactly how a house that had left Flux would
+            # go on trading it.
+            evidence = self.octopus.get_account_agreements(force=force)
+            if not evidence:
+                self.store["flux_account_evidence"] = {}
+                self.store["flux_rates_problem"] = (
+                    "the account's agreements could not be read, so nothing is proven")
+                return
+            self.store["flux_account_evidence"] = evidence
+            imp_agreement = evidence.get("import") or {}
+            exp_agreement = evidence.get("export") or {}
+            # THE BILLED PRODUCT, never a probe. `_probe_product_by_prefix`
+            # returns the most recently LAUNCHED matching product, which on a
+            # re-versioned tariff is not the one this house is on — so the rates
+            # would come from a product nobody is billed for. No probe and no
+            # fallback may arm trading.
+            imp_code   = imp_agreement.get("product_code")
+            exp_code   = exp_agreement.get("product_code")
+            imp_tariff = imp_agreement.get("tariff_code")
+            exp_tariff = exp_agreement.get("tariff_code")
+            if not (imp_code and exp_code and imp_tariff and exp_tariff):
+                self.store["flux_rates_problem"] = (
+                    "the account's own Flux import and export products could not both "
+                    "be identified, and no probed product may stand in for them")
+                return
+            # YESTERDAY, today and tomorrow. Yesterday is not optional: the
+            # daily history is written just after midnight for the day that has
+            # just ENDED, and without its bands that write cannot be weighted —
+            # it would silently fall back to a flat rate every single night.
+            today = _london_today()
+            imp, exp = [], []
+            for day in (today - timedelta(days=1), today, today + timedelta(days=1)):
+                imp.extend(self.octopus._fetch_rate_schedule(imp_code, imp_tariff, day) or [])
+                exp.extend(self.octopus._fetch_rate_schedule(exp_code, exp_tariff, day) or [])
+            if not imp or not exp:
+                self.store["flux_rates_problem"] = "the Flux rate schedules came back empty"
+                return
+            self.store["flux_import_slots"]  = imp
+            self.store["flux_export_slots"]  = exp
+            self.store["flux_rates_at"]      = time.time()
+            self.store["flux_rates_problem"] = ""
+        except Exception as exc:                        # noqa: BLE001
+            self.store["flux_rates_problem"] = f"{type(exc).__name__}: {exc}"
+            self.logger.debug(f"[Flux] rate refresh failed: {exc!r}")
+
+    # ---- observation -------------------------------------------------------
+
+    def _flux_observation(self):
+        """(flows_dict, observed_at) fresh enough to lease, or None.
+
+        The executor refuses an observation older than ten seconds and this
+        plugin's tiered read takes about seven on a ten-second poll, so the
+        cached snapshot is routinely too old. Rather than surrender control every
+        other tick, one direct read is taken when the cache has aged out. It also
+        gives the house and PV figures the site-headroom sums need at the same
+        instant as the SOC, which a cached snapshot cannot promise.
+        """
+        cached_at = float((self.latest_inverter_data or {}).get("_read_at") or 0.0)
+        data      = self.latest_inverter_data or {}
+        now       = time.time()
+        keys      = ("batterySoc", "pvPowerWatts", "homePowerWatts", "gridPowerWatts")
+        if cached_at and all(data.get(k) is not None for k in keys) \
+                and 0 <= (now - cached_at) <= FLUX_OBSERVATION_MAX_AGE_S:
+            return {k: float(data[k]) for k in keys}, cached_at
+        if not (self.modbus and self.modbus.connected):
+            return None
+        fresh = self.modbus.read_power_flows()
+        if not fresh:
+            return None
+        return ({"batterySoc":     float(fresh["batterySoc"]),
+                 "pvPowerWatts":   float(fresh["pvPowerWatts"]),
+                 "homePowerWatts": float(fresh["homePowerWatts"]),
+                 "gridPowerWatts": float(fresh["gridPowerWatts"])},
+                time.time())
+
+    def _flux_inputs(self, observed, observed_at):
+        """Everything plan() is allowed to see."""
+        tz    = _london_tz()
+        prefs = self.pluginPrefs
+        now   = datetime.now(timezone.utc)
+        verified, _why = self._flux_tariff_verified()
+
+        bands = None
+        try:
+            bands = _flux_strategy.derive_bands(
+                self._flux_rate_spans("flux_import_slots"),
+                self._flux_rate_spans("flux_export_slots"), tz, now)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] band derivation failed: {exc!r}")
+
+        house = None
+        try:
+            house = _flux_strategy.HalfHourProfile(
+                self.store.get("consumption_profile", []), tz)
+        except (ValueError, TypeError) as exc:
+            self.logger.debug(f"[Flux] no usable consumption profile: {exc}")
+
+        pv = None
+        fc = self.latest_forecast_data or {}
+        try:
+            buckets = {}
+            buckets.update(fc.get("_hourly_p50_today") or {})
+            buckets.update(fc.get("_hourly_p50_tomorrow") or {})
+            if buckets:
+                # PER-DAY factors. The forecast publishes one for today and one
+                # for tomorrow and they differ — today has measured generation
+                # behind it, tomorrow has none — so a single factor biases the
+                # overnight charge by whatever the two disagree by.
+                today_local = _london_today()
+                pv = _flux_strategy.HourlyPvForecast(
+                    buckets, tz,
+                    bias=float(fc.get("biasFactor", 1.0) or 1.0),
+                    bias_by_date={
+                        today_local: float(fc.get("biasFactorToday")
+                                           or fc.get("biasFactor", 1.0) or 1.0),
+                        today_local + timedelta(days=1):
+                            float(fc.get("biasFactorTomorrow")
+                                  or fc.get("biasFactor", 1.0) or 1.0),
+                    })
+        except (ValueError, TypeError) as exc:
+            self.logger.debug(f"[Flux] no usable solar forecast: {exc}")
+
+        inv_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
+        import_limit_w = int(_as_float(prefs.get("fluxSiteImportLimitKw"),
+                                       _as_float(prefs.get("inverterMaxKw"), 10.0)) * 1000)
+
+        site = _flux_strategy.FluxSite(
+            capacity_kwh          = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
+            charge_power_w        = inv_max_w,
+            discharge_power_w     = inv_max_w,
+            export_limit_w        = int(_as_float(prefs.get("maxExportKw"), 4.0) * 1000),
+            import_limit_w        = import_limit_w,
+            import_limit_verified = _as_bool(prefs.get("fluxSiteImportVerified", False)),
+            efficiency            = _as_float(prefs.get("batteryEfficiency"), 94.0) / 100.0,
+            wear_p_per_kwh        = _as_float(prefs.get("fluxWearPencePerKwh"),
+                                              _flux_strategy.DEFAULT_WEAR_P_PER_KWH),
+            reserve_pct           = _as_float(prefs.get("fluxReservePct"),
+                                              _flux_strategy.DEFAULT_RESERVE_PCT),
+            policy_floor_pct      = self._flux_planner_floor_pct(),
+            max_charge_soc_pct    = _as_float(prefs.get("fluxMaxChargeSocPct"), 100.0),
+        )
+
+        # AGES COME FROM SUCCESSFUL FETCHES, not from when a task last ran.
+        # `last_forecast` is stamped whether the fetch worked or not, so a
+        # forecast that has been failing for six hours would read as fresh.
+        rates_at    = float(self.store.get("flux_rates_at") or 0.0)
+        forecast_at = float(self.store.get("forecast_ok_at") or 0.0)
+        profile_at  = float(self.store.get("profile_built_at") or 0.0)
+        age = (lambda stamp: (time.time() - stamp) if stamp else None)
+
+        flows = _flux_strategy.FluxFlows(
+            pv_w      = observed["pvPowerWatts"],
+            house_w   = observed["homePowerWatts"],
+            grid_w    = observed["gridPowerWatts"],
+        )
+        return _flux_strategy.FluxInputs(
+            now             = now,
+            local_tz        = tz,
+            bands           = bands,
+            site            = site,
+            soc_pct         = observed["batterySoc"],
+            house           = house,
+            pv              = pv,
+            flows           = flows,
+            commitments     = self._flux_commitments(),
+            tariff_verified = verified,
+            commissioned    = _as_bool(prefs.get("fluxCommissioned", False)),
+            enabled         = _as_bool(prefs.get("fluxEnabled", False)),
+            rates_age_s     = age(rates_at),
+            forecast_age_s  = age(forecast_at),
+            profile_age_s   = age(profile_at),
+            telemetry_age_s = max(0.0, time.time() - observed_at),
+            flows_age_s     = max(0.0, time.time() - observed_at),
+        )
+
+    def _flux_target(self, decision, observed_at):
+        """A leased FluxTarget, or None.
+
+        TWO LEASES. The DECISION lease (decision_at .. decision_until) says how
+        long this PLAN may speak for the plant; `decision_at` is when the plan was
+        made, taken from the decision itself, so a renewal cannot become a
+        re-stamp of an expired plan. The OBSERVATION lease (observed_at ..
+        expires_at) says how long the reading behind it can be trusted, and that
+        is seconds.
+        """
+        if decision is None or not decision.owns or decision.decision_until is None:
+            return None
+        now      = datetime.now(timezone.utc)
+        made_at  = decision.decision_at or now
+        observed = datetime.fromtimestamp(observed_at, tz=timezone.utc)
+        until    = decision.decision_until
+        if until <= now or made_at > now:
+            return None
+        if (until - made_at) > timedelta(minutes=30) or (now - made_at) > timedelta(minutes=30):
+            return None                 # an expired plan is re-planned, never re-stamped
+        expires = min(observed + timedelta(seconds=FLUX_OBSERVATION_LEASE_S), until)
+        if expires <= now or observed > now:
+            return None
+        try:
+            return _FluxTarget(
+                decision_at          = made_at,
+                decision_until       = until,
+                observed_at          = observed,
+                expires_at           = expires,
+                ems_mode             = int(decision.ems_mode),
+                charge_limit_w       = int(decision.charge_limit_w),
+                discharge_limit_w    = int(decision.discharge_limit_w),
+                charge_cutoff_pct    = round(float(decision.charge_cutoff_pct), 1),
+                discharge_cutoff_pct = round(float(decision.discharge_cutoff_pct), 1),
+            )
+        except (TypeError, ValueError) as exc:
+            log(f"[Flux] Could not build a target from the decision ({exc}) — "
+                f"standing down this cycle", level="WARNING")
+            return None
+
+    # ---- release and pre-emption ------------------------------------------
+
+    def _flux_release(self, reason, preempted=False):
+        """Hand the inverter back to the baseline and stop owning it.
+
+        `preempted` starts the stand-down period AND changes what an unconfirmed
+        hand-back means. At a window end, nobody else wants the registers, so the
+        claim is kept and retried. Under pre-emption, retrying a baseline restore
+        would put mode 2 over the top of whatever the new owner has just written,
+        so the claim is given up outright — which is honest, because somebody
+        else really has taken over.
+        """
+        ex = getattr(self, "flux_executor", None)
+        if ex is None:
+            return ""
+        result = ""
+        try:
+            if ex.owns_control:
+                try:
+                    ex.configure_baseline(**self._flux_baseline())
+                except Exception as exc:
+                    self.logger.debug(f"[Flux] baseline refresh before release: {exc!r}")
+                result = ex.step(None, datetime.now(timezone.utc),
+                                 communications_ok=bool(self.modbus and self.modbus.connected))
+                if result == "released":
+                    log(f"[Flux] Control handed back — {reason}. The inverter is on the "
+                        f"baseline the manager expects, with the discharge floor at "
+                        f"{self._policy_discharge_floor_pct():.0f}%.")
+                elif preempted:
+                    yielded = ex.step(None, datetime.now(timezone.utc),
+                                      supervisor_owns=True,
+                                      communications_ok=bool(self.modbus and self.modbus.connected))
+                    log(f"[Flux] Hand-back to the baseline was not confirmed "
+                        f"({result}; {ex.last_error or 'no detail'}), so the claim has "
+                        f"been given up outright — {reason} owns the inverter now and "
+                        f"the manager's verify pass will settle the limits.",
+                        level="WARNING")
+                    result = yielded
+                else:
+                    log(f"[Flux] Hand-back is not yet confirmed ({result}; "
+                        f"{ex.last_error or 'no detail'}) — the supervisor keeps the "
+                        f"claim and retries.", level="WARNING")
+        except Exception as exc:                        # noqa: BLE001
+            log(f"[Flux] Hand-back raised {exc!r} — keeping the claim and retrying",
+                level="ERROR")
+            result = "pending"
+        self.store["flux_applied_key"] = None
+        self.store["flux_last_result"] = result
+        if preempted:
+            self.store["flux_preempted_at"] = time.time()
+            self.store["flux_clear_ticks"]  = 0
+        return result
+
+    def _flux_preempt(self, reason):
+        """Called by anything about to write to the inverter itself, BEFORE it writes.
+
+        Returns True when Flux no longer holds the claim. A False return is worth
+        logging by the caller but must never block it: the other owner outranks
+        Flux by definition, and a paid window does not wait.
+
+        Cheap and safe when Flux is off.
+        """
+        self.store["flux_manual_preempt"] = reason
+        ex = getattr(self, "flux_executor", None)
+        if ex is None or not ex.owns_control:
+            self.store["flux_preempted_at"] = time.time()
+            self.store["flux_clear_ticks"]  = 0
+            return True
+        self._flux_release(f"pre-empted by {reason}", preempted=True)
+        if self._flux_owns_control():
+            log(f"[Flux] {reason} is taking the inverter, but the Flux claim could "
+                f"not be relinquished ({ex.last_error or 'no detail'}). Proceeding — "
+                f"the new owner's own writes stand.", level="WARNING")
+            return False
+        return True
+
+    def _flux_clear_preempt(self):
+        if self.store.get("flux_manual_preempt"):
+            self.store["flux_manual_preempt"] = ""
+
+    def _flux_may_claim(self):
+        """True when the stand-down has expired and the coast has been clear for
+        several consecutive ticks. One clear reading is not evidence."""
+        since = time.time() - float(self.store.get("flux_preempted_at") or 0.0)
+        if since < FLUX_PREEMPT_COOLDOWN_S:
+            return False
+        return int(self.store.get("flux_clear_ticks") or 0) >= FLUX_RECLAIM_TICKS
+
+    # ---- the tick ----------------------------------------------------------
+
+    def _flux_supervisor_tick(self):
+        """The whole Flux control path, once per plugin tick. Self-locking."""
+        if not self._flux_enabled():
+            with self._state_lock:
+                self._flux_recover_while_disabled()
+            return
+        with self._state_lock:
+            try:
+                self._flux_supervisor_step()
+            except Exception:
+                self.logger.exception(
+                    "[Flux] Supervisor raised — releasing control and continuing")
+                try:
+                    self._flux_release("the supervisor hit an error", preempted=True)
+                except Exception:
+                    pass
+
+    def _flux_recover_while_disabled(self):
+        """Reconcile a claim left behind, without arming any trading.
+
+        Two ways to get here with a claim outstanding: the feature switched off
+        mid-window, or a restart finding a journal from a previous run. Neither
+        may simply drop the executor — the claim is durable, the hardware may
+        still be in a Flux mode, and discarding the object loses the only thing
+        that knows to reconcile. So the executor is ADOPTED (built if a journal
+        exists), released, and only let go once the release is confirmed.
+
+        No target is ever offered on this path, so nothing here can trade.
+        """
+        ex = getattr(self, "flux_executor", None)
+        if ex is None:
+            if not FLUX_AVAILABLE or self.modbus is None:
+                return
+            try:
+                if not os.path.exists(self._flux_journal_path()):
+                    self.store["flux_status"] = "off"
+                    return
+            except Exception:
+                return
+            ex = self._flux_ensure_executor(allow_create=True)
+            if ex is None:
+                return
+            log("[Flux] A claim journal was found while the strategy is switched "
+                "off — reconciling the inverter back to the baseline before "
+                "standing down.", level="WARNING")
+        owner = self._flux_other_owner()
+        if owner:
+            # Keep the executor AND journal throughout the external owner's
+            # tenure, including later ticks when owns_control is already false.
+            self.store["flux_last_result"] = ex.step(
+                None, datetime.now(timezone.utc), supervisor_owns=True,
+                communications_ok=bool(self.modbus and self.modbus.connected))
+            self.store["flux_status"] = f"switched off; {owner} owns the inverter"
+            return
+        # Always step after the owner leaves: its exclusive ownership does not
+        # prove the baseline. The real executor reconciles supervisor handback
+        # even though owns_control was false while that owner was active.
+        try:
+            ex.configure_baseline(**self._flux_baseline())
+            result = ex.step(None, datetime.now(timezone.utc),
+                             communications_ok=bool(self.modbus and self.modbus.connected))
+        except Exception as exc:
+            self.logger.warning(f"[Flux] Disabled recovery still pending: {exc}")
+            result = "pending"
+        self.store["flux_last_result"] = result
+        if result != "released":
+            self.store["flux_status"] = "switched off, but the hand-back is not confirmed — retrying"
+            return
+        self.flux_executor = None
+        self.store["flux_status"] = "off"
+        try:
+            os.remove(self._flux_journal_path())
+        except OSError:
+            pass
+
+    def _flux_supervisor_step(self):
+        """One pass. Caller holds _state_lock."""
+        ex = self._flux_ensure_executor()
+        if ex is None:
+            self.store["flux_status"] = "unavailable"
+            return
+
+        comms = bool(self.modbus and self.modbus.connected)
+
+        # A manual pre-emption is sticky for the stand-down and then lets go. The
+        # STATE it leaves behind (an import in flight, a paused manager) keeps its
+        # own entry below for as long as it is really true.
+        if (self.store.get("flux_manual_preempt")
+                and time.time() - float(self.store.get("flux_preempted_at") or 0.0)
+                >= FLUX_PREEMPT_COOLDOWN_S):
+            self._flux_clear_preempt()
+
+        owner = self._flux_other_owner()
+        if owner != (self.store.get("flux_owner_reason") or ""):
+            # Say so when Flux starts or stops standing aside. Silence here is how
+            # a whole peak window went by on 17-Sep-2026 with nobody knowing why.
+            if owner:
+                log(f"[Flux] Standing aside: {owner}.")
+            elif self.store.get("flux_owner_reason"):
+                log(f"[Flux] No longer standing aside ({self.store.get('flux_owner_reason')} has ended).")
+        self.store["flux_owner_reason"] = owner
+        if owner:
+            # NEVER a baseline restore here. By the time an owner is VISIBLE to
+            # this pass it has already written its own mode and limits — every
+            # path that takes the inverter calls _flux_preempt first, which is
+            # where the clean, ordered hand-back happens. Restoring now would put
+            # mode 2 over the top of a live paid export, which is the exact
+            # failure the ordered pre-emption exists to prevent. So the claim is
+            # given up with no writes at all, and the new owner plus the
+            # manager's verify pass settle the registers.
+            self.store["flux_clear_ticks"]  = 0
+            self.store["flux_last_result"]  = ex.step(
+                None, datetime.now(timezone.utc),
+                supervisor_owns=True, communications_ok=comms)
+            self.store["flux_preempted_at"] = time.time()
+            self.store["flux_applied_key"]  = None
+            self.store["flux_status"] = f"standing down — {owner}"
+            return
+        self.store["flux_clear_ticks"] = int(self.store.get("flux_clear_ticks") or 0) + 1
+
+        if not comms:
+            # The executor keeps the claim and reports pending: a lost connection
+            # is not an acknowledgement that anything stopped, and nothing here
+            # is a hardware timer.
+            self.store["flux_last_result"] = ex.step(
+                None, datetime.now(timezone.utc), communications_ok=False)
+            self.store["flux_status"] = "inverter unreachable — claim held, not confirmed"
+            return
+
+        observation = self._flux_observation()
+        if observation is None:
+            if ex.owns_control:
+                self._flux_release("the inverter readings could not be refreshed")
+            self.store["flux_status"] = "no usable inverter reading"
+            return
+        observed, observed_at = observation
+
+        inputs   = self._flux_inputs(observed, observed_at)
+        decision = _flux_strategy.plan(inputs)
+        self.store["flux_decision"] = decision
+        self.store["flux_status"]   = _flux_strategy.describe(decision)
+        self._flux_log_decision(decision)
+
+        # A late announcement must re-plan at once rather than ride out the
+        # applied command: the reservation it creates changes what is spare.
+        signature = _flux_strategy.commitment_signature(inputs.commitments)
+        if signature != self.store.get("flux_commitment_signature"):
+            if self.store.get("flux_commitment_signature") is not None:
+                log(f"[Flux] Grid-event commitments changed — re-planning. "
+                    f"{len(inputs.commitments)} now stand.")
+            self.store["flux_commitment_signature"] = signature
+            self.store["flux_applied_key"] = None
+
+        if not decision.owns:
+            if ex.owns_control:
+                self._flux_release(decision.reason)
+            return
+
+        if not ex.owns_control and not self._flux_may_claim():
+            self.store["flux_status"] = (
+                "waiting out the stand-down period after being pre-empted")
+            return
+
+        # RENEWED EVERY TICK FROM A FRESH OBSERVATION. A skip longer than the
+        # observation lease would leave the executor holding a decision whose
+        # reading had expired, and nothing on the inverter enforces that lease.
+        # The executor's renewal path is read-back only when the command has not
+        # changed, which is what makes this affordable.
+        target = self._flux_target(decision, observed_at)
+        if target is None:
+            if ex.owns_control:
+                self._flux_release("the decision could not be leased")
+            return
+
+        result = ex.step(target, datetime.now(timezone.utc), communications_ok=True)
+        self.store["flux_last_step"]   = time.time()
+        self.store["flux_last_result"] = result
+        if result == "applied":
+            self.store["flux_applied_key"]   = decision.control_key()
+            self.store["flux_pending_since"] = 0.0
+        else:
+            self.store["flux_applied_key"] = None
+            if result == "pending":
+                self._flux_note_pending(ex, decision)
+            else:
+                self.store["flux_pending_since"] = 0.0
+
+    def _flux_note_pending(self, ex, decision):
+        """Record an unacknowledged command and keep retrying it.
+
+        There is deliberately NO timeout that declares somebody else has taken
+        over: `supervisor_owns` means another owner really has the registers, and
+        saying so because a clock ran out would be a lie told to the one component
+        that must not be lied to. So the claim stands and the release is retried
+        every tick, with one ERROR at the start and one an hour after that, until
+        it is confirmed or a real owner pre-empts it.
+        """
+        started = float(self.store.get("flux_pending_since") or 0.0)
+        now     = time.time()
+        if not started:
+            self.store["flux_pending_since"] = now
+            self.store["flux_pending_logged"] = now
+            # THE WINDOW ENDING IS NOT A FAULT. A renewal issued in the last seconds
+            # of the window is refused by the executor, because its lease may not
+            # outlive the window — which is correct, and it is what happens at 19:00
+            # and 05:00 every day. Logging that as a WARNING about an inverter that
+            # "did not acknowledge" reads as a failure (live, 17-Sep-2026 19:00:33)
+            # and would teach the reader to ignore the message that matters.
+            until = getattr(decision, "decision_until", None)
+            if until is not None and until <= datetime.now(timezone.utc):
+                log(f"[Flux] The {decision.mode} window ended while the last command "
+                    f"was still in flight, so it was not renewed. The inverter goes "
+                    f"back to the manager on the next tick.")
+                return
+            log(f"[Flux] The inverter did not acknowledge the {decision.mode} "
+                f"command ({ex.last_error or 'no detail'}). The supervisor keeps the "
+                f"claim and retries; the ordinary manager stays hands-off while a "
+                f"claim is outstanding.", level="WARNING")
+            return
+        if now - float(self.store.get("flux_pending_logged") or 0.0) < 3600:
+            return
+        self.store["flux_pending_logged"] = now
+        log(f"[Flux] The inverter has not acknowledged a Flux command for "
+            f"{int((now - started) // 60)} minutes ({ex.last_error or 'no detail'}). "
+            f"The claim is still outstanding and the ordinary manager is hands-off. "
+            f"Switch the Flux strategy off in the plugin configuration to force a "
+            f"reconciled hand-back.", level="ERROR")
+
+    def _flux_log_decision(self, decision):
+        """One line when the plan changes, and never the same line twice."""
+        key = f"{decision.mode}|{decision.reason}"
+        if self.store.get("flux_note_logged") == key:
+            return
+        self.store["flux_note_logged"] = key
+        log(f"[Flux] {_flux_strategy.describe(decision)}")
+
+    # ================================================================
     # Indigo Action Callbacks
     # ================================================================
 
@@ -10964,6 +13063,11 @@ class Plugin(indigo.PluginBase):
                     f"premium. Pause the manager first if you need to override it.",
                     level="WARNING")
                 return
+            # A person has asked for this, so Flux lets go BEFORE the write, not
+            # after. See _flux_preempt: discovering the manual action on the next
+            # supervisor pass would mean reading back registers this action had
+            # just set and "correcting" them.
+            self._flux_preempt("a Force Grid Import action")
             props      = action.props
             inv_max_kw = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
             power_kw   = min(max(0.0, _as_float(props.get("powerKw"), inv_max_kw)), inv_max_kw)
@@ -10987,6 +13091,7 @@ class Plugin(indigo.PluginBase):
         limits how hard the battery can discharge (grid export then = headroom minus
         house load). The field used to be ignored entirely (always inverter max)."""
         with self._state_lock:
+            self._flux_preempt("a Force Grid Export action")
             inv_max_kw  = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
             power_kw    = min(max(0.0, _as_float(action.props.get("powerKw"), inv_max_kw)),
                               inv_max_kw)
@@ -11010,6 +13115,7 @@ class Plugin(indigo.PluginBase):
         (or the manager's next tick) — pause the manager first to hold it.
         """
         with self._state_lock:
+            self._flux_preempt("a Force Daytime Export action")
             inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
             log("[Action] Force daytime export: mode 0x05 (Discharge PV First) — test")
             if self.modbus and self.modbus.daytime_export(inv_max_w):
@@ -11026,6 +13132,7 @@ class Plugin(indigo.PluginBase):
         hold it; restore with Set Self-Consumption then Resume Battery Manager.
         """
         with self._state_lock:
+            self._flux_preempt("a Force VPP Export Drive action")
             self.store["vpp_is_daytime"]        = True
             self.store["vpp_export_submode"]    = None
             self.store["vpp_bank_charge_cap_w"] = -1
@@ -11036,6 +13143,7 @@ class Plugin(indigo.PluginBase):
     def actionSetSelfConsumption(self, action):
         """Action: Return to self-consumption mode."""
         with self._state_lock:
+            self._flux_preempt("a Set Self-Consumption action")
             log("[Action] Set self-consumption mode")
             if self.modbus:
                 self.modbus.set_self_consumption()
@@ -11047,6 +13155,9 @@ class Plugin(indigo.PluginBase):
     def actionReturnToLocalEms(self, action):
         """Action: Disable Remote EMS and return to local inverter control."""
         with self._state_lock:
+            # Remote EMS is about to be DISABLED, which takes the registers the
+            # executor holds its claim over out from under it. Let go first.
+            self._flux_preempt("a Return to Local EMS action")
             log("[Action] Return to local EMS control")
             if self.modbus:
                 self.modbus.return_to_local()
@@ -11067,6 +13178,12 @@ class Plugin(indigo.PluginBase):
         On RESUME we force an immediate re-evaluation on the next tick.
         """
         was_paused = self.store.get("manager_paused", False)
+        # Pause means hands off the inverter, and that has to include the Flux
+        # supervisor — otherwise "Paused" would be a label on a plugin still
+        # trading. Released BEFORE the hand-back write below, and before the
+        # pause flag can be read by anything else.
+        if paused and not was_paused:
+            self._flux_preempt(f"the manager being paused ({source})")
         self.store["manager_paused"] = paused
         dev = self._find_device("batteryManager")
         if dev:
@@ -11105,6 +13222,10 @@ class Plugin(indigo.PluginBase):
         elif was_paused:
             # Resume: re-evaluate now rather than waiting up to MANAGER_EVAL_INTERVAL.
             self.store["last_manager"] = 0.0
+            # Resuming is the explicit end of the manual hold. The cooldown still
+            # runs (see _flux_may_claim) — the person gets their hands back on the
+            # inverter immediately, and Flux has to wait its turn.
+            self._flux_clear_preempt()
             log(f"[Pause] Manager resumed ({source}) — re-evaluating immediately.")
 
     def actionPauseManager(self, action):
@@ -12243,11 +14364,35 @@ class Plugin(indigo.PluginBase):
             # effect without a restart.
             inverter_max_w=int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000),
         )
+        # An executor built against the PREVIOUS driver is now holding a dead
+        # socket. Re-bind it to the new one before anything else can use it — a
+        # preference change mid-claim would otherwise strand the claim on a
+        # disconnected driver, and every write and read-back through it would
+        # fail while the claim itself stayed outstanding.
+        self._flux_rebind_driver()
+
         # Startup Modbus initialisations — connect once for all startup writes.
         # HOLD_ESS_MAX_DISCHARGE (40034) persists across mode changes on the inverter.
         # A previous force_discharge() call may have left a low limit that caps battery
         # output even in self-consumption mode. Always reset to full inverter capacity.
-        if self.modbus.connect():
+        #
+        # SKIPPED ENTIRELY WHILE A FLUX CLAIM IS OUTSTANDING. These three writes
+        # are the legacy "clear anything stale" pass, and after a crash they are
+        # exactly wrong: a Flux charge left the inverter in mode 3 with a charge
+        # cutoff at, say, 80%, and that cutoff is the only thing stopping it
+        # charging to 100% unattended. Lifting it to 100% and both limits to
+        # maximum — before the journal has even been read — removes the backstop
+        # from a mode that is still running. Reconciliation happens first, on the
+        # first tick; these writes resume on the next restart, by which time
+        # there is no claim to protect.
+        if self._flux_recovery_pending():
+            log("[Flux] A claim journal is outstanding, so the usual startup reset "
+                "of the charge and discharge limits has been SKIPPED — lifting the "
+                "charge cutoff now would remove the backstop from a mode that may "
+                "still be running. The supervisor reconciles on the first tick.",
+                level="WARNING")
+            self.modbus.connect()
+        elif self.modbus.connect():
             inverter_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
             self.modbus.set_discharge_limit(inverter_max_w)   # clear any stale discharge cap
             self.modbus.set_charge_limit(inverter_max_w)      # clear any stale charge cap
@@ -12368,6 +14513,8 @@ class Plugin(indigo.PluginBase):
             # must not turn a settled "Octopus said no" back into an hourly retry.
             "saving_sessions_join_refused":
                 list(self.store.get("saving_sessions_join_refused") or [])[-200:],
+            "saving_sessions_not_our_region":
+                list(self.store.get("saving_sessions_not_our_region") or [])[-200:],
             # WARN-ONCE LATCHES. Persisted for exactly the reason above, and it
             # is not a nicety: an in-memory latch is a warn-once-PER-RESTART
             # latch, which on a plugin restarted several times in a working day
@@ -12454,6 +14601,9 @@ class Plugin(indigo.PluginBase):
             if data.get("saving_sessions_join_refused"):
                 self.store["saving_sessions_join_refused"] = \
                     list(data["saving_sessions_join_refused"])[-200:]
+            if data.get("saving_sessions_not_our_region"):
+                self.store["saving_sessions_not_our_region"] = \
+                    list(data["saving_sessions_not_our_region"])[-200:]
             # The warn-once latches come back as SETS, because that is what the
             # three checks that read them expect; JSON can only carry a list, so
             # the conversion has to happen on the way in. Restored WITHOUT

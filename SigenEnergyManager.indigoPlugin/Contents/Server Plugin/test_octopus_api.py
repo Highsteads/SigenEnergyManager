@@ -33,12 +33,12 @@ class _FakeResp:
 _LEDGER = {"data": {"account": {
     "balance": 39239,
     "electricityAgreements": [
-        {"meterPoint": {"mpan": "1591059073620"},
+        {"meterPoint": {"mpan": "1234567890123"},
          "tariff": {"__typename": "StandardTariff",
                     "tariffCode": "E-1R-SILVER-26-04-01-F",
                     "displayName": "Octopus Tracker",
                     "standingCharge": 61.51824, "unitRate": 23.478}},
-        {"meterPoint": {"mpan": "1574300590436"},
+        {"meterPoint": {"mpan": "1234567890999"},
          "tariff": {"__typename": "StandardTariff",
                     "tariffCode": "E-1R-OUTGOING-VAR-24-10-26-F",
                     "displayName": "Outgoing Octopus",
@@ -56,8 +56,8 @@ _LEDGER = {"data": {"account": {
 def _make_api():
     api = octopus_api.OctopusAPI(
         api_key="k", account_id="A-TEST",
-        mpan="1591059073620", serial="21M0",
-        export_mpan="1574300590436", export_serial="21M0",
+        mpan="1234567890123", serial="21M0",
+        export_mpan="1234567890999", export_serial="21M0",
         gas_mprn="5036739000", gas_serial="G4F",
     )
     api._get_kraken_token = lambda: "tok"     # skip the network token mutation
@@ -282,7 +282,7 @@ class TestFinancialsClassification(unittest.TestCase):
     def _ledger(self, second_mpan, second_code):
         return {"data": {"account": {"balance": 0, "gasAgreements": [],
             "electricityAgreements": [
-                {"meterPoint": {"mpan": "1591059073620"},
+                {"meterPoint": {"mpan": "1234567890123"},
                  "tariff": {"__typename": "StandardTariff", "tariffCode": "E-1R-SILVER-26-04-01-F",
                             "displayName": "Tracker", "standingCharge": 61.5, "unitRate": 23.0}},
                 {"meterPoint": {"mpan": second_mpan},
@@ -291,7 +291,7 @@ class TestFinancialsClassification(unittest.TestCase):
             ]}}}
 
     def test_export_by_mpan_without_outgoing_code(self):
-        octopus_api.requests.post.return_value = _FakeResp(self._ledger("1574300590436", "E-1R-WEIRD-F"))
+        octopus_api.requests.post.return_value = _FakeResp(self._ledger("1234567890999", "E-1R-WEIRD-F"))
         fin = self.api.get_account_financials(force=True)
         self.assertEqual(fin["export"]["unit_p"], 12.0)
         self.assertEqual(fin["elec"]["unit_p"], 23.0)   # import unaffected
@@ -312,6 +312,65 @@ class TestFinancialsClassification(unittest.TestCase):
             self._ledger("9999999999999", "E-1R-OUTGOING-VAR-24-10-26-F"))
         fin = self.api.get_account_financials(force=True)
         self.assertEqual(fin["export"]["unit_p"], 12.0)
+
+
+class TestFluxHalfHourlyLedger(unittest.TestCase):
+    """Paired Flux comes back as HalfHourlyTariff with dated unitRates and no
+    single unitRate. Until v5.110.0 that left both unit rates None, so the
+    published elec_unit_rate_p and export_rate_p froze on Tracker and Outgoing."""
+
+    def setUp(self):
+        self.api = _make_api()
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        iso = lambda d: d.isoformat()
+        def rates(before, current, after):
+            return [{"validFrom": iso(now - timedelta(hours=3)),
+                     "validTo": iso(now - timedelta(hours=1)), "value": before},
+                    {"validFrom": iso(now - timedelta(hours=1)),
+                     "validTo": iso(now + timedelta(hours=1)), "value": current},
+                    {"validFrom": iso(now + timedelta(hours=1)),
+                     "validTo": iso(now + timedelta(hours=3)), "value": after}]
+        octopus_api.requests.post.return_value = _FakeResp({"data": {"account": {
+            "balance": 0, "gasAgreements": [],
+            "electricityAgreements": [
+                # The export MPAN is deliberately NOT configured here, so the code
+                # alone must identify it: FLUX-EXPORT carries no OUTGOING.
+                {"meterPoint": {"mpan": "9999999999999"},
+                 "tariff": {"__typename": "HalfHourlyTariff",
+                            "tariffCode": "E-1R-FLUX-EXPORT-23-02-14-F",
+                            "displayName": "Octopus Flux Export", "standingCharge": 0.0,
+                            "unitRates": rates(4.2064, 27.6905, 9.7084)}},
+                {"meterPoint": {"mpan": "1234567890123"},
+                 "tariff": {"__typename": "HalfHourlyTariff",
+                            "tariffCode": "E-1R-FLUX-IMPORT-23-02-14-F",
+                            "displayName": "Octopus Flux Import", "standingCharge": 61.51824,
+                            "unitRates": rates(14.618415, 34.099905, 24.35433)}},
+            ]}}})
+        self.api.export_mpan = ""
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def test_import_unit_rate_is_the_band_in_force(self):
+        fin = self.api.get_account_financials(force=True)
+        self.assertEqual(fin["elec"]["unit_p"], 34.099905)
+        self.assertEqual(fin["elec"]["display_name"], "Octopus Flux Import")
+        self.assertEqual(len(fin["elec"]["unit_rates"]), 3)
+
+    def test_flux_export_is_recognised_by_its_code(self):
+        fin = self.api.get_account_financials(force=True)
+        self.assertIsNotNone(fin["export"])
+        self.assertEqual(fin["export"]["unit_p"], 27.6905)
+        self.assertEqual(fin["export"]["tariff_code"], "E-1R-FLUX-EXPORT-23-02-14-F")
+
+    def test_no_band_covering_now_is_none_not_zero(self):
+        self.assertIsNone(octopus_api._rate_in_force(
+            [{"valid_from": "2020-01-01T00:00:00Z", "valid_to": "2020-01-02T00:00:00Z",
+              "value_inc_vat": 9.0}],
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc)))
 
 
 class TestGasZeroBoundary(unittest.TestCase):

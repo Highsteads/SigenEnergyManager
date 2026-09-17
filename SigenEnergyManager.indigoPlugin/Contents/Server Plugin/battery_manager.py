@@ -504,6 +504,16 @@ BANK_FIRST_PROMOTE_MARGIN_KWH = 5.0
 # Data classes
 # ============================================================
 
+# Standard Octopus Flux peak window start, UK local hour (overflow pacing, v5.109.3).
+FLUX_PEAK_START_HOUR = 16
+
+# v5.109.5: hourly-mean forecast PV is multiplied by this before asking whether the
+# rest of today could still clip. Hourly means hide broken-cloud bursts above the
+# mean. A CHOSEN safety margin (17-Sep-2026), NOT a measured figure; the 28-Sep
+# bank-first review measures clip-boundary minutes on Flux days and can revise it.
+FLUX_CLIP_GUST_FACTOR = 1.25
+
+
 @dataclass
 class TariffData:
     """Tariff-related information passed to the decision engine."""
@@ -2116,6 +2126,73 @@ class BatteryManager:
         net_to_battery = balance.remaining_solar_kwh - balance.remaining_home_to_dusk_kwh
         return net_to_battery - headroom_kwh
 
+    def _overflow_pacing_hours(self, snapshot: ManagerSnapshot,
+                               hours_to_dusk: float) -> Tuple[float, str]:
+        """How long the overflow charge has to reach its target, and what the deadline is.
+
+        Dusk, except on standard Octopus Flux before the 16:00 peak, where it is 16:00.
+        CliveS, 17-Sep-2026. On Flux a kWh exported in the day earns the standard 9.7p
+        while the same kWh held until 16:00 sells at 27.7p (about 21p after losses and
+        wear) or saves 34p of peak import. Pacing to dusk let the battery reach the
+        peak window lower than it needed to be, having sold the difference at 9.7p.
+        The physics gate still decides WHETHER solar overflows (to dusk); only the
+        rate changes, so a day that cannot fill the battery is untouched. Intelligent
+        Flux has different windows and keeps dusk.
+        """
+        try:
+            if snapshot.tariff.tariff_key != TARIFF_FLUX:
+                return hours_to_dusk, "dusk"
+            now_local  = self._to_local(snapshot.now)
+            peak_local = now_local.replace(hour=FLUX_PEAK_START_HOUR, minute=0,
+                                           second=0, microsecond=0)
+            hours_to_peak = (peak_local - now_local).total_seconds() / 3600.0
+            if hours_to_peak <= 0.0 or hours_to_peak >= hours_to_dusk:
+                return hours_to_dusk, "dusk"
+            return hours_to_peak, "the 4pm Flux peak"
+        except Exception:                                    # noqa: BLE001
+            return hours_to_dusk, "dusk"             # fail to the old behaviour
+
+    def _flux_clip_risk_passed(self, snapshot: ManagerSnapshot) -> bool:
+        """True on standard Flux once nothing left of today's sun can clip.
+
+        CliveS, 17-Sep-2026: bank the extra solar to 100% rather than sell it at 9.7p,
+        because a stored kWh saves buying one at 14.6p overnight (about 15.5p after
+        losses). The July argument for 95% was clipping: once full, PV above the house
+        plus the 4 kW export cap is thrown away. So 100% is aimed at only when every
+        remaining hour's forecast PV, grossed up by FLUX_CLIP_GUST_FACTOR, fits under
+        the house's expected use plus the export cap.
+
+        Conservative everywhere it can be: no forecast for the rest of today, a
+        missing consumption profile (house taken as zero), or any error all answer
+        False, which keeps the ordinary 95% target.
+        """
+        try:
+            if snapshot.tariff.tariff_key != TARIFF_FLUX:
+                return False
+            local_now = self._to_local(snapshot.now).replace(tzinfo=None)
+            now_hour  = local_now.replace(minute=0, second=0, microsecond=0)
+            today     = local_now.strftime("%Y-%m-%d")
+            scale     = (float(snapshot.bias_factor_today or 1.0)
+                         * float(snapshot.pv_tracking_factor or 1.0))
+            profile   = (snapshot.consumption_profile
+                         if len(snapshot.consumption_profile or []) == 48 else None)
+            seen = False
+            for key, wh in (snapshot.forecast_p50 or {}).items():
+                if not str(key).startswith(today):
+                    continue
+                key_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+                if key_dt < now_hour:
+                    continue
+                seen     = True
+                pv_kw    = float(wh) / 1000.0 * scale      # Wh in an hour = mean kW
+                house_kw = (float(profile[key_dt.hour * 2]) + float(profile[key_dt.hour * 2 + 1])
+                            if profile else 0.0)
+                if pv_kw * FLUX_CLIP_GUST_FACTOR > house_kw + float(snapshot.max_export_kw):
+                    return False
+            return seen
+        except Exception:                                    # noqa: BLE001
+            return False
+
     def _check_solar_overflow(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> Optional[Decision]:
@@ -2197,6 +2274,13 @@ class BatteryManager:
         if snapshot.storm_active:
             target_pct = 100.0
 
+        # v5.109.5: on Flux, once the rest of the day cannot clip, fill to 100% instead
+        # of selling the last five points at 9.7p. See _flux_clip_risk_passed.
+        fill_to_full = (not snapshot.storm_active and target_pct < 100.0
+                        and self._flux_clip_risk_passed(snapshot))
+        if fill_to_full:
+            target_pct = 100.0
+
         # Floor. NOTE the dull-day case needs no guard here, and a "will the solar
         # actually reach the target?" test would be dead code: the physics gate above
         # only lets us export when net_to_battery EXCEEDS the room to 100%, so whenever
@@ -2222,7 +2306,8 @@ class BatteryManager:
             0.0,
             (target_pct - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh,
         )
-        required_charge_kw = headroom_to_target / max(0.5, hours_to_dusk)
+        pace_hours, pace_label = self._overflow_pacing_hours(snapshot, hours_to_dusk)
+        required_charge_kw = headroom_to_target / max(0.5, pace_hours)
         pv_surplus_kw      = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
         export_kw          = min(
             max(0.0, pv_surplus_kw - required_charge_kw),
@@ -2240,13 +2325,16 @@ class BatteryManager:
                 f"Solar overflow: {balance.surplus_kwh:.1f} kWh 24h surplus | "
                 f"{solar_surplus:.1f} kWh physics surplus\n"
                 f"Req charge {required_charge_kw:.2f} kW to {target_pct:.0f}% target"
-                f"{' (storm)' if snapshot.storm_active else ''}  |  "
+                f"{' (storm)' if snapshot.storm_active else ''}"
+                f"{' (Flux: no clip risk left today, banking to full)' if fill_to_full else ''}  |  "
                 f"PV surplus {pv_surplus_kw:.2f} kW  |  "
                 f"Export {export_kw:.2f} kW  |  Cap {cap_w}W\n"
                 f"Battery {balance.battery_kwh:.1f} kWh  |  "
                 f"Solar remaining {remaining_solar_kwh:.1f} kWh  |  "
                 f"Home to dusk {remaining_home_kwh:.1f} kWh  |  "
                 f"{hours_to_dusk:.1f}h to dusk"
+                + (f"  |  paced to {pace_label} ({pace_hours:.1f}h)"
+                   if pace_label != "dusk" else "")
             ),
             power_watts     = cap_w,
             export_kw       = export_kw,

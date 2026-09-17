@@ -31,3 +31,8 @@ experiments/
 
 # Test runner caches — never belong in the bundle or the repo
 .pytest_cache/
+
+# Local operational records for this installation — personal paths, certificates and
+# billing figures. Never published (17-Sep-2026).
+docs/flux-changeover-handover.md
+docs/flux-daily-reports.md

@@ -1690,6 +1690,111 @@ class TestSolarOverflowChargeTarget(unittest.TestCase):
         self.assertEqual(SOLAR_OVERFLOW_MIN_END_SOC_PCT, 80.0)
 
 
+class TestSolarOverflowPacesToTheFluxPeak(unittest.TestCase):
+    """v5.109.3. On standard Flux the overflow charge is paced to reach its target by
+    16:00, not dusk: stored solar sells at 27.7p in the peak, exported early at 9.7p."""
+
+    # Borrow the fixture without inheriting (and re-running) its tests.
+    CAP   = TestSolarOverflowChargeTarget.CAP
+    _snap = TestSolarOverflowChargeTarget._snap
+    _bal  = TestSolarOverflowChargeTarget._bal
+
+    def _flux(self, hh, mm=0, tariff="flux", **kw):
+        from zoneinfo import ZoneInfo
+        snap = self._snap(pv_w=kw.pop("pv_w", 4700), home_w=kw.pop("home_w", 650),
+                          target=kw.pop("target", 95.0))
+        snap.tariff = TariffData(tariff_key=tariff)
+        snap.now = datetime(2026, 9, 18, hh, mm, tzinfo=ZoneInfo("Europe/London"))
+        return BatteryManager()._check_solar_overflow(
+            snap, self._bal(hours_to_dusk=kw.pop("hours_to_dusk", 8.0)))
+
+    def test_before_the_peak_flux_charges_faster_and_exports_less(self):
+        flux    = self._flux(11)                    # 5 h to 16:00, 8 h to dusk
+        tracker = self._flux(11, tariff="tracker")
+        self.assertLess(flux.export_kw, tracker.export_kw)
+        self.assertIn("4pm Flux peak", flux.reason)
+        expected_req = (95.0 - 77.0) / 100.0 * self.CAP / 5.0
+        self.assertAlmostEqual(flux.export_kw, min((4700 - 650) / 1000.0 - expected_req, 4.0),
+                               places=6)
+
+    def test_after_four_it_paces_to_dusk_as_before(self):
+        a = self._flux(17, hours_to_dusk=2.0)
+        b = self._flux(17, tariff="tracker", hours_to_dusk=2.0)
+        self.assertAlmostEqual(a.export_kw, b.export_kw, places=6)
+        self.assertNotIn("Flux peak", a.reason)
+
+    def test_intelligent_flux_and_other_tariffs_keep_dusk(self):
+        for key in ("iflux", "go", "agile", "tracker"):
+            with self.subTest(key=key):
+                self.assertNotIn("Flux peak", self._flux(11, tariff=key).reason)
+
+    def test_bst_is_local_time_not_utc(self):
+        """15:30 BST is 14:30 UTC: half an hour to the peak, never an hour and a half."""
+        d = self._flux(15, 30)
+        self.assertIn("(0.5h)", d.reason)
+
+
+class TestSolarOverflowFillsToFullOnFluxOnceClipRiskHasPassed(unittest.TestCase):
+    """v5.109.5. CliveS, 17-Sep-2026: bank the last points to 100% rather than sell
+    them at 9.7p, but only once nothing left of the day's sun could clip."""
+
+    CAP   = TestSolarOverflowChargeTarget.CAP
+    _snap = TestSolarOverflowChargeTarget._snap
+    _bal  = TestSolarOverflowChargeTarget._bal
+
+    def _run(self, hh, forecast_kw, tariff="flux", profile_kw=0.5, storm=False, soc=96.0):
+        from zoneinfo import ZoneInfo
+        snap = self._snap(soc_pct=soc, pv_w=4700, home_w=500, target=95.0, storm=storm)
+        snap.tariff = TariffData(tariff_key=tariff)
+        snap.now = datetime(2026, 9, 18, hh, 10, tzinfo=ZoneInfo("Europe/London"))
+        snap.forecast_p50 = {f"2026-09-18 {h:02d}:00:00": int(kw * 1000)
+                             for h, kw in forecast_kw.items()}
+        snap.consumption_profile = [profile_kw / 2.0] * 48 if profile_kw is not None else []
+        bm = BatteryManager()
+        return bm, snap, bm._check_solar_overflow(snap, self._bal(soc_pct=soc, hours_to_dusk=3.0))
+
+    AFTERNOON = {15: 3.0, 16: 2.0, 17: 1.0, 18: 0.3}      # max 3.0*1.25 = 3.75 < 4.5
+    MIDDAY    = {11: 7.0, 12: 8.0, 13: 7.5, 14: 6.0}      # 8.0*1.25 = 10 > 4.5
+
+    def test_no_clip_risk_left_banks_to_full_and_exports_less(self):
+        _, _, flux    = self._run(15, self.AFTERNOON)
+        _, _, tracker = self._run(15, self.AFTERNOON, tariff="tracker")
+        self.assertIn("banking to full", flux.reason)
+        self.assertIn("to 100% target", flux.reason)
+        self.assertLess(flux.export_kw, tracker.export_kw)
+
+    def test_clip_risk_still_ahead_keeps_ninety_five(self):
+        _, _, d = self._run(11, self.MIDDAY)
+        self.assertNotIn("banking to full", d.reason)
+        self.assertIn("to 95% target", d.reason)
+
+    def test_the_gust_margin_is_what_decides_a_close_hour(self):
+        """3.8 kW mean fits under 0.5 + 4.0 = 4.5, but not once grossed up by 1.25."""
+        bm, snap, _ = self._run(15, {15: 3.8})
+        self.assertFalse(bm._flux_clip_risk_passed(snap))
+        bm, snap, _ = self._run(15, {15: 3.5})
+        self.assertTrue(bm._flux_clip_risk_passed(snap))
+
+    def test_no_forecast_or_no_profile_stays_conservative(self):
+        bm, snap, _ = self._run(15, {})
+        self.assertFalse(bm._flux_clip_risk_passed(snap))
+        bm, snap, _ = self._run(15, {15: 3.4}, profile_kw=None)   # house taken as zero
+        self.assertFalse(bm._flux_clip_risk_passed(snap))           # 3.4*1.25 = 4.25 > 4.0
+
+    def test_earlier_hours_do_not_count(self):
+        bm, snap, _ = self._run(15, {**self.MIDDAY, **self.AFTERNOON})
+        self.assertTrue(bm._flux_clip_risk_passed(snap))
+
+    def test_other_tariffs_and_storms_unchanged(self):
+        for key in ("tracker", "agile", "iflux", "go"):
+            with self.subTest(key=key):
+                _, _, d = self._run(15, self.AFTERNOON, tariff=key)
+                self.assertNotIn("banking to full", d.reason)
+        _, _, storm = self._run(15, self.AFTERNOON, storm=True)
+        self.assertIn("(storm)", storm.reason)
+        self.assertNotIn("banking to full", storm.reason)
+
+
 class TestSolarOverflowHysteresis(unittest.TestCase):
     """v3.10: the engage/release boundary has a dead band and a re-engage dwell.
 

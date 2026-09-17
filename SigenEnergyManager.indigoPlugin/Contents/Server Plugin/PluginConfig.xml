@@ -467,6 +467,44 @@ Guards, all automatic: it only ever runs for a session you are actually opted in
         <Label>Leave this on Automatic unless you are rehearsing a tariff you have not switched to yet. The plugin normally reads your live agreement from Octopus, and until you are actually on a tariff there is no way to prove its planning works — the first run happens on the first morning you are billed for it. Setting this forces the whole chain to behave as if you were already on that tariff: detection, the half-hourly rate fetch, the import planner and the dashboard all use it, against the real published prices. It does NOT change what Octopus charges you, and your bill, balance and agreement are still read from your actual account. It does mean the battery makes decisions for a tariff you are not on, so the sensible time to use it is a period when the battery is not importing anyway. A warning is logged at every start and every save while it is on, and the tariff is shown as "(forced)" so it cannot be left set by accident. Set it back to Automatic once your real tariff matches.</Label>
     </Field>
 
+    <Field id="separator_flux" type="separator"/>
+    <Field id="fluxHeading" type="label" fontColor="darkgray">
+        <Label>OCTOPUS FLUX STRATEGY (draft — leave switched off unless you are on Flux)</Label>
+    </Field>
+    <Field id="fluxEnabledInfo" type="label">
+        <Label>Flux pays three prices for what you import and three for what you export, on the same clock: cheap overnight, dear between 4pm and 7pm, standard the rest of the day. This strategy fills the battery overnight for what the house is forecast to need, and sells what is genuinely spare during the dear hours. It takes the inverter over only inside those windows. Outside them, and any time a storm, a power cut, a paid Axle window, a Saving Session, a Happy Hour or anything you do by hand is in play, it hands the inverter straight back to the ordinary manager. Both boxes below must be ticked before it does anything at all, and it does nothing whatever unless Octopus tell the plugin your account really is on Flux — forcing the tariff above is a rehearsal and is never taken as proof.</Label>
+    </Field>
+    <Field id="fluxEnabled" type="checkbox" defaultValue="false">
+        <Label>Use the Flux strategy:</Label>
+    </Field>
+    <Field id="fluxCommissioned" type="checkbox" defaultValue="false">
+        <Label>Commissioning is signed off:</Label>
+    </Field>
+    <Field id="fluxCommissionedInfo" type="label">
+        <Label>Tick this only when you have worked through the activation checklist in docs/flux-controller.md and watched the inverter do each of those things yourself. It is a separate box from the one above because the first says what you want and this one says what has been proven on your own hardware. Until BOTH boxes are ticked the strategy does nothing at all: it makes no plans, logs no decisions and never touches the inverter. The one thing it still does is tidy up after itself, by handing the inverter back if a previous run left it holding the controls.</Label>
+    </Field>
+    <Field id="fluxReservePct" type="textfield" defaultValue="20">
+        <Label>Keep this much battery back at all times (%):</Label>
+    </Field>
+    <Field id="fluxReservePctInfo" type="label">
+        <Label>A flat floor no Flux decision may sell through, whatever the price. The battery the house needs before the cheap rate comes back is worked out separately from the forecast and added on top of this, so the floor is the last line rather than the whole reserve. Storm, power-cut and flood-prevention floors override it upwards and never downwards. Default 20.</Label>
+    </Field>
+    <Field id="fluxWearPencePerKwh" type="textfield" defaultValue="5">
+        <Label>Battery wear to charge each traded kWh (pence):</Label>
+    </Field>
+    <Field id="fluxWearPencePerKwhInfo" type="label">
+        <Label>Every kWh cycled through the battery to make money costs something in battery life, and a trade that does not cover it is a trade that loses. This figure is added to the cost of a stored kWh before any sale is called profitable, alongside the round-trip loss taken from the battery efficiency setting further up. Default 5.</Label>
+    </Field>
+    <Field id="fluxSiteImportLimitKw" type="textfield" defaultValue="10.0">
+        <Label>Most the site can safely import (kW):</Label>
+    </Field>
+    <Field id="fluxSiteImportVerified" type="checkbox" defaultValue="false">
+        <Label>That import limit has been verified:</Label>
+    </Field>
+    <Field id="fluxSiteImportInfo" type="label">
+        <Label>An overnight charge is the one thing here that pulls hard on your supply, and the inverter's own rating is not the same thing as what your incoming supply, main fuse and wiring will carry alongside everything else in the house. Until the box is ticked the strategy will not size a grid charge at all — it defers and says so in the log, rather than assuming. Tick it only once someone has checked the real figure for your installation.</Label>
+    </Field>
+
     <Field id="separator_debug" type="separator"/>
     <Field id="showDebugInfo" type="checkbox" defaultValue="false">
         <Label>Enable debug logging:</Label>
