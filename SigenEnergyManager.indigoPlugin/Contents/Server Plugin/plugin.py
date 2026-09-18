@@ -16,8 +16,9 @@
 #              Claude Opus 5 (5.109.4 — Saving Session Pushover in plain English)
 #              Claude Opus 5 (5.109.5 — on Flux, bank to 100% once the day cannot clip)
 #              Claude Opus 5 (5.110.0 — Flux import priced by band; every tier published)
-# Date:        17-09-2026
-# Version:     5.110.0
+#              Claude Opus 5 (5.110.1 — the Flux floor stops shouting its re-asserts)
+# Date:        18-09-2026
+# Version:     5.110.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

@@ -4,8 +4,15 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Opus 5
-# Date:        05-09-2026 12:50
-# Version:     1.14 (LIFETIME ENERGY BLOCKS — load 30094, ESS charge/discharge
+# Date:        18-09-2026 06:20
+# Version:     1.15 (set_discharge_limit() logs at INFO only when the value
+#              CHANGES, DEBUG when the same value is re-asserted. The Flux
+#              controller re-writes its floor every tick, so the first
+#              overnight window wrote 381 identical INFO lines into the event
+#              log in three hours -- 381 of the day's 537 Sigenergy lines.
+#              The latch clears on a failed write, on disconnect, and when a
+#              read disagrees, so the register auditor's corrections stay INFO.)
+#              prior 1.14 (LIFETIME ENERGY BLOCKS — load 30094, ESS charge/discharge
 #              30200/30204 probed and added; the four plant energy reads become
 #              four BLOCK reads; reset-type daily registers are never served from
 #              the slow cache (a ten-minute-old daily counter spanning midnight is
@@ -499,6 +506,18 @@ class SigenergyModbus:
         self._reconnect_delay_max  = 120
         self._reconnect_delay      = self._reconnect_delay_base
         self._last_request_time    = 0.0
+        # v1.15: last discharge limit we successfully WROTE, or None when we
+        # cannot vouch for the register. set_discharge_limit() logs at INFO
+        # only when the value actually changes, DEBUG when it is the same
+        # value re-asserted. The Flux controller re-asserts its floor every
+        # tick, which put 381 identical "Setting ESS max discharge limit: 0W"
+        # lines into the event log during the 02:00-05:00 window on
+        # 18-Sep-2026 -- 381 of the 537 Sigenergy lines for the whole day,
+        # burying the six that mattered. The latch is cleared on a failed
+        # write, on disconnect, and whenever a READ disagrees with it, so a
+        # correction by the register auditor (which only writes after reading
+        # a wrong value) is still announced at INFO.
+        self._last_discharge_limit_w = None
         # Per-string block absent-latch. The 31025 block exists on this
         # firmware but may not on others (the 50000 pre-heat lesson: a spec
         # register is not a hardware register). Three consecutive failures of
@@ -617,6 +636,7 @@ class SigenergyModbus:
             except Exception:
                 pass
         self._connected = False
+        self._last_discharge_limit_w = None
         self.logger.info("Disconnected from Sigenergy inverter")
 
     # ================================================================
@@ -1383,8 +1403,14 @@ class SigenergyModbus:
             self.logger.warning(f"Discharge limit {watts}W exceeds sanity ceiling "
                                 f"{MAX_POWER_LIMIT_W}W — clamping")
             watts = MAX_POWER_LIMIT_W
-        self.logger.info(f"Setting ESS max discharge limit: {watts}W")
-        return self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts)
+        if watts == self._last_discharge_limit_w:
+            self.logger.debug(f"Setting ESS max discharge limit: {watts}W (unchanged)")
+        else:
+            self.logger.info(f"Setting ESS max discharge limit: {watts}W")
+        success = self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts)
+        # Only a write we know landed lets us stay quiet about the next one.
+        self._last_discharge_limit_w = watts if success else None
+        return success
 
     def set_export_limit(self, watts):
         """Set grid max export power limit (registers 40038-40039, watts).
@@ -1662,6 +1688,10 @@ class SigenergyModbus:
         if raw is None:
             return None
         self.logger.debug(f"Discharge limit read: {raw}W")
+        if raw != self._last_discharge_limit_w:
+            # The register moved under us (mode change, external owner, a
+            # rejected write). Whatever writes it back is a real change.
+            self._last_discharge_limit_w = None
         return raw
 
     def read_charge_limit(self):

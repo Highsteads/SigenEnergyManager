@@ -1215,6 +1215,111 @@ class TestLifetimeEnergyBlocks(unittest.TestCase):
                           "batteryDischargeLifetimeKwh": 2396.45})
 
 
+class TestDischargeLimitLogsOnChangeOnly(unittest.TestCase):
+    """v1.15: the Flux floor is re-asserted every tick, and each re-assert used
+    to write an INFO line. 381 of them landed in the event log between 02:00 and
+    05:00 on 18-Sep-2026 -- 381 of the day's 537 Sigenergy lines -- for a value
+    that never moved after the first write. INFO must mean the limit CHANGED."""
+
+    def _mk(self):
+        modbus, mock_client = _make_modbus()
+        modbus.logger = MagicMock()
+        return modbus, mock_client
+
+    def _levels(self, modbus):
+        """Return the level each 'max discharge limit' line was logged at."""
+        out = []
+        for level in ("info", "debug"):
+            for call in getattr(modbus.logger, level).call_args_list:
+                if call.args and "max discharge limit" in str(call.args[0]):
+                    out.append((level, str(call.args[0])))
+        return out
+
+    def _counts(self, modbus):
+        levels = [lvl for lvl, _ in self._levels(modbus)]
+        return levels.count("info"), levels.count("debug")
+
+    def test_first_write_is_info(self):
+        modbus, _ = self._mk()
+        self.assertTrue(modbus.set_discharge_limit(0))
+        self.assertEqual(self._counts(modbus), (1, 0))
+
+    def test_reasserting_the_same_value_drops_to_debug(self):
+        modbus, _ = self._mk()
+        for _ in range(60):
+            self.assertTrue(modbus.set_discharge_limit(0))
+        info, debug = self._counts(modbus)
+        self.assertEqual(info, 1, "only the first assert of a value is news")
+        self.assertEqual(debug, 59)
+
+    def test_a_real_change_is_still_info(self):
+        modbus, _ = self._mk()
+        for watts in (0, 0, 0, 10000, 10000, 0):
+            modbus.set_discharge_limit(watts)
+        info, debug = self._counts(modbus)
+        self.assertEqual(info, 3, "0 -> 10000 -> 0 are three changes")
+        self.assertEqual(debug, 3)
+
+    def test_the_register_still_gets_every_write(self):
+        """Quieter logging must not turn a re-assert into a skipped write --
+        the Flux floor depends on being re-written, not on being logged."""
+        modbus, mock_client = self._mk()
+        for _ in range(5):
+            modbus.set_discharge_limit(0)
+        self.assertEqual(mock_client.write_registers.call_count, 5)
+
+    def test_a_drifted_register_makes_the_correction_info_again(self):
+        """The register auditor only writes after READING a wrong value. If the
+        latch survived that read, its correction would log at DEBUG and the one
+        line worth seeing would be the one hidden."""
+        modbus, mock_client = self._mk()
+        modbus.set_discharge_limit(0)
+        # Something else moves the register; the auditor reads it, then corrects.
+        mock_client._regs[HOLD_ESS_MAX_DISCHARGE]     = 0
+        mock_client._regs[HOLD_ESS_MAX_DISCHARGE + 1] = 10000
+        self.assertEqual(modbus.read_discharge_limit(), 10000)
+        modbus.set_discharge_limit(0)
+        info, _ = self._counts(modbus)
+        self.assertEqual(info, 2, "the correction after a drift is real news")
+
+    def test_a_matching_readback_keeps_the_latch(self):
+        """Flux reads back after every set. That must not re-arm INFO, or the
+        quieting does nothing at all."""
+        modbus, _ = self._mk()
+        for _ in range(10):
+            modbus.set_discharge_limit(0)
+            self.assertEqual(modbus.read_discharge_limit(), 0)
+        info, _ = self._counts(modbus)
+        self.assertEqual(info, 1)
+
+    def test_a_failed_write_is_never_vouched_for(self):
+        """A write that did not land leaves the register unknown, so the retry
+        that follows it is news again. The failure itself is already an ERROR
+        from _write_uint32_registers naming the register and the value, which
+        is why the attempt line may stay quiet."""
+        modbus, mock_client = self._mk()
+        modbus.set_discharge_limit(0)                    # INFO 1, latch armed
+        bad = MagicMock()
+        bad.isError.return_value = True
+        mock_client.write_registers.side_effect = lambda **kw: bad
+        self.assertFalse(modbus.set_discharge_limit(0))  # fails, latch dropped
+        self.assertTrue(modbus.logger.error.called, "a failed write must be loud")
+        mock_client.write_registers.side_effect = None
+        modbus._connected = True        # the helper drops the connection on error
+        modbus.set_discharge_limit(0)                    # INFO 2, the retry
+        info, _ = self._counts(modbus)
+        self.assertEqual(info, 2, "the retry after a failed write is news again")
+
+    def test_disconnect_drops_the_latch(self):
+        modbus, _ = self._mk()
+        modbus.set_discharge_limit(0)
+        modbus.disconnect()
+        modbus._connected = True
+        modbus.set_discharge_limit(0)
+        info, _ = self._counts(modbus)
+        self.assertEqual(info, 2, "a new connection is no proof of the old register")
+
+
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
     unittest.main(verbosity=2)

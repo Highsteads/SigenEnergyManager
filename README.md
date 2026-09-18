@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.110.0 · Requires Indigo 2025.2 or later
+**Version:** 5.110.1 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -145,6 +145,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.110.1 | 18-Sep-2026 | **The overnight Flux charge no longer fills the log with the same line.** While it holds the battery in the cheap window the plugin re-writes the discharge limit every half minute, and each re-write announced itself. The first night on Flux put 381 identical lines into the Indigo log in three hours, which buried the six lines that actually said what the battery was doing. The limit is now announced only when it changes. A correction after the setting has drifted still shows, because that is a real change. |
 | 5.110.0 | 17-Sep-2026 | **Costs on Octopus Flux now use the price each unit was actually bought at.** Exports were already valued band by band; imports were valued at whichever price happened to be in force when you looked, so the same day's import could read at 14.6p, 24.4p or 34.1p a unit. Each day's record now carries the import price weighted by when the electricity came in, days before the switch keep their old Tracker and Outgoing prices untouched, and the status data lists every import and export price with the hours it applies, for the dashboard's Rates tiles. The published `elec_unit_rate_p`, `export_rate_p` and tariff-name variables follow the account again (they had frozen on Tracker and Outgoing, because Octopus reports Flux without a single unit rate), the `tracker_rate_*` pair reads `n/a` when you are not on Tracker, and a new `export_rates_today_json` carries today's export bands. Watching the first live Flux peak also fixed three things in the Flux controller: early solar export no longer keeps it out of the 4pm to 7pm window, it no longer stops and restarts the export every half minute as the solar moves, and it lets the inverter's own 4 kW export limit hold the meter rather than chasing the solar itself. |
 | 5.109.5 | 17-Sep-2026 | **On Octopus Flux, the battery now fills to 100% once the day's sun can no longer be wasted.** The usual 95% target exists because a full battery throws away solar that is more than the house uses plus the 4 kW export limit. Once the forecast says no hour left today can reach that, the plugin stops selling the last few points at 9.7p and keeps them, which saves buying the same energy overnight at 14.6p. Earlier in the day, and on other tariffs, 95% stands. |
 | 5.109.4 | 17-Sep-2026 | **Saving Session notifications now read as plain English.** The title says where you stand ("you are in", "join it in the Octopus app", "not worth joining"), times read as "tomorrow from 6pm to 7pm", and the message only asks you to do something you can actually do. A session this account cannot join, because it is full or Octopus refused, is no longer announced at all. |

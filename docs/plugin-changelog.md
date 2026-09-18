@@ -15,6 +15,39 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.110.1 — 18-09-2026
+
+**The Flux floor stopped shouting its re-asserts** (`sigenergy_modbus.py` 1.14 -> 1.15).
+
+`set_discharge_limit()` logged at INFO on every call. The Flux executor re-asserts the
+discharge limit on every tick while it holds the inverter, so the **first overnight window
+on the native controller wrote 381 identical `Setting ESS max discharge limit: 0W` lines
+into the Indigo event log between 02:00 and 05:00** — 381 of the 537 Sigenergy lines for
+the whole of 18-Sep — for a value that never moved after the first write. The six `[Flux]`
+lines that said what the battery was actually doing were buried in them.
+
+`set_charge_limit()` already had a `quiet=` flag for exactly this, but the Flux layer
+reaches every setter through `FluxExecutor._set_read(setter, reader, value, tol)`, whose
+driver contract is a one-argument setter checked by name in `rebind()`. Threading a kwarg
+through it would have changed that contract, and `_set_read` cannot tell a first assert
+from a re-assert anyway. So the decision is made where the knowledge is:
+
+- the last **successfully written** value is latched on the driver;
+- an equal value logs at DEBUG, a different one at INFO;
+- **the register is still written every time** — only the logging is conditional, and a
+  test asserts the write count, because a re-assert that stopped happening would drop the
+  Flux floor;
+- the latch clears on a failed write (which is already an ERROR naming the register), on
+  `disconnect()`, and **whenever `read_discharge_limit()` disagrees with it**. That last one
+  is what keeps the register auditor loud: it only writes after reading a wrong value, so
+  its correction is a real change and must not be hidden by a stale latch.
+
+Eight tests in `test_sigenergy_modbus.py`. Three mutants were checked against them before
+the change was trusted — dropping the condition, dropping the read invalidation, and
+returning early instead of writing — and all three turn the suite red.
+
+---
+
 ## v5.110.0 — 17-09-2026
 
 **Also in 5.110.0 — two faults found watching the first live Flux peak (Claude, Flux session):**
