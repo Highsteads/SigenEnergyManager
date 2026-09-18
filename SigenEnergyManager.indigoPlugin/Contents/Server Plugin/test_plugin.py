@@ -4482,6 +4482,87 @@ class TestBankFirstMetrics(unittest.TestCase):
     def _record(self, stub, decision, snap, soc_pct=56.9):
         plugin.Plugin._record_bank_first_metrics(stub, snap, decision, soc_pct)
 
+    # ── the day's first verdict must survive a restart (v5.110.2) ──────────
+    def _roundtrip_store(self, store):
+        """Save `store` through _save_accumulators_locked and read it back."""
+        import json as _j, os as _os, tempfile as _tf, threading as _th
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {}
+        # The saver reads the ordinary daily counters too, so start from a
+        # complete store and overlay the bank-first state under test.
+        base = {
+            "pv_daily_kwh": 1.0, "grid_import_daily_kwh": 0.0,
+            "grid_export_daily_kwh": 2.0, "home_daily_kwh": 3.0,
+            "peak_soc": 90.0, "min_soc": 40.0, "today_date": "2026-08-31",
+            "pv_lifetime_start_kwh": 100.0, "import_lifetime_start_kwh": 10.0,
+            "export_lifetime_start_kwh": 20.0,
+        }
+        base.update(store)
+        p.store       = base
+        p._state_lock = _th.RLock()
+        p._save_home_profile = MagicMock()
+        path = _os.path.join(_tf.mkdtemp(), "accumulators.json")
+        p._save_accumulators_locked(path)
+        with open(path, encoding="utf-8") as fh:
+            return _j.load(fh)
+
+    def test_every_bank_first_key_the_plugin_seeds_is_persisted(self):
+        """A restart must not lose any part of the bank-first day state.
+
+        GENERIC on purpose: the key set comes from the plugin's own seeding, so a
+        key added to it later is covered here without anyone remembering to. That
+        is the gap this test exists for — v5.106.0 added the first-classification
+        trio to the seed, the reset, the setter and the RESTORE, and missed only
+        the save, so every restart silently re-stamped the day's opening verdict
+        with the current time and the current forecast.
+        """
+        st = self._stub()
+        self._record(st, self._decision(), self._Snap())
+        keys = sorted(k for k in st.store if k.startswith("bank_first_"))
+        self.assertGreater(len(keys), 10, "the seeding did not run")
+
+        # Distinctive values, so a key written as its default still counts as lost.
+        marked = {}
+        for i, k in enumerate(keys):
+            v = st.store[k]
+            marked[k] = (f"mark{i}" if isinstance(v, str) or v is None
+                         else (not v) if isinstance(v, bool)
+                         else v + 17)
+        st.store.update(marked)
+
+        saved = self._roundtrip_store(st.store)
+        missing = [k for k in keys if k not in saved]
+        self.assertEqual(missing, [], f"not persisted, so a restart loses them: {missing}")
+        wrong = {k: (marked[k], saved[k]) for k in keys if saved[k] != marked[k]}
+        self.assertEqual(wrong, {}, f"persisted with the wrong value: {wrong}")
+
+    def test_the_first_classification_survives_a_restart(self):
+        """The live fault: 15-Sep-2026 filed 15:50 and 17-Sep 19:03 as the day's
+        first classification. Both were simply the first evaluation after a
+        restart, not the morning verdict that governed the day."""
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=37.4))
+        self.assertEqual(st.store["bank_first_first_class_kwh"], 37.4)
+        opening = st.store["bank_first_first_class_local"]
+
+        saved = self._roundtrip_store(st.store)
+        for k in ("bank_first_first_class_kwh", "bank_first_first_class_small",
+                  "bank_first_first_class_local", "bank_first_promoted_local"):
+            self.assertIn(k, saved, f"{k} is lost on every restart")
+        self.assertEqual(saved["bank_first_first_class_kwh"], 37.4)
+        self.assertEqual(saved["bank_first_first_class_local"], opening)
+
+        # And a restart must not let a later, drifted forecast re-stamp it.
+        revived = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 39.9,
+                                       "forecastDate": "2026-08-31"},
+                             store=saved)
+        self._record(revived, self._decision(), self._Snap(raw_today_kwh=39.9))
+        self.assertEqual(revived.store["bank_first_first_class_kwh"], 37.4,
+                         "the afternoon forecast overwrote the morning verdict")
+        self.assertEqual(revived.store["bank_first_first_class_local"], opening)
+
     # ── promotion hysteresis (v5.106.0) ────────────────────────────────────
     def _reclassify(self, first_kwh, then_kwh, bank_max=40.0):
         """Latch the day from `first_kwh`, then feed it `then_kwh`. Returns the latch."""

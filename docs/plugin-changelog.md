@@ -15,6 +15,47 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.110.2 — 18-09-2026
+
+**The day's first bank-first verdict did not survive a restart, and v5.106.0 is why.**
+
+v5.106.0 added `bank_first_first_class_kwh` / `_small` / `_local` (and `_promoted_local`)
+precisely so the daily record would stop publishing the 23:59 latch as though it were the
+morning's verdict. It wired them into four of the five places they belong: the `__init__`
+seed, the midnight reset, the setter, and `_load_accumulators`' restore tuple. It missed
+`_save_accumulators_locked`.
+
+So the restore read `data.get("bank_first_first_class_kwh", None)` from a file that never
+contained the key, got `None` every time, and the next evaluation re-stamped all four with
+the CURRENT clock and the CURRENT forecast — the exact fault v5.106.0 was written to remove,
+reintroduced one dict further down.
+
+Live evidence, from `daily_history.json`:
+
+- **15-Sep** filed `first_classified_local = 15:50` on 37.4 kWh. v5.106.0 was committed at
+  09:22 and v5.107.0 at 14:23 that day.
+- **17-Sep** filed `19:03`. That day carried the Flux arming plus 5.109.x-5.110.0.
+- **16-Sep**, a day with no restart, filed `00:21` — correct, and the control case that shows
+  the mechanism rather than the feature was at fault.
+
+The four keys are now persisted. The restore tuple's indentation is straightened too: those
+same four lines sat at a shallower indent than their neighbours, which is the visible
+fingerprint of the hasty edit that missed the save.
+
+**Nothing the battery does changes.** `bank_first_small_latched` and `bank_first_latch_date`
+were always persisted, so the hold itself always survived a restart correctly. This is the
+record of *why*, not the control.
+
+**Two tests, and the first is deliberately generic.**
+`test_every_bank_first_key_the_plugin_seeds_is_persisted` takes its key set from the plugin's
+own seeding rather than a list of its own, marks every key with a distinctive value, saves and
+reads back — so a key added to the seed later is covered without anyone remembering to. That
+is the gap that let this through. The second replays 15-Sep: the opening verdict survives the
+round trip, and a later drifted forecast does not overwrite it. Reverting the fix turns both
+red.
+
+---
+
 ## v5.110.1 — 18-09-2026
 
 **The Flux floor stopped shouting its re-asserts** (`sigenergy_modbus.py` 1.14 -> 1.15).

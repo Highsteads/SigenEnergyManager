@@ -17,8 +17,9 @@
 #              Claude Opus 5 (5.109.5 — on Flux, bank to 100% once the day cannot clip)
 #              Claude Opus 5 (5.110.0 — Flux import priced by band; every tier published)
 #              Claude Opus 5 (5.110.1 — the Flux floor stops shouting its re-asserts)
+#              Claude Opus 5 (5.110.2 — the day's first bank-first verdict survives a restart)
 # Date:        18-09-2026
-# Version:     5.110.1
+# Version:     5.110.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -14503,6 +14504,17 @@ class Plugin(indigo.PluginBase):
             "bank_first_arm_minutes":        self.store.get("bank_first_arm_minutes", 0),
             "bank_first_first_arm_local":    self.store.get("bank_first_first_arm_local", ""),
             "bank_first_peak_surplus_kw":    self.store.get("bank_first_peak_surplus_kw", 0.0),
+            # v5.110.2: these four were added to the seed, the reset, the setter AND
+            # the restore by v5.106.0, but never here — so every restart lost them and
+            # the next classification re-stamped them with the CURRENT time and the
+            # CURRENT forecast. That is precisely the fault v5.106.0 was written to
+            # remove, reintroduced one dict down. 15-Sep-2026 filed its first
+            # classification at 15:50 and 17-Sep at 19:03, both of them simply the
+            # first evaluation after a restart.
+            "bank_first_first_class_kwh":    self.store.get("bank_first_first_class_kwh"),
+            "bank_first_first_class_small":  self.store.get("bank_first_first_class_small"),
+            "bank_first_first_class_local":  self.store.get("bank_first_first_class_local", ""),
+            "bank_first_promoted_local":     self.store.get("bank_first_promoted_local", ""),
             # Storm state is NOT day-specific (a warning can span midnight) — persist it
             # so a restart during an active warning doesn't re-send the Pushover.
             "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
@@ -14729,10 +14741,10 @@ class Plugin(indigo.PluginBase):
                             f"inverter's own daily counters on the first read")
                 for _bf_key, _bf_default in (
                     ("bank_first_small_latched",     False),
-                ("bank_first_first_class_kwh",   None),
-                ("bank_first_first_class_small", None),
-                ("bank_first_first_class_local", ""),
-                ("bank_first_promoted_local",    ""),
+                    ("bank_first_first_class_kwh",   None),
+                    ("bank_first_first_class_small", None),
+                    ("bank_first_first_class_local", ""),
+                    ("bank_first_promoted_local",    ""),
                     ("bank_first_latch_date",        ""),
                     ("bank_first_blocked_samples",   0),
                     ("bank_first_withheld_kwh",      0.0),
