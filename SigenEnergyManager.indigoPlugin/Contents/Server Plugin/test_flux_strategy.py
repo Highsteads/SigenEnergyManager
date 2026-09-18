@@ -867,5 +867,115 @@ class TestExecutorWouldAcceptThesePlans(unittest.TestCase):
             self.assertGreaterEqual(checked, 6)
 
 
+class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
+    """v5.110.3. `_flux_log_decision` claims "never the same line twice", and
+    keyed on f"{mode}|{reason}". The reason carries a running figure that falls
+    every tick, so the key never matched itself and the guard never fired once:
+    310 [Flux] lines reached the Indigo event log on 18-Sep-2026, 103 of them
+    between 02:00 and 05:00, one per tick, for a plan that changed four times."""
+
+    # The real reasons, verbatim from the 18-Sep-2026 event log.
+    CHEAP = ("cheap window — buying about {:.1f} kWh at 14.6p to {:.0f}%, of which "
+             "0.0 kWh is what the house and its commitments need, and {:.1f} kWh "
+             "is for the peak window at a 10.1p margin")
+    PEAK  = ("peak window — about {:.1f} kWh is spare above what the house needs "
+             "before 2am, selling at 27.7p for a 10.1p margin after losses and "
+             "wear, holding {:.0f}% back")
+
+    def _charge(self, kwh, target):
+        return fs.FluxDecision(
+            mode=fs.MODE_CHARGE, owns=True, ems_mode=3,
+            charge_limit_w=10000, discharge_limit_w=0,
+            charge_cutoff_pct=float(target), discharge_cutoff_pct=20.0,
+            reason=self.CHEAP.format(kwh, target, kwh))
+
+    def _export(self, kwh, floor):
+        return fs.FluxDecision(
+            mode=fs.MODE_EXPORT, owns=True, ems_mode=5,
+            charge_limit_w=0, discharge_limit_w=10000,
+            charge_cutoff_pct=100.0, discharge_cutoff_pct=float(floor),
+            reason=self.PEAK.format(kwh, floor))
+
+    def _lines(self, decisions):
+        """Replay the guard exactly as _flux_log_decision runs it."""
+        logged, last = [], None
+        for d in decisions:
+            key = fs.note_key(d)
+            if key == last:
+                continue
+            last = key
+            logged.append(fs.describe(d))
+        return logged
+
+    def test_the_overnight_window_is_one_line_per_target_not_per_tick(self):
+        """02:00-05:00 as it actually ran: the buy figure decays 8.0 -> 3.4 while
+        the target moves 75 -> 73 -> 83 -> 82. Four plans, 103 ticks."""
+        ticks = []
+        for target, hi, lo in ((75, 8.0, 6.4), (73, 5.8, 3.4),
+                               (83, 7.0, 5.2), (82, 4.6, 0.2)):
+            kwh = hi
+            while kwh >= lo:
+                ticks.append(self._charge(kwh, target))
+                kwh -= 0.1
+        self.assertGreater(len(ticks), 100, "the real window was ~103 ticks")
+        self.assertEqual(len(self._lines(ticks)), 4,
+                         "one line per target, not one per tick")
+
+    def test_the_peak_window_is_one_line_per_floor(self):
+        """16:00-19:00 as it ran: 19.0 kWh spare decaying to 6.3, floor 42/41/40."""
+        ticks = []
+        for floor, hi, lo in ((42, 19.0, 12.1), (41, 12.0, 8.1), (40, 8.0, 6.3)):
+            kwh = hi
+            while kwh >= lo:
+                ticks.append(self._export(kwh, floor))
+                kwh -= 0.1
+        self.assertGreater(len(ticks), 100)
+        self.assertEqual(len(self._lines(ticks)), 3)
+
+    def test_the_old_key_could_not_dedupe_anything(self):
+        """The regression this fixes. Proven, not asserted from memory."""
+        ticks = [self._charge(k / 10.0, 75) for k in range(80, 64, -1)]
+        old = {f"{d.mode}|{d.reason}" for d in ticks}
+        self.assertEqual(len(old), len(ticks), "every tick was a distinct old key")
+        self.assertEqual(len(self._lines(ticks)), 1)
+
+    def test_a_changed_target_is_still_news(self):
+        """Quieter must not mean silent: the target IS the plan."""
+        self.assertEqual(len(self._lines([self._charge(8.0, 75),
+                                          self._charge(7.9, 75),
+                                          self._charge(7.0, 83)])), 2)
+
+    def test_the_same_registers_with_a_different_explanation_still_logs(self):
+        """MODE_SUPPLY_HOUSE explains itself two ways with identical control
+        fields. Keying on control_key() alone would swallow the second."""
+        def supply(why):
+            return fs.FluxDecision(
+                mode=fs.MODE_SUPPLY_HOUSE, owns=True, ems_mode=2,
+                charge_limit_w=0, discharge_limit_w=10000,
+                charge_cutoff_pct=100.0, discharge_cutoff_pct=20.0,
+                reason=f"peak window, but {why}, so the battery runs the house")
+        a = supply("selling does not cover what it cost to store, after losses and wear")
+        b = supply("there is nothing spare above what the house and its commitments need")
+        self.assertEqual(a.control_key(), b.control_key(), "premise of this test")
+        self.assertEqual(len(self._lines([a, b])), 2)
+
+    def test_a_deferral_reason_is_never_swallowed(self):
+        """Deferred decisions share every control field, so only the words
+        separate 'no rates' from 'not verified as Flux'."""
+        def defer(why):
+            return fs.FluxDecision(mode=fs.MODE_DEFER, owns=False,
+                                   reason=f"no Flux decision — {why}")
+        lines = self._lines([defer("the rates are stale"),
+                             defer("the account is not verified as Flux")])
+        self.assertEqual(len(lines), 2)
+
+    def test_masking_does_not_collapse_different_wordings(self):
+        a = fs.FluxDecision(mode=fs.MODE_HOLD, owns=False, reason="holding for 12 minutes")
+        b = fs.FluxDecision(mode=fs.MODE_HOLD, owns=False, reason="holding for 3 minutes")
+        c = fs.FluxDecision(mode=fs.MODE_HOLD, owns=False, reason="holding for 3 hours")
+        self.assertEqual(fs.note_key(a), fs.note_key(b), "only the digits moved")
+        self.assertNotEqual(fs.note_key(b), fs.note_key(c), "minutes is not hours")
+
+
 if __name__ == "__main__":
     unittest.main()

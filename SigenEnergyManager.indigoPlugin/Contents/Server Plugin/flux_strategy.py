@@ -25,6 +25,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 import math
+import re
 from typing import Mapping, Optional, Tuple
 
 
@@ -1249,3 +1250,33 @@ def describe(decision):
     if decision.deferred:
         return decision.reason
     return f"{decision.mode.replace('_', ' ')}: {decision.reason}"
+
+
+# A whole number masks to ONE "#", never one per digit: "19.0" and "9.9" are
+# both a kWh figure that moved, and a per-digit mask made them different keys.
+# An interior "." or "," is part of the number; a full stop ending a sentence is
+# not, because it is not followed by a digit.
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def note_key(decision):
+    """Dedupe key for the one-line [Flux] plan note: the control fields, plus
+    the reason with its DIGITS masked.
+
+    `reason` carries a running figure -- "buying about 7.9 kWh", "spare above
+    what the house needs", "for the peak in 12 minutes" -- which moves on
+    almost every tick. A key built from the prose therefore never matched
+    itself and the "never the same line twice" guard never once fired: 310
+    [Flux] lines reached the Indigo event log on 18-Sep-2026, one per tick,
+    103 of them between 02:00 and 05:00.
+
+    Masking only the digits is deliberately weaker than keying on
+    control_key() alone. Two plans can share every control field and still
+    say different things -- MODE_SUPPLY_HOUSE explains itself either as
+    "selling does not cover what it cost to store" or as "there is nothing
+    spare above what the house needs", with identical registers -- so a key
+    that ignored the wording would swallow a genuinely different explanation.
+    A change of WORDING is always news; a change of only the digits is not.
+    """
+    masked = _NUMBER_RE.sub("#", decision.reason)
+    return f"{decision.control_key()}|{masked}"

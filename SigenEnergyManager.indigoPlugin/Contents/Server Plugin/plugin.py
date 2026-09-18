@@ -18,8 +18,9 @@
 #              Claude Opus 5 (5.110.0 — Flux import priced by band; every tier published)
 #              Claude Opus 5 (5.110.1 — the Flux floor stops shouting its re-asserts)
 #              Claude Opus 5 (5.110.2 — the day's first bank-first verdict survives a restart)
+#              Claude Opus 5 (5.110.3 — the Flux plan note stops repeating itself)
 # Date:        18-09-2026
-# Version:     5.110.2
+# Version:     5.110.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -13037,8 +13038,13 @@ class Plugin(indigo.PluginBase):
             f"reconciled hand-back.", level="ERROR")
 
     def _flux_log_decision(self, decision):
-        """One line when the plan changes, and never the same line twice."""
-        key = f"{decision.mode}|{decision.reason}"
+        """One line when the plan changes, and never the same line twice.
+
+        The key comes from flux_strategy.note_key(), NOT from the message: the
+        reason text carries a figure that moves every tick, so keying on the
+        prose meant the guard never fired. See note_key() for the detail.
+        """
+        key = _flux_strategy.note_key(decision)
         if self.store.get("flux_note_logged") == key:
             return
         self.store["flux_note_logged"] = key
