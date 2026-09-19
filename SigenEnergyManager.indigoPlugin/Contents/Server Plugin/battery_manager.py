@@ -508,9 +508,37 @@ BANK_FIRST_PROMOTE_MARGIN_KWH = 5.0
 FLUX_PEAK_START_HOUR = 16
 
 # v5.109.5: hourly-mean forecast PV is multiplied by this before asking whether the
-# rest of today could still clip. Hourly means hide broken-cloud bursts above the
-# mean. A CHOSEN safety margin (17-Sep-2026), NOT a measured figure; the 28-Sep
-# bank-first review measures clip-boundary minutes on Flux days and can revise it.
+# rest of today could still clip.
+#
+# IT IS NOT A MARGIN THAT COVERS BROKEN-CLOUD BURSTS, AND THE COMMENT HERE USED TO SAY
+# IT WAS. MEASURED 19-09-2026 over ten June-to-August days between 8 and 32 kWh, from
+# this inverter's own ten-second history: the ratio of the day's largest INSTANT PV to
+# its largest HOURLY MEAN ran 1.69 to 3.24, and was never once as low as 1.25. A factor
+# that would genuinely cover the bursts is somewhere past 3.
+#
+# IT STAYS AT 1.25 ANYWAY, because the bursts are not worth covering. On the five of
+# those ten days this check would have CLEARED, the energy the array made above the
+# house-plus-export-cap ceiling came to 0, 0.045, 0, 0.016 and 0.217 kWh for the whole
+# day — and that is the theoretical maximum, assuming a full battery at the instant of
+# every burst. In practice it was zero on all five, because the battery peaked at 84.5,
+# 87.4, 80.6, 77.4 and 96.2%: a battery with room in it swallows a burst, and there is
+# nothing to throw away. Set against that, clearing the check moves up to the whole
+# room between the pref target and 100% — 1.75 kWh here — from the standard export rate
+# to the peak one. Raising the factor to something "honest" would make the check refuse
+# on most days and forfeit tens of pence to avoid two.
+#
+# SO WHAT IT ACTUALLY DOES is bias the check toward refusing as the day gets brighter,
+# which is the decision that matters: a day big enough to clip has hourly means far
+# above the ceiling and is refused with or without the factor, while a dull day is
+# cleared with or without it. 1.25 only moves the handful of days in between, and moves
+# them in the safe direction. Judge any replacement on THAT, not on whether it bounds
+# the gust — and re-measure before changing it, because the array and the export cap
+# are what set the ratio.
+#
+# Method, so the next reader can repeat it: group device_history_<inverter> by local
+# day and hour, compare max(pvpowerwatts) against avg(pvpowerwatts), and sum
+# (pv - home - cap) over the samples where it is positive. The 28-Sep bank-first review
+# carries the rest of this question.
 FLUX_CLIP_GUST_FACTOR = 1.25
 
 
