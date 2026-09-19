@@ -83,14 +83,16 @@ class FluxIndependentReviewTests(unittest.TestCase):
         # Only 1 kWh can enter the battery at noon; 8 kWh is needed that evening.
         self.assertGreaterEqual(need,14.)
 
-    def test_zoneinfo_and_plugin_pytz_fallback_resolve_same_flux_boundary(self):
-        import pytz
-        for stamp in ('2026-09-16T00:00:00+00:00',
-                      '2026-10-25T00:30:00+00:00',
-                      '2027-03-28T00:30:00+00:00'):
-            now=datetime.fromisoformat(stamp)
-            self.assertEqual(fs.next_cheap_start(now,TZ),
-                             fs.next_cheap_start(now,pytz.timezone('Europe/London')))
+    # test_zoneinfo_and_plugin_pytz_fallback_resolve_same_flux_boundary lived here
+    # until 19-09-2026. It imports the REAL pytz to compare it against zoneinfo, and
+    # CI deliberately runs this suite once with NO third-party packages installed, to
+    # keep the pytz-absent fallbacks exercised — so the import errored and the build
+    # was red for six consecutive pushes from v5.110.0 onwards. run_tests.py fails on
+    # a skip by design (a skipped test is not testing), and its own note says anything
+    # genuinely not applicable should be moved or deleted rather than skipped. A
+    # comparison OF two libraries cannot run in the leg that has only one of them, so
+    # it now lives in tests/test_flux_timezone_contract.py, which CI runs with pytest
+    # after installing requirements.txt. Nothing is lost: it still runs on every push.
 
     def test_grid_supplies_cheap_window_house_without_double_battery_purchase(self):
         i=scenario(hour=2,soc_pct=20.,house=fs.HalfHourProfile([.5]*48,TZ))
