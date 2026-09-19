@@ -20,8 +20,9 @@
 #              Claude Opus 5 (5.110.2 — the day's first bank-first verdict survives a restart)
 #              Claude Opus 5 (5.110.3 — the Flux plan note stops repeating itself)
 #              Claude Opus 5 (5.110.4 — and stops again, now the watt figure is out of the key)
+#              Claude Opus 5 (5.111.0 — no pacing at all once the day cannot clip)
 # Date:        19-09-2026
-# Version:     5.110.4
+# Version:     5.111.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

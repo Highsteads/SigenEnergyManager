@@ -2307,8 +2307,39 @@ class BatteryManager:
             (target_pct - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh,
         )
         pace_hours, pace_label = self._overflow_pacing_hours(snapshot, hours_to_dusk)
-        required_charge_kw = headroom_to_target / max(0.5, pace_hours)
         pv_surplus_kw      = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
+
+        # v5.111.0: do not pace at all once the day cannot clip. Pacing exists for
+        # exactly one reason — to stop the battery filling early and throwing away
+        # the afternoon above the export cap. fill_to_full is set only after
+        # _flux_clip_risk_passed has walked every remaining hour of the forecast and
+        # found that none of them can clip, so by construction there is nothing left
+        # to pace away from and spreading the charge can only sell at the standard
+        # 9.7p what the 4pm window would pay 27.7p for.
+        #
+        # LIVE CASE, 18-Sep-2026, the day this was written for. The clip check passed
+        # at 11:53 and the target duly became 100%, but the 1.75 kWh of room was then
+        # spread over the four hours to the peak: 0.43 kW in, 1.66 kW out. Cloud
+        # arrived seventeen minutes later, the array fell from 2.5 kW to 1.1 kW, and
+        # the battery finished the afternoon at 97.7% having sold 0.39 kWh at the
+        # standard rate. Taking the whole surplus costs NOTHING when the forecast
+        # holds — the surplus is still there afterwards and still exports, because
+        # headroom_to_target clamps to zero at the target and the cap opens to the
+        # full DNO limit — and keeps the difference when it does not. It is the
+        # asymmetry this file's header already argues for, applied to the last five
+        # points as well as the first ninety-five.
+        #
+        # GUARDED ON HEADROOM, which is the one way this could go wrong: at or above
+        # the target there is no room left, so required_charge_kw MUST fall back to
+        # the paced formula (which yields zero) and let export run at the full cap.
+        # Without the guard a full battery would be told to absorb the whole surplus
+        # and would export nothing at all.
+        unpaced = bool(fill_to_full and headroom_to_target > 0.0)
+        if unpaced:
+            required_charge_kw = pv_surplus_kw
+        else:
+            required_charge_kw = headroom_to_target / max(0.5, pace_hours)
+
         export_kw          = min(
             max(0.0, pv_surplus_kw - required_charge_kw),
             snapshot.max_export_kw,
@@ -2318,6 +2349,16 @@ class BatteryManager:
             SOLAR_OVERFLOW_MIN_CHARGE_W,
             snapshot.pv_watts - snapshot.house_load_watts - export_w,
         )
+
+        # A cap set to the surplus MEASURED THIS TICK leaks while it is stale. The
+        # limit is only rewritten when it moves by more than SOLAR_OVERFLOW_CAP_DEADBAND_W,
+        # so the array climbing between ticks puts the difference on the grid at the
+        # standard rate — tolerable when export is what we wanted, and self-defeating
+        # here, where the whole point is that nothing leaves. Self-consumption cannot
+        # charge from anything but surplus, so lifting the ceiling to the inverter's
+        # own limit asks for "everything spare" and can never import.
+        if unpaced:
+            cap_w = max(cap_w, int(max(0.0, snapshot.inverter_max_kw) * 1000))
 
         return Decision(
             action          = ACTION_SOLAR_OVERFLOW,
@@ -2333,7 +2374,9 @@ class BatteryManager:
                 f"Solar remaining {remaining_solar_kwh:.1f} kWh  |  "
                 f"Home to dusk {remaining_home_kwh:.1f} kWh  |  "
                 f"{hours_to_dusk:.1f}h to dusk"
-                + (f"  |  paced to {pace_label} ({pace_hours:.1f}h)"
+                + ("  |  unpaced: nothing left today can clip"
+                   if unpaced else
+                   f"  |  paced to {pace_label} ({pace_hours:.1f}h)"
                    if pace_label != "dusk" else "")
             ),
             power_watts     = cap_w,

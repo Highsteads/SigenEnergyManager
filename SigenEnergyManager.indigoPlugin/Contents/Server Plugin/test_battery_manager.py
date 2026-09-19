@@ -1795,6 +1795,82 @@ class TestSolarOverflowFillsToFullOnFluxOnceClipRiskHasPassed(unittest.TestCase)
         self.assertNotIn("banking to full", storm.reason)
 
 
+class TestSolarOverflowDoesNotPaceOnceTheDayCannotClip(unittest.TestCase):
+    """v5.111.0. Pacing exists to stop the battery filling early and clipping the
+    afternoon. Once _flux_clip_risk_passed says no remaining hour CAN clip, there is
+    nothing to pace away from, so the whole surplus goes in the battery and export
+    waits for the target. 18-Sep-2026 is the day that paid for this rule."""
+
+    CAP   = TestSolarOverflowChargeTarget.CAP
+    _snap = TestSolarOverflowChargeTarget._snap
+    _bal  = TestSolarOverflowChargeTarget._bal
+
+    # Every hour under the house's 0.5 kW plus the 4.0 kW cap even after the 1.25
+    # gust margin (3.5 * 1.25 = 4.375 < 4.5), so the clip check passes.
+    CLEAR    = {11: 2.5, 12: 3.0, 13: 3.5, 14: 2.0, 15: 1.5, 16: 0.8, 17: 0.3, 18: 0.1}
+    # 8.0 * 1.25 = 10.0, far above 4.5 — the day can still clip.
+    CLIPPING = {11: 7.0, 12: 8.0, 13: 7.5, 14: 6.0, 15: 3.0, 16: 1.0, 17: 0.3, 18: 0.1}
+
+    def _run(self, forecast_kw, soc=95.0, pv_w=2580, home_w=500, tariff="flux",
+             storm=False, hh=11, mm=53):
+        from zoneinfo import ZoneInfo
+        snap = self._snap(soc_pct=soc, pv_w=pv_w, home_w=home_w, target=95.0, storm=storm)
+        snap.tariff             = TariffData(tariff_key=tariff)
+        snap.now                = datetime(2026, 9, 18, hh, mm, tzinfo=ZoneInfo("Europe/London"))
+        snap.forecast_p50       = {f"2026-09-18 {h:02d}:00:00": int(kw * 1000)
+                                   for h, kw in forecast_kw.items()}
+        snap.consumption_profile = [0.25] * 48          # 0.5 kW per hour, two half-hours
+        return BatteryManager()._check_solar_overflow(
+            snap, self._bal(soc_pct=soc, hours_to_dusk=7.0))
+
+    def test_the_eighteenth_of_september_would_now_export_nothing(self):
+        """The live failure. SOC 95.0% at 11:53, 2.08 kW of surplus, clip risk already
+        passed. The old pacing asked for 0.43 kW and sold the other 1.66 kW at the
+        standard rate; seventeen minutes later the cloud came and the battery finished
+        the day at 97.7%."""
+        d = self._run(self.CLEAR)
+        self.assertEqual(d.export_kw, 0.0)
+        self.assertIn("unpaced", d.reason)
+        self.assertIn("to 100% target", d.reason)
+        # The whole surplus, and the old paced figure is gone.
+        self.assertAlmostEqual(d.power_watts / 1000.0, 10.0, places=6)
+        self.assertNotIn("Req charge 0.43", d.reason)
+
+    def test_the_cap_is_lifted_clear_of_the_measured_surplus(self):
+        """The limit is only rewritten on a 500 W move, so a cap pinned to this tick's
+        surplus leaks whatever the array gains before the next one."""
+        d = self._run(self.CLEAR)
+        self.assertGreaterEqual(d.power_watts, 10_000)          # inverter_max_kw default
+        self.assertGreater(d.power_watts, 2580 - 500)
+
+    def test_a_battery_at_the_target_still_exports_at_the_full_cap(self):
+        """The guard. With no headroom left there is nothing to absorb the surplus, so
+        the paced formula must take over and open export to the DNO cap — the one way
+        an unguarded change here would strand a full battery exporting nothing."""
+        d = self._run(self.CLEAR, soc=100.0, pv_w=8500, home_w=500)
+        self.assertEqual(d.export_kw, 4.0)
+        self.assertNotIn("unpaced", d.reason)
+
+    def test_pacing_is_untouched_while_the_day_can_still_clip(self):
+        d = self._run(self.CLIPPING)
+        self.assertGreater(d.export_kw, 0.0)
+        self.assertNotIn("unpaced", d.reason)
+        self.assertIn("to 95% target", d.reason)
+        self.assertIn("paced to", d.reason)
+
+    def test_other_tariffs_still_pace(self):
+        for key in ("tracker", "agile", "iflux", "go"):
+            with self.subTest(key=key):
+                d = self._run(self.CLEAR, tariff=key)
+                self.assertNotIn("unpaced", d.reason)
+                self.assertGreater(d.export_kw, 0.0)
+
+    def test_a_storm_still_paces_lazily_to_its_hundred_per_cent(self):
+        d = self._run(self.CLEAR, storm=True)
+        self.assertIn("(storm)", d.reason)
+        self.assertNotIn("unpaced", d.reason)
+
+
 class TestSolarOverflowHysteresis(unittest.TestCase):
     """v3.10: the engage/release boundary has a dead band and a re-engage dwell.
 

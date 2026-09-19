@@ -15,6 +15,52 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.0 — 19-09-2026
+
+**Pacing survived the one condition that makes it pointless.**
+
+`_check_solar_overflow` paces the charge so the battery reaches its target by the
+deadline and exports everything above that rate. v5.109.5 added `fill_to_full`, which
+raises the target to 100% on Flux once `_flux_clip_risk_passed` has walked every
+remaining hour of the forecast and found none of them able to exceed the house load
+plus the export cap. The target moved; the pacing did not.
+
+That leaves the pacing doing nothing it was built for. It exists to stop the battery
+filling early and throwing away the afternoon above the cap — and the branch only runs
+once the day has been declared unable to clip. So every kWh it holds back is sold at the
+standard rate for no benefit at all.
+
+LIVE, 18-09-2026. The check passed at 11:53 and the target duly became 100%, but the
+1.75 kWh of room was spread over the four hours to the peak: `Req charge 0.43 kW to 100%
+target (Flux: no clip risk left today, banking to full) | PV surplus 2.08 kW | Export
+1.66 kW | Cap 427W`. Cloud arrived at 12:10, the array fell from 2.5 kW to 1.1 kW, and
+the battery finished the afternoon at 97.7% having exported 0.39 kWh at the standard
+rate — energy the 16:00 window would have taken at 27.7p.
+
+`unpaced = fill_to_full and headroom_to_target > 0.0` now takes the whole surplus.
+
+- **Guarded on headroom, and that guard is the change's only real risk.** At or above
+  the target there is no room to absorb anything, so `required_charge_kw` must fall back
+  to the paced formula (which yields zero) and let export run at the full cap. Without
+  it a full battery would be told to swallow the whole surplus and would export nothing.
+  `test_a_battery_at_the_target_still_exports_at_the_full_cap` is that guard; dropping
+  the condition turns it red.
+- **The cap is lifted to the inverter's own limit while unpaced.** `cap_w` is otherwise
+  the surplus measured on this tick, and the limit is only rewritten when it moves by
+  more than `SOLAR_OVERFLOW_CAP_DEADBAND_W`, so a climbing array puts the difference on
+  the grid between ticks. Self-consumption cannot charge from anything but surplus, so a
+  high ceiling asks for "everything spare" and can never import.
+- **Costs nothing when the forecast holds.** The surplus is still there afterwards and
+  still exports, because `headroom_to_target` clamps to zero at the target and the cap
+  opens to the full DNO limit. The gain is bounded by the room between the pref target
+  and 100% — 1.75 kWh here, so under 20p on a perfect day. It is the right shape, not a
+  large sum.
+- Six tests. Reverting the change reproduces the live figure to three decimal places
+  (1.654 kW against the logged 1.66 kW), and three mutations — dropping the headroom
+  guard, dropping the cap lift, halving the requested charge — are each caught.
+
+---
+
 ## v5.110.2 — 18-09-2026
 
 **The day's first bank-first verdict did not survive a restart, and v5.106.0 is why.**
