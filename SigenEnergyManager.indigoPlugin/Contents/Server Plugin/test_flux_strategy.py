@@ -882,17 +882,33 @@ class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
              "before 2am, selling at 27.7p for a 10.1p margin after losses and "
              "wear, holding {:.0f}% back")
 
-    def _charge(self, kwh, target):
+    @staticmethod
+    def _jitter(kwh):
+        """The commanded power as the plugin really derives it: the energy still
+        to buy, spread over the time left to buy it in, so it wanders by a watt
+        or two on every tick. On the night of 18/19-Sep-2026 it ran from 316W to
+        337W and changed on essentially every plan.
+
+        THE FIXTURE MUST CARRY THIS. Every test in this class used a flat
+        10000W, so none of them could express the fault that then took the whole
+        window: seven green tests over a fixture that held the moving field
+        still. See test_a_watt_of_jitter_is_not_a_new_plan."""
+        return 316 + (int(round(kwh * 10)) % 22)
+
+    def _charge(self, kwh, target, watts=None):
         return fs.FluxDecision(
             mode=fs.MODE_CHARGE, owns=True, ems_mode=3,
-            charge_limit_w=10000, discharge_limit_w=0,
+            charge_limit_w=self._jitter(kwh) if watts is None else watts,
+            discharge_limit_w=0,
             charge_cutoff_pct=float(target), discharge_cutoff_pct=20.0,
             reason=self.CHEAP.format(kwh, target, kwh))
 
     def _export(self, kwh, floor):
+        # The export branch derives its power the same way the charge branch
+        # does, so it carries the same jitter.
         return fs.FluxDecision(
             mode=fs.MODE_EXPORT, owns=True, ems_mode=5,
-            charge_limit_w=0, discharge_limit_w=10000,
+            charge_limit_w=0, discharge_limit_w=self._jitter(kwh),
             charge_cutoff_pct=100.0, discharge_cutoff_pct=float(floor),
             reason=self.PEAK.format(kwh, floor))
 
@@ -975,6 +991,73 @@ class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
         c = fs.FluxDecision(mode=fs.MODE_HOLD, owns=False, reason="holding for 3 hours")
         self.assertEqual(fs.note_key(a), fs.note_key(b), "only the digits moved")
         self.assertNotEqual(fs.note_key(b), fs.note_key(c), "minutes is not hours")
+
+    # ---- v5.110.4: the same bug, one layer down -------------------------
+
+    def test_a_watt_of_jitter_is_not_a_new_plan(self):
+        """THE REGRESSION 5.110.3 SHIPPED. Its key was control_key(), which
+        carries the raw watt figure, and the commanded power is re-derived on
+        every plan. So the note was keyed on a running number all over again --
+        just a number that is in no sentence anybody reads.
+
+        The real night: 143 plan notes between 02:00 and 05:00, a metronomic 27
+        seconds apart, carrying five distinct sentences between them."""
+        ticks = [self._charge(0.8, 41, watts=w)
+                 for w in (316, 317, 319, 318, 320, 322, 321, 323)]
+        self.assertEqual(len({d.control_key() for d in ticks}), len(ticks),
+                         "premise: every tick was a distinct register-level plan")
+        self.assertEqual(len(self._lines(ticks)), 1,
+                         "one sentence, so one line")
+
+    def test_the_night_of_18_19_september_is_two_lines(self):
+        """Replayed from the event log: one hold, then a charge to 41% whose buy
+        figure fell 0.8 -> 0.5 kWh while the power wandered 316W to 337W.
+
+        143 lines went out. They carried five distinct sentences, but only TWO
+        distinct plans: the four charge sentences differ in nothing but their
+        digits, which is precisely what the guard exists to collapse. The target
+        never moved off 41%, and a target that did move would still be a line --
+        see test_a_changed_target_is_still_news."""
+        ticks = [self._charge(0.0, 41)]                    # the opening hold-ish plan
+        ticks[0] = fs.FluxDecision(
+            mode=fs.MODE_HOLD, owns=True, ems_mode=2,
+            charge_limit_w=10000, discharge_limit_w=0,
+            charge_cutoff_pct=100.0, discharge_cutoff_pct=20.0,
+            reason="the cheap window is open and the battery already holds "
+                   "everything the day ahead is forecast to need")
+        for kwh in (0.8, 0.7, 0.6, 0.5):
+            for _ in range(35):                            # ~27s apart for 3 hours
+                ticks.append(self._charge(kwh, 41))
+                ticks.append(self._charge(kwh, 41, watts=self._jitter(kwh) + 1))
+        self.assertGreater(len(ticks), 140)
+        self.assertEqual(len(self._lines(ticks)), 2)
+
+    def test_power_is_kept_only_as_a_sign(self):
+        """Charging at 316W and at 9000W is the same sentence; charging and not
+        charging is not."""
+        a = self._charge(0.8, 41, watts=316)
+        b = self._charge(0.8, 41, watts=9000)
+        c = self._charge(0.8, 41, watts=0)
+        self.assertEqual(fs.note_key(a), fs.note_key(b))
+        self.assertNotEqual(fs.note_key(a), fs.note_key(c))
+
+    def test_the_key_is_no_finer_than_the_message(self):
+        """The note prints the target as a whole percent, so the key holds it as
+        a whole percent. 41.4 and 41.2 both read '41%' and must not be two
+        lines; 41 and 42 read differently and must be."""
+        self.assertEqual(fs.note_key(self._charge(0.8, 41.4)),
+                         fs.note_key(self._charge(0.8, 41.2)))
+        self.assertNotEqual(fs.note_key(self._charge(0.8, 41)),
+                            fs.note_key(self._charge(0.8, 42)))
+
+    def test_note_key_does_not_use_control_key(self):
+        """Guard the wiring, not the wording: control_key() is the register
+        identity and must never be what a sentence is keyed on."""
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(fs.note_key))
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        self.assertNotIn("control_key", called)
 
 
 if __name__ == "__main__":

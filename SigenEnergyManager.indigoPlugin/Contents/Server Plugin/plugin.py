@@ -19,8 +19,9 @@
 #              Claude Opus 5 (5.110.1 — the Flux floor stops shouting its re-asserts)
 #              Claude Opus 5 (5.110.2 — the day's first bank-first verdict survives a restart)
 #              Claude Opus 5 (5.110.3 — the Flux plan note stops repeating itself)
-# Date:        18-09-2026
-# Version:     5.110.3
+#              Claude Opus 5 (5.110.4 — and stops again, now the watt figure is out of the key)
+# Date:        19-09-2026
+# Version:     5.110.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

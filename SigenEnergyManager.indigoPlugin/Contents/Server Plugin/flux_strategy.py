@@ -1259,9 +1259,35 @@ def describe(decision):
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
 
 
+def note_control_key(decision):
+    """The part of the control state a PLAN NOTE is allowed to be keyed on.
+
+    control_key() is the register-level identity: it exists so the executor
+    re-writes the inverter when any commanded value moves, and it therefore
+    carries the raw watt figures. `charge_limit_w` is re-derived on every plan
+    from the energy still to buy and the time left to buy it in, so on the
+    night of 18/19-Sep-2026 it wandered between 316W and 337W and changed on
+    essentially every tick. It appears NOWHERE in the message.
+
+    So keying the note on control_key() reproduced the very bug v5.110.3 set
+    out to fix, one layer down: 143 plan notes between 02:00 and 05:00, at a
+    metronomic 27 seconds apart, carrying five distinct sentences between them.
+    The running figure had simply moved out of the prose and into the fields.
+
+    THE KEY MUST BE AS COARSE AS THE MESSAGE. Power is not in the note at all,
+    so only its SIGN is kept -- charging or not, discharging or not. The
+    cutoffs are in the note as whole percentages, so they are kept as whole
+    percentages: when the text says 41% and then 42%, that is a visible change
+    and deserves a line; 41.4% against 41.2% is not.
+    """
+    return (decision.mode, decision.ems_mode,
+            decision.charge_limit_w > 0, decision.discharge_limit_w > 0,
+            round(decision.charge_cutoff_pct), round(decision.discharge_cutoff_pct))
+
+
 def note_key(decision):
-    """Dedupe key for the one-line [Flux] plan note: the control fields, plus
-    the reason with its DIGITS masked.
+    """Dedupe key for the one-line [Flux] plan note: the note-level control
+    fields, plus the reason with its DIGITS masked.
 
     `reason` carries a running figure -- "buying about 7.9 kWh", "spare above
     what the house needs", "for the peak in 12 minutes" -- which moves on
@@ -1270,13 +1296,16 @@ def note_key(decision):
     [Flux] lines reached the Indigo event log on 18-Sep-2026, one per tick,
     103 of them between 02:00 and 05:00.
 
-    Masking only the digits is deliberately weaker than keying on
-    control_key() alone. Two plans can share every control field and still
-    say different things -- MODE_SUPPLY_HOUSE explains itself either as
-    "selling does not cover what it cost to store" or as "there is nothing
-    spare above what the house needs", with identical registers -- so a key
-    that ignored the wording would swallow a genuinely different explanation.
-    A change of WORDING is always news; a change of only the digits is not.
+    Masking only the digits is deliberately weaker than keying on the control
+    state alone. Two plans can share every control field and still say
+    different things -- MODE_SUPPLY_HOUSE explains itself either as "selling
+    does not cover what it cost to store" or as "there is nothing spare above
+    what the house needs", with identical registers -- so a key that ignored
+    the wording would swallow a genuinely different explanation. A change of
+    WORDING is always news; a change of only the digits is not.
+
+    It uses note_control_key(), NOT control_key(): see there for why the
+    register-level identity is the wrong granularity for a sentence.
     """
     masked = _NUMBER_RE.sub("#", decision.reason)
-    return f"{decision.control_key()}|{masked}"
+    return f"{note_control_key(decision)}|{masked}"

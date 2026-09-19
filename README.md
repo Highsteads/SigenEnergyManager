@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.110.3 · Requires Indigo 2025.2 or later
+**Version:** 5.110.4 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -145,6 +145,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.110.4 | 19-Sep-2026 | **The Flux plan note really does stay quiet now.** Yesterday's fix compared what the plugin was asking the battery to do, and that comparison included the exact charging power in watts. The plugin works that power out afresh on every check, from the energy still to buy and the time left to buy it in, so overnight it wandered between 316 and 337 watts and was different almost every time. That number appears in no message anybody reads, but it still made every check look like a new plan, and 143 lines went out between 2am and 5am for two plans. The comparison now looks only at what the sentence itself says: charging or not, and the target as the whole percentage the message prints. A changed target, a changed mode or a changed explanation is still a line. |
 | 5.110.3 | 18-Sep-2026 | **The Flux plan note no longer repeats itself on every check.** The plugin writes one line when its plan for the battery changes, and it was meant to stay quiet until the plan actually moved. It decided whether the plan had moved by comparing the whole sentence, and the sentence carries a running figure that falls a little on every check, so no two were ever alike and the line went out every time. The first full day on Flux put 310 of them in the log, 103 of them between 2am and 5am, for a plan that changed four times. It now compares what it is actually asking the battery to do, together with the wording, so a genuinely different explanation still shows and only the changing figures are ignored. |
 | 5.110.2 | 18-Sep-2026 | **A restart no longer loses the record of how the day was judged.** On days forecast below the threshold the plugin holds daytime export back until the battery is nearly full, and it files the verdict it reached that morning along with the forecast it used. Four pieces of that record were never saved to disk, so restarting the plugin wiped them, and the next check wrote them again with the time of day and the forecast as they stood right then. The day's history then read as though it had been judged in the afternoon on an afternoon forecast. Nothing the battery did was affected, only the record of why. |
 | 5.110.1 | 18-Sep-2026 | **The overnight Flux charge no longer fills the log with the same line.** While it holds the battery in the cheap window the plugin re-writes the discharge limit every half minute, and each re-write announced itself. The first night on Flux put 381 identical lines into the Indigo log in three hours, which buried the six lines that actually said what the battery was doing. The limit is now announced only when it changes. A correction after the setting has drifted still shows, because that is a real change. |

@@ -2177,7 +2177,13 @@ class TestExportRateReporting(unittest.TestCase):
 
         def _fetch(force=False):
             order.append("fetch")
-            _seed_flux_day(p, datetime(2026, 9, 17, 17, 0, tzinfo=LONDON))
+            # SEEDED FOR TODAY, because what follows reads the REAL clock.
+            # Pinned to 17-Sep-2026 this passed on the 17th and the 18th and
+            # went red on the 19th, when the seeded bands no longer covered
+            # "now" and the published figure fell back to the 12p default --
+            # which is the very fault the test exists to catch, so it failed
+            # for the right reason and the wrong cause.
+            _seed_flux_day(p, datetime.now(LONDON))
             ev = _evidence()
             ev["export_valid_from"] = "2026-09-16T23:00:00Z"
             p.store["flux_account_evidence"] = ev
@@ -2398,7 +2404,9 @@ class TestTariffSidesPayload(unittest.TestCase):
 
     def test_both_sides_carry_names_and_tiers(self):
         p = _mk_plugin()
-        _seed_flux_day(p, datetime(2026, 9, 17, 17, 0, tzinfo=LONDON))
+        # _tariff_sides_payload reads the real clock, so the bands are seeded
+        # for today. See the note in TestExportRateReporting.
+        _seed_flux_day(p, datetime.now(LONDON))
         p.octopus = MagicMock()
         p.octopus.get_account_financials.return_value = {
             "elec":   {"display_name": "Octopus Flux Import",
