@@ -15,6 +15,52 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.1 — 19-09-2026
+
+**"Not holding" was two different facts sharing one value, and the log reported the wrong one.**
+
+`_log_bank_first` writes a matched pair: one line when the bank-first hold engages, one when it
+lifts. It decided the hold had lifted from `decision.bank_first_holding` being False. But that flag
+is set only when bank-first is the gate that ACTUALLY refused, and `_overflow_skip_reason` walks the
+gates in order — night, 24h surplus, physics, dwell, then bank-first. The moment an earlier gate
+refuses, bank-first is never consulted and the flag goes False for a reason that says nothing at all
+about the hold.
+
+LIVE, 19-09-2026. At 08:30 the hold engaged: `Banking first — daytime export held until SOC reaches
+95%. SOC 36.0%, today's forecast 32.1 kWh`. At 08:31 the PHYSICS gate refused, the sun being too
+weak to fill the battery, and the plugin logged `Bank-first satisfied at 08:31 — SOC 36.0%, export
+handed back to the overflow gate. Held 0h01m, 0.0 kWh not exported`. Nothing was satisfied and
+nothing was handed back: the battery peaked at 79.0% and the export counter moved 0.07 kWh all day
+before the 16:00 peak.
+
+Three consequences, in rising order of cost:
+
+1. The line is false on its face — 36% against a stated 95% gate.
+2. It latches once a day, so the genuine release would have been silent had the battery reached the
+   gate that afternoon.
+3. `bank_first_released_local` in the daily record took the same wrong stamp, and that record is
+   what the 28-Sep four-week review reads to judge whether the hold behaved.
+
+Now three states rather than two: `BANK_FIRST_HOLDING`, `BANK_FIRST_RELEASED`, `BANK_FIRST_NOT_ASKED`
+on `Decision.bank_first_state`, set where the gates are actually walked.
+
+- **An export already running reports NOT_ASKED**, not RELEASED. `_check_solar_overflow` takes the
+  release path when a cap is live and never walks the engage gates, so a running export is no
+  evidence about a gate that was not consulted this tick.
+- **`bank_first_holding` is kept** for the callers that already read it, and a test asserts the two
+  fields can never disagree.
+- **Both the log line and the record stamp read the state**, and `_log_bank_first` now derives
+  `holding` from it too, so the opening and closing lines cannot disagree about what the gate did.
+- **Suppressing the wrong line must not swallow the right one.** A test drives holding ->
+  not_asked -> released and asserts the release still lands, with the real SOC in it.
+- 11 tests. Four mutations killed: reverting either read to the old two-state form, claiming a
+  running cap asked the gate, and having HOLDING set the wrong state.
+
+Same family as `feedback_absent_state_is_never_a_match` — a question that was never put, counted as
+a question that was answered.
+
+---
+
 ## v5.111.0 — 19-09-2026
 
 **Pacing survived the one condition that makes it pointless.**

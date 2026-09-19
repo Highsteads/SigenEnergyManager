@@ -4476,8 +4476,15 @@ class TestBankFirstMetrics(unittest.TestCase):
         return st
 
     @staticmethod
-    def _decision(holding=False, gate=95.0):
-        return types.SimpleNamespace(bank_first_holding=holding, bank_first_gate_pct=gate)
+    def _decision(holding=False, gate=95.0, state=None):
+        """v5.111.1: `not holding` is two different facts. Left unsaid, a non-holding
+        decision here means the gate ran and let the day through, which is what these
+        tests were always about; pass state=BANK_FIRST_NOT_ASKED for the other one."""
+        if state is None:
+            state = plugin.BANK_FIRST_HOLDING if holding else plugin.BANK_FIRST_RELEASED
+        return types.SimpleNamespace(bank_first_holding=holding,
+                                     bank_first_gate_pct=gate,
+                                     bank_first_state=state)
 
     def _record(self, stub, decision, snap, soc_pct=56.9):
         plugin.Plugin._record_bank_first_metrics(stub, snap, decision, soc_pct)
@@ -4768,6 +4775,28 @@ class TestBankFirstMetrics(unittest.TestCase):
         self._record(st, self._decision(holding=False), self._Snap(), soc_pct=95.1)
         self.assertEqual(st.store["bank_first_released_local"], "08:12")
 
+    def test_an_earlier_gate_refusing_does_not_stamp_a_release(self):
+        """19-09-2026, live. The hold engaged at 08:30 with SOC 36% against a 95%
+        gate; one tick later the PHYSICS gate refused, so bank-first was never
+        consulted. The old two-state read stamped released_local as 08:31 on a day
+        that peaked at 79% and exported nothing before 16:00 — and the four-week
+        review reads this field."""
+        st = self._stub(store={"bank_first_blocked_samples": 1})
+        self._record(st, self._decision(holding=False,
+                                        state=plugin.BANK_FIRST_NOT_ASKED),
+                     self._Snap(), soc_pct=36.0)
+        self.assertFalse(st.store.get("bank_first_released_local"))
+
+    def test_a_genuine_release_after_a_not_asked_gap_is_still_stamped(self):
+        """The other half, and the reason this is not just a suppression: the stamp
+        must survive the gap and land on the real release."""
+        st = self._stub(store={"bank_first_blocked_samples": 1})
+        self._record(st, self._decision(holding=False,
+                                        state=plugin.BANK_FIRST_NOT_ASKED),
+                     self._Snap(), soc_pct=36.0)
+        self._record(st, self._decision(holding=False), self._Snap(), soc_pct=95.2)
+        self.assertEqual(st.store["bank_first_released_local"], "08:12")
+
     def test_a_day_that_never_held_gets_no_release_stamp(self):
         st = self._stub()
         self._record(st, self._decision(holding=False), self._Snap())
@@ -4861,12 +4890,19 @@ class TestBankFirstLogging(unittest.TestCase):
         max_export_kw = 4.0
 
     @staticmethod
-    def _decision(holding, gate=95.0):
-        return types.SimpleNamespace(bank_first_holding=holding, bank_first_gate_pct=gate)
+    def _decision(holding, gate=95.0, state=None):
+        """See the note on the twin of this in TestBankFirstMetrics: an unstated
+        state means the gate genuinely ran."""
+        if state is None:
+            state = plugin.BANK_FIRST_HOLDING if holding else plugin.BANK_FIRST_RELEASED
+        return types.SimpleNamespace(bank_first_holding=holding,
+                                     bank_first_gate_pct=gate,
+                                     bank_first_state=state)
 
-    def _log(self, stub, holding, soc=56.9):
+    def _log(self, stub, holding, soc=56.9, state=None):
         with patch.object(plugin, "log") as logged:
-            plugin.Plugin._log_bank_first(stub, self._decision(holding), self._Snap(), soc)
+            plugin.Plugin._log_bank_first(
+                stub, self._decision(holding, state=state), self._Snap(), soc)
         return [c.args[0] for c in logged.call_args_list]
 
     def test_the_hold_is_logged_once_per_day(self):
@@ -4887,6 +4923,30 @@ class TestBankFirstLogging(unittest.TestCase):
         self.assertIn("Bank-first satisfied", released[0])
         self.assertIn("5h29m", released[0])
         self.assertEqual(self._log(st, holding=False, soc=95.4), [])
+
+    def test_an_earlier_gate_refusing_is_not_a_release(self):
+        """The line this whole change exists for. Live on 19-09-2026 it read
+        "Bank-first satisfied at 08:31 — SOC 36.0%, export handed back to the overflow
+        gate" on a day where nothing was handed back and nothing was exported."""
+        st = self._stub()
+        self._log(st, holding=True)
+        st.store["bank_first_blocked_samples"] = 1
+        self.assertEqual(
+            self._log(st, holding=False, soc=36.0,
+                      state=plugin.BANK_FIRST_NOT_ASKED), [])
+
+    def test_the_real_release_still_lands_after_a_not_asked_gap(self):
+        """Suppressing the wrong line must not swallow the right one. The latch is
+        spent only by a release that actually happened."""
+        st = self._stub()
+        self._log(st, holding=True)
+        st.store["bank_first_blocked_samples"] = 329
+        st.store["bank_first_withheld_kwh"]    = 6.21
+        self._log(st, holding=False, soc=36.0, state=plugin.BANK_FIRST_NOT_ASKED)
+        released = self._log(st, holding=False, soc=95.1)
+        self.assertEqual(len(released), 1)
+        self.assertIn("Bank-first satisfied", released[0])
+        self.assertIn("95.1%", released[0])
 
     def test_a_day_that_never_held_logs_nothing(self):
         self.assertEqual(self._log(self._stub(), holding=False), [])

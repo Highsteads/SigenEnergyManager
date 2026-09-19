@@ -499,6 +499,28 @@ SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX = 80.0
 # export back is the cheap error and selling early is the expensive one.
 BANK_FIRST_PROMOTE_MARGIN_KWH = 5.0
 
+# v5.111.1: what the bank-first gate did on this tick, in THREE states rather than
+# two. The old pair was `holding` and `not holding`, and "not holding" silently
+# covered two different things: the gate was asked and let the day through, and the
+# gate was never asked at all because an earlier gate had already refused. They are
+# not the same fact and must not share a value.
+#
+# LIVE, 19-09-2026. At 08:30 the hold engaged at SOC 36.0% against a 95% gate. At
+# 08:31 the PHYSICS gate refused — the sun was still too weak to fill the battery —
+# so the bank-first gate was not consulted, `holding` went False, and the plugin
+# logged "Bank-first satisfied at 08:31 — SOC 36.0%, export handed back to the
+# overflow gate". Nothing was satisfied and nothing was handed back: the battery
+# peaked at 79% that day and not one kWh was exported before 16:00. Worse, the line
+# latches once a day, so the genuine release — had the battery reached 95% that
+# afternoon — would have been silent. The daily record's `released_local` took the
+# same wrong stamp, and that record is what the four-week review reads.
+#
+# Same family as feedback_absent_state_is_never_a_match: a question that was never
+# put, counted as a question that was answered.
+BANK_FIRST_HOLDING   = "holding"     # the gate was asked and refused the day
+BANK_FIRST_RELEASED  = "released"    # the gate was asked and let the day through
+BANK_FIRST_NOT_ASKED = "not_asked"   # an earlier gate refused; the gate never ran
+
 
 # ============================================================
 # Data classes
@@ -782,6 +804,11 @@ class Decision:
     # plugin.py composes the log line and the device state from these.
     bank_first_holding:  bool  = False
     bank_first_gate_pct: float = 0.0
+    # v5.111.1 — the three-state companion to bank_first_holding above. `holding` is
+    # the same fact as that flag; the other two split what "False" used to conflate.
+    # Anything that reports a RELEASE must read this, never the flag — see the
+    # BANK_FIRST_* constants for the live failure that followed from not doing so.
+    bank_first_state:    str   = BANK_FIRST_NOT_ASKED
     # v3.5 — Plan-object audit trail: (tag, message) tuples appended at every
     # branch evaluate() considers (matched OR skipped).  Plugin logs this on
     # action change to make the WHY visible without re-running with debug on.
@@ -928,9 +955,19 @@ class BatteryManager:
         # export is disabled entirely: a lockout or storm day must not be attributed to
         # banking, or the report would credit this feature with somebody else's refusal.
         _bank_first_holding = False
+        _bank_first_state   = BANK_FIRST_NOT_ASKED
         if snapshot.export_enabled:
             overflow = self._check_solar_overflow(snapshot, balance)
             if overflow is not None:
+                # Every ENGAGE gate passed, so bank-first was asked and let the day
+                # through — unless a cap was already running, in which case
+                # _check_solar_overflow took the release path and never walked the
+                # engage gates at all. A running export is not evidence about a gate
+                # that was not consulted.
+                overflow.bank_first_state = (
+                    BANK_FIRST_NOT_ASKED if snapshot.solar_overflow_active
+                    else BANK_FIRST_RELEASED
+                )
                 audit.append(("OVERFLOW", f"matched -> {overflow.reason}"))
                 overflow.audit_trail = audit
                 return overflow
@@ -940,8 +977,15 @@ class BatteryManager:
             # _overflow_skip_reason for why that matters most in the winter.
             _tag, _msg = self._overflow_skip_reason(snapshot, balance)
             audit.append(("OVERFLOW", _msg))
+            # _overflow_skip_reason walks the SAME gate order, so its tag says how
+            # far the walk got: "bank_first" means the gate refused, "unknown" means
+            # every gate including it passed (a bug path, but an asked one), and any
+            # earlier tag means it was never reached.
             if _tag == "bank_first":
                 _bank_first_holding = True
+                _bank_first_state   = BANK_FIRST_HOLDING
+            elif _tag == "unknown":
+                _bank_first_state   = BANK_FIRST_RELEASED
         else:
             audit.append(("OVERFLOW", "skipped — export not enabled"))
 
@@ -962,6 +1006,7 @@ class BatteryManager:
                 "matched -> previously-applied overflow cap no longer applicable"
             ))
             release.bank_first_holding  = _bank_first_holding
+            release.bank_first_state    = _bank_first_state
             release.bank_first_gate_pct = (
                 float(snapshot.solar_overflow_bank_first_soc) if _bank_first_holding else 0.0
             )
@@ -982,6 +1027,7 @@ class BatteryManager:
         )
         audit.append(("DEFAULT", "matched -> self-consumption (no other branch applied)"))
         default_decision.bank_first_holding  = _bank_first_holding
+        default_decision.bank_first_state    = _bank_first_state
         default_decision.bank_first_gate_pct = (
             float(snapshot.solar_overflow_bank_first_soc) if _bank_first_holding else 0.0
         )

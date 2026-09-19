@@ -36,6 +36,7 @@ from battery_manager import (
     SOLAR_OVERFLOW_MIN_DWELL_MIN,
     SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH,
     SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT,
+    BANK_FIRST_HOLDING, BANK_FIRST_RELEASED, BANK_FIRST_NOT_ASKED,
     SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
     SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX,
     MIN_EXPORT_KWH,
@@ -2204,6 +2205,52 @@ class TestSolarOverflowBankFirst(unittest.TestCase):
         is one-way on purpose, and the fail-open path must not undo it."""
         d = self._evaluate(10.4, soc_pct=56.9, raw_today=0.0, latched=True)
         self.assertTrue(d.bank_first_holding)
+
+    # ── holding / released / never asked are THREE facts (v5.111.1) ────────
+    def test_the_gate_refusing_reports_holding(self):
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=35.6)
+        self.assertEqual(d.bank_first_state, BANK_FIRST_HOLDING)
+
+    def test_an_earlier_gate_refusing_reports_not_asked_not_released(self):
+        """19-09-2026, live. The hold engaged at 08:30; one tick later the PHYSICS
+        gate refused because the sun could not yet fill the battery, so bank-first was
+        never consulted. The old two-state field could only say "not holding", and the
+        plugin read that as a release — logging "Bank-first satisfied at 08:31 — SOC
+        36.0%" on a day that peaked at 79% and exported nothing before 16:00."""
+        d = self._evaluate(-25.0, soc_pct=36.0, raw_today=32.1)
+        self.assertIn("physics surplus", self._audit(d))
+        self.assertFalse(d.bank_first_holding)
+        self.assertEqual(d.bank_first_state, BANK_FIRST_NOT_ASKED)
+
+    def test_the_gate_letting_the_day_through_reports_released(self):
+        """A big day: the gate is asked and does not block, and an export starts."""
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=55.0)
+        self.assertGreater(d.export_kw, 0.0)
+        self.assertEqual(d.bank_first_state, BANK_FIRST_RELEASED)
+
+    def test_an_export_already_running_reports_not_asked(self):
+        """The engage gates are not walked on the release path, so a running cap is
+        no evidence about a gate that was never consulted this tick."""
+        d = self._evaluate(10.4, soc_pct=56.9, raw_today=55.0, active=True)
+        self.assertGreater(d.export_kw, 0.0)
+        self.assertEqual(d.bank_first_state, BANK_FIRST_NOT_ASKED)
+
+    def test_export_disabled_reports_not_asked(self):
+        d = self._evaluate(10.4, soc_pct=50.0, raw_today=20.0, export_enabled=False)
+        self.assertEqual(d.bank_first_state, BANK_FIRST_NOT_ASKED)
+
+    def test_the_two_fields_never_disagree(self):
+        """bank_first_holding is kept for the callers that already read it; it must
+        mean exactly the same thing as the HOLDING state and nothing else."""
+        for kw in ({"soc_pct": 56.9, "raw_today": 35.6},
+                   {"soc_pct": 36.0, "raw_today": 32.1, "surplus": -25.0},
+                   {"soc_pct": 56.9, "raw_today": 55.0},
+                   {"soc_pct": 50.0, "raw_today": 20.0, "export_enabled": False}):
+            with self.subTest(**kw):
+                surplus = kw.pop("surplus", 10.4)
+                d = self._evaluate(surplus, **kw)
+                self.assertEqual(d.bank_first_holding,
+                                 d.bank_first_state == BANK_FIRST_HOLDING)
 
     def test_a_dull_day_audit_names_the_physics_gate_not_bank_first(self):
         """A day turned down because the sun cannot fill the battery must not be

@@ -21,8 +21,9 @@
 #              Claude Opus 5 (5.110.3 — the Flux plan note stops repeating itself)
 #              Claude Opus 5 (5.110.4 — and stops again, now the watt figure is out of the key)
 #              Claude Opus 5 (5.111.0 — no pacing at all once the day cannot clip)
+#              Claude Opus 5 (5.111.1 — the bank-first log stops claiming a release that never happened)
 # Date:        19-09-2026
-# Version:     5.111.0
+# Version:     5.111.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -218,6 +219,7 @@ from battery_manager  import (
     FLOOD_PREV_FORECAST_MULT,
     pv_tracking_factor as _pv_tracking_factor,
     need_for_weekday as _need_for_weekday,
+    BANK_FIRST_HOLDING, BANK_FIRST_RELEASED, BANK_FIRST_NOT_ASKED,
     SOLAR_OVERFLOW_TARGET_SOC_PCT, SOLAR_OVERFLOW_MIN_END_SOC_PCT,
     SOLAR_OVERFLOW_SHADOW_TARGET_SOC_PCT,
     SOLAR_OVERFLOW_CAP_DEADBAND_W,
@@ -4165,8 +4167,16 @@ class Plugin(indigo.PluginBase):
                     store["bank_first_withheld_kwh"] = float(
                         store.get("bank_first_withheld_kwh", 0.0)
                     ) + float(shadow.export_kw) * MANAGER_EVAL_INTERVAL / 3600.0
+            # v5.111.1: stamp a RELEASE only when the gate was actually consulted and
+            # let the day through. "Not holding" used to be enough, and it covers the
+            # case where an earlier gate refused and bank-first never ran — which on
+            # 19-09-2026 stamped released_local as 08:31 at SOC 36% against a 95%
+            # gate, on a day that reached 79% and exported nothing before 16:00. The
+            # four-week review reads this field.
             elif (int(store.get("bank_first_blocked_samples", 0)) > 0
-                  and not store.get("bank_first_released_local")):
+                  and not store.get("bank_first_released_local")
+                  and getattr(decision, "bank_first_state", BANK_FIRST_NOT_ASKED)
+                      == BANK_FIRST_RELEASED):
                 store["bank_first_released_local"] = local_now.strftime("%H:%M")
 
             # ── 3. the measured cost ────────────────────────────────────────
@@ -5006,7 +5016,11 @@ class Plugin(indigo.PluginBase):
                 store["bank_first_logged_date"]    = ""
                 store["bank_first_release_logged"] = False
 
-            holding = bool(getattr(decision, "bank_first_holding", False))
+            # One read, two lines. v5.111.1 moved both the opening and the closing
+            # line onto the three-state field so they cannot disagree about what the
+            # gate did; `holding` is now derived rather than read separately.
+            state   = getattr(decision, "bank_first_state", BANK_FIRST_NOT_ASKED)
+            holding = (state == BANK_FIRST_HOLDING)
             gate    = float(getattr(decision, "bank_first_gate_pct", 0.0) or 0.0)
             gate    = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX, max(0.0, gate))
 
@@ -5020,7 +5034,12 @@ class Plugin(indigo.PluginBase):
                     f"{max_kwh:.1f} kWh cap-saturation threshold, so nothing is gained "
                     f"by selling early — the surplus is still there this afternoon.")
 
-            if (not holding
+            # v5.111.1: `not holding` is not evidence of a release — see the
+            # BANK_FIRST_* constants in battery_manager.py for the 19-09-2026 line
+            # that claimed the hold was satisfied at 36% SOC because the physics gate
+            # had refused one tick after the hold engaged. Read the state instead, so
+            # this fires once, on a gate that genuinely ran and let the day through.
+            if (state == BANK_FIRST_RELEASED
                     and store.get("bank_first_logged_date") == today_str
                     and not store.get("bank_first_release_logged")
                     and int(store.get("bank_first_blocked_samples", 0)) > 0):
