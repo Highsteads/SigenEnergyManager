@@ -61,6 +61,70 @@ rate — energy the 16:00 window would have taken at 27.7p.
 
 ---
 
+## v5.110.4 — 19-09-2026
+
+**The same bug one layer down: 5.110.3's key was `control_key()`, and `control_key()` carries the
+raw watt figure.**
+
+The charge branch sets `charge_limit_w=int(power_w)`, re-derived on every plan from the energy
+still to buy over the time left to buy it in. On the first night under the new guard it wandered
+**316W to 337W and changed on essentially every tick** — a number that appears in no message
+anybody reads.
+
+Measured rather than inferred. `set_charge_limit` logged 146 calls across 22 distinct watt values
+between 02:00 and 05:00, and the **143 `[Flux]` lines came out a metronomic 27 seconds apart** (91
+gaps of 27s, 46 of 28s), carrying five distinct sentences and only two distinct plans. A drifting
+value crossing a rounding boundary would have been bursty; a perfectly regular cadence said the
+key changed every single time.
+
+New `note_control_key()` = mode, ems_mode, the SIGN of each limit (charging or not, discharging or
+not), and both cutoffs as WHOLE percentages.
+
+- **The key must be no finer than the message.** The note prints `{target:.0f}%`, so 41.4 and 41.2
+  are one line and 41 vs 42 are two; power is in no sentence, so only its sign survives.
+- **`control_key()` stays exactly as it was.** It is the REGISTER identity and the executor must
+  still re-write on a watt.
+- **The old fixture could not express the fault.** Every test in
+  `TestNoteKeyDedupesOnPlanNotProse` used a flat `charge_limit_w=10000`, so seven green tests sat
+  over the one field that was moving. `_jitter()` now derives it from the kWh by default, and
+  `test_a_watt_of_jitter_is_not_a_new_plan` asserts the premise — every tick a distinct
+  `control_key()` — before asserting the cure.
+- 12 tests, 5 mutations killed (revert to `control_key()`, raw watts, drop the reason, cutoff at
+  1dp, drop the cutoffs). Two pre-existing RED tests fixed on the way: `_seed_flux_day` was pinned
+  to 17-Sep-2026 while the code under test read the real clock, so both passed on the 17th and
+  18th and went red on the 19th.
+
+---
+
+## v5.110.3 — 18-09-2026
+
+**The "never the same line twice" guard had never once fired.**
+
+`_flux_log_decision` deduped on `f"{decision.mode}|{decision.reason}"`, and `reason` embeds a
+running figure — `buying about {buy_kwh:.1f} kWh`, `about {surplus_kwh:.1f} kWh is spare`, `for the
+peak in N minutes` — that moves on nearly every tick. **The key never matched itself and the guard
+was dead from the day it was written.** The first full unattended day on Flux put **310 `[Flux]`
+lines into the event log** (103 charge, 136 export, 71 hold), one per tick, for a day whose plan
+changed four times overnight and three times in the peak.
+
+Now keys on new `flux_strategy.note_key()` = `control_key()` plus the reason with whole NUMBERS
+masked to `#`.
+
+- **Mask per NUMBER, not per digit.** `19.0` masks to `##.#` and `9.9` to `#.#`, so a per-digit
+  mask makes the same decaying figure a new key each time it crosses a power of ten. The tests
+  caught that; review had not.
+- **`control_key()` alone was rejected on evidence.** `MODE_SUPPLY_HOUSE` explains itself two ways
+  with byte-identical registers, and every deferral shares all six control fields, so dropping the
+  wording would swallow a genuinely different explanation.
+- 7 tests replay the real 18-Sep tick sequence (103 and 136 ticks) and assert 4 and 3 lines; all 4
+  mutations caught (old prose key, constant key, control_key-only, no masking).
+
+This is our own standing rule — dedupe on stable keys built from structured findings, never on the
+message body — broken in our own code. Superseded the next morning by v5.110.4, which fixed the
+same guard again.
+
+---
+
 ## v5.110.2 — 18-09-2026
 
 **The day's first bank-first verdict did not survive a restart, and v5.106.0 is why.**
