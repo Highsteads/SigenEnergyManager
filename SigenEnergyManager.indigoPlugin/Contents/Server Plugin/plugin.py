@@ -23,7 +23,7 @@
 #              Claude Opus 5 (5.111.0 — no pacing at all once the day cannot clip)
 #              Claude Opus 5 (5.111.1 — the bank-first log stops claiming a release that never happened)
 # Date:        19-09-2026
-# Version:     5.111.1
+# Version:     5.111.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

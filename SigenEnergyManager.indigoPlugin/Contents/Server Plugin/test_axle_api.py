@@ -177,6 +177,65 @@ class TestAxleFailureIsVisible(unittest.TestCase):
                 self.assertIsNone(self.api.get_next_event())
                 self.assertIsNone(self.api.last_error)
 
+    # --- a quiet feed logs ONCE, not every ten minutes (v1.6) -------------
+
+    def test_repeat_quiet_polls_log_once(self):
+        # The poll runs every ~10 min and quiet is the NORMAL state, so an
+        # unconditional line wrote ~144 identical rows a day (measured
+        # 20-09-2026) and was the bulk of the plugin log.
+        log = MagicMock()
+        api = axle_api.AxleAPI("token123", logger=log)
+        axle_api.requests.get = MagicMock(return_value=_resp(json_data=None))
+        for _ in range(6):
+            self.assertIsNone(api.get_next_event())
+        quiet = [c for c in log.debug.call_args_list
+                 if "no event scheduled" in str(c)]
+        self.assertEqual(len(quiet), 1, f"expected one line, got {len(quiet)}")
+
+    def test_quiet_shape_change_is_logged(self):
+        # The three shapes mean different things upstream, so a switch between
+        # them is real news — the key carries the shape, not just "quiet".
+        log = MagicMock()
+        api = axle_api.AxleAPI("token123", logger=log)
+        for resp in (_resp(json_data=None),
+                     _resp(json_data=None),
+                     _resp(status=204, content=b""),
+                     _resp(status=204, content=b"")):
+            axle_api.requests.get = MagicMock(return_value=resp)
+            api.get_next_event()
+        quiet = [c for c in log.debug.call_args_list
+                 if "no event scheduled" in str(c)]
+        self.assertEqual(len(quiet), 2)
+        self.assertIn("null response", str(quiet[0]))
+        self.assertIn("204 / empty body", str(quiet[1]))
+
+    def test_an_event_rearms_the_quiet_line(self):
+        # Without the re-arm the latch would still hold the old shape and the
+        # NEXT quiet spell — the one after a real event — would go unlogged.
+        log = MagicMock()
+        api = axle_api.AxleAPI("token123", logger=log)
+        for resp in (_resp(json_data=None),
+                     _resp(json_data=dict(_VALID)),
+                     _resp(json_data=None)):
+            axle_api.requests.get = MagicMock(return_value=resp)
+            api.get_next_event()
+        quiet = [c for c in log.debug.call_args_list
+                 if "no event scheduled" in str(c)]
+        self.assertEqual(len(quiet), 2, "an event must re-arm the quiet line")
+
+    def test_quiet_line_key_carries_no_varying_token(self):
+        # A dedupe key built from prose that contains a timestamp or a counter
+        # never matches on the next pass, so the guard silently does nothing.
+        log = MagicMock()
+        api = axle_api.AxleAPI("token123", logger=log)
+        for shape in ("204 / empty body", "null response", "all-null event object"):
+            api._last_quiet_shape = None
+            api._log_no_event(shape)
+        for call in log.debug.call_args_list:
+            self.assertFalse(any(ch.isdigit() and ch not in "204"
+                                 for ch in str(call).replace("204", "")),
+                             f"varying token in quiet key: {call}")
+
     def test_half_null_event_is_still_an_error(self):
         # Only ONE timestamp missing is malformed, not "no event" — the guard
         # must not swallow it. This is the half of the discrimination that a
