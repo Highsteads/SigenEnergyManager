@@ -24,8 +24,9 @@
 #              Claude Opus 5 (5.111.1 — the bank-first log stops claiming a release that never happened)
 #              Claude Opus 5 (5.111.3 — the bank-first line quotes the forecast it was actually classified on)
 #              Claude Opus 5 (5.111.4 — the data directory refuses a path that is not one)
+#              Claude Opus 5 (5.111.5 — a Plugin Store icon, at last)
 # Date:        20-09-2026
-# Version:     5.111.4
+# Version:     5.111.5
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

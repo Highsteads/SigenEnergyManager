@@ -15,6 +15,32 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.5 — 20-09-2026
+
+**`Contents/Resources/icon.png`, which this plugin had never had.**
+
+`Contents/Resources` existed and was empty — that is how it came up, while checking the v5.111.4
+release asset against the installed bundle. Seven Highsteads repos ship an icon; the largest
+plugin of the lot did not, so anywhere it is listed it falls back to Indigo's generic plugin
+picture.
+
+- **256 x 256 PNG**, which `official-plugin-dev.md` calls the optimal size; the hard floor is
+  128px high, and the Store shows it at about that. Checked at 128 before committing.
+- **Drawn to the house pattern** the other four already share: dark navy rounded square, the name
+  in white caps across the top over a cyan rule, one glyph in the middle, a subtitle word in
+  spaced cyan caps below. Here the glyph is an upright battery, charged about seven tenths, with
+  a sun at its shoulder — solar and storage, which is the whole plugin in one mark.
+- **`tools/make_icon.py` is committed with it.** A PNG nobody can regenerate is a dead end the
+  first time the name or the palette changes; the script draws at 4x and downsamples with
+  LANCZOS, which is the cheap way to clean edges.
+- **It only reaches the Plugin Store through a RELEASE.** The Store reads the icon from the
+  bundle in the published release, so adding it to the repo alone changes nothing anyone sees.
+
+**Still without one, noted while checking:** Dashboards. Its four tracked PNGs are all
+`apple-touch-icon` files for the web pages, not `Contents/Resources/icon.png`.
+
+---
+
 ## v5.111.4 — 20-09-2026
 
 **`os.makedirs` will happily create a directory named after a mock, and did — inside the bundle
