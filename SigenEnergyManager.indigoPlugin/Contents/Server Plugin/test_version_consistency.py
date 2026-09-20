@@ -104,12 +104,39 @@ class TestVersionConsistency(unittest.TestCase):
             f"{self.plist['PluginVersion']}")
 
     def test_the_plugin_py_header_matches_the_bundle(self):
+        """20-09-2026: this read the first 2000 BYTES of plugin.py, and the header
+        carries one credit line per released version, so it grows every time the
+        thing under test changes. v5.111.3's line pushed `# Version:` past the
+        window and the test reported "plugin.py has no '# Version:' header line" —
+        a guard that had been counting down to a false failure since it was written,
+        and would have kept CI red on a correct file.
+
+        Read the leading COMMENT BLOCK instead. It is bounded by the header itself,
+        so it cannot be outgrown, and the canonical `tests/` copy of this file reads
+        the whole source for the same reason.
+        """
         path = os.path.join(HERE, "plugin.py")
+        header_lines = []
         with open(path, encoding="utf-8") as fh:
-            head = fh.read(2000)
+            for line in fh:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    break
+                header_lines.append(line)
+        head = "".join(header_lines)
+
         found = re.search(r"^# Version:\s*(\S+)", head, re.MULTILINE)
         self.assertIsNotNone(found, "plugin.py has no '# Version:' header line")
         self.assertEqual(found.group(1), str(self.plist["PluginVersion"]))
+
+    def test_the_header_search_is_not_bounded_by_a_fixed_window(self):
+        """The property the test above lost. The header grows by a line per release,
+        so any fixed byte or line budget is a deadline, not a bound."""
+        src = open(os.path.join(HERE, os.path.basename(__file__)), encoding="utf-8").read()
+        body = src[src.index("def test_the_plugin_py_header_matches_the_bundle"):]
+        body = body[:body.index("def test_the_header_search_is_not_bounded")]
+        self.assertNotRegex(body, r"\.read\(\s*\d+\s*\)",
+                            "a fixed-size read will be outgrown by the credit list")
 
 
 if __name__ == "__main__":
