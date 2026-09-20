@@ -15,6 +15,47 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.4 — 20-09-2026
+
+**`os.makedirs` will happily create a directory named after a mock, and did — inside the bundle
+people install.**
+
+`_get_data_dir` joined `indigo.server.getInstallFolderPath()` onto a path and created the result,
+with no check on what came back. Found in the LIVE installed bundle on 20-09-2026 while verifying
+the v5.111.3 release asset against it:
+
+```
+Contents/Server Plugin/MagicMock/mock.getInstallFolderPath()/<object id>/
+    Preferences/Plugins/com.clives.indigoplugin.sigenergy-energy-manager
+```
+
+Four of them, one per test run, dated **12-09-2026 and still there eight days later**. A suite had
+built a `Plugin` for real against a mocked `indigo`; `run_tests.py` chdirs into the bundle, so the
+junk landed inside the plugin. All empty, so nothing was lost — but nothing noticed either.
+
+- **It no longer reproduces, and that is luck rather than design.** Every test today uses
+  `Plugin.__new__`, which skips `__init__` and so never reaches this method. Verified by running
+  both runners over a `git archive` tree in a clean virtualenv: nothing is created. The route
+  closed itself when the tests changed, and could reopen the day one of them constructs a Plugin.
+- **The method now refuses a non-path** — not a `str`, or blank — with a message naming the type
+  and value. Failing is strictly better than succeeding into the wrong directory: a plugin whose
+  data directory is nonsense loses its accumulators, its plugin log and its VPP ledger in silence,
+  and the only symptom is that yesterday never happened. `None` and `""` are covered for the same
+  reason, those being the plausible real-world versions of the same fault.
+- **`test_no_stray_artefacts.py` guards the CLASS, not the route.** It walks the bundle for
+  directories whose names look like stringified mocks and fails naming them. It checks RESIDUE
+  rather than only this run, deliberately: test ordering would otherwise decide what it can see,
+  and residue from an earlier run is exactly what sat unnoticed for over a week. A second test
+  builds the precise shape the live fault left, confirms the detector fires, and removes it —
+  a guard nobody has watched fail is not a guard.
+- 5 tests, 3 mutations killed: dropping the type guard, accepting a blank string, and a detector
+  pattern that matches nothing. The control arm — a real path still works and lands exactly where
+  it should — is there so the class cannot pass against a method that refuses everything.
+
+Same family as `feedback_test_suite_writes_live_files`.
+
+---
+
 ## v5.111.3 — 20-09-2026
 
 **The bank-first opening line quotes the forecast the day was CLASSIFIED on, not the

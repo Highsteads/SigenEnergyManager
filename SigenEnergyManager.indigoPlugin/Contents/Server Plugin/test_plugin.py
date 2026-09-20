@@ -4432,6 +4432,66 @@ class TestDawnTargetPct(unittest.TestCase):
         self.assertGreater(self._plugin({})._dawn_target_pct(), 10)
 
 
+class TestDataDirRefusesANonPath(unittest.TestCase):
+    """v5.111.4. `_get_data_dir` joined whatever `getInstallFolderPath()` returned
+    onto a path and called `os.makedirs` on the result — so a mocked indigo produced
+    a REAL directory named after the mock, inside the plugin bundle.
+
+    Found in the live installed bundle on 20-09-2026: four of them under
+    `Contents/Server Plugin/MagicMock/mock.getInstallFolderPath()/<object id>/`,
+    dated 12-09-2026 and still there eight days later."""
+
+    def _call_with(self, install_path):
+        import tempfile
+        stub = plugin.Plugin.__new__(plugin.Plugin)
+        with tempfile.TemporaryDirectory() as tmp:
+            before = sorted(os.listdir(tmp))
+            cwd = os.getcwd()
+            os.chdir(tmp)                       # anything relative lands HERE, not the bundle
+            try:
+                with patch.object(plugin.indigo.server, "getInstallFolderPath",
+                                  return_value=install_path):
+                    try:
+                        return plugin.Plugin._get_data_dir(stub), None, tmp, before
+                    except Exception as exc:    # noqa: BLE001
+                        return None, exc, tmp, before
+            finally:
+                os.chdir(cwd)
+
+    def test_a_mock_is_refused_and_creates_nothing(self):
+        got, exc, tmp, before = self._call_with(MagicMock())
+        self.assertIsNone(got)
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertIn("not a path", str(exc))
+        self.assertEqual(sorted(os.listdir(tmp)) if os.path.isdir(tmp) else before, before,
+                         "a directory was created from a mock")
+
+    def test_none_and_blank_are_refused_too(self):
+        """The same fault with a plausible real cause: an Indigo that answered None,
+        or an empty string, would otherwise silently relocate the plugin's whole
+        state — accumulators, logs and the VPP ledger — to a relative path."""
+        for bad in (None, "", "   "):
+            with self.subTest(bad=bad):
+                got, exc, _tmp, _before = self._call_with(bad)
+                self.assertIsNone(got)
+                self.assertIsInstance(exc, RuntimeError)
+
+    def test_a_real_path_still_works(self):
+        """The control arm. Without it this class would pass just as well against a
+        method that refused everything."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = plugin.Plugin.__new__(plugin.Plugin)
+            with patch.object(plugin.indigo.server, "getInstallFolderPath",
+                              return_value=tmp):
+                got = plugin.Plugin._get_data_dir(stub)
+            self.assertTrue(os.path.isdir(got))
+            self.assertEqual(
+                got,
+                os.path.join(tmp, "Preferences", "Plugins",
+                             "com.clives.indigoplugin.sigenergy-energy-manager"))
+
+
 class TestBankFirstMetrics(unittest.TestCase):
     """v5.79.0: the measurement behind the bank-first export hold.
 

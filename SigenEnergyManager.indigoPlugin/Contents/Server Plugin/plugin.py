@@ -23,8 +23,9 @@
 #              Claude Opus 5 (5.111.0 — no pacing at all once the day cannot clip)
 #              Claude Opus 5 (5.111.1 — the bank-first log stops claiming a release that never happened)
 #              Claude Opus 5 (5.111.3 — the bank-first line quotes the forecast it was actually classified on)
+#              Claude Opus 5 (5.111.4 — the data directory refuses a path that is not one)
 # Date:        20-09-2026
-# Version:     5.111.3
+# Version:     5.111.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -14472,8 +14473,33 @@ class Plugin(indigo.PluginBase):
         )
 
     def _get_data_dir(self):
-        """Return plugin data directory path (create if needed)."""
+        """Return plugin data directory path (create if needed).
+
+        v5.111.4: the install path is CHECKED before anything is created. It used
+        to be joined and made unconditionally, so anything other than a real path
+        produced a real directory named after it — and `makedirs` is perfectly happy
+        to do that.
+
+        Found 20-Sep-2026 inside the live bundle: a tree at
+        `Contents/Server Plugin/MagicMock/mock.getInstallFolderPath()/<object id>/
+        Preferences/Plugins/com.clives.indigoplugin.sigenergy-energy-manager`, four
+        deep, one per test run, dated 12-Sep and still there eight days later. A
+        suite had built a Plugin for real against a mocked `indigo`, this method ran,
+        and the stringified mock became a folder inside the plugin people install.
+        No test reaches `__init__` today, which is why it stopped happening rather
+        than because anything prevented it.
+
+        Failing here is strictly better than succeeding into a wrong directory: a
+        plugin whose data directory is nonsense loses its accumulators, its logs and
+        its VPP ledger silently, and the only sign is that yesterday never happened.
+        """
         data_dir = indigo.server.getInstallFolderPath()
+        if not isinstance(data_dir, str) or not data_dir.strip():
+            raise RuntimeError(
+                "indigo.server.getInstallFolderPath() returned "
+                f"{type(data_dir).__name__} {data_dir!r}, not a path. Refusing to "
+                "create a data directory from it."
+            )
         data_dir = os.path.join(data_dir, "Preferences", "Plugins",
                                 "com.clives.indigoplugin.sigenergy-energy-manager")
         if not os.path.exists(data_dir):
