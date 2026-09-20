@@ -15,6 +15,50 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.3 — 20-09-2026
+
+**The bank-first opening line quotes the forecast the day was CLASSIFIED on, not the
+one showing when the hold engaged.**
+
+Live on 20-09-2026, plugin v5.111.2:
+
+```
+[Manager] Banking first — daytime export held until SOC reaches 95%. SOC 34.6%,
+today's forecast 40.5 kWh is below the 40.0 kWh cap-saturation threshold, ...
+```
+
+40.5 is not below 40.0. The sentence states something a reader can check and find false.
+
+The decision behind it was correct throughout. `bank_first_first_class_kwh` was **39.9**,
+stamped at **00:05**; the forecast wandered up past the threshold by 08:00 and was back to
+37.8 by 10:14. `_log_bank_first` printed the live `snapshot.raw_today_kwh` beside a verdict
+that had been reached from a different figure hours earlier.
+
+**The fix is not the first classification of the day.** That is a separate record and it is
+the wrong one here: a day that opens BIG and is later demoted has a first classification
+ABOVE the threshold, so printing it produces the same false sentence in the other
+direction. What the line has to name is the figure the latch IN FORCE was reached through.
+
+`bank_first_latched_small_kwh` / `_local` are stamped on the TRANSITION into small, where
+`still_small` was reached through `raw_kwh < max_kwh` — so "below the threshold" is true of
+that figure **by construction**, not by luck. Six places, per the warning v5.110.2 left in
+this file about adding a field to five of them: the seed, the `setdefault` block, the daily
+reset, the setter, the **save dict**, and the restore defaults.
+
+A missing figure prints no figure rather than a wrong one — an accumulators file written
+before this version restores a latch with nothing behind it.
+
+**1914 to 1920 tests. Four mutations killed**, and the fourth was found by the sweep rather
+than by design: stamping once a day instead of on every transition SURVIVED the first pass,
+because the demotion test uses a day that opens big and so has no earlier small latch to
+keep. The case that separates them is small -> big -> small again, where a once-a-day stamp
+describes a hold that ended hours before. Four causes for a surviving mutant, and this was
+the missing test.
+
+The strongest of the new tests asserts the **property** rather than the wording: whatever
+forecast the rendered sentence quotes must be below the threshold the same sentence quotes.
+That fails for any future rewording that reintroduces the fault.
+
 ## v5.111.1 — 19-09-2026
 
 **"Not holding" was two different facts sharing one value, and the log reported the wrong one.**

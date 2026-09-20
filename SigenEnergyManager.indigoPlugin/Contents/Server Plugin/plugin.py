@@ -22,8 +22,9 @@
 #              Claude Opus 5 (5.110.4 — and stops again, now the watt figure is out of the key)
 #              Claude Opus 5 (5.111.0 — no pacing at all once the day cannot clip)
 #              Claude Opus 5 (5.111.1 — the bank-first log stops claiming a release that never happened)
-# Date:        19-09-2026
-# Version:     5.111.2
+#              Claude Opus 5 (5.111.3 — the bank-first line quotes the forecast it was actually classified on)
+# Date:        20-09-2026
+# Version:     5.111.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1653,6 +1654,11 @@ class Plugin(indigo.PluginBase):
         self.store["bank_first_first_class_small"] = None
         self.store["bank_first_first_class_local"] = ""
         self.store["bank_first_promoted_local"]    = ""
+        # v5.111.3: the forecast the latch IN FORCE was set from, and when. Not the
+        # same as the first classification of the day — a day that starts big and is
+        # demoted has a first classification that never governed anything.
+        self.store["bank_first_latched_small_kwh"]   = None
+        self.store["bank_first_latched_small_local"] = ""
         self.store["bank_first_latch_date"]     = ""
         # Daily measurement. Counted in manager ticks, which are one a minute.
         self.store["bank_first_blocked_samples"]   = 0
@@ -4057,6 +4063,8 @@ class Plugin(indigo.PluginBase):
                 ("bank_first_first_class_small", None),
                 ("bank_first_first_class_local", ""),
                 ("bank_first_promoted_local",    ""),
+                ("bank_first_latched_small_kwh",   None),
+                ("bank_first_latched_small_local", ""),
             ):
                 store.setdefault(_key, _default)
 
@@ -4075,6 +4083,8 @@ class Plugin(indigo.PluginBase):
                 store["bank_first_first_class_small"] = None
                 store["bank_first_first_class_local"] = ""
                 store["bank_first_promoted_local"]    = ""
+                store["bank_first_latched_small_kwh"]   = None
+                store["bank_first_latched_small_local"] = ""
             max_kwh = min(float(snapshot.solar_overflow_bank_first_max_kwh or 0.0),
                           SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
             status  = str(self.latest_forecast_data.get("forecastStatus", ""))
@@ -4143,6 +4153,18 @@ class Plugin(indigo.PluginBase):
                 # 08:52 was filed as "classified_small: false, classified_from_kwh:
                 # 41.3", which is neither the verdict that governed the morning nor
                 # the number it was reached from. 14-Sep-2026 read exactly that way.
+                # v5.111.3: record the forecast the latch now in force was set
+                # from. The opening log line used to print the LIVE forecast beside
+                # the threshold, and on 20-09-2026 that read "today's forecast 40.5
+                # kWh is below the 40.0 kWh cap-saturation threshold" — a sentence a
+                # reader can see is false. The day had been classified small at 00:05
+                # on 39.9 kWh and the forecast had drifted up by the time the hold
+                # engaged at 08:00. Captured on the TRANSITION, where `still_small`
+                # was reached through `raw_kwh < max_kwh`, so "below the threshold" is
+                # true of this figure by construction rather than by luck.
+                if still_small and not was_small:
+                    store["bank_first_latched_small_kwh"]   = round(raw_kwh, 2)
+                    store["bank_first_latched_small_local"] = local_now.strftime("%H:%M")
                 if store.get("bank_first_first_class_kwh") is None:
                     store["bank_first_first_class_kwh"]   = round(raw_kwh, 2)
                     store["bank_first_first_class_small"] = still_small
@@ -5028,9 +5050,21 @@ class Plugin(indigo.PluginBase):
                 store["bank_first_logged_date"] = today_str
                 max_kwh = min(float(snapshot.solar_overflow_bank_first_max_kwh or 0.0),
                               SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
+                # v5.111.3: quote the forecast the day was CLASSIFIED on, not the
+                # one showing now — see the setter in _record_bank_first_metrics. A
+                # missing figure prints no figure: an absent number is a worse read
+                # than no number only when the reader cannot tell which they have.
+                latched_kwh   = store.get("bank_first_latched_small_kwh")
+                latched_local = str(store.get("bank_first_latched_small_local") or "")
+                if latched_kwh is None:
+                    fc_clause = "today's forecast is below the"
+                else:
+                    fc_clause = (f"today's forecast was {float(latched_kwh):.1f} kWh when "
+                                 f"the day was classified small"
+                                 f"{f' at {latched_local}' if latched_local else ''}, "
+                                 f"below the")
                 log(f"[Manager] Banking first — daytime export held until SOC reaches "
-                    f"{gate:.0f}%. SOC {soc_pct:.1f}%, today's forecast "
-                    f"{float(snapshot.raw_today_kwh or 0.0):.1f} kWh is below the "
+                    f"{gate:.0f}%. SOC {soc_pct:.1f}%, {fc_clause} "
                     f"{max_kwh:.1f} kWh cap-saturation threshold, so nothing is gained "
                     f"by selling early — the surplus is still there this afternoon.")
 
@@ -14542,6 +14576,11 @@ class Plugin(indigo.PluginBase):
             "bank_first_first_class_small":  self.store.get("bank_first_first_class_small"),
             "bank_first_first_class_local":  self.store.get("bank_first_first_class_local", ""),
             "bank_first_promoted_local":     self.store.get("bank_first_promoted_local", ""),
+            # v5.111.3, and listed here FIRST for the reason the paragraph above
+            # gives: without these two a restart loses the classified forecast and
+            # the opening line falls back to printing no figure at all.
+            "bank_first_latched_small_kwh":   self.store.get("bank_first_latched_small_kwh"),
+            "bank_first_latched_small_local": self.store.get("bank_first_latched_small_local", ""),
             # Storm state is NOT day-specific (a warning can span midnight) — persist it
             # so a restart during an active warning doesn't re-send the Pushover.
             "storm_alerted_level":       self.store.get("storm_alerted_level", "none"),
@@ -14772,6 +14811,8 @@ class Plugin(indigo.PluginBase):
                     ("bank_first_first_class_small", None),
                     ("bank_first_first_class_local", ""),
                     ("bank_first_promoted_local",    ""),
+                    ("bank_first_latched_small_kwh",   None),
+                    ("bank_first_latched_small_local", ""),
                     ("bank_first_latch_date",        ""),
                     ("bank_first_blocked_samples",   0),
                     ("bank_first_withheld_kwh",      0.0),

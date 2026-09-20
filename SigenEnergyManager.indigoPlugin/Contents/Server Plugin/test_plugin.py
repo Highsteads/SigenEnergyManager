@@ -4630,6 +4630,66 @@ class TestBankFirstMetrics(unittest.TestCase):
         self.assertFalse(st.store["bank_first_small_latched"])   # promoted, correctly
         self.assertTrue(st.store["bank_first_promoted_local"])   # and the time is kept
 
+    def test_the_latch_records_the_forecast_it_was_set_from(self):
+        """v5.111.3. The opening log line reads this, so it must be the figure the
+        latch in force was actually reached through."""
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=37.4))
+        self.assertAlmostEqual(st.store["bank_first_latched_small_kwh"], 37.4)
+        self.assertTrue(st.store["bank_first_latched_small_local"])
+
+        # A later wobble that does not clear the margin leaves the latch alone, so
+        # it must leave the figure behind the latch alone too.
+        st.latest_forecast_data["todayKwh"] = 40.7
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=40.7))
+        self.assertTrue(st.store["bank_first_small_latched"])
+        self.assertAlmostEqual(st.store["bank_first_latched_small_kwh"], 37.4,
+                               msg="a wobble restamped the figure the hold rests on")
+
+    def test_a_demotion_restamps_the_figure_the_hold_rests_on(self):
+        """Why this is not the first classification of the day. A day that opens BIG
+        and is demoted has a first-classification figure ABOVE the threshold — print
+        that beside "below the threshold" and the sentence is false in the other
+        direction. The transition is what the hold rests on."""
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 41.0,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=41.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+        self.assertIsNone(st.store["bank_first_latched_small_kwh"],
+                          "a big day has no small latch to describe")
+
+        st.latest_forecast_data["todayKwh"] = 39.9
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=39.9))
+        self.assertTrue(st.store["bank_first_small_latched"])
+        self.assertAlmostEqual(st.store["bank_first_latched_small_kwh"], 39.9)
+        self.assertAlmostEqual(st.store["bank_first_first_class_kwh"], 41.0,
+                               msg="the day's first verdict is a separate record")
+
+    def test_a_day_that_goes_small_big_then_small_again_follows_the_latest_latch(self):
+        """The case that separates this field from the day's first classification.
+
+        Found by mutating the setter to stamp once a day: the demotion test alone
+        could not tell the two apart, because the day it uses opens big and so has
+        no earlier small latch to keep. Small at 37.4, promoted at 46.0, demoted
+        again at 39.9 — the hold now in force was reached through 39.9, and a line
+        quoting 37.4 describes a hold that ended hours earlier.
+        """
+        st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
+                                  "forecastDate": "2026-08-31"})
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=37.4))
+        self.assertAlmostEqual(st.store["bank_first_latched_small_kwh"], 37.4)
+
+        st.latest_forecast_data["todayKwh"] = 46.0          # a genuine revision
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=46.0))
+        self.assertFalse(st.store["bank_first_small_latched"])
+
+        st.latest_forecast_data["todayKwh"] = 39.9          # and back down
+        self._record(st, self._decision(), self._Snap(raw_today_kwh=39.9))
+        self.assertTrue(st.store["bank_first_small_latched"])
+        self.assertAlmostEqual(st.store["bank_first_latched_small_kwh"], 39.9,
+                               msg="the line would describe a hold that already ended")
+
     def test_a_day_never_promoted_records_no_promotion_time(self):
         st = self._stub(forecast={"forecastStatus": "OK", "todayKwh": 37.4,
                                   "forecastDate": "2026-08-31"})
@@ -4904,6 +4964,72 @@ class TestBankFirstLogging(unittest.TestCase):
             plugin.Plugin._log_bank_first(
                 stub, self._decision(holding, state=state), self._Snap(), soc)
         return [c.args[0] for c in logged.call_args_list]
+
+    # ── the opening line must quote the figure that DECIDED the day ────────
+    @staticmethod
+    def _quoted_figures(line):
+        """Pull (forecast, threshold) out of the opening sentence.
+
+        Read back from the rendered line rather than from the store, because the
+        fault of 20-09-2026 was entirely in the rendering — every stored value
+        involved was correct.
+        """
+        import re as _re
+        fc = _re.search(r"forecast was ([\d.]+) kWh", line)
+        th = _re.search(r"([\d.]+) kWh cap-saturation threshold", line)
+        return (float(fc.group(1)) if fc else None,
+                float(th.group(1)) if th else None)
+
+    def test_the_opening_line_quotes_the_forecast_the_day_was_classified_on(self):
+        """Live on 20-09-2026 this line read "today's forecast 40.5 kWh is below the
+        40.0 kWh cap-saturation threshold" — a sentence a reader can see is false.
+        The day was classified small at 00:05 on 39.9 kWh; the forecast had drifted
+        up by the time the hold engaged at 08:00, and the line printed the drifted
+        one against the verdict the old one had reached."""
+        st = self._stub(store={"bank_first_latched_small_kwh":   39.9,
+                               "bank_first_latched_small_local": "00:05"})
+        snap = self._Snap()
+        snap.raw_today_kwh = 40.5              # the live forecast, now above the gate
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first(st, self._decision(True), snap, 34.6)
+        line = logged.call_args_list[0].args[0]
+
+        self.assertIn("39.9 kWh", line)
+        self.assertNotIn("40.5", line, "the live forecast is not what decided anything")
+        self.assertIn("00:05", line, "a figure without its time cannot be checked")
+
+    def test_the_opening_line_never_states_a_falsehood_about_the_threshold(self):
+        """The property, not the wording: whatever figure the sentence quotes must
+        actually be below the threshold the same sentence quotes. This is what the
+        20-09-2026 line failed, and it fails for any future rewording too."""
+        st = self._stub(store={"bank_first_latched_small_kwh":   39.9,
+                               "bank_first_latched_small_local": "00:05"})
+        snap = self._Snap()
+        snap.raw_today_kwh = 40.5
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first(st, self._decision(True), snap, 34.6)
+        forecast, threshold = self._quoted_figures(logged.call_args_list[0].args[0])
+
+        self.assertIsNotNone(threshold, "the line stopped naming its threshold")
+        self.assertIsNotNone(forecast, "the line stopped naming a forecast")
+        self.assertLess(forecast, threshold,
+                        "the line claims a forecast is below a threshold it exceeds")
+
+    def test_a_missing_classified_forecast_prints_no_figure_rather_than_a_wrong_one(self):
+        """An accumulators file written before v5.111.3 restores a latch with no
+        figure behind it. No number is a poorer line; a number that was never the
+        one consulted is a false one."""
+        st = self._stub()
+        snap = self._Snap()
+        snap.raw_today_kwh = 40.5
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first(st, self._decision(True), snap, 34.6)
+        line = logged.call_args_list[0].args[0]
+
+        self.assertIn("Banking first", line)
+        self.assertIn("cap-saturation threshold", line)
+        self.assertNotIn("40.5", line)
+        self.assertIsNone(self._quoted_figures(line)[0])
 
     def test_the_hold_is_logged_once_per_day(self):
         st = self._stub()
