@@ -7727,5 +7727,55 @@ class TestUpcomingSessionsForDisplay(unittest.TestCase):
         self.assertEqual(stub.store["saving_sessions_upcoming"], [])
 
 
+class TestPreChargeNeverStopsARunningExport(unittest.TestCase):
+    """21-Sep-2026 18:01:32 live: the pre-charge "stop charging" step wrote Self
+    Consumption over a Saving Session export (mode 0x05), because it only knew
+    Axle's old ESS-first 0x06. Verify put the export back 37 s later."""
+
+    def _p(self, mode, **store):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.modbus = MagicMock()
+        p.modbus.read_ems_mode.return_value = mode
+        p.store  = {"vpp_state": plugin.VPP_PRE_CHARGING, "vpp_pre_charge_soc": 60.0,
+                    "vpp_charge_stopped": False, "grid_export_daily_kwh": 0.0,
+                    "export_active": False, "saving_session_export_active": False}
+        p.store.update(store)
+        p.latest_inverter_data = {"batterySoc": 86.7}
+        for name in ("_vpp_transition", "_trigger_event", "_write_vpp_event_header",
+                     "_update_vpp_device", "_start_vpp_precharge", "_end_vpp_export",
+                     "_log_vpp_snapshot", "_set_vpp_discharge_cutoff",
+                     "_restore_discharge_cutoff"):
+            setattr(p, name, MagicMock())
+        p._event_is_daytime = MagicMock(return_value=True)
+        start = datetime.now(timezone.utc) + timedelta(minutes=28)
+        self.event = {"start_time": start, "end_time": start + timedelta(hours=1),
+                      "import_export": "export", "duration_hrs": 1.0}
+        return p
+
+    def test_pv_first_export_is_left_alone(self):
+        p = self._p(0x05)
+        p._apply_vpp_event(self.event)
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertTrue(p.store["vpp_charge_stopped"])
+
+    def test_ess_first_export_is_left_alone(self):
+        p = self._p(0x06)
+        p._apply_vpp_event(self.event)
+        p.modbus.set_self_consumption.assert_not_called()
+
+    def test_a_session_export_flag_protects_it_when_the_read_fails(self):
+        p = self._p(None, saving_session_export_active=True)
+        p._apply_vpp_event(self.event)
+        p.modbus.set_self_consumption.assert_not_called()
+
+    def test_a_charging_inverter_is_still_stopped(self):
+        """Control: the step still does its job when nothing is exporting."""
+        p = self._p(0x02)
+        p._apply_vpp_event(self.event)
+        p.modbus.set_self_consumption.assert_called_once()
+        self.assertTrue(p.store["vpp_charge_stopped"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

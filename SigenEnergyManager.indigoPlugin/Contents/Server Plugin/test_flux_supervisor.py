@@ -2464,5 +2464,53 @@ class TestTariffSidesPayload(unittest.TestCase):
         self.assertEqual(out["export_side"]["tiers"], [])
 
 
+class TestBackupReserveMoveIsNotDrift(unittest.TestCase):
+    """21-Sep-2026: pre-charge wrote 25.7% at 18:00:56, a Saving Session began at
+    18:01:13, and verify's correct move to 20% was logged as a WARNING about drift."""
+
+    def _verify(self, actual, written):
+        p = _mk_plugin()
+        p.store["export_active"] = False
+        p.store["import_active"] = False
+        p.modbus.read_backup_soc = lambda: actual
+        if written is not None:
+            p.store["backup_reserve_written"] = written
+        lines = []
+        real = plugin.log
+        plugin.log = lambda msg, level="INFO", **kw: lines.append((level, msg))
+        try:
+            p._verify_ems_registers()
+        finally:
+            plugin.log = real
+        reserve = [(lv, m) for lv, m in lines if "Backup reserve" in m]
+        return p, reserve
+
+    def test_our_own_earlier_value_moves_quietly(self):
+        p, lines = self._verify(25.7, 25.7)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0][0], "INFO")
+        self.assertIn(("backup_soc", p._policy_discharge_floor_pct()), p.modbus.writes)
+
+    def test_a_value_we_did_not_write_still_warns(self):
+        _, lines = self._verify(25.7, 30.0)
+        self.assertEqual(lines[0][0], "WARNING")
+
+    def test_nothing_written_since_start_still_warns(self):
+        _, lines = self._verify(25.7, None)
+        self.assertEqual(lines[0][0], "WARNING")
+
+    def test_the_correction_is_remembered(self):
+        p, _ = self._verify(25.7, None)
+        self.assertEqual(p.store["backup_reserve_written"],
+                         round(p._policy_discharge_floor_pct(), 1))
+
+    def test_the_flux_driver_reports_what_it_wrote(self):
+        seen = []
+        d = plugin._FluxRawDriver(_FakeModbus(), {"inverterMaxKw": "10"},
+                                  on_backup_written=seen.append)
+        self.assertTrue(d.set_discharge_cutoff(37.6))
+        self.assertEqual(seen, [37.6])
+
+
 if __name__ == "__main__":
     unittest.main()

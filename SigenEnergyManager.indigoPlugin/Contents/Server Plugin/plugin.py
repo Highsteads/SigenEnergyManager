@@ -26,8 +26,9 @@
 #              Claude Opus 5 (5.111.4 — the data directory refuses a path that is not one)
 #              Claude Opus 5 (5.111.5 — a Plugin Store icon, at last)
 #              Claude Opus 5 (5.111.6 — the Flux peak starts at 16:00, not 16:05)
+#              Claude Opus 5 (5.111.7 — pre-charge never stops a running export; reserve moves are not drift)
 # Date:        21-09-2026
-# Version:     5.111.6
+# Version:     5.111.7
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -379,6 +380,9 @@ FLUX_RECLAIM_TICKS         = 3
 # Stamping the stand-down while it held the inverter cost the first five minutes
 # of every peak (live 17-Sep and 21-Sep-2026: export started ~16:05).
 FLUX_OWNER_PRE_PEAK_OVERFLOW = "solar overflow is running"
+# The Remote EMS modes that discharge to the grid: 0x05 PV-first, 0x06 ESS-first.
+# Either means the battery is not charging.
+_VPP_EXPORT_MODES = (0x05, 0x06)
 # There is deliberately no give-up timeout for an unconfirmed claim. An earlier
 # draft had one; it worked by telling the executor an external supervisor had
 # taken over, which is a lie when nothing has. See _flux_note_pending.
@@ -1387,9 +1391,12 @@ class _FluxRawDriver:
     a driver that returns a truthy non-bool would be read as a failed write.
     """
 
-    def __init__(self, modbus, prefs):
+    def __init__(self, modbus, prefs, on_backup_written=None):
         self._modbus = modbus
         self._prefs  = prefs
+        # Told of every backup-reserve value that lands, so the verify pass can
+        # tell a policy move from a register something else changed.
+        self._on_backup_written = on_backup_written
 
     @property
     def inverter_max_w(self):
@@ -1412,7 +1419,10 @@ class _FluxRawDriver:
         # hardware watchdog, so whatever floor Flux last wrote survives a lost
         # connection — on 40048 that would lock the house out of its own battery
         # in a power cut that followed; on 40046 the battery stays fully usable.
-        return bool(self._modbus.set_backup_soc(float(pct)))
+        ok = bool(self._modbus.set_backup_soc(float(pct)))
+        if ok and self._on_backup_written is not None:
+            self._on_backup_written(float(pct))
+        return ok
 
     def set_remote_ems_mode(self, mode):
         return bool(self._modbus.set_remote_ems_mode(int(mode)))
@@ -6962,9 +6972,21 @@ class Plugin(indigo.PluginBase):
             expected_backup = self._policy_discharge_floor_pct()
             actual_backup   = self.modbus.read_backup_soc()
             if actual_backup is not None and abs(actual_backup - expected_backup) > 0.5:
-                log(f"[Verify] Backup reserve mismatch: inverter={actual_backup:.1f}% "
-                    f"expected={expected_backup:.1f}% — correcting", level="WARNING")
-                self.modbus.set_backup_soc(expected_backup)
+                # TWO DIFFERENT EVENTS LOOK THE SAME HERE. If the register still
+                # holds what THIS plugin last wrote, nothing drifted: the policy
+                # moved (a dispatch began, so its own energy stopped being held
+                # back) and this is the planned follow-up — live 21-Sep-2026 the
+                # Axle pre-charge wrote 25.7% at 18:00:56, the Saving Session
+                # began at 18:01:13, and the correct floor became 20%. Only a value
+                # the plugin did NOT write is drift worth a warning.
+                if self._backup_is_our_own(actual_backup):
+                    log(f"[Verify] Backup reserve {actual_backup:.1f}% -> "
+                        f"{expected_backup:.1f}%: the energy held back for grid "
+                        f"events has changed.")
+                else:
+                    log(f"[Verify] Backup reserve mismatch: inverter={actual_backup:.1f}% "
+                        f"expected={expected_backup:.1f}% — correcting", level="WARNING")
+                self._set_backup_reserve(expected_backup)
 
         # --- Whole-site grid import cap (registers 40040-41) ---
         # Asserted only once the site limit is verified. Enforced by the inverter at
@@ -8620,17 +8642,25 @@ class Plugin(indigo.PluginBase):
             soc_ready          = current_soc >= required_soc
 
             # Step 1: stop charging once SOC target is reached (fire once only).
-            # Guard against fighting Axle: if 40031 already reads 0x06
-            # (Discharge ESS first) then Axle is mid-dispatch and we must
-            # not overwrite it with 0x02. Battery is already not charging
-            # in that case, so the "stop charging" intent is satisfied.
+            # NEVER BY STOPPING AN EXPORT. The guard used to be `mode == 0x06`
+            # alone, from when Axle's cloud drove the dispatch and always used
+            # ESS-first. Since the plugin self-drives (5.28) a daylight export is
+            # 0x05, and a Saving Session or Flux peak running into the pre-charge
+            # half-hour uses the same driver — live 21-Sep-2026 18:01:32 this line
+            # wrote Self Consumption over a Saving Session export and the verify
+            # pass put it back 37 s later. Either discharge mode already means
+            # "not charging", so the intent is met and nothing is written.
             if soc_ready and not charge_stopped:
                 cur_mode = self.modbus.read_ems_mode() if self.modbus else None
-                if cur_mode == 0x06:
+                exporting = (cur_mode in _VPP_EXPORT_MODES
+                             or bool(self.store.get("export_active"))
+                             or bool(self.store.get("saving_session_export_active")))
+                if exporting:
                     self.store["vpp_charge_stopped"] = True
                     vpp_log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
-                        f"{required_soc:.0f}% target. Axle already dispatching "
-                        f"(40031=0x06) — leaving inverter under Axle control.")
+                        f"{required_soc:.0f}% target. An export is already running "
+                        f"(mode {cur_mode if cur_mode is None else hex(cur_mode)}) — "
+                        f"leaving it alone; the battery is not charging.")
                 elif self.modbus:
                     self.modbus.set_self_consumption()
                     self.store["vpp_charge_stopped"] = True
@@ -9294,7 +9324,7 @@ class Plugin(indigo.PluginBase):
         if self.modbus:
             self.modbus.set_discharge_cutoff(floor_pct)
             if self._owns_backup_reserve():
-                self.modbus.set_backup_soc(
+                self._set_backup_reserve(
                     self._policy_discharge_floor_pct(dispatch_event=event))
             self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
             vpp_log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
@@ -11752,9 +11782,33 @@ class Plugin(indigo.PluginBase):
         cutoff = self._absolute_cutoff_pct()
         self.modbus.set_discharge_cutoff(cutoff)
         if self._owns_backup_reserve():
-            self.modbus.set_backup_soc(
+            self._set_backup_reserve(
                 self._policy_discharge_floor_pct(dispatch_event=dispatch_event))
         return cutoff
+
+    # ---- backup reserve (40046): one writer, and a memory of what it wrote ----
+
+    def _note_backup_written(self, pct):
+        self.store["backup_reserve_written"] = round(float(pct), 1)
+
+    def _set_backup_reserve(self, pct):
+        """Write 40046 and remember the value, so verify can tell our own
+        earlier write from a register that something else changed."""
+        ok = bool(self.modbus.set_backup_soc(pct))
+        if ok:
+            self._note_backup_written(pct)
+        return ok
+
+    def _backup_is_our_own(self, actual_pct):
+        """True when the register holds the value this plugin last wrote.
+
+        Unknown (nothing written since start) is NOT ours: a restart must not
+        turn a real drift into a quiet line.
+        """
+        written = self.store.get("backup_reserve_written")
+        if written is None:
+            return False
+        return abs(float(actual_pct) - float(written)) <= 0.5
 
     def _grid_outage_active(self):
         """True only during a FRESH, VERIFIED grid outage. Two sources must agree.
@@ -11908,7 +11962,8 @@ class Plugin(indigo.PluginBase):
         if ex is None or self.modbus is None or not FLUX_AVAILABLE:
             return
         try:
-            adapter = _FluxRawDriver(self.modbus, self.pluginPrefs)
+            adapter = _FluxRawDriver(self.modbus, self.pluginPrefs,
+                                    on_backup_written=self._note_backup_written)
             # Prove the adapter answers before handing it over. The constructor
             # only stores two references, so a broken one fails at the first
             # WRITE otherwise — which is the worst moment to find out.
@@ -11935,7 +11990,8 @@ class Plugin(indigo.PluginBase):
                 return None
             try:
                 self.flux_executor = _FluxExecutor(
-                    _FluxRawDriver(self.modbus, self.pluginPrefs),
+                    _FluxRawDriver(self.modbus, self.pluginPrefs,
+                                    on_backup_written=self._note_backup_written),
                     self._flux_journal_path(),
                     **self._flux_baseline())
                 log("[Flux] Supervisor armed. It takes control only inside the Flux "

@@ -15,7 +15,42 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
-## v5.111.6 — 21-09-2026
+## v5.111.7 — 21-09-2026
+
+**Two faults at the 18:00 hand-over, found reviewing the first evening with a Flux peak, an
+Axle event (18:30-19:30) and a Saving Session (18:00-19:00) together.**
+
+### Pre-charge no longer stops a running export
+
+- **Live 21-Sep-2026:** the Axle pre-charge began at 18:00:24 and pre-empted Flux; the Saving
+  Session drove a 0x05 export from 18:01:13; at 18:01:32 pre-charge Step 1 ("stop charging once
+  SOC target is reached") read 0x05 and wrote Self Consumption over it. The verify pass logged
+  `VPP export mode drift` and re-asserted 0x05 at 18:02:09 — 37 s lost, ~0.04 kWh.
+- **Cause:** Step 1's guard was `cur_mode == 0x06`, written when Axle's cloud drove every
+  dispatch ESS-first. Since self-drive (5.28) daylight export is 0x05, and Flux and Saving
+  Sessions use the same driver.
+- **Fix:** new `_VPP_EXPORT_MODES = (0x05, 0x06)`. Step 1 stands aside when the mode is either,
+  or `export_active` / `saving_session_export_active` is set (covers a failed mode read). A
+  discharge mode already means "not charging", so the step's intent is met with no write.
+
+### A reserve the plugin moved itself is not drift
+
+- **Live:** pre-charge wrote the backup reserve (40046) at 25.7% at 18:00:56, which excluded the
+  Axle event's own energy but still held the Saving Session's. The session began dispatching at
+  18:01:13, so its energy stopped being reserved too, and the right floor became 20%. Verify
+  corrected it correctly, but logged `Backup reserve mismatch` at WARNING.
+- **Fix:** every 40046 write now goes through `_set_backup_reserve` (or, for the Flux executor,
+  `_FluxRawDriver(on_backup_written=)`), which records the value in
+  `store["backup_reserve_written"]`. Verify logs an INFO line when the register still holds the
+  plugin's own last value, and the WARNING only when it holds something else. Nothing written
+  since start counts as NOT ours, so a restart cannot quieten real drift. The correction itself is
+  unchanged.
+- `sigenergy_modbus.py` is untouched, so the SigenVPP copy stays byte-identical.
+
+Tests: `TestPreChargeNeverStopsARunningExport` (4) and `TestBackupReserveMoveIsNotDrift` (5);
+5/5 mutations killed.
+
+ — 21-09-2026
 
 **The Flux peak is claimed at 16:00, not 16:05.**
 
