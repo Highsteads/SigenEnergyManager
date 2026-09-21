@@ -25,8 +25,9 @@
 #              Claude Opus 5 (5.111.3 — the bank-first line quotes the forecast it was actually classified on)
 #              Claude Opus 5 (5.111.4 — the data directory refuses a path that is not one)
 #              Claude Opus 5 (5.111.5 — a Plugin Store icon, at last)
-# Date:        20-09-2026
-# Version:     5.111.5
+#              Claude Opus 5 (5.111.6 — the Flux peak starts at 16:00, not 16:05)
+# Date:        21-09-2026
+# Version:     5.111.6
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -372,6 +373,12 @@ FLUX_OBSERVATION_LEASE_S   = _FLUX_MAX_OBSERVATION_AGE_S
 FLUX_ACCOUNT_EVIDENCE_MAX_AGE_S = 6 * 3600
 FLUX_PREEMPT_COOLDOWN_S    = 300
 FLUX_RECLAIM_TICKS         = 3
+# The one owner whose tenure ENDS ON THE CLOCK. Solar overflow outranks Flux
+# only outside the 16:00-19:00 peak (see _flux_other_owner), so its hand-over at
+# 16:00 is scheduled, not a pre-emption, and it cannot come back until 19:00.
+# Stamping the stand-down while it held the inverter cost the first five minutes
+# of every peak (live 17-Sep and 21-Sep-2026: export started ~16:05).
+FLUX_OWNER_PRE_PEAK_OVERFLOW = "solar overflow is running"
 # There is deliberately no give-up timeout for an unconfirmed claim. An earlier
 # draft had one; it worked by telling the executor an external supervisor had
 # taken over, which is a lie when nothing has. See _flux_note_pending.
@@ -11988,7 +11995,7 @@ class Plugin(indigo.PluginBase):
             # 16:00 peak, silently, with the battery at 96%). The Flux export mode
             # sends PV first anyway, so standing overflow down in the peak loses
             # nothing and lets the battery's spare energy sell at the peak price.
-            return "solar overflow is running"
+            return FLUX_OWNER_PRE_PEAK_OVERFLOW
         if self.store.get("flood_prev_target_soc"):
             return "flood prevention is holding a discharge floor"
         if self._power_cut_window_active():
@@ -12976,11 +12983,18 @@ class Plugin(indigo.PluginBase):
             # failure the ordered pre-emption exists to prevent. So the claim is
             # given up with no writes at all, and the new owner plus the
             # manager's verify pass settle the registers.
-            self.store["flux_clear_ticks"]  = 0
+            if owner == FLUX_OWNER_PRE_PEAK_OVERFLOW:
+                # A stand-aside that ends on the clock is not a pre-emption: no
+                # stand-down, and its ticks count as clear, so the peak is
+                # claimed on the first tick after 16:00 rather than at 16:05.
+                self.store["flux_clear_ticks"] = int(
+                    self.store.get("flux_clear_ticks") or 0) + 1
+            else:
+                self.store["flux_clear_ticks"]  = 0
+                self.store["flux_preempted_at"] = time.time()
             self.store["flux_last_result"]  = ex.step(
                 None, datetime.now(timezone.utc),
                 supervisor_owns=True, communications_ok=comms)
-            self.store["flux_preempted_at"] = time.time()
             self.store["flux_applied_key"]  = None
             self.store["flux_status"] = f"standing down — {owner}"
             return

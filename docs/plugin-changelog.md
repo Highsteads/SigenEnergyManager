@@ -15,7 +15,29 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
-## v5.111.5 — 20-09-2026
+## v5.111.6 — 21-09-2026
+
+**The Flux peak is claimed at 16:00, not 16:05.**
+
+Live 21-Sep-2026: the Flux supervisor logged "No longer standing aside (solar overflow is
+running has ended)" and its export plan at 16:00:06, but the inverter stayed in Max Self
+Consumption, charging, until about 16:05. The same five minutes were lost on 17-Sep, when the
+fix that stopped overflow counting as an owner INSIDE the peak (5.109.5) left this half alone.
+
+- **Cause:** the owner branch of `_flux_supervisor_step` stamped `flux_preempted_at` and zeroed
+  `flux_clear_ticks` on EVERY tick an owner held the inverter. Solar overflow is an owner until
+  15:59:59, so the stamp was seconds old at 16:00 and `_flux_may_claim` waited out the full
+  `FLUX_PREEMPT_COOLDOWN_S` (300 s).
+- **Fix:** new `FLUX_OWNER_PRE_PEAK_OVERFLOW` names the one owner whose tenure ends on the clock.
+  Its ticks neither stamp the stand-down nor reset the clear count; they count as clear. Every
+  other owner behaves exactly as before.
+- **No flap risk:** `_flux_other_owner` only returns the overflow owner outside the peak, and the
+  strategy never claims outside a window, so the waiver can only ever apply at the 16:00 edge.
+  Overflow cannot become an owner again until 19:00.
+- `TestPeakClaimedAtFourNotFive`, 3 tests. Two fail with the fix disabled; the third checks a
+  real owner (`export_active`) still starts the stand-down.
+
+ — 20-09-2026
 
 **`Contents/Resources/icon.png`, which this plugin had never had.**
 

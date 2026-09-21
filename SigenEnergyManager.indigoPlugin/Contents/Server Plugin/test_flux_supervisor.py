@@ -1423,6 +1423,39 @@ class TestSupervisorStep(_FluxCase):
         self.assertNotEqual(p.store["flux_manual_preempt"], "")
 
 
+class TestPeakClaimedAtFourNotFive(_FluxCase):
+    """21-Sep-2026 live: overflow held the inverter until 16:00, every one of its
+    ticks restarted the five-minute stand-down, and export began at ~16:05."""
+
+    def _overflow_until_four(self, soc=95.0):
+        p, when = self._at((15, 59), soc=soc, solar_overflow_active=True,
+                           flux_preempted_at=0.0, flux_clear_ticks=0)
+        for _ in range(plugin.FLUX_RECLAIM_TICKS):   # overflow held it for a while
+            self._run(p, when)
+        self.assertEqual(p.store["flux_owner_reason"],
+                         plugin.FLUX_OWNER_PRE_PEAK_OVERFLOW)
+        self.assertEqual(p.flux_executor.targets(), [])
+        return p, when
+
+    def test_overflow_standing_aside_does_not_start_the_stand_down(self):
+        p, _ = self._overflow_until_four()
+        self.assertEqual(p.store["flux_preempted_at"], 0.0)
+
+    def test_the_peak_is_claimed_on_the_first_tick_after_four(self):
+        p, when = self._overflow_until_four()
+        four = when.replace(hour=16, minute=0, second=5)
+        self._run(p, four, at=four)
+        self.assertEqual(p.store["flux_owner_reason"], "")
+        self.assertEqual(len(p.flux_executor.targets()), 1)
+
+    def test_a_real_owner_still_starts_the_stand_down(self):
+        p, when = self._at((15, 59), soc=95.0, export_active=True,
+                           flux_preempted_at=0.0, flux_clear_ticks=5)
+        self._run(p, when)
+        self.assertGreater(p.store["flux_preempted_at"], 0.0)
+        self.assertEqual(p.store["flux_clear_ticks"], 0)
+
+
 class TestPendingClaim(_FluxCase):
     """review 4: no arbitrary timeout may pretend somebody else took over."""
 
