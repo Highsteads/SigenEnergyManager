@@ -29,8 +29,9 @@
 #              Claude Opus 5 (5.111.7 — pre-charge never stops a running export; reserve moves are not drift)
 #              Claude Opus 5.5 (5.111.8 — /api/status never queues behind a battery command)
 #              Claude Opus 5.5 (5.112.0 — Weekend Happy Hours booked for you; the overnight charge leaves room)
+#              Claude Opus 5.5 (5.112.1 — the plugin trusts its own bookings; a later second hour is counted)
 # Date:        22-09-2026
-# Version:     5.112.0
+# Version:     5.112.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1646,6 +1647,7 @@ class Plugin(indigo.PluginBase):
         # v5.112.0 booking. All three persisted (see _save_accumulators_locked).
         self.store["happy_hour_notes_sent"]     = []     # "kind:day[:codes]" keys, never prose
         self.store["happy_hour_book_refused"]   = []     # slot codes Octopus would not book
+        self.store["happy_hour_booked_codes"]   = []     # slot codes THIS plugin booked (5.112.1)
         self.store["happy_hour_used"]           = {}     # {"day", "spans", "kwh"} for the result note
         self.store["happy_hour_book_warned"]    = ""     # warn-once day for "import is off"
 
@@ -6172,6 +6174,11 @@ class Plugin(indigo.PluginBase):
                         for event, s in pairs:
                             if s is slot:
                                 event["joined"] = True
+                        codes = [str(x) for x in
+                                 (self.store.get("happy_hour_booked_codes") or [])]
+                        if slot.code not in codes:
+                            self.store["happy_hour_booked_codes"] = (codes + [slot.code])[-200:]
+                            self._save_accumulators()
                         log(f"[HappyHour] Booked {slot.code}: "
                             f"{_hh_booking.span_words([slot], tz)} on {day:%A %d %B}"
                             + (" (already booked)" if result.get("already") else ""))
@@ -6213,6 +6220,21 @@ class Plugin(indigo.PluginBase):
         if refused != refused_before:
             self.store["happy_hour_book_refused"] = list(refused)[-200:]
             self._save_accumulators()
+
+    def _apply_local_happy_hour_bookings(self, data):
+        """Mark as booked every Happy Hour slot this plugin booked itself (5.112.1).
+
+        The booking mutation answers with the booked event, so a code in
+        `happy_hour_booked_codes` is a fact the plugin holds on the API's own
+        word — not a guess — and it outranks a feed that has not caught up.
+        """
+        codes = {str(x) for x in (self.store.get("happy_hour_booked_codes") or [])}
+        if not codes:
+            return
+        for e in (data or {}).get("events") or []:
+            if (e.get("direction") == SAVING_SESSION_HAPPY_HOUR
+                    and str(e.get("code") or "") in codes):
+                e["joined"] = True
 
     def _mark_happy_hour_note_sent(self, key):
         """Record a note key. True if it was new. Keys are structured (kind, day,
@@ -6387,7 +6409,15 @@ class Plugin(indigo.PluginBase):
         # place: a booking flips `joined` on the event, and the window cache
         # below admits booked slots only. Isolated so a fault in the booking
         # check can never cost the poll its alerts or its window cache.
+        #
+        # First (5.112.1): a slot this plugin booked IS booked, whatever the
+        # feed says this poll. Octopus's own list may lag the booking, and read
+        # as unbooked it would both drop the slot from the window cache — no free
+        # import — and invite a second booking of the same Sunday. Inside the
+        # guard, so that if it ever fails the booking step is skipped with it,
+        # which is the safe way round.
         try:
+            self._apply_local_happy_hour_bookings(data)
             self._auto_book_happy_hours(data, now_utc)
             self._happy_hour_morning_note(data, now_utc)
         except Exception:                                           # noqa: BLE001
@@ -15176,6 +15206,8 @@ class Plugin(indigo.PluginBase):
                 list(self.store.get("happy_hour_notes_sent") or [])[-200:],
             "happy_hour_book_refused":
                 list(self.store.get("happy_hour_book_refused") or [])[-200:],
+            "happy_hour_booked_codes":
+                list(self.store.get("happy_hour_booked_codes") or [])[-200:],
             "happy_hour_used":           self.store.get("happy_hour_used") or {},
             # Restart-critical control state. These also live in pluginPrefs,
             # but runtime pref writes only reach .indiPref on a GRACEFUL
@@ -15246,7 +15278,8 @@ class Plugin(indigo.PluginBase):
             if data.get("saving_sessions_not_our_region"):
                 self.store["saving_sessions_not_our_region"] = \
                     list(data["saving_sessions_not_our_region"])[-200:]
-            for _k in ("happy_hour_notes_sent", "happy_hour_book_refused"):
+            for _k in ("happy_hour_notes_sent", "happy_hour_book_refused",
+                       "happy_hour_booked_codes"):
                 if data.get(_k):
                     self.store[_k] = [str(x) for x in list(data[_k])[-200:]]
             if isinstance(data.get("happy_hour_used"), dict):

@@ -267,6 +267,16 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         self.assertIn("One free hour is booked", body)
         self.assertIn("leaving one, not enough for another hour.", body)
 
+    def test_a_second_hour_added_later_counts_the_whole_day(self):
+        """The span covers both hours, so the sentence must too. The first draft
+        read 'One free hour is booked for Sunday, from 1pm to 3pm'."""
+        p = _plan(pv_kwh=8.0, slots=_slots(booked=(14,)), tokens=5)
+        title, body = hb.booked_message(p, LONDON, self.TODAY, SCHEME_END)
+        self._check(title, body)
+        self.assertIn("Two free hours are booked for Sunday 27 September, from 1pm to 3pm.", body)
+        self.assertIn("just added one more hour to the one already booked.", body)
+        self.assertIn("spends two of your five tokens, leaving three", body)
+
     def test_a_forced_booking_says_why(self):
         last = date(2026, 10, 25)
         now  = datetime(2026, 10, 22, 14, 0, tzinfo=LONDON).astimezone(timezone.utc)

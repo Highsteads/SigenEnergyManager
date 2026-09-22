@@ -2448,6 +2448,7 @@ class TestCheckSavingSessions(unittest.TestCase):
         _auto_book_happy_hours    = plugin.Plugin._auto_book_happy_hours
         _happy_hour_morning_note  = plugin.Plugin._happy_hour_morning_note
         _happy_hour_slots_by_day  = plugin.Plugin._happy_hour_slots_by_day
+        _apply_local_happy_hour_bookings = plugin.Plugin._apply_local_happy_hour_bookings
         # staticmethod() is required: aliasing a @staticmethod as a bare class
         # attribute rebinds it as an INSTANCE method, so the stub arrives as the
         # first positional argument. It fails as a TypeError on a date compare,
@@ -7653,6 +7654,13 @@ class TestUpcomingSessionsForDisplay(unittest.TestCase):
 
         _auto_join_saving_sessions = plugin.Plugin._auto_join_saving_sessions
         _saving_session_for_us = plugin.Plugin._saving_session_for_us
+        # v5.112.x: the poll's Happy Hour steps, real and inert with their
+        # checkboxes absent — so these tests run the path production runs
+        # rather than falling into its error guard.
+        _apply_local_happy_hour_bookings = plugin.Plugin._apply_local_happy_hour_bookings
+        _auto_book_happy_hours    = plugin.Plugin._auto_book_happy_hours
+        _happy_hour_morning_note  = plugin.Plugin._happy_hour_morning_note
+        _happy_hour_slots_by_day  = plugin.Plugin._happy_hour_slots_by_day
 
     def _event(self, direction="TURN_DOWN", joined=True, hours=6, event_id="1",
                points=72, capacity=None):

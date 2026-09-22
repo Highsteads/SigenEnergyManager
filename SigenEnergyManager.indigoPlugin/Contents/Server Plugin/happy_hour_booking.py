@@ -336,13 +336,19 @@ def _kwh(x):
 def booked_message(plan, tz, today, scheme_end):
     """(title, body) for slots the plugin has just booked."""
     slots   = tuple(plan.booked) + tuple(plan.book)
-    hours   = len(plan.book)
+    hours   = len(plan.book)            # booked NOW, and what the tokens paid for
+    total   = len(slots)                # everything booked for the day
     when    = day_words(plan.day, today)
     title   = (f"Free electricity booked for {when}" if when in ("today", "tomorrow")
                else f"Free electricity booked for {plan.day:%A}")
-    parts = [f"{_cap(_plural(hours, 'free hour'))} "
-             f"{'is' if hours == 1 else 'are'} booked for {when}, "
+    # The sentence counts the DAY, because the span beside it covers the day: a
+    # second hour added later once read "One free hour is booked, from 1pm to 3pm".
+    parts = [f"{_cap(_plural(total, 'free hour'))} "
+             f"{'is' if total == 1 else 'are'} booked for {when}, "
              f"{span_words(slots, tz)}."]
+    if plan.booked:
+        parts.append(f"The plugin has just added {_plural(hours, 'more hour')} to the "
+                     f"{number_words(len(plan.booked))} already booked.")
     parts.append("The battery will fill itself from the grid for nothing then, and the "
                  "overnight top-up that morning will be smaller to leave room for it.")
     if plan.pv_day_kwh is not None and plan.useful_kwh is not None:

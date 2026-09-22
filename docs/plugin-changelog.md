@@ -15,6 +15,22 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.1 — 22-09-2026
+
+**The plugin trusts its own Happy Hour bookings, and a later second hour is counted.**
+
+- New persisted `happy_hour_booked_codes`: every slot `book_happy_hour_event` confirmed (the reply
+  carried the matching `bookedEvent`). `_apply_local_happy_hour_bookings()` marks those events
+  joined on every poll, before booking and before the window cache, inside the booking step's
+  error guard. Without it a feed lagging the booking would have dropped the slot from the window
+  cache (no free import) and let the plan book the same Sunday again, spending tokens twice.
+- `booked_message` counts the whole day's hours beside a span that covers the whole day, and says
+  when an hour was added to one already booked. The first draft read "One free hour is booked for
+  Sunday, from 1pm to 3pm".
+- A third `_check_saving_sessions` test stub (`TestUpcomingSessionsForDisplay`) was running the
+  booking steps into their error guard; it now carries them, inert, like the others.
+- Tests 2043 -> 2047; the four new guards each broken on purpose and caught.
+
 ## v5.112.0 — 22-09-2026
 
 **Weekend Happy Hours booked by the plugin, and three faults that made a booked hour worth

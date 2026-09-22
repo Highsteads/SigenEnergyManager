@@ -119,6 +119,21 @@ class TestAutoBooking(unittest.TestCase):
         self.assertIn("from 1pm to 3pm", body)
         self.assertEqual(p.store["happy_hour_tokens"], 3)
 
+    def test_a_booking_is_remembered_on_the_plugins_own_word(self):
+        p = _mk(pv_kwh=8.0)
+        p._auto_book_happy_hours({"token_balance": 7, "events": _slot_events()}, THURSDAY)
+        self.assertEqual(p.store["happy_hour_booked_codes"], ["EVENT_13", "EVENT_14"])
+
+    def test_a_feed_that_has_not_caught_up_cannot_cause_a_second_booking(self):
+        """The same Sunday seen again with the booked slots still showing as free:
+        the plugin's own record keeps it from booking two more."""
+        p = _mk(pv_kwh=8.0)
+        p._auto_book_happy_hours({"token_balance": 7, "events": _slot_events()}, THURSDAY)
+        stale = {"token_balance": 3, "events": _slot_events()}      # joined=False again
+        p._apply_local_happy_hour_bookings(stale)
+        p._auto_book_happy_hours(stale, THURSDAY + timedelta(hours=1))
+        self.assertEqual(p.octopus.book_happy_hour_event.call_count, 2)
+
     def test_the_booking_id_is_sent_so_the_reply_can_be_checked(self):
         p = _mk(pv_kwh=8.0)
         p._auto_book_happy_hours({"token_balance": 7, "events": _slot_events()}, THURSDAY)
@@ -273,6 +288,7 @@ class TestItSurvivesARestart(unittest.TestCase):
             "export_lifetime_start_kwh": 20.0,
             "happy_hour_notes_sent":   ["booked:2026-09-27:EVENT_13,EVENT_14"],
             "happy_hour_book_refused": ["EVENT_12"],
+            "happy_hour_booked_codes": ["EVENT_13", "EVENT_14"],
             "happy_hour_used": {"day": "2026-09-27", "spans": [["a", "b"]], "kwh": 9.5},
         }
         p._state_lock = threading.RLock()
@@ -282,16 +298,18 @@ class TestItSurvivesARestart(unittest.TestCase):
         p._save_accumulators_locked(path)
         with open(path, encoding="utf-8") as fh:
             saved = json.load(fh)
-        for k in ("happy_hour_notes_sent", "happy_hour_book_refused", "happy_hour_used"):
+        for k in ("happy_hour_notes_sent", "happy_hour_book_refused",
+                  "happy_hour_booked_codes", "happy_hour_used"):
             self.assertEqual(saved[k], p.store[k], k)
 
         q = plugin.Plugin.__new__(plugin.Plugin)
         q.logger = MagicMock()
         q.store  = {"happy_hour_notes_sent": [], "happy_hour_book_refused": [],
-                    "happy_hour_used": {}}
+                    "happy_hour_booked_codes": [], "happy_hour_used": {}}
         q._get_data_dir = lambda: d
         q._load_accumulators()
-        for k in ("happy_hour_notes_sent", "happy_hour_book_refused", "happy_hour_used"):
+        for k in ("happy_hour_notes_sent", "happy_hour_book_refused",
+                  "happy_hour_booked_codes", "happy_hour_used"):
             self.assertEqual(q.store[k], p.store[k], k)
 
 
@@ -380,6 +398,19 @@ class TestTheWiring(unittest.TestCase):
         p = self._poll_with_slots(auto_book=False)
         titles = [c.args[0] for c in p._send_pushover.call_args_list]
         self.assertEqual(len([t for t in titles if t.startswith("Octopus Happy Hour")]), 4)
+
+    def test_a_slot_the_plugin_booked_reaches_the_window_cache_whatever_the_feed_says(self):
+        p = _mk(prefs={"happyHourAutoBook": False})
+        day = (datetime.now(timezone.utc) + timedelta(days=1)).astimezone(LONDON).date()
+        events = _slot_events(day=day)                                # all joined=False
+        p.store["happy_hour_booked_codes"] = ["EVENT_13"]
+        p.octopus.get_saving_sessions.return_value = {
+            "has_joined": True, "token_balance": 5, "events": events}
+        p.store.update({"saving_sessions_notified": [e["id"] for e in events],
+                        "saving_sessions_join_refused": []})
+        plugin.Plugin._check_saving_sessions(p)
+        cached = [w["id"] for w in p.store["saving_sessions_windows"]]
+        self.assertEqual(cached, [6013])
 
     def test_a_booking_fault_cannot_stop_the_poll(self):
         p = _mk()
