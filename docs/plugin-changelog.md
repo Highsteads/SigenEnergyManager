@@ -15,6 +15,22 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.2 — 22-09-2026
+
+**A clear Flux journal at startup is an INFO line, not a WARNING.**
+
+- `_init_modules` logged `[Flux] A claim journal is outstanding ...` at WARNING whenever
+  `flux_claim.json` existed — which, once Flux is armed, is every restart: the executor saves
+  `{"owns": false, "pending": false, "supervisor_owned": false}` after each release. 15 such
+  warnings 20-22 Sep-2026, none of them a fault.
+- New `_flux_journal_says_clear()`: True only for version 1 with all three flags exactly `False`.
+  Clear -> INFO ("the journal from the last run says nothing was held"); live, missing, unreadable
+  or unknown -> the WARNING as before. Used for the log LEVEL only: the startup reset is still
+  skipped and the executor still reconciles on the first tick, by design ("no persisted flag
+  proves hardware state").
+- Tests 2047 -> 2051; three breakages (truthiness for `is False`, version check dropped, the
+  level choice bypassed) each caught.
+
 ## v5.112.1 — 22-09-2026
 
 **The plugin trusts its own Happy Hour bookings, and a later second hour is counted.**

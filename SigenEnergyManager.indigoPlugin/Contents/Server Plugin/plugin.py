@@ -30,8 +30,9 @@
 #              Claude Opus 5.5 (5.111.8 — /api/status never queues behind a battery command)
 #              Claude Opus 5.5 (5.112.0 — Weekend Happy Hours booked for you; the overnight charge leaves room)
 #              Claude Opus 5.5 (5.112.1 — the plugin trusts its own bookings; a later second hour is counted)
+#              Claude Opus 5.5 (5.112.2 — a clear Flux journal at startup is not a warning)
 # Date:        22-09-2026
-# Version:     5.112.1
+# Version:     5.112.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -12394,6 +12395,24 @@ class Plugin(indigo.PluginBase):
         except Exception:                              # noqa: BLE001
             return False
 
+    def _flux_journal_says_clear(self):
+        """True only when the journal on disk reads as a valid, CLEAR claim record.
+
+        5.112.2, for the startup log's level alone. Clear means version 1 with
+        `owns`, `pending` and `supervisor_owned` all exactly False. Anything else —
+        a live claim, a missing or unreadable file, an unknown version — is False,
+        so the doubtful case keeps its WARNING. Never used to decide what the
+        plugin DOES: the executor reconciles regardless, by design.
+        """
+        try:
+            with open(self._flux_journal_path(), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            return False
+        return (isinstance(data, dict) and data.get("version") == 1
+                and data.get("owns") is False and data.get("pending") is False
+                and data.get("supervisor_owned") is False)
+
     def _flux_rebind_driver(self):
         """Point an existing executor at the CURRENT Modbus driver.
 
@@ -15008,11 +15027,23 @@ class Plugin(indigo.PluginBase):
         # first tick; these writes resume on the next restart, by which time
         # there is no claim to protect.
         if self._flux_recovery_pending():
-            log("[Flux] A claim journal is outstanding, so the usual startup reset "
-                "of the charge and discharge limits has been SKIPPED — lifting the "
-                "charge cutoff now would remove the backstop from a mode that may "
-                "still be running. The supervisor reconciles on the first tick.",
-                level="WARNING")
+            # The behaviour is the same either way: the executor re-checks the
+            # inverter after every start, because no saved flag proves what the
+            # hardware is doing. Only the LEVEL differs (5.112.2). A journal that
+            # itself says nothing was held is the ordinary state of an armed Flux
+            # plugin between windows, so it is an INFO line; the WARNING is kept
+            # for a journal that says a claim was live, or cannot be read. It had
+            # been a WARNING on every restart — 15 of them 20-22 Sep-2026.
+            if self._flux_journal_says_clear():
+                log("[Flux] The Flux journal from the last run says nothing was held; "
+                    "the usual startup reset is left to the supervisor, which "
+                    "re-checks the inverter on its first tick.")
+            else:
+                log("[Flux] A claim journal is outstanding, so the usual startup reset "
+                    "of the charge and discharge limits has been SKIPPED — lifting the "
+                    "charge cutoff now would remove the backstop from a mode that may "
+                    "still be running. The supervisor reconciles on the first tick.",
+                    level="WARNING")
             self.modbus.connect()
         elif self.modbus.connect():
             inverter_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)

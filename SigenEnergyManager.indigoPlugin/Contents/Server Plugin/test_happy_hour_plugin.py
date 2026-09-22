@@ -455,5 +455,49 @@ class TestTheStartupLineSaysWhatIsArmed(unittest.TestCase):
     def test_nothing_ticked_says_nothing(self):
         self.assertEqual(self._lines({}), [])
 
+
+class TestTheFluxJournalLineIsOnlyAWarningWhenItShouldBe(unittest.TestCase):
+    """5.112.2. An armed Flux plugin leaves a journal on disk between windows, and
+    every restart logged a WARNING about it — 15 in three days — although the
+    journal itself said nothing was held. Only a live or unreadable journal is a
+    warning now. What the plugin DOES at startup is unchanged."""
+
+    def _p(self, content):
+        d = tempfile.mkdtemp()
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.data_dir = d
+        if content is not None:
+            with open(os.path.join(d, "flux_claim.json"), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return p
+
+    CLEAR = '{"version": 1, "owns": false, "pending": false, "supervisor_owned": false, "target_expiry": null}'
+
+    def test_a_clear_journal_reads_clear(self):
+        self.assertTrue(self._p(self.CLEAR)._flux_journal_says_clear())
+
+    def test_a_live_claim_does_not(self):
+        for field in ("owns", "pending", "supervisor_owned"):
+            doc = json.loads(self.CLEAR)
+            doc[field] = True
+            self.assertFalse(self._p(json.dumps(doc))._flux_journal_says_clear(), field)
+
+    def test_missing_unreadable_or_unknown_journals_keep_the_warning(self):
+        self.assertFalse(self._p(None)._flux_journal_says_clear())
+        self.assertFalse(self._p("{not json")._flux_journal_says_clear())
+        doc = json.loads(self.CLEAR)
+        doc["version"] = 2
+        self.assertFalse(self._p(json.dumps(doc))._flux_journal_says_clear())
+        doc = json.loads(self.CLEAR)
+        doc["owns"] = 0                      # falsy is not False
+        self.assertFalse(self._p(json.dumps(doc))._flux_journal_says_clear())
+
+    def test_the_startup_path_asks_before_choosing_the_level(self):
+        import inspect
+        src = inspect.getsource(plugin.Plugin._init_modules)
+        branch = src[src.index("if self._flux_recovery_pending():"):]
+        self.assertLess(branch.index("self._flux_journal_says_clear()"),
+                        branch.index('level="WARNING"'))
+
 if __name__ == "__main__":
     unittest.main()
