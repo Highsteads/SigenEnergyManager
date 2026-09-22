@@ -1028,6 +1028,7 @@ class TestCommitmentsFromState(unittest.TestCase):
     def test_a_happy_hour_is_an_IMPORT_commitment_not_an_export_one(self):
         """Free power wants an empty battery, not a full one."""
         p = _mk_plugin()
+        p.pluginPrefs["happyHourImport"] = True
         now = datetime.now(timezone.utc)
         p.store["saving_sessions_windows"] = [{
             "id": "hh1", "start": (now + timedelta(hours=1)).isoformat(),
@@ -1036,6 +1037,47 @@ class TestCommitmentsFromState(unittest.TestCase):
         c = p._flux_commitments()
         self.assertEqual(len(c), 1)
         self.assertEqual(c[0].kind, "import")
+        self.assertAlmostEqual(c[0].energy_kwh, 10.0, places=3)
+
+    def test_a_happy_hour_is_not_offered_to_the_planner_while_the_import_is_off(self):
+        """v5.112.0: the overnight charge now LEAVES ROOM for a free hour. With the
+        import switched off the hour banks nothing, so leaving room for it would
+        just leave the battery short."""
+        p = _mk_plugin()
+        p.pluginPrefs["happyHourImport"] = False
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [{
+            "id": "hh1", "start": (now + timedelta(hours=1)).isoformat(),
+            "end": (now + timedelta(hours=2)).isoformat(),
+            "points": 0, "direction": plugin.SAVING_SESSION_HAPPY_HOUR}]
+        self.assertEqual(p._flux_commitments(), ())
+
+    def test_a_live_booked_free_hour_outranks_flux_before_the_manager_acts(self):
+        """The 2pm case. Flux holds the battery from 2pm for the 4pm peak, and the
+        manager never acts while Flux holds it — so the import flag alone could
+        never be set, and a 2pm free hour never started. The window itself must
+        stand Flux down."""
+        p = _mk_plugin()
+        p.pluginPrefs["happyHourImport"] = True
+        p._flux_peak_now = lambda: False
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [{
+            "id": "hh1", "start": (now - timedelta(minutes=5)).isoformat(),
+            "end": (now + timedelta(minutes=55)).isoformat(),
+            "points": 0, "direction": plugin.SAVING_SESSION_HAPPY_HOUR}]
+        self.assertFalse(p.store["happy_hour_import_active"])
+        self.assertIn("Happy Hour", p._flux_other_owner())
+
+    def test_a_booked_free_hour_that_has_not_started_does_not_stand_flux_down(self):
+        p = _mk_plugin()
+        p.pluginPrefs["happyHourImport"] = True
+        p._flux_peak_now = lambda: False
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [{
+            "id": "hh1", "start": (now + timedelta(minutes=30)).isoformat(),
+            "end": (now + timedelta(minutes=90)).isoformat(),
+            "points": 0, "direction": plugin.SAVING_SESSION_HAPPY_HOUR}]
+        self.assertEqual(p._flux_other_owner(), "")
 
     def test_axle_and_octopus_on_the_same_day_both_appear(self):
         p = _mk_plugin()

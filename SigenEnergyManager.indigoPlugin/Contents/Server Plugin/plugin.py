@@ -28,8 +28,9 @@
 #              Claude Opus 5 (5.111.6 — the Flux peak starts at 16:00, not 16:05)
 #              Claude Opus 5 (5.111.7 — pre-charge never stops a running export; reserve moves are not drift)
 #              Claude Opus 5.5 (5.111.8 — /api/status never queues behind a battery command)
+#              Claude Opus 5.5 (5.112.0 — Weekend Happy Hours booked for you; the overnight charge leaves room)
 # Date:        22-09-2026
-# Version:     5.111.8
+# Version:     5.112.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -48,6 +49,7 @@ import sys
 import threading
 import time
 import copy
+from dataclasses import replace as _replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -221,6 +223,7 @@ from battery_manager  import (
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT, ACTION_SAVING_SESSION, ACTION_HAPPY_HOUR_IMPORT,
+    HAPPY_HOUR_FAIR_USE_KWH,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     pv_tracking_factor as _pv_tracking_factor,
@@ -262,6 +265,14 @@ except Exception as _flux_import_exc:       # noqa: BLE001 — a broken half mus
     FLUX_IMPORT_ERROR = repr(_flux_import_exc)
 else:
     FLUX_IMPORT_ERROR = ""
+
+# The Weekend Happy Hour booking check (v5.112.0). It simulates with the Flux
+# planner's walk, so it rides on the same import: a missing module means the
+# plugin books nothing, never a plugin that will not start.
+try:
+    import happy_hour_booking as _hh_booking
+except Exception:                           # noqa: BLE001
+    _hh_booking = None
 
 # ============================================================
 # Constants
@@ -1632,6 +1643,11 @@ class Plugin(indigo.PluginBase):
         self.store["happy_hour_import_active"]  = False
         self.store["happy_hour_anchor_kwh"]     = None   # grid-import counter at window entry
         self.store["happy_hour_free_kwh"]       = 0.0    # free kWh banked in the last window
+        # v5.112.0 booking. All three persisted (see _save_accumulators_locked).
+        self.store["happy_hour_notes_sent"]     = []     # "kind:day[:codes]" keys, never prose
+        self.store["happy_hour_book_refused"]   = []     # slot codes Octopus would not book
+        self.store["happy_hour_used"]           = {}     # {"day", "spans", "kwh"} for the result note
+        self.store["happy_hour_book_warned"]    = ""     # warn-once day for "import is off"
 
         # Half-hourly SQLite logging — delta anchors (reset each write)
         self.store["hh_anchor_pv_kwh"]     = None  # cumulative PV at last slot boundary
@@ -5777,6 +5793,43 @@ class Plugin(indigo.PluginBase):
             day += timedelta(days=1)
         return len(weekends) * per
 
+    def _session_inside_flux_peak(self, start_at, end_at):
+        """True when a session sits wholly inside the 4pm-7pm Flux peak, on a day
+        the Flux strategy is armed. v5.112.0.
+
+        That is when joining costs NOTHING: the Flux controller exports at the
+        4 kW limit through the peak anyway (measured on the meter 17-20 Sep-2026,
+        2.00 kWh every half hour on days with no session at all), so a session
+        inside it adds its points and a token and takes no extra energy. Outside
+        the peak the export is energy the house would otherwise have used.
+        """
+        if _flux_strategy is None or not start_at or not end_at or not self._flux_armed():
+            return False
+        tz = _london_tz()
+        if tz is None:
+            return False
+        try:
+            last = end_at - timedelta(seconds=1)
+            return bool(_flux_strategy.in_window(start_at, tz, _flux_strategy.FLUX_PEAK_START,
+                                                 _flux_strategy.FLUX_PEAK_END)
+                        and _flux_strategy.in_window(last, tz, _flux_strategy.FLUX_PEAK_START,
+                                                     _flux_strategy.FLUX_PEAK_END))
+        except Exception:                                           # noqa: BLE001
+            return False
+
+    def _session_join_verdict(self, event, session_start_local, now_local=None):
+        """(worth_joining, reason) for a Power Down. The ONE owner of the question.
+
+        v5.112.0. Inside the Flux peak a session is always worth joining — it
+        costs nothing there — and that holds after the Happy Hour scheme ends too,
+        when its points are still free. Everywhere else the token verdict decides,
+        exactly as before. Both the auto-join and the announcement ask this, so
+        the push can never say one thing while the join does another.
+        """
+        if self._session_inside_flux_peak(event.get("start_at"), event.get("end_at")):
+            return True, ""
+        return self._happy_hour_token_verdict(session_start_local, now_local=now_local)
+
     def _happy_hour_token_verdict(self, session_start_local, now_local=None):
         """(worth_joining, reason) for a session starting on `session_start_local`.
 
@@ -5947,7 +6000,7 @@ class Plugin(indigo.PluginBase):
             # here instead would make every test of this guard depend on the real
             # calendar and start failing of its own accord on 1 November 2026.
             _today = (now_utc.astimezone(_tz) if _tz else now_utc).date()
-            _worth, _why = self._happy_hour_token_verdict(_start, now_local=_today)
+            _worth, _why = self._session_join_verdict(event, _start, _today)
             if not _worth:
                 if self.store.get("saving_sessions_budget_logged") != str(code):
                     self.store["saving_sessions_budget_logged"] = str(code)
@@ -6000,6 +6053,261 @@ class Plugin(indigo.PluginBase):
             # joined to a session nothing will act on and have no way to know.
             log("[SavingSessions] Opted in, but 'drive the battery' is switched off, "
                 "so the export will not be driven for it.", level="WARNING")
+
+    # ---- Weekend Happy Hour booking (v5.112.0) ---------------------------
+
+    def _happy_hour_slots_by_day(self, data, now_utc):
+        """{local date: [(event, Slot), ...]} for Happy Hour slots still to come.
+
+        Only slots for this account's region, not yet ended, and before the
+        scheme's end. The event dict is carried beside its Slot so a booking can
+        flip `joined` on the very dict the window cache is built from.
+        """
+        tz = _london_tz()
+        out = {}
+        if tz is None or _hh_booking is None:
+            return out
+        for e in data.get("events") or []:
+            if e.get("direction") != SAVING_SESSION_HAPPY_HOUR:
+                continue
+            start, end = e.get("start_at"), e.get("end_at")
+            if not start or not end or end <= now_utc:
+                continue
+            if not self._saving_session_for_us(e):
+                continue
+            day = start.astimezone(tz).date()
+            if day >= HAPPY_HOUR_SCHEME_END:
+                continue
+            out.setdefault(day, []).append((e, _hh_booking.Slot(
+                event_id=str(e.get("id")), code=str(e.get("code") or ""),
+                start=start, end=end, capacity=e.get("capacity"),
+                booked=bool(e.get("joined")))))
+        return out
+
+    def _auto_book_happy_hours(self, data, now_utc):
+        """Book Weekend Happy Hour slots, if the owner asked us to. v5.112.0.
+
+        CliveS, 22-Sep-2026, on the plan put to him: two hours on any Sunday the
+        battery can really use them, every token spent before the offer ends, and
+        the plugin to do the booking. The judgement lives in happy_hour_booking
+        (pure, tested); this is the plumbing around it.
+
+        Runs on every Saving Sessions poll — hourly, and every ten minutes once a
+        slot is near — so a Sunday held back on Thursday's forecast is looked at
+        again as the forecast firms up. Slots have limited places, so a booking
+        is made on the first poll that decides it, not saved for later.
+
+        Called BEFORE the window cache is built, and it flips `joined` on the
+        event it books, so the planner and the manager see the booking at once.
+        Nothing here ever cancels: whether a cancellation refunds the tokens is
+        not known.
+        """
+        if _hh_booking is None or _flux_strategy is None or not self.octopus:
+            return
+        if not _as_bool(self.pluginPrefs.get("happyHourAutoBook"), False):
+            return
+        if not _as_bool(self.pluginPrefs.get("happyHourImport"), False):
+            if self.store.get("happy_hour_book_warned") != str(_london_today()):
+                self.store["happy_hour_book_warned"] = str(_london_today())
+                log("[HappyHour] Automatic booking is on, but charging the battery "
+                    "during a Happy Hour is off, so a booked hour would bank nothing. "
+                    "Nothing is booked until both are ticked.", level="WARNING")
+            return
+
+        by_day = self._happy_hour_slots_by_day(data, now_utc)
+        if not by_day:
+            return
+        tz       = _london_tz()
+        today    = now_utc.astimezone(tz).date()
+        need     = self._happy_hour_tokens_required()
+        tokens   = data.get("token_balance")
+        per_hour = min(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0),
+                       HAPPY_HOUR_FAIR_USE_KWH)
+        refused  = {str(x) for x in (self.store.get("happy_hour_book_refused") or [])}
+        refused_before = set(refused)
+        site  = self._flux_site()
+        pv    = self._flux_pv_forecast(include_ahead=True)
+        house = None
+        try:
+            house = _flux_strategy.HalfHourProfile(
+                self.store.get("consumption_profile", []), tz)
+        except (ValueError, TypeError):
+            house = None
+        soc = (self.latest_inverter_data or {}).get("batterySoc")
+
+        for day in sorted(by_day):
+            pairs = by_day[day]
+            start_kwh = None
+            if day == today and isinstance(soc, (int, float)):
+                # Decided on the day: the overnight charge has already happened,
+                # so the real battery is the starting point, not the plan's.
+                start_kwh = site.capacity_kwh * float(soc) / 100.0
+            try:
+                plan = _hh_booking.plan_day(
+                    day=day, slots=[s for _e, s in pairs], tokens=tokens,
+                    tokens_per_hour=need, now=now_utc, tz=tz, site=site,
+                    house=house, pv=pv, per_hour_kwh=per_hour,
+                    scheme_end=HAPPY_HOUR_SCHEME_END, refused=refused,
+                    start_kwh=start_kwh)
+            except Exception as exc:                                # noqa: BLE001
+                log(f"[HappyHour] Could not work out a booking for {day:%a %d %b}: "
+                    f"{exc}", level="WARNING")
+                continue
+
+            self.logger.debug(f"[HappyHour] {day}: {plan.outcome}, "
+                              f"book={[s.code for s in plan.book]}, "
+                              f"useful={plan.useful_kwh}, tokens={tokens}")
+            if plan.outcome == _hh_booking.BOOK:
+                done = []
+                for slot in plan.book:
+                    try:
+                        result = self.octopus.book_happy_hour_event(
+                            slot.code, event_id=slot.event_id)
+                    except Exception as exc:                        # noqa: BLE001
+                        log(f"[HappyHour] Booking {slot.code} raised: {exc}",
+                            level="WARNING")
+                        break
+                    if result.get("ok"):
+                        done.append(slot)
+                        for event, s in pairs:
+                            if s is slot:
+                                event["joined"] = True
+                        log(f"[HappyHour] Booked {slot.code}: "
+                            f"{_hh_booking.span_words([slot], tz)} on {day:%A %d %B}"
+                            + (" (already booked)" if result.get("already") else ""))
+                    elif result.get("permanent"):
+                        refused.add(slot.code)
+                        log(f"[HappyHour] Octopus would not book {slot.code}, so another "
+                            f"slot will be tried: {result.get('reason')}", level="WARNING")
+                    else:
+                        log(f"[HappyHour] Booking {slot.code} failed, will retry within "
+                            f"the hour: {result.get('reason')}", level="WARNING")
+                        break
+                if done:
+                    booked_plan = _replace(plan, book=tuple(done))
+                    title, body = _hh_booking.booked_message(
+                        booked_plan, tz, today, HAPPY_HOUR_SCHEME_END)
+                    key = f"booked:{day}:{','.join(sorted(s.code for s in done))}"
+                    self._send_happy_hour_note(key, title, body)
+                    if day == today:
+                        # The booking message already says it is today; a morning
+                        # reminder on top would repeat it.
+                        self._mark_happy_hour_note_sent(f"morning:{day}")
+                    if isinstance(tokens, int):
+                        tokens = max(0, tokens - need * len(done))
+                        self.store["happy_hour_tokens"] = tokens
+            elif plan.outcome in (_hh_booking.HOLD_BRIGHT, _hh_booking.HOLD_NO_FORECAST):
+                title, body = _hh_booking.hold_message(plan, tz, today,
+                                                       HAPPY_HOUR_SCHEME_END)
+                self._send_happy_hour_note(f"hold:{day}:{plan.outcome}", title, body)
+            elif plan.outcome == _hh_booking.NOTHING_BOOKABLE and plan.hours_held > \
+                    2 * plan.sundays_after:
+                # Tokens that cannot wait for a later Sunday and nowhere to put
+                # them: say so once, in the log, where it can be looked at.
+                if self._mark_happy_hour_note_sent(f"stuck:{day}"):
+                    log(f"[HappyHour] Every slot on {day:%A %d %B} is full or refused, "
+                        f"and {plan.hours_held} free hour"
+                        f"{'' if plan.hours_held == 1 else 's'} cannot all wait for a "
+                        f"later Sunday.", level="WARNING")
+
+        if refused != refused_before:
+            self.store["happy_hour_book_refused"] = list(refused)[-200:]
+            self._save_accumulators()
+
+    def _mark_happy_hour_note_sent(self, key):
+        """Record a note key. True if it was new. Keys are structured (kind, day,
+        codes), never the message text, which carries figures that change hourly."""
+        sent = [str(x) for x in (self.store.get("happy_hour_notes_sent") or [])]
+        if key in sent:
+            return False
+        self.store["happy_hour_notes_sent"] = (sent + [key])[-200:]
+        self._save_accumulators()
+        return True
+
+    def _send_happy_hour_note(self, key, title, body):
+        """One Pushover per key, ever. The log carries the same words."""
+        if not self._mark_happy_hour_note_sent(key):
+            return
+        body = _ascii_plain(body)
+        log(f"[HappyHour] {title}. {body}")
+        self._send_pushover(_ascii_plain(title), body, priority="0")
+
+    def _happy_hour_morning_note(self, data, now_utc):
+        """The morning reminder on a day with booked free hours. v5.112.0.
+
+        From 8am, once per day, and only while the battery will actually charge in
+        the hour — the message says it will. Sent whoever booked the slots.
+        """
+        if _hh_booking is None:
+            return
+        if not _as_bool(self.pluginPrefs.get("happyHourImport"), False):
+            return
+        tz = _london_tz()
+        if tz is None:
+            return
+        local = now_utc.astimezone(tz)
+        if local.hour < 8:
+            return
+        today = local.date()
+        slots = [s for _e, s in self._happy_hour_slots_by_day(data, now_utc).get(today, [])
+                 if s.booked and s.start > now_utc]
+        if not slots:
+            return
+        if f"morning:{today}" in (self.store.get("happy_hour_notes_sent") or []):
+            return
+        title, body = _hh_booking.reminder_message(slots, tz)
+        self._send_happy_hour_note(f"morning:{today}", title, body)
+
+    def _happy_hour_cheap_rate_p(self):
+        """The cheapest import price published for today, for the result note.
+        None when the tariff is not banded, and the note then leaves money out."""
+        try:
+            tiers = self._band_tiers("import")
+            return float(tiers[0]["p"]) if tiers else None
+        except Exception:                                           # noqa: BLE001
+            return None
+
+    def _happy_hour_result_note(self, banked_kwh, now_utc=None):
+        """Say what the day's free hours banked, once the last of them has ended.
+
+        The free-kWh figure accumulates across the day's windows (two booked hours
+        need not be next to each other), and the note waits until no booked hour
+        is left today, so a day's free power gets one message, not one per slot.
+        """
+        if _hh_booking is None:
+            return
+        tz = _london_tz()
+        if tz is None:
+            return
+        now   = now_utc or datetime.now(timezone.utc)
+        today = str(now.astimezone(tz).date())
+        used  = self.store.get("happy_hour_used") or {}
+        if used.get("day") != today:
+            used = {"day": today, "spans": [], "kwh": 0.0}
+        if banked_kwh is not None:
+            used["kwh"] = round(float(used.get("kwh") or 0.0) + float(banked_kwh), 2)
+        self.store["happy_hour_used"] = used
+        for w in self.store.get("saving_sessions_windows") or []:
+            if w.get("direction") != SAVING_SESSION_HAPPY_HOUR:
+                continue
+            try:
+                start = datetime.fromisoformat(str(w["start"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start > now and str(start.astimezone(tz).date()) == today:
+                return          # another booked hour today; say it all afterwards
+        slots = []
+        for a, b in used.get("spans") or []:
+            try:
+                slots.append(_hh_booking.Slot(event_id="", code="",
+                                              start=datetime.fromisoformat(a),
+                                              end=datetime.fromisoformat(b)))
+            except (TypeError, ValueError):
+                continue
+        title, body = _hh_booking.result_message(
+            used.get("kwh") if banked_kwh is not None else None,
+            slots, tz, self._happy_hour_cheap_rate_p())
+        self._send_happy_hour_note(f"result:{today}", title, body)
 
     def _saving_session_for_us(self, event):
         """False only when we KNOW this session is not open to this account's region.
@@ -6075,6 +6383,16 @@ class Plugin(indigo.PluginBase):
         #     first would leave a session we just joined un-armed until the NEXT poll
         #     — up to an hour, and the session may not last that long.
         self._auto_join_saving_sessions(data, now_utc)
+        # Book Weekend Happy Hours (v5.112.0) for the same reason and in the same
+        # place: a booking flips `joined` on the event, and the window cache
+        # below admits booked slots only. Isolated so a fault in the booking
+        # check can never cost the poll its alerts or its window cache.
+        try:
+            self._auto_book_happy_hours(data, now_utc)
+            self._happy_hour_morning_note(data, now_utc)
+        except Exception:                                           # noqa: BLE001
+            self.logger.exception("[HappyHour] The booking check raised — skipped "
+                                  "this poll")
         # Normalised to str on BOTH sides. GraphQL's ID type is specified to
         # serialise as a STRING, and this payload happens to return an int — so
         # comparing the raw value against a persisted set is one API tweak away
@@ -6117,6 +6435,13 @@ class Plugin(indigo.PluginBase):
             turn_down = direction == SAVING_SESSION_TURN_DOWN
             happy_hour = direction == SAVING_SESSION_HAPPY_HOUR
 
+            if happy_hour and _as_bool(self.pluginPrefs.get("happyHourAutoBook"), False):
+                # v5.112.0: the plugin books these itself and sends ONE message
+                # per Sunday saying what it booked or why it held back. Four
+                # per-slot pushes on top of that would be the noise v5.85.0
+                # already had to cut back once.
+                new_ids.append(event_id)
+                continue
             if happy_hour:
                 # A Happy Hour is BOOKED, not opted into, and booking costs tokens.
                 # Telling someone to "opt in to earn" on a slot they cannot book is
@@ -6159,7 +6484,7 @@ class Plugin(indigo.PluginBase):
                 skip_why = ""
                 if turn_down and not joined and auto_on:
                     _sd = (start_local.date() if hasattr(start_local, "date") else start_local)
-                    _ok, _why = self._happy_hour_token_verdict(_sd)
+                    _ok, _why = self._session_join_verdict(event, _sd)
                     skip_why = "" if _ok else _why
                 if not joined and (refused or event.get("capacity") == "FULL"):
                     # Cannot be joined at all, so it does not concern us: no push.
@@ -6339,7 +6664,31 @@ class Plugin(indigo.PluginBase):
 
         banked_str = f"{banked:.2f} kWh banked free" if banked is not None else "amount unknown"
         log(f"[Manager] Happy Hour import ended ({why}) — {banked_str}")
+        try:
+            self._happy_hour_result_note(banked)
+        except Exception:                                           # noqa: BLE001
+            self.logger.exception("[HappyHour] Could not send the result note")
         self._save_accumulators()
+
+    def _note_happy_hour_span(self, window):
+        """Remember a free window the import actually ran in, for the day's
+        result note. Kept per day; a new day starts a new record."""
+        if not window:
+            return
+        tz = _london_tz()
+        try:
+            start = datetime.fromisoformat(str(window["start"]))
+            end   = datetime.fromisoformat(str(window["end"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        today = str(start.astimezone(tz).date()) if tz else str(start.date())
+        used = self.store.get("happy_hour_used") or {}
+        if used.get("day") != today:
+            used = {"day": today, "spans": [], "kwh": 0.0}
+        span = [start.isoformat(), end.isoformat()]
+        if span not in used["spans"]:
+            used["spans"] = list(used["spans"]) + [span]
+            self.store["happy_hour_used"] = used
 
     def _check_happy_hour_overrun(self):
         """Second, independent guard on an over-running Happy Hour import.
@@ -6628,15 +6977,24 @@ class Plugin(indigo.PluginBase):
             self._drive_vpp_export()
 
         elif action == ACTION_HAPPY_HOUR_IMPORT:
-            # FREE electricity for one booked hour: grid-charge at inverter max.
+            # FREE electricity for a booked hour: grid-charge at inverter max.
             # Reuses force_charge (mode 0x03 + charge limit + the hardware charge
-            # cutoff backstop) — the same proven path ACTION_START_IMPORT drives,
-            # so a crash mid-window cannot leave it charging unbounded.
+            # cutoff) — the same proven path ACTION_START_IMPORT drives, so a
+            # crash mid-window cannot leave it charging unbounded.
+            #
+            # v5.112.0: the hardware cutoff IS the stop now, set at the target
+            # itself rather than three points above it. The manager used to stop
+            # the import in software on reaching the target and hand back to self
+            # consumption, which put the house on the battery for the rest of the
+            # free hour. It now stays in the import to the end of the window, so
+            # the cutoff is what ends the charging, and the battery's discharge is
+            # pinned at zero so the house runs on the grid, which is free.
+            target = float(decision.target_soc_pct or 95.0)
+            cutoff = min(target, 100.0)
+            self._note_happy_hour_span(self._happy_hour_window())
             if not self.store.get("happy_hour_import_active"):
                 power_w = min(int(decision.power_watts or 10000),
                               int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
-                target  = decision.target_soc_pct or 93.0
-                cutoff  = min(float(target) + 3.0, 100.0)
                 if self.modbus and self.modbus.connected and \
                         self.modbus.force_charge(power_w, cutoff_soc=cutoff):
                     # Anchor the free-kWh measurement on the cumulative import
@@ -6646,14 +7004,26 @@ class Plugin(indigo.PluginBase):
                     self.store["happy_hour_anchor_kwh"] = self.store.get(
                         "grid_import_daily_kwh", 0.0)
                     self.store["import_active"] = True
-                    self.store["import_target_soc"] = float(target)
+                    self.store["import_target_soc"] = target
                     self._set_import_cutoff(cutoff)
+                    # Best effort: _verify_ems_registers expects zero for as long
+                    # as the free import runs and re-asserts it within a minute.
+                    self.modbus.set_discharge_limit(0)
                     self._save_accumulators()   # persist the anchor immediately
                     log(f"[Manager] Happy Hour import — {decision.reason}")
                 else:
                     log("[Manager] Happy Hour import could not be started "
                         "(inverter unreachable or the charge command was refused)",
                         level="WARNING")
+            elif abs(target - float(self.store.get("import_target_soc") or 0.0)) >= 1.0:
+                # The target moves mid-window when the afternoon passes the clip
+                # test (95 -> 100). Move the hardware stop with it, or the battery
+                # stops at the old figure while the plan says the new one.
+                if self.modbus and self.modbus.connected and \
+                        self.modbus.set_charge_cutoff(cutoff):
+                    self.store["import_target_soc"] = target
+                    self._set_import_cutoff(cutoff)
+                    log(f"[Manager] Happy Hour import — target now {target:.0f}%")
 
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
@@ -6726,7 +7096,7 @@ class Plugin(indigo.PluginBase):
             # dawn projection turns against us, and that must stand the export down
             # just as promptly. Latch on the flag, not on the clock.
             if self.store.get("happy_hour_import_active"):
-                self._end_happy_hour_import("window ended or battery reached target")
+                self._end_happy_hour_import("the free hour ended")
 
             if self.store.get("saving_session_export_active"):
                 self.store["saving_session_export_active"] = False
@@ -6796,8 +7166,14 @@ class Plugin(indigo.PluginBase):
                     level="WARNING")
                 self.modbus.set_self_consumption()
 
-        # Check if active import has reached target SOC
-        if self.store["import_active"]:
+        # Check if active import has reached target SOC. NOT for a free Happy
+        # Hour (v5.112.0): that import runs to the END of its window, with its
+        # charging stopped by the hardware cutoff at the target, so the house
+        # keeps drawing the free grid power instead of the battery. Ending it
+        # here would hand back to self consumption with the free hour still
+        # running, and the manager — seeing its import flag still set — would
+        # never re-drive it. The window end and the overrun backstop end it.
+        if self.store["import_active"] and not self.store.get("happy_hour_import_active"):
             current_soc = self.latest_inverter_data.get("batterySoc", 0.0)
             target_soc  = self.store["import_target_soc"]
             if current_soc >= target_soc:
@@ -6895,6 +7271,7 @@ class Plugin(indigo.PluginBase):
                            not discharge register, to cap grid flow; battery must be free to supply
                            house load + grid simultaneously)
           - import_active: charge limit = inverter max (full import power), discharge = inverter max
+          - a Happy Hour import: discharge = 0 (v5.112.0 — the house runs on the free grid)
           - otherwise:     both limits = inverter max (unrestricted self-consumption)
         """
         if not self.modbus or not self.modbus.connected:
@@ -6905,6 +7282,11 @@ class Plugin(indigo.PluginBase):
         # Always expect inverter max — night_export() uses HOLD_GRID_MAX_EXPORT_LIMIT
         # (not the discharge register) to constrain grid flow.
         expected_discharge_w = inv_max_w
+        # Except inside a free Happy Hour, where the import pins the battery's
+        # discharge at zero so the house draws the free grid power instead. This
+        # pass must hold that, not "correct" it back to maximum.
+        if self.store.get("happy_hour_import_active"):
+            expected_discharge_w = 0
 
         # During solar overflow the charge limit is intentionally reduced.
         # Use the stored cap as the expected value so verify() doesn't fight it.
@@ -12073,7 +12455,13 @@ class Plugin(indigo.PluginBase):
             return f"an Axle VPP window ({_vpp})"
         if self.store.get("saving_session_export_active"):
             return "an Octopus Saving Session"
-        if self.store.get("happy_hour_import_active"):
+        # The WINDOW, not only the flag (v5.112.0). The flag is set by
+        # _act_on_decision, which never runs while Flux holds the inverter — and
+        # Flux holds it from 2pm for the 4pm peak. So a 2pm-3pm free hour met a
+        # Flux claim that nothing ever pre-empted, and the import never started.
+        # A booked free hour is live from its first second whether or not the
+        # manager has managed to act on it yet.
+        if self.store.get("happy_hour_import_active") or self._happy_hour_window():
             return "a Happy Hour free import"
         if self.store.get("import_active"):
             return "the manager has a grid import in flight"
@@ -12162,11 +12550,19 @@ class Plugin(indigo.PluginBase):
                     reward_p_per_kwh=None,
                     event_id=str(window.get("id") or "session")))
             elif direction == SAVING_SESSION_HAPPY_HOUR:
-                # Free import: what it needs is EMPTY battery, not full.
+                # Free import: what it needs is EMPTY battery, not full. Since
+                # v5.112.0 the planner acts on this — the overnight charge leaves
+                # room for it — so it must only be offered when the manager will
+                # really import through the window. With the import switched off
+                # the free hour banks nothing, and a charge that left room for it
+                # would simply leave the battery short.
+                if not _as_bool(self.pluginPrefs.get("happyHourImport"), False):
+                    continue
                 inv_kw = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
+                per_hour = min(inv_kw, HAPPY_HOUR_FAIR_USE_KWH)
                 out.append(_flux_strategy.EventCommitment(
                     source="octopus", kind="import", start=start, end=end,
-                    energy_kwh=round(inv_kw * hours, 3),
+                    energy_kwh=round(per_hour * hours, 3),
                     event_id=str(window.get("id") or "happyhour")))
         return tuple(out)
 
@@ -12733,6 +13129,67 @@ class Plugin(indigo.PluginBase):
                  "gridPowerWatts": float(fresh["gridPowerWatts"])},
                 time.time())
 
+    def _flux_pv_forecast(self, include_ahead=False):
+        """The solar forecast as the planner reads it, or None. One owner.
+
+        Lifted out of _flux_inputs in v5.112.0 so the Weekend Happy Hour booking
+        check reads the SAME forecast, with the same corrections, as the charge it
+        is trying to shape. `include_ahead` adds the days after tomorrow (the
+        booking check decides on a Thursday about a Sunday); those days carry the
+        forecast's general correction, having no day of their own.
+        """
+        tz = _london_tz()
+        fc = self.latest_forecast_data or {}
+        try:
+            buckets = {}
+            if include_ahead:
+                buckets.update(fc.get("_hourly_p50_ahead") or {})
+            buckets.update(fc.get("_hourly_p50_today") or {})
+            buckets.update(fc.get("_hourly_p50_tomorrow") or {})
+            if not buckets:
+                return None
+            # PER-DAY factors. The forecast publishes one for today and one
+            # for tomorrow and they differ — today has measured generation
+            # behind it, tomorrow has none — so a single factor biases the
+            # overnight charge by whatever the two disagree by.
+            today_local = _london_today()
+            return _flux_strategy.HourlyPvForecast(
+                buckets, tz,
+                bias=float(fc.get("biasFactor", 1.0) or 1.0),
+                bias_by_date={
+                    today_local: float(fc.get("biasFactorToday")
+                                       or fc.get("biasFactor", 1.0) or 1.0),
+                    today_local + timedelta(days=1):
+                        float(fc.get("biasFactorTomorrow")
+                              or fc.get("biasFactor", 1.0) or 1.0),
+                })
+        except (ValueError, TypeError) as exc:
+            self.logger.debug(f"[Flux] no usable solar forecast: {exc}")
+            return None
+
+    def _flux_site(self):
+        """The battery and site limits as the planner reads them. One owner
+        (v5.112.0): the Happy Hour booking check simulates with these too."""
+        prefs = self.pluginPrefs
+        inv_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
+        import_limit_w = int(_as_float(prefs.get("fluxSiteImportLimitKw"),
+                                       _as_float(prefs.get("inverterMaxKw"), 10.0)) * 1000)
+        return _flux_strategy.FluxSite(
+            capacity_kwh          = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
+            charge_power_w        = inv_max_w,
+            discharge_power_w     = inv_max_w,
+            export_limit_w        = int(_as_float(prefs.get("maxExportKw"), 4.0) * 1000),
+            import_limit_w        = import_limit_w,
+            import_limit_verified = _as_bool(prefs.get("fluxSiteImportVerified", False)),
+            efficiency            = _as_float(prefs.get("batteryEfficiency"), 94.0) / 100.0,
+            wear_p_per_kwh        = _as_float(prefs.get("fluxWearPencePerKwh"),
+                                              _flux_strategy.DEFAULT_WEAR_P_PER_KWH),
+            reserve_pct           = _as_float(prefs.get("fluxReservePct"),
+                                              _flux_strategy.DEFAULT_RESERVE_PCT),
+            policy_floor_pct      = self._flux_planner_floor_pct(),
+            max_charge_soc_pct    = _as_float(prefs.get("fluxMaxChargeSocPct"), 100.0),
+        )
+
     def _flux_inputs(self, observed, observed_at):
         """Everything plan() is allowed to see."""
         tz    = _london_tz()
@@ -12755,50 +13212,8 @@ class Plugin(indigo.PluginBase):
         except (ValueError, TypeError) as exc:
             self.logger.debug(f"[Flux] no usable consumption profile: {exc}")
 
-        pv = None
-        fc = self.latest_forecast_data or {}
-        try:
-            buckets = {}
-            buckets.update(fc.get("_hourly_p50_today") or {})
-            buckets.update(fc.get("_hourly_p50_tomorrow") or {})
-            if buckets:
-                # PER-DAY factors. The forecast publishes one for today and one
-                # for tomorrow and they differ — today has measured generation
-                # behind it, tomorrow has none — so a single factor biases the
-                # overnight charge by whatever the two disagree by.
-                today_local = _london_today()
-                pv = _flux_strategy.HourlyPvForecast(
-                    buckets, tz,
-                    bias=float(fc.get("biasFactor", 1.0) or 1.0),
-                    bias_by_date={
-                        today_local: float(fc.get("biasFactorToday")
-                                           or fc.get("biasFactor", 1.0) or 1.0),
-                        today_local + timedelta(days=1):
-                            float(fc.get("biasFactorTomorrow")
-                                  or fc.get("biasFactor", 1.0) or 1.0),
-                    })
-        except (ValueError, TypeError) as exc:
-            self.logger.debug(f"[Flux] no usable solar forecast: {exc}")
-
-        inv_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
-        import_limit_w = int(_as_float(prefs.get("fluxSiteImportLimitKw"),
-                                       _as_float(prefs.get("inverterMaxKw"), 10.0)) * 1000)
-
-        site = _flux_strategy.FluxSite(
-            capacity_kwh          = _as_float(prefs.get("batteryCapacityKwh"), 35.04),
-            charge_power_w        = inv_max_w,
-            discharge_power_w     = inv_max_w,
-            export_limit_w        = int(_as_float(prefs.get("maxExportKw"), 4.0) * 1000),
-            import_limit_w        = import_limit_w,
-            import_limit_verified = _as_bool(prefs.get("fluxSiteImportVerified", False)),
-            efficiency            = _as_float(prefs.get("batteryEfficiency"), 94.0) / 100.0,
-            wear_p_per_kwh        = _as_float(prefs.get("fluxWearPencePerKwh"),
-                                              _flux_strategy.DEFAULT_WEAR_P_PER_KWH),
-            reserve_pct           = _as_float(prefs.get("fluxReservePct"),
-                                              _flux_strategy.DEFAULT_RESERVE_PCT),
-            policy_floor_pct      = self._flux_planner_floor_pct(),
-            max_charge_soc_pct    = _as_float(prefs.get("fluxMaxChargeSocPct"), 100.0),
-        )
+        pv   = self._flux_pv_forecast()
+        site = self._flux_site()
 
         # AGES COME FROM SUCCESSFUL FETCHES, not from when a task last ran.
         # `last_forecast` is stamped whether the fetch worked or not, so a
@@ -14308,11 +14723,19 @@ class Plugin(indigo.PluginBase):
         from "I must have tapped it in the app and forgotten".
         """
         try:
-            if not _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False):
-                return
-            log("[SavingSessions] Automatic opt-in is ON — announced Power Down "
-                "sessions will be joined for you. Power Ups and Happy Hours are "
-                "never joined automatically.")
+            if _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False):
+                log("[SavingSessions] Automatic opt-in is ON — announced Power Down "
+                    "sessions will be joined for you. Power Ups are never joined "
+                    "automatically.")
+            # v5.112.0: booking spends tokens, so it announces itself the same way.
+            if _as_bool(self.pluginPrefs.get("happyHourAutoBook"), False):
+                if _as_bool(self.pluginPrefs.get("happyHourImport"), False):
+                    log("[HappyHour] Automatic booking is ON — Weekend Happy Hour "
+                        "slots will be booked for you when the battery can use them, "
+                        "and every token spent before the offer ends.")
+                else:
+                    log("[HappyHour] Automatic booking is ticked but charging during a "
+                        "Happy Hour is not, so nothing will be booked.", level="WARNING")
         except Exception as exc:                                    # noqa: BLE001
             self.logger.debug(f"[SavingSessions] setting announcement skipped: {exc!r}")
 
@@ -14745,6 +15168,15 @@ class Plugin(indigo.PluginBase):
             "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
             "happy_hour_anchor_kwh":     self.store.get("happy_hour_anchor_kwh"),
             "happy_hour_free_kwh":       self.store.get("happy_hour_free_kwh", 0.0),
+            # v5.112.0 booking: which notes have gone out (so a restart cannot
+            # resend a booking or a reminder), which slots Octopus refused (so a
+            # restart does not retry them hourly), and the day's free windows and
+            # kWh (so a restart mid-Sunday still reports the whole day).
+            "happy_hour_notes_sent":
+                list(self.store.get("happy_hour_notes_sent") or [])[-200:],
+            "happy_hour_book_refused":
+                list(self.store.get("happy_hour_book_refused") or [])[-200:],
+            "happy_hour_used":           self.store.get("happy_hour_used") or {},
             # Restart-critical control state. These also live in pluginPrefs,
             # but runtime pref writes only reach .indiPref on a GRACEFUL
             # shutdown — a crash or hard-kill (plausible in exactly the
@@ -14814,6 +15246,11 @@ class Plugin(indigo.PluginBase):
             if data.get("saving_sessions_not_our_region"):
                 self.store["saving_sessions_not_our_region"] = \
                     list(data["saving_sessions_not_our_region"])[-200:]
+            for _k in ("happy_hour_notes_sent", "happy_hour_book_refused"):
+                if data.get(_k):
+                    self.store[_k] = [str(x) for x in list(data[_k])[-200:]]
+            if isinstance(data.get("happy_hour_used"), dict):
+                self.store["happy_hour_used"] = data["happy_hour_used"]
             # The warn-once latches come back as SETS, because that is what the
             # three checks that read them expect; JSON can only carry a list, so
             # the conversion has to happen on the way in. Restored WITHOUT

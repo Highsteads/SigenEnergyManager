@@ -1,6 +1,11 @@
 # SPEC — Weekend Happy Hour import (SigenEnergyManager Phase 3)
 
 Status: **SIGNED OFF and BUILT in v5.83.0** · drafted 03-Sep-2026 · target v5.83.0
+
+> **Superseded in part by v5.112.0 — see [happy-hour-booking.md](happy-hour-booking.md).** The plugin
+> now books the slots itself, the Flux overnight charge leaves room for them, a live free hour
+> pre-empts the Flux hold, and the import runs to the END of the window with the battery's
+> discharge at zero instead of handing back at the target. "Pre-drain" is still not built.
 Decisions taken by CliveS 03-Sep-2026: passive fill only · count-and-tag the import ·
 full inverter charge rate.
 

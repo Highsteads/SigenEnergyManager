@@ -2609,11 +2609,37 @@ class TestHappyHourOverride(unittest.TestCase):
         self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
         self.assertIn("refusing to guess", d.reason)
 
-    def test_full_battery_declines_and_explains_itself(self):
+    def test_a_full_battery_stays_in_the_import_so_the_house_uses_free_power(self):
+        """v5.112.0. Handing back at the target put the house on the battery for
+        the rest of the free hour while the grid, which was free, sat idle."""
         snap = _make_snapshot(soc_pct=95.0, happy_hour_active=True, now_hour=12)
         d = self.mgr.evaluate(snap)
-        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
-        self.assertIn("nothing worth importing", d.reason)
+        self.assertEqual(d.action, ACTION_HAPPY_HOUR_IMPORT)
+        self.assertIn("free grid power", d.reason)
+        self.assertNotIn("importing up to", d.reason)
+
+    def test_the_target_is_100_once_nothing_left_today_can_clip(self):
+        """CliveS's Flux rule of 17-Sep-2026, applied to free power as well."""
+        self.mgr._flux_clip_risk_passed = lambda snapshot: True
+        d = self.mgr.evaluate(_make_snapshot(soc_pct=55.0, happy_hour_active=True,
+                                             now_hour=12))
+        self.assertEqual(d.target_soc_pct, 100.0)
+        self.assertIn("100% target", d.reason)
+
+    def test_the_target_stays_at_the_daily_target_while_the_sun_could_clip(self):
+        self.mgr._flux_clip_risk_passed = lambda snapshot: False
+        snap = _make_snapshot(soc_pct=55.0, happy_hour_active=True, now_hour=12)
+        d = self.mgr.evaluate(snap)
+        self.assertEqual(d.target_soc_pct, float(snap.solar_overflow_target_pct))
+        self.assertLess(d.target_soc_pct, 100.0)
+
+    def test_the_target_rule_is_the_clip_test_itself_not_a_copy_of_it(self):
+        """One owner of 'may the battery go to 100% today'. A second copy of the
+        rule would drift from the first, as every duplicated rule here has."""
+        import inspect
+        src = inspect.getsource(type(self.mgr)._happy_hour_target_pct)
+        self.assertIn("_flux_clip_risk_passed(snapshot)", src)
+        self.assertNotIn("FLUX_CLIP_GUST_FACTOR", src)
 
     def test_no_export_gate_applies(self):
         # Unlike the turn-down branch, this IMPORTS — a power-cut lockout or storm

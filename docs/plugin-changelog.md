@@ -15,6 +15,52 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.0 — 22-09-2026
+
+**Weekend Happy Hours booked by the plugin, and three faults that made a booked hour worth
+almost nothing on Flux.** Design and rules: `docs/happy-hour-booking.md`.
+
+- **The planner ignored a booked hour.** `_flux_commitments()` has handed a Happy Hour to Flux as
+  an `import` commitment since 5.109, and `flux_strategy.build_steps` read only `export`, so the
+  02:00-05:00 charge bought ~15 kWh for the peak (15.45 kWh on 21-Sep) and a dull Sunday met the
+  free hour ~75-85% full. `flux_strategy` v2.1: steps carry a 6th element (free import kWh);
+  new `walk()` returns a `WalkResult` with `spill_kwh` and `free_in_kwh`; `run_steps` keeps its
+  4-tuple. In a free step the grid serves the house and fills the battery within the one charge
+  limit, sun first; never beside an export commitment (the manager fails closed there).
+  `_charge_plan` needed no change: its headroom comes from the walk. The cheap-window reason says
+  `leaving room for up to N kWh of free Happy Hour electricity`. The commitment is now offered
+  ONLY while `happyHourImport` is on.
+- **A 2pm free hour never started.** `MODE_HOLD` owns the inverter from 14:00; the manager never
+  acts while Flux owns it; `happy_hour_import_active` is only set by acting. `_flux_other_owner()`
+  now also returns an owner for a live `_happy_hour_window()`.
+- **At the target the free hour handed back** and the house ran on the battery. The decision now
+  stays `ACTION_HAPPY_HOUR_IMPORT` for the whole window; `force_charge` cutoff = the target (was
+  +3); `set_discharge_limit(0)` at start; `_verify_ems_registers` expects discharge 0 while
+  `happy_hour_import_active`; the unconditional end-of-`_act_on_decision` target check skips a
+  free hour; a rising target (95 -> 100) moves the cutoff. New
+  `BatteryManager._happy_hour_target_pct()`: 100 when `_flux_clip_risk_passed`, else the daily
+  target.
+- **Booking.** New pure `happy_hour_booking.py` (`plan_day`, `useful_free_kwh`, messages).
+  `octopus_api.book_happy_hour_event()` — success only when the reply's `bookedEvent.eventId` is
+  the one asked for; any Octopus refusal is permanent for that slot; auth/HTTP/network transient.
+  Probed safely with a code that cannot exist: HTTP 200, data null, `OE-1305`. Plugin:
+  `_auto_book_happy_hours` (after auto-join, before the window cache, isolated in try/except),
+  `_happy_hour_morning_note`, `_happy_hour_result_note`, `_note_happy_hour_span`; notes deduped on
+  `kind:day[:codes]` keys. Persisted: `happy_hour_notes_sent`, `happy_hour_book_refused`,
+  `happy_hour_used`. New pref `happyHourAutoBook` (off). Per-slot "Happy Hour available" pushes
+  are suppressed while it is on.
+- **Join verdict.** New `_session_join_verdict()` — one owner, asked by both the auto-join and the
+  announcement: a session wholly inside the Flux peak (`_session_inside_flux_peak`, Flux armed)
+  is always worth joining; everything else goes to `_happy_hour_token_verdict` unchanged. Without
+  it the auto-join declined every session from 27-Oct and, after 1-Nov, for good.
+- **Forecast.** `openmeteo_forecast` v1.9: `FORECAST_DAYS = 6`; days after tomorrow kept as
+  `_hourly_p50_ahead` + `aheadDayKwh`. `_flux_pv_forecast(include_ahead)` and `_flux_site()`
+  lifted out of `_flux_inputs` so the booking check simulates with the same figures.
+- **Tests:** 1936 -> 2043. New `test_happy_hour_booking.py` (38), `test_happy_hour_plugin.py`
+  (30), plus planner, manager, act-path, verify, API and forecast cases. **Mutation sweep: 30
+  breakages, 30 caught** — the one that first survived (the per-slot push switch) had no test and
+  now has two.
+
 ## v5.111.8 — 22-09-2026
 
 **`/api/status` no longer queues behind a battery command.**

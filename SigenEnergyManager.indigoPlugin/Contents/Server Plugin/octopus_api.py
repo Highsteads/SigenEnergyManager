@@ -1330,6 +1330,98 @@ class OctopusAPI:
         return {"ok": True, "already": False, "permanent": False,
                 "reason": "opted in"}
 
+    def book_happy_hour_event(self, event_code, event_id=None):
+        """Book ONE Weekend Happy Hour slot, spending tokens. Returns a result dict.
+
+        v5.112.0. Same shape as join_saving_session_event:
+            {"ok": bool, "already": bool, "permanent": bool, "reason": str}
+
+        `ok` is True only when the mutation's own reply carries the booked event
+        — and, when `event_id` is given, the SAME event. Nothing here reads
+        success into the absence of an error: the backend answers HTTP 200 to
+        everything, refusals included (measured 22-Sep-2026 with a code that
+        cannot exist: HTTP 200, `bookSavingSessionsWeekendHappyHourEvent: null`,
+        errorCode OE-1305 "The Saving Sessions event could not be found").
+
+        UNLIKE A SESSION JOIN, A BOOKING CAN BE UNDONE: the schema carries
+        cancelSavingSessionsWeekendHappyHourBooking. Whether a cancel hands the
+        tokens back is NOT documented and has not been measured, so nothing in
+        the plugin cancels — a booking is made only when it is meant.
+
+        Any refusal Octopus gives (a full slot, a finished event, too few tokens)
+        is `permanent` for THIS slot. The caller picks another slot rather than
+        asking again every hour. Network, HTTP and auth failures are transient.
+        """
+        blank = {"ok": False, "already": False, "permanent": False, "reason": ""}
+        if not event_code:
+            return dict(blank, permanent=True, reason="no event code given")
+        if not self.api_key or not self.account_id:
+            return dict(blank, reason="no Octopus account configured")
+        token = self._get_kraken_token()
+        if not token:
+            return dict(blank, reason="could not obtain a Kraken token")
+        if not self._record_request():
+            return dict(blank, reason="Octopus API rate limit reached")
+
+        mutation = json.dumps({
+            "query": ("mutation ($a: String!, $c: String!) {"
+                      "  bookSavingSessionsWeekendHappyHourEvent("
+                      "      input: {accountNumber: $a, eventCode: $c}) {"
+                      "    bookedEvent { eventId eventType }"
+                      "  }"
+                      "}"),
+            "variables": {"a": self.account_id, "c": event_code},
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL_BACKEND,
+                data=mutation.encode(),
+                # RAW token on the backend host — see join_saving_session_event.
+                headers={"Content-Type": "application/json", "Authorization": token},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except (requests.RequestException, ValueError) as e:
+            return dict(blank, reason=f"network error: {e}")
+
+        if not response.ok:
+            if response.status_code in (401, 403):
+                self._kraken_token = None
+            return dict(blank, reason=f"HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as e:
+            return dict(blank, reason=f"malformed reply: {e}")
+
+        errs = (payload or {}).get("errors") or []
+        for err in errs:
+            ext    = err.get("extensions") or {}
+            code   = ext.get("errorCode") or "?"
+            detail = (ext.get("reason") or err.get("message") or "").strip()
+            if code == "OE-0102":
+                self._kraken_token = None
+                return dict(blank, reason=f"auth rejected ({code}): {detail}")
+            if "already" in detail.lower():
+                # The join mutation reports "already signed up" as an error that
+                # is really a success (OE-1308). Read a booking the same way, but
+                # only on the words, since the booking code has not been seen.
+                return {"ok": True, "already": True, "permanent": False,
+                        "reason": "already booked"}
+            return dict(blank, permanent=True,
+                        reason=f"Octopus refused ({code}): {detail}")
+
+        data   = ((payload or {}).get("data") or {}).get(
+            "bookSavingSessionsWeekendHappyHourEvent") or {}
+        booked = data.get("bookedEvent") or {}
+        if not booked:
+            return dict(blank, reason="no booking returned")
+        if event_id is not None and str(booked.get("eventId")) != str(event_id):
+            return dict(blank, reason=(f"the reply booked event {booked.get('eventId')}, "
+                                       f"not {event_id}"))
+
+        # Tokens and the joined flag both changed; drop the cached read.
+        self._saving_sessions_cache_at = 0.0
+        return {"ok": True, "already": False, "permanent": False, "reason": "booked"}
+
     # ================================================================
     # Internal: Tracker Rates
     # ================================================================

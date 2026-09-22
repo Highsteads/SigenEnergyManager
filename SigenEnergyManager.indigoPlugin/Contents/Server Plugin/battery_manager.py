@@ -1088,35 +1088,38 @@ class BatteryManager:
             )
         if snapshot.happy_hour_active:
             # FREE electricity: import as hard as the inverter allows, up to the
-            # configured target SOC. Note there is deliberately NO export_enabled
-            # gate here, unlike the turn-down branch above — this IMPORTS, so a
-            # post-power-cut lockout or storm suppression is irrelevant to it, and
-            # a storm actively WANTS a full battery. Do not "harmonise" the two.
+            # target SOC. Note there is deliberately NO export_enabled gate here,
+            # unlike the turn-down branch above — this IMPORTS, so a post-power-cut
+            # lockout or storm suppression is irrelevant to it, and a storm
+            # actively WANTS a full battery. Do not "harmonise" the two.
+            target = self._happy_hour_target_pct(snapshot)
             kwh = happy_hour_import_kwh(
                 soc_pct        = snapshot.current_soc_pct,
                 capacity_kwh   = snapshot.capacity_kwh,
-                target_soc_pct = snapshot.solar_overflow_target_pct,
+                target_soc_pct = target,
                 charge_kw      = snapshot.inverter_max_kw,
                 window_hours   = snapshot.happy_hour_hours,
             )
             if kwh > 0:
-                return Decision(
-                    action          = ACTION_HAPPY_HOUR_IMPORT,
-                    reason          = (f"Octopus Happy Hour — free electricity, importing up to "
-                                       f"{kwh:.1f} kWh to fill headroom "
-                                       f"({snapshot.current_soc_pct:.0f}% -> "
-                                       f"{snapshot.solar_overflow_target_pct:.0f}% target)"),
-                    target_soc_pct  = snapshot.solar_overflow_target_pct,
-                    power_watts     = int(max(0.0, snapshot.inverter_max_kw) * 1000),
-                )
-            # Already at target is the COMMON case on a sunny Sunday and is not a
-            # fault — but say it, so a free hour that banked nothing is explained
-            # rather than looking like the feature failing to fire.
+                reason = (f"Octopus Happy Hour — free electricity, importing up to "
+                          f"{kwh:.1f} kWh to fill headroom "
+                          f"({snapshot.current_soc_pct:.0f}% -> {target:.0f}% target)")
+            else:
+                # v5.112.0: STAY IN THE IMPORT when the battery is full enough.
+                # Until then this handed back to self consumption, and the house
+                # then ran on the battery for the rest of the free hour while the
+                # grid, which was free, sat idle. Held in the import mode with the
+                # battery's own discharge pinned at zero, the house runs on free
+                # power until the window closes and the battery keeps every kWh.
+                reason = (f"Octopus Happy Hour — battery at "
+                          f"{snapshot.current_soc_pct:.0f}% against a {target:.0f}% "
+                          f"target, so it takes no more; the house runs on the free "
+                          f"grid power until the hour ends")
             return Decision(
-                action = ACTION_SELF_CONSUMPTION,
-                reason = (f"Happy Hour window, but nothing worth importing: battery at "
-                          f"{snapshot.current_soc_pct:.0f}% against a "
-                          f"{snapshot.solar_overflow_target_pct:.0f}% target"),
+                action          = ACTION_HAPPY_HOUR_IMPORT,
+                reason          = reason,
+                target_soc_pct  = target,
+                power_watts     = int(max(0.0, snapshot.inverter_max_kw) * 1000),
             )
         if snapshot.saving_session_active:
             # STRICTLY BELOW the VPP branch above, and the ordering is the whole
@@ -2266,6 +2269,21 @@ class BatteryManager:
             return seen
         except Exception:                                    # noqa: BLE001
             return False
+
+    def _happy_hour_target_pct(self, snapshot: ManagerSnapshot) -> float:
+        """How full a free Happy Hour may fill the battery. v5.112.0.
+
+        The standing daily target (`solarOverflowTargetSoc`, 95) keeps room for
+        sunshine that would otherwise clip. CliveS's Flux rule of 17-Sep-2026
+        takes the battery to 100% once nothing left of today's sun can clip, and
+        free grid power is a better reason to fill the last five points than
+        9.7p sunshine is — so the same test decides it here. Another tariff, a
+        forecast that is missing or doubtful, or any error keeps the target.
+        """
+        base = float(snapshot.solar_overflow_target_pct)
+        if self._flux_clip_risk_passed(snapshot):
+            return max(base, 100.0)
+        return base
 
     def _check_solar_overflow(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance

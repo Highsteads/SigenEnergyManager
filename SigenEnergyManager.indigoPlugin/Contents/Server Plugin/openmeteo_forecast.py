@@ -6,9 +6,14 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Opus 4.8
-# Date:        05-09-2026 14:00
-# Version:     1.8 (the optimiser file path is injectable and an EMPTY forecast never
+# Author:      CliveS & Claude Opus 4.8; v1.9 Claude Opus 5.5
+# Date:        05-09-2026 14:00; v1.9 22-09-2026
+# Version:     1.9 (six days fetched, not three, and the days after tomorrow kept as
+#              `_hourly_p50_ahead` / `aheadDayKwh` — SigenEnergyManager 5.112.0 books
+#              Octopus Weekend Happy Hours when the slots open on a THURSDAY, and a
+#              three-day fetch could not see the Sunday it was deciding about.
+#              Nothing that reads today or tomorrow changes.)
+#              prior 1.8 (the optimiser file path is injectable and an EMPTY forecast never
 #              overwrites it. The path was a hardcoded absolute constant, so the plugin's
 #              own test suite, run on the Indigo Mac, clobbered the LIVE
 #              Python Scripts/openmeteo_forecast.json with zero slots on every run —
@@ -132,6 +137,11 @@ PERFORMANCE_RATIO = 0.90
 
 # Open-Meteo API
 OPENMETEO_URL   = "https://api.open-meteo.com/v1/forecast"
+# Today plus five. The Weekend Happy Hour booking check decides on a Thursday
+# (when Octopus open the slots) about the Sunday three days on, and re-checks
+# every hour until the slot; six days lets a slot released as early as Tuesday
+# still be judged. The extra days cost nothing extra — still one call per array.
+FORECAST_DAYS   = 6
 REQUEST_TIMEOUT = 10    # seconds per array call (Open-Meteo answers <1s;
                         # 30s made a blackholed network stall a tick ~4 min)
 # Ceiling for serving DISK CACHE as a fetch-failure fallback. Beyond this the
@@ -263,6 +273,8 @@ class OpenMeteoForecast:
             forecastStatus, lastUpdate,
             _hourly_p50_today  ({"YYYY-MM-DD HH:00:00": wh_int})
             _hourly_p50_tomorrow (same format, for tomorrow's date)
+            _hourly_p50_ahead (same format, every day AFTER tomorrow — v1.9)
+            aheadDayKwh ({"YYYY-MM-DD": raw kWh} for those days — v1.9)
             _dawn_times ({"YYYY-MM-DD": tz-aware datetime of first PV > threshold})
         """
         if not REQUESTS_AVAILABLE:
@@ -619,6 +631,8 @@ class OpenMeteoForecast:
         # Apply inverter cap and split into today / tomorrow buckets
         hourly_today    = {}
         hourly_tomorrow = {}
+        hourly_ahead    = {}
+        ahead_totals    = {}
         today_total     = 0.0
         tomorrow_total  = 0.0
         dawn_times      = {}
@@ -643,7 +657,13 @@ class OpenMeteoForecast:
             elif slot_date == tomorrow:
                 hourly_tomorrow[key] = wh_int
                 tomorrow_total      += capped_kwh
-            # day-after-tomorrow data available from forecast_days=3 but not needed here
+            elif slot_date > tomorrow:
+                # v1.9: kept for the Weekend Happy Hour booking check, which
+                # decides on a Thursday about a Sunday. RAW like the other two
+                # buckets; the reader applies the correction it wants.
+                hourly_ahead[key] = wh_int
+                day_key = slot_date.strftime("%Y-%m-%d")
+                ahead_totals[day_key] = ahead_totals.get(day_key, 0.0) + capped_kwh
 
             # Dawn tracking: first slot above threshold for each date
             if wh_int >= PV_GENERATION_THRESHOLD_WH:
@@ -692,6 +712,8 @@ class OpenMeteoForecast:
             "arrays_total":         len(self.arrays),
             "_hourly_p50_today":    hourly_today,
             "_hourly_p50_tomorrow": hourly_tomorrow,
+            "_hourly_p50_ahead":    hourly_ahead,
+            "aheadDayKwh":          {d: round(v, 1) for d, v in sorted(ahead_totals.items())},
             "_dawn_times":          dawn_times,
         }
 
@@ -752,7 +774,7 @@ class OpenMeteoForecast:
             "tilt":       array_cfg["tilt"],
             "azimuth":    array_cfg["azimuth"],
             "timezone":   "Europe/London",
-            "forecast_days": 3,
+            "forecast_days": FORECAST_DAYS,
             "timeformat": "iso8601",
         }
 
@@ -946,6 +968,8 @@ class OpenMeteoForecast:
             "lastUpdate":           datetime.now().strftime("%H:%M:%S"),
             "_hourly_p50_today":    {},
             "_hourly_p50_tomorrow": {},
+            "_hourly_p50_ahead":    {},
+            "aheadDayKwh":          {},
             "_dawn_times":          {},
         }
 

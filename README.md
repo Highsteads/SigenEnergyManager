@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.111.8 · Requires Indigo 2025.2 or later
+**Version:** 5.112.0 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -52,10 +52,14 @@ battery genuinely cannot reach the configured minimum SOC by next sunrise.
 - Export-sync check *(v5.19)* — compares the inverter's daily export kWh
   against Octopus's settled half-hourly readings for the last 7 settled
   days; anything outside ±5 % is flagged as drift
-- Saving Sessions alert *(v5.80)* — Pushover the moment Octopus announces a new
-  Saving Session, naming the window and the Octopoints/kWh rate. Notify-only —
-  extra export during a session earns Octopoints on top of the normal export
-  rate, but doesn't change what the plugin dispatches
+- Octopus Saving Sessions *(v5.80-v5.112)* — a plain-English Pushover when a session is
+  announced; optional automatic opt-in to Power Downs (on Flux, a session inside the
+  4pm-7pm peak is always joined, since the battery exports then anyway); optional export
+  through a joined session, so it is won rather than merely joined
+- Weekend Happy Hours *(v5.83, v5.112)* — the battery charges from the grid for nothing
+  through a booked free hour and keeps the house on the free power to the end of it; the
+  plugin can book the slots itself, two hours on any Sunday the battery can use them, and
+  spends every token before the offer ends; on Flux the overnight charge leaves room
 
 **Axle VPP (`axle_api.py`)**
 - Reads the announced event schedule from Axle's API a day ahead, then **self-drives
@@ -145,6 +149,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.112.0 | 22-Sep-2026 | **The plugin now books your Weekend Happy Hours, and the battery is ready for them.** Two successful Power Downs earn an hour of free electricity on a Sunday, and Octopus open the slots each Thursday with limited places. With the new box ticked the plugin books them for you. It books two hours on any Sunday the battery can really use them, judged by simulating the day from the solar forecast and counting the free energy the battery would take, less any sunshine that free energy would push out to the grid, and it holds your tokens back on a day bright enough to fill the battery by itself. Every token is spent by the last Sunday before the offer ends on 1 November, whatever the weather, so none are lost. You get one message saying what it booked and why, a reminder on the morning, and a note afterwards of what the free hours banked, and the four separate slot announcements stop. It never cancels a booking. **Three faults stood in the way of a booked hour doing any good, and all three are fixed.** On Flux the overnight cheap-rate charge ignored a booked hour and filled the battery the free power needed empty. It now leaves room, and says so in the log. From 2pm the Flux controller holds the battery for the 4pm peak, and nothing let a 2pm free hour take over from it, so that hour would never have charged at all. And once the battery reached its target the free hour handed back and ran the house from the battery for the rest of the hour while the free grid sat idle. It now keeps the house on the free power until the hour ends, and fills to 100% when nothing left of the day's sun could clip. **Power Downs between 4pm and 7pm are now always joined on Flux,** because the battery exports at its limit through the peak anyway, so a session there costs nothing. The token check now decides only the sessions outside it, which also means the plugin keeps joining the peak sessions after the offer ends. The solar forecast now looks six days ahead instead of three, so a Thursday decision can see Sunday. Off by default. 1936 to 2043 tests, and 30 deliberate breakages each caught. |
 | 5.111.8 | 22-Sep-2026 | **The status page no longer goes quiet while the battery is being told what to do.** Each time the plugin changes the battery's settings it takes up to about 16 seconds, and until now anything asking for the live figures had to wait for it to finish, which was long enough for the Dashboards energy page to give up and log a warning. That was 133 warnings in a week, most of them at 4pm when the Flux peak starts. It now waits a second at most and otherwise answers with the figures it read a few seconds earlier, saying how old they are. Nothing about how the battery is controlled changes. |
 | 5.111.7 | 21-Sep-2026 | **Two hand-over faults from the first evening with Flux, an Axle event and a Saving Session together.** Half an hour before an Axle event the plugin stops the battery charging once it holds enough. That step only recognised the export mode Axle's own cloud used to send, so on 21 September it switched off a Saving Session export that was already running, for about 40 seconds until the plugin's own check put it back. It now leaves any running export alone. Separately, the plugin logged a warning about the battery reserve setting whenever the reserve it wanted changed because a grid event had started. That is planned, not a fault, so it is now an ordinary log line, and the warning is kept for a setting the plugin did not write itself. |
 | 5.111.6 | 21-Sep-2026 | **On Octopus Flux the peak export now starts at 4pm, not five minutes later.** When the daytime solar export was running up to 4pm, the Flux controller treated it like something that had taken the battery away and waited five minutes after it stopped before selling. That export only ever gives way at 4pm by the clock, so there is nothing to wait for: the controller now takes over on its first check after 4pm. On a sunny day that is roughly a third of a kWh more sold at the 27.7p peak rate. |

@@ -265,13 +265,21 @@ You never sign in and nothing is stored: the link is read fresh each time and ex
     <Field id="label_savingSessionAutoJoin_info" type="label" fontSize="small">
         <Label>Joining the Saving Sessions campaign does NOT enrol you in each session — every one is a separate opt-in, and a session you have not joined pays nothing however much you export. With this ticked the plugin opts you in as soon as a session is announced, so none is missed while you are asleep or away.
 
-It only ever joins a Power Down, never a Power Up (which wants you to use MORE) and never a Weekend Happy Hour (which is a booking that spends a token, and that stays your decision). Opting in is one-way — Octopus offer no way to withdraw — but a session you end up not meeting simply pays nothing, with no penalty.</Label>
+It only ever joins a Power Down, never a Power Up (which wants you to use MORE). Booking a Weekend Happy Hour spends tokens, so it has its own box below. Opting in is one-way — Octopus offer no way to withdraw — but a session you end up not meeting simply pays nothing, with no penalty.</Label>
     </Field>
     <Field id="savingSessionExport" type="checkbox" defaultValue="false">
         <Label>Export the battery during a Saving Session:</Label>
     </Field>
     <Field id="happyHourImport" type="checkbox" defaultValue="false">
         <Label>Charge the battery during a Weekend Happy Hour:</Label>
+    </Field>
+    <Field id="happyHourAutoBook" type="checkbox" defaultValue="false">
+        <Label>Book Weekend Happy Hours automatically:</Label>
+    </Field>
+    <Field id="label_happyHourAutoBook_info" type="label" fontSize="small">
+        <Label>Octopus open the Sunday slots on a Thursday and each slot has limited places. With this ticked the plugin books them for you, checking every hour until the slots start. It books two hours on any Sunday the battery can really use them — it simulates the day from the solar forecast and counts the free energy the battery would take, less any sunshine that free energy would push out to the grid — and holds your tokens back on a day bright enough to fill the battery by itself. Every token is spent by the last Sunday before the offer ends, whatever the weather, so none are lost. You get one message saying what it booked and why, a reminder on the morning, and a note of what the free hours banked.
+
+It needs the charging box above, since a booked hour that does not charge the battery banks nothing. It never cancels a booking: whether a cancellation gives the tokens back is not known.</Label>
     </Field>
     <Field id="happyHourTokensRequired" type="textfield" defaultValue="2">
         <Label>Tokens needed to book a Happy Hour:</Label>
@@ -283,12 +291,12 @@ It only ever joins a Power Down, never a Power Up (which wants you to use MORE) 
         <Label>Happy Hours you expect to use (blank = all of them):</Label>
     </Field>
     <Field id="label_happyHourUsableHours_info" type="label">
-        <Label>Stops the plugin opting you in to a session whose token you could never spend. A Power Down is worth doing for the free hour it pays towards, so once you hold enough tokens for every hour you will realistically use, another session only costs you battery and sells units at a loss. The plugin already knows how many hours COULD be booked before the scheme ends, counting two per remaining weekend, and will never let this number exceed that. But that ceiling is generous and will rarely stop anything, so if you only intend to spend an hour when solar is poor, put the number you actually expect to use here. It also refuses any session too late in October for Octopus to score it in time to book a weekend. Leave it blank and only the calendar limits apply.</Label>
+        <Label>Stops the plugin opting you in to a session whose token you could never spend. A Power Down is worth doing for the free hour it pays towards, so once you hold enough tokens for every hour you will realistically use, another session outside the Flux peak only costs you battery. (On Flux a session between 4pm and 7pm is always joined: the battery is exporting at its limit then anyway, so the points come free. After the offer ends every session is joined for its points, as before it began.) The plugin already knows how many hours COULD be booked before the scheme ends, counting two per remaining weekend, and will never let this number exceed that. But that ceiling is generous and will rarely stop anything, so if you only intend to spend an hour when solar is poor, put the number you actually expect to use here. It also refuses any session too late in October for Octopus to score it in time to book a weekend. Leave it blank and only the calendar limits apply.</Label>
     </Field>
     <Field id="label_happyhour_info" type="label" fontSize="small">
         <Label>A Happy Hour is an hour of FREE electricity you book on the Octopus site, earned by two successful Power Down sessions. With this ticked, the battery grid-charges at full inverter power for that hour so the free energy is banked rather than wasted.
 
-It only ever runs for the slot you actually booked (Octopus offers four each Sunday), it fills to your configured target rather than 100%, and it stops early once the battery is full. Slots fall mid-Sunday when solar is often already filling the battery, so on a bright day there may be no room to fill and it will correctly do nothing.</Label>
+It only ever runs for a slot that is actually booked (Octopus offers four each Sunday). It fills to your configured target, or to 100% on Flux once nothing left of the day's sun could clip, and then keeps the house on the free grid power until the hour ends rather than running it from the battery. On Flux the overnight cheap-rate charge leaves room for a booked hour, so the free energy replaces what would otherwise have been bought.</Label>
     </Field>
     <Field id="label_savingsessions_info" type="label" fontSize="small">
         <Label>Alerts are always sent when a session is announced. This checkbox is the separate question of whether the battery is driven to export during the window, which is what earns the Octopoints.

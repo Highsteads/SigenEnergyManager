@@ -19,7 +19,7 @@ import sys
 import openmeteo_forecast
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -549,6 +549,56 @@ class TestNowLocalIsAware(unittest.TestCase):
     def test_now_local_is_timezone_aware(self):
         fc = _isolated_forecast()
         self.assertIsNotNone(fc._now_local().tzinfo)
+class TestDaysAfterTomorrowAreKept(unittest.TestCase):
+    """v1.9. The Weekend Happy Hour booking check decides on a Thursday about the
+    Sunday three days on. A three-day fetch could not see it, and the days it did
+    fetch after tomorrow were thrown away."""
+
+    def setUp(self):
+        import openmeteo_forecast as omf
+        from datetime import datetime as _dt
+        self._omf      = omf
+        self._prev_req = omf.REQUESTS_AVAILABLE
+        omf.REQUESTS_AVAILABLE = True
+        self.f = _isolated_forecast()
+        base = _dt(2026, 9, 24, 12, 0)            # a Thursday
+        self.f._now_local = lambda: base.replace(tzinfo=__import__("zoneinfo").ZoneInfo("Europe/London"))
+        rows = []
+        for day in range(6):
+            for h in range(24):
+                t = (base.replace(hour=0) + timedelta(days=day, hours=h))
+                rows.append((t.strftime("%Y-%m-%dT%H:%M"), 500.0 if 10 <= h < 14 else 0.0))
+        self.f._fetch_array = lambda _cfg: rows
+
+    def tearDown(self):
+        self._omf.REQUESTS_AVAILABLE = self._prev_req
+
+    def test_the_request_asks_for_six_days(self):
+        self.assertEqual(self._omf.FORECAST_DAYS, 6)
+
+    def test_sunday_is_there_on_thursday(self):
+        combined = self.f._fetch_all_arrays()
+        ahead = combined["_hourly_p50_ahead"]
+        self.assertIn("2026-09-27 12:00:00", ahead)                 # Sunday
+        self.assertIn("2026-09-29 12:00:00", ahead)                 # the last day fetched
+        self.assertNotIn("2026-09-24 12:00:00", ahead)              # today is not "ahead"
+        self.assertNotIn("2026-09-25 12:00:00", ahead)              # nor is tomorrow
+        self.assertEqual(sorted(combined["aheadDayKwh"]),
+                         ["2026-09-26", "2026-09-27", "2026-09-28", "2026-09-29"])
+        self.assertGreater(combined["aheadDayKwh"]["2026-09-27"], 0.0)
+
+    def test_today_and_tomorrow_are_exactly_as_before(self):
+        combined = self.f._fetch_all_arrays()
+        self.assertTrue(all(k.startswith("2026-09-24") for k in combined["_hourly_p50_today"]))
+        self.assertTrue(all(k.startswith("2026-09-25") for k in combined["_hourly_p50_tomorrow"]))
+        self.assertEqual(len(combined["_hourly_p50_today"]), 24)
+
+    def test_the_empty_forecast_has_the_new_keys_too(self):
+        d = self.f._empty_forecast("test")
+        self.assertEqual(d["_hourly_p50_ahead"], {})
+        self.assertEqual(d["aheadDayKwh"], {})
+
+
 class TestForecastCarriesItsOwnDate(unittest.TestCase):
     """Every forecast dict must say which local day its totals are FOR.
 

@@ -2437,6 +2437,17 @@ class TestCheckSavingSessions(unittest.TestCase):
         # Real too, and this one decides whether the account is committed at all —
         # a stub here would mean every auto-join test ran without the guard.
         _happy_hour_token_verdict = plugin.Plugin._happy_hour_token_verdict
+        # v5.112.0: the one owner of "worth joining", which asks the Flux peak
+        # first. Real, with Flux unarmed in these prefs, so the token verdict
+        # still decides every case below exactly as it did.
+        _session_join_verdict     = plugin.Plugin._session_join_verdict
+        _session_inside_flux_peak = plugin.Plugin._session_inside_flux_peak
+        _flux_armed               = plugin.Plugin._flux_armed
+        _flux_enabled             = plugin.Plugin._flux_enabled
+        # Real and inert: both return at once with their checkboxes absent.
+        _auto_book_happy_hours    = plugin.Plugin._auto_book_happy_hours
+        _happy_hour_morning_note  = plugin.Plugin._happy_hour_morning_note
+        _happy_hour_slots_by_day  = plugin.Plugin._happy_hour_slots_by_day
         # staticmethod() is required: aliasing a @staticmethod as a bare class
         # attribute rebinds it as an INSTANCE method, so the stub arrives as the
         # first positional argument. It fails as a TypeError on a date compare,
@@ -7069,6 +7080,10 @@ class TestAutoJoinSavingSessions(unittest.TestCase):
         # The REAL guard. Stubbing it would mean every test below ran without the
         # one check that decides whether the account gets committed.
         _happy_hour_token_verdict   = plugin.Plugin._happy_hour_token_verdict
+        _session_join_verdict       = plugin.Plugin._session_join_verdict
+        _session_inside_flux_peak   = plugin.Plugin._session_inside_flux_peak
+        _flux_armed                 = plugin.Plugin._flux_armed
+        _flux_enabled               = plugin.Plugin._flux_enabled
         _happy_hour_tokens_required = plugin.Plugin._happy_hour_tokens_required
         # staticmethod() required — see the note in TestCheckSavingSessions.
         happy_hour_slots_left       = staticmethod(plugin.Plugin.happy_hour_slots_left)
@@ -7775,6 +7790,133 @@ class TestPreChargeNeverStopsARunningExport(unittest.TestCase):
         p._apply_vpp_event(self.event)
         p.modbus.set_self_consumption.assert_called_once()
         self.assertTrue(p.store["vpp_charge_stopped"])
+
+
+
+class TestHappyHourImportRunsToTheEndOfTheWindow(unittest.TestCase):
+    """v5.112.0. The free hour used to stop in software at the target and hand
+    back to self consumption, which put the house on the battery for the rest of
+    the free hour. Now the hardware cutoff stops the charging AT the target, the
+    battery's discharge is pinned at zero, and only the window end (or the
+    overrun backstop) hands back."""
+
+    def _mk(self, soc=60.0, active=False, target_now=0.0):
+        from battery_manager import Decision
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        m = p.modbus  = MagicMock()
+        m.connected   = True
+        m.force_charge.return_value      = True
+        m.set_charge_cutoff.return_value = True
+        p.latest_inverter_data = {"batterySoc": soc}
+        p.store = {
+            "import_active":            active,
+            "export_active":            False,
+            "happy_hour_import_active": active,
+            "happy_hour_anchor_kwh":    2.0 if active else None,
+            "grid_import_daily_kwh":    3.0,
+            "import_target_soc":        target_now,
+            "import_scheduled_time":    None,
+        }
+        p._set_import_cutoff  = MagicMock()
+        p._save_accumulators  = MagicMock()
+        p._trigger_event      = MagicMock()
+        return p, Decision
+
+    def _hh(self, Decision, target):
+        return Decision(action=plugin.ACTION_HAPPY_HOUR_IMPORT, reason="free hour",
+                        target_soc_pct=target, power_watts=10000)
+
+    def test_the_hardware_cutoff_is_the_target_itself(self):
+        p, Decision = self._mk()
+        p._act_on_decision(self._hh(Decision, 95.0))
+        self.assertEqual(p.modbus.force_charge.call_args.kwargs["cutoff_soc"], 95.0)
+        self.assertTrue(p.store["happy_hour_import_active"])
+        self.assertEqual(p.store["happy_hour_anchor_kwh"], 3.0)
+
+    def test_the_battery_does_not_run_the_house_during_the_free_hour(self):
+        p, Decision = self._mk()
+        p._act_on_decision(self._hh(Decision, 100.0))
+        p.modbus.set_discharge_limit.assert_called_once_with(0)
+
+    def test_reaching_the_target_does_not_hand_back_while_the_hour_runs(self):
+        """The end-of-method 'import target reached' check used to end EVERY
+        import at its target, this one included."""
+        p, Decision = self._mk(soc=100.0, active=True, target_now=100.0)
+        p._act_on_decision(self._hh(Decision, 100.0))
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertTrue(p.store["import_active"])
+        self.assertTrue(p.store["happy_hour_import_active"])
+
+    def test_an_ordinary_import_still_stops_at_its_target(self):
+        """The exemption is the free hour's alone."""
+        from battery_manager import Decision
+        p, _ = self._mk(soc=90.0)
+        p.store["import_active"]     = True
+        p.store["import_target_soc"] = 85.0
+        p._act_on_decision(Decision(action=plugin.ACTION_SCHEDULE_IMPORT, reason="x"))
+        p.modbus.set_self_consumption.assert_called()
+        self.assertFalse(p.store["import_active"])
+
+    def test_a_rising_target_moves_the_hardware_stop(self):
+        """95 -> 100 when the afternoon passes the clip test."""
+        p, Decision = self._mk(soc=94.0, active=True, target_now=95.0)
+        p._act_on_decision(self._hh(Decision, 100.0))
+        p.modbus.set_charge_cutoff.assert_called_once_with(100.0)
+        self.assertEqual(p.store["import_target_soc"], 100.0)
+        p.modbus.force_charge.assert_not_called()
+
+    def test_an_unchanged_target_writes_nothing(self):
+        p, Decision = self._mk(soc=80.0, active=True, target_now=100.0)
+        p._act_on_decision(self._hh(Decision, 100.0))
+        p.modbus.set_charge_cutoff.assert_not_called()
+        p.modbus.force_charge.assert_not_called()
+
+
+class TestVerifyHoldsTheFreeHourDischargeAtZero(unittest.TestCase):
+    """The verify pass must hold the zero discharge limit of a free hour, not
+    'correct' it back to the inverter maximum inside a minute."""
+
+    def _mk(self, discharge_w, happy=True):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "batteryHealthCutoff": "1.0"}
+        p.store = {
+            "vpp_state": plugin.VPP_IDLE,
+            "saving_session_export_active": False,
+            "export_active": False,
+            "solar_overflow_active": False,
+            "vpp_cutoff_raised": False,
+            "flood_prev_target_soc": None,
+            "import_charge_cutoff_pct": 100.0 if happy else None,
+            "import_active": True,
+            "happy_hour_import_active": happy,
+        }
+        m = p.modbus = MagicMock()
+        m.connected = True
+        m.read_ems_mode.return_value         = 0x03
+        m.read_discharge_limit.return_value  = discharge_w
+        m.read_charge_limit.return_value     = 10000
+        m.read_discharge_cutoff.return_value = 1.0
+        m.read_charge_cutoff.return_value    = 100.0
+        return p
+
+    def test_a_zero_discharge_limit_is_left_alone_in_a_free_hour(self):
+        p = self._mk(discharge_w=0)
+        p._verify_ems_registers()
+        p.modbus.set_discharge_limit.assert_not_called()
+
+    def test_a_drifted_limit_is_put_back_to_zero_in_a_free_hour(self):
+        p = self._mk(discharge_w=10000)
+        p._verify_ems_registers()
+        p.modbus.set_discharge_limit.assert_called_once_with(0)
+
+    def test_an_ordinary_import_still_expects_the_maximum(self):
+        p = self._mk(discharge_w=0, happy=False)
+        p._verify_ems_registers()
+        p.modbus.set_discharge_limit.assert_called_once_with(10000)
 
 
 if __name__ == "__main__":

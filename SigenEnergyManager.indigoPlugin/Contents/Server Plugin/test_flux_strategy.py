@@ -1060,5 +1060,133 @@ class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
         self.assertNotIn("control_key", called)
 
 
+# ================================================================
+# Free-import windows (v5.112.0) — a booked Weekend Happy Hour in the walk
+# ================================================================
+
+SUNDAY = (2026, 9, 20)
+
+
+def _free(day, start_h, end_h, kw=10.0):
+    """A booked free-import window, shaped the way plugin._flux_commitments makes it."""
+    d = datetime(*day, tzinfo=LONDON).date() if isinstance(day, tuple) else day
+    start = fs._wall(LONDON, d, fs.time(start_h, 0))
+    end   = fs._wall(LONDON, d, fs.time(end_h, 0))
+    hours = (end - start).total_seconds() / 3600.0
+    return fs.EventCommitment(source="octopus", kind="import", start=start, end=end,
+                              energy_kwh=kw * hours, event_id=f"hh-{start_h}")
+
+
+def _sim(day=SUNDAY, pv_kwh=12.0, commitments=(), site=None, daily_kwh=24.0):
+    d = datetime(*day, tzinfo=LONDON).date()
+    return fs.SimInputs(site=site or _site(), house=_profile(daily_kwh),
+                        pv=_pv(d, pv_kwh), commitments=tuple(commitments))
+
+
+def _at(day, h, m=0):
+    return fs._wall(LONDON, datetime(*day, tzinfo=LONDON).date(), fs.time(h, m))
+
+
+class TestFreeImportWindows(unittest.TestCase):
+    """Before v5.112.0 a Happy Hour reached the planner as an 'import' commitment
+    and was then never read, so the overnight charge bought the room the free
+    hour needed. These pin the walk, the charge plan and the spill count."""
+
+    def test_the_old_tuple_is_unchanged_for_every_existing_caller(self):
+        s = _sim(pv_kwh=20.0)
+        steps = fs.build_steps(s, _at(SUNDAY, 5), _at(SUNDAY, 23))
+        old = fs.run_steps(s.site, steps, 20.0)
+        new = fs.walk(s.site, steps, 20.0)
+        self.assertEqual(old, (new.end_kwh, new.min_kwh, new.unmet_kwh, new.max_kwh))
+
+    def test_a_free_hour_fills_at_the_charge_limit_and_the_house_runs_on_the_grid(self):
+        s = _sim(pv_kwh=0.0, commitments=(_free(SUNDAY, 13, 14),))
+        steps = fs.build_steps(s, _at(SUNDAY, 13), _at(SUNDAY, 14))
+        r = fs.walk(s.site, steps, 10.0)
+        eff = s.site.one_way_efficiency
+        # 10 kW for an hour, grid-side, and not a kWh of it spent on the house.
+        self.assertAlmostEqual(r.free_in_kwh, 10.0, places=6)
+        self.assertAlmostEqual(r.end_kwh, 10.0 + 10.0 * eff, places=6)
+        self.assertAlmostEqual(r.min_kwh, 10.0, places=6)
+
+    def test_without_the_window_the_same_hour_drains_the_battery(self):
+        s = _sim(pv_kwh=0.0)
+        steps = fs.build_steps(s, _at(SUNDAY, 13), _at(SUNDAY, 14))
+        r = fs.walk(s.site, steps, 10.0)
+        self.assertLess(r.end_kwh, 10.0)
+        self.assertEqual(r.free_in_kwh, 0.0)
+
+    def test_the_sun_goes_first_and_shares_the_one_charge_limit(self):
+        """Free grid energy tops up what the sun leaves of the charge limit. Both
+        cannot have the whole 10 kW, or the plan banks energy the inverter could
+        never move."""
+        d = datetime(*SUNDAY, tzinfo=LONDON).date()
+        buckets = {f"{d:%Y-%m-%d} {h:02d}:00:00": (4500.0 if h == 13 else 0.0)
+                   for h in range(24)}
+        s = fs.SimInputs(site=_site(), house=_profile(24.0),
+                         pv=fs.HourlyPvForecast(buckets, LONDON),
+                         commitments=(_free(SUNDAY, 13, 14),))
+        r = fs.walk(s.site, fs.build_steps(s, _at(SUNDAY, 13), _at(SUNDAY, 14)), 5.0)
+        # 4.5 kWh of sun, 1 kWh of it straight to the house: 3.5 in from the sun,
+        # so 6.5 from the grid fills the 10 kW limit.
+        self.assertAlmostEqual(r.free_in_kwh, 6.5, places=6)
+        self.assertAlmostEqual(r.spill_kwh, 0.0, places=6)
+
+    def test_a_full_battery_takes_nothing_free_and_spills_the_sun(self):
+        cap = _site().capacity_kwh
+        s = _sim(pv_kwh=27.0, commitments=(_free(SUNDAY, 12, 13),))
+        r = fs.walk(s.site, fs.build_steps(s, _at(SUNDAY, 12), _at(SUNDAY, 13)), cap)
+        self.assertEqual(r.free_in_kwh, 0.0)
+        self.assertAlmostEqual(r.spill_kwh, 3.0 - 1.0, places=6)   # 3 kWh an hour of sun, 1 to the house
+
+    def test_a_free_window_is_not_counted_beside_an_export_commitment(self):
+        """The manager fails closed when a turn-down and a Happy Hour coincide.
+        A plan that banked the free energy anyway would rest on an import the
+        manager is going to refuse."""
+        s = _sim(pv_kwh=0.0, commitments=(_free(SUNDAY, 13, 14),
+                                          _axle(SUNDAY, 13, 14, kw=4.0)))
+        r = fs.walk(s.site, fs.build_steps(s, _at(SUNDAY, 13), _at(SUNDAY, 14)), 20.0)
+        self.assertEqual(r.free_in_kwh, 0.0)
+        self.assertLess(r.end_kwh, 20.0)
+
+    def test_sun_sent_out_on_purpose_is_not_spill(self):
+        """In an export decision's no-charge regime the PV goes to the grid by
+        design. Counting it as spill would read a planned sale as waste."""
+        s = _sim(pv_kwh=27.0)
+        steps = fs.build_steps(s, _at(SUNDAY, 12), _at(SUNDAY, 13))
+        r = fs.walk(s.site, steps, 10.0, no_charge_until=_at(SUNDAY, 13))
+        self.assertEqual(r.spill_kwh, 0.0)
+
+    def test_the_overnight_charge_leaves_room_for_a_booked_free_hour(self):
+        """The fault this release exists for: a dull Sunday, 02:30, two booked
+        free hours at 1pm. The charge must buy less, not fill the battery."""
+        plain  = fs.plan(_inputs((2, 30), soc_pct=30.0, day=SUNDAY,
+                                 pv=_pv(datetime(*SUNDAY, tzinfo=LONDON).date(), 10.0)))
+        booked = fs.plan(_inputs((2, 30), soc_pct=30.0, day=SUNDAY,
+                                 pv=_pv(datetime(*SUNDAY, tzinfo=LONDON).date(), 10.0),
+                                 commitments=(_free(SUNDAY, 13, 15),)))
+        self.assertEqual(plain.mode, fs.MODE_CHARGE)
+        bought_with = booked.planned_kwh if booked.mode == fs.MODE_CHARGE else 0.0
+        self.assertLess(bought_with, plain.planned_kwh - 10.0)
+        self.assertIn("free Happy Hour electricity", booked.reason)
+
+    def test_the_charge_plan_says_nothing_about_free_power_when_none_is_booked(self):
+        d = fs.plan(_inputs((2, 30), soc_pct=30.0, day=SUNDAY))
+        self.assertNotIn("Happy Hour", d.reason)
+
+    def test_the_household_floor_is_still_protected_before_the_free_hour(self):
+        """Leaving room must never mean arriving at the free hour below the
+        reserve: the house still runs on the battery from 5am until then."""
+        sim = _sim(pv_kwh=0.0, commitments=(_free(SUNDAY, 13, 15),))
+        floor = _site().capacity_kwh * 0.20
+        need, infeasible = fs.required_start_kwh(sim, _at(SUNDAY, 5),
+                                                 _at(SUNDAY, 13), floor)
+        r = fs.walk(sim.site, fs.build_steps(sim, _at(SUNDAY, 5), _at(SUNDAY, 13)), need)
+        self.assertEqual(infeasible, 0.0)
+        self.assertGreaterEqual(r.min_kwh, floor - 1e-6)
+        # 8 hours of a 1 kW house, less nothing from the sun
+        self.assertAlmostEqual(need - floor, 8.0 / sim.site.one_way_efficiency, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()

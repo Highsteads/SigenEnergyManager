@@ -944,6 +944,103 @@ def _join_err(error_code, reason):
                                        "reason": reason}}]}
 
 
+def _book_ok(event_id=6406):
+    return {"data": {"bookSavingSessionsWeekendHappyHourEvent": {
+        "bookedEvent": {"eventId": event_id, "eventType": "WEEKEND_HAPPY_HOUR"}}}}
+
+
+def _book_err(error_code, message, reason=None):
+    ext = {"errorCode": error_code, "errorDescription": message}
+    if reason is not None:
+        ext["reason"] = reason
+    return {"data": {"bookSavingSessionsWeekendHappyHourEvent": None},
+            "errors": [{"message": message,
+                        "path": ["bookSavingSessionsWeekendHappyHourEvent"],
+                        "extensions": ext}]}
+
+
+class TestBookHappyHourEvent(unittest.TestCase):
+    """v5.112.0. A booking SPENDS tokens, so success is claimed only when the
+    reply carries the booked event, and the same event that was asked for."""
+
+    def setUp(self):
+        self.api = _make_api()
+        self._orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+
+    def tearDown(self):
+        octopus_api.requests = self._orig
+
+    def _post(self, payload, ok=True, status=200):
+        octopus_api.requests.post.return_value = _FakeResp(payload, ok=ok, status=status)
+
+    def test_a_booking_the_reply_confirms_is_success(self):
+        self._post(_book_ok(6406))
+        r = self.api.book_happy_hour_event("EVENT_83_200926", event_id=6406)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["already"])
+
+    def test_a_reply_naming_a_different_event_is_not_success(self):
+        self._post(_book_ok(9999))
+        r = self.api.book_happy_hour_event("EVENT_83_200926", event_id=6406)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["permanent"])
+
+    def test_the_mutation_and_host_are_the_ones_introspected(self):
+        self._post(_book_ok(6406))
+        self.api.book_happy_hour_event("EVENT_83_200926", event_id=6406)
+        args, kwargs = octopus_api.requests.post.call_args
+        self.assertEqual(args[0], octopus_api.KRAKEN_GRAPHQL_BACKEND)
+        body = kwargs["data"].decode()
+        self.assertIn("bookSavingSessionsWeekendHappyHourEvent", body)
+        self.assertIn("EVENT_83_200926", body)
+        self.assertEqual(kwargs["headers"]["Authorization"], "tok")
+
+    def test_not_found_is_a_permanent_refusal(self):
+        """The live shape, measured 22-Sep-2026 with a code that cannot exist."""
+        self._post(_book_err("OE-1305", "Saving Sessions event not found."))
+        r = self.api.book_happy_hour_event("EVENT_DOES_NOT_EXIST")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["permanent"])
+        self.assertIn("OE-1305", r["reason"])
+
+    def test_already_booked_is_success(self):
+        self._post(_book_err("OE-1308", "Account ineligible.",
+                             reason="Account is already signed up to this event."))
+        r = self.api.book_happy_hour_event("E1")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["already"])
+
+    def test_auth_failure_is_retryable_and_purges_the_token(self):
+        self.api._kraken_token = "stale"
+        self._post(_book_err("OE-0102", "'Authorization' header is invalid"))
+        r = self.api.book_happy_hour_event("E1")
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["permanent"])
+        self.assertIsNone(self.api._kraken_token)
+
+    def test_http_200_with_nothing_in_it_is_not_success(self):
+        self._post({"data": {"bookSavingSessionsWeekendHappyHourEvent": None}})
+        r = self.api.book_happy_hour_event("E1")
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["permanent"])
+
+    def test_an_http_error_is_not_success(self):
+        self._post({}, ok=False, status=502)
+        self.assertFalse(self.api.book_happy_hour_event("E1")["ok"])
+
+    def test_a_success_drops_the_cached_session_read(self):
+        self.api._saving_sessions_cache_at = 123456.0
+        self._post(_book_ok(6406))
+        self.api.book_happy_hour_event("E1", event_id=6406)
+        self.assertEqual(self.api._saving_sessions_cache_at, 0.0)
+
+    def test_no_code_is_refused_without_a_call(self):
+        r = self.api.book_happy_hour_event("")
+        self.assertTrue(r["permanent"])
+        octopus_api.requests.post.assert_not_called()
+
+
 class TestJoinSavingSessionEvent(unittest.TestCase):
     def setUp(self):
         self.api = _make_api()

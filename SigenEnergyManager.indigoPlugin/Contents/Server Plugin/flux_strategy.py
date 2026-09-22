@@ -4,9 +4,17 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context)
-# Date:        16-09-2026
-# Version:     2.0
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1 Claude Opus 5.5
+# Date:        16-09-2026; v2.1 22-09-2026
+# Version:     2.1
+#
+# v2.1 (SigenEnergyManager 5.112.0) puts a booked Weekend Happy Hour INTO the
+# walk. It had been handed over as an "import" commitment since 5.109 and never
+# read, so the 02:00-05:00 charge filled the battery the free hour needed empty.
+# The walk now lets the grid serve the house and fill the battery for nothing
+# inside such a window, and counts the sunshine that finds no room (spill), so
+# a caller can tell a free hour that is worth booking from one that would only
+# push the day's own solar out to the grid.
 #
 # v2.0 answers the Codex review (docs/flux-codex-review-required.md):
 #   * the energy budget is CHRONOLOGICAL — a half-hourly simulation in UTC, not a
@@ -635,6 +643,40 @@ def _commitment_kwh(commitments, a, b, kind="export"):
     return total
 
 
+@dataclass(frozen=True)
+class SimInputs:
+    """The four things a walk reads, for a caller that is not making a decision.
+
+    `build_steps`, `simulate` and `required_start_kwh` only ever touch these
+    four attributes of a FluxInputs. The Weekend Happy Hour booking check
+    (v5.112.0) simulates a Sunday that has not happened yet, with no live
+    telemetry, rates or ages behind it, so it passes this instead of inventing
+    the rest of a FluxInputs.
+    """
+    site:        FluxSite
+    house:       "HalfHourProfile"
+    pv:          "HourlyPvForecast"
+    commitments: Tuple[EventCommitment, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class WalkResult:
+    """Everything one forward walk learns.
+
+    `run_steps` returns the first four as a tuple, in the order every older
+    caller unpacks. The last two were added for free-import windows (v5.112.0):
+    how much free grid energy the battery actually took, and how much surplus
+    sunshine found no room — the second is what a free hour pushes out when it
+    lands on a day the roof would have filled anyway.
+    """
+    end_kwh:     float
+    min_kwh:     float
+    unmet_kwh:   float
+    max_kwh:     float
+    spill_kwh:   float = 0.0
+    free_in_kwh: float = 0.0
+
+
 def build_steps(inputs, a, b):
     """The half-hourly demand/supply grid for [a, b), built ONCE.
 
@@ -642,6 +684,12 @@ def build_steps(inputs, a, b):
     rebuilding the series forty times meant forty passes over the profile and the
     forecast, and the supervisor runs this on the plugin's only thread every ten
     seconds. Built once, the search is forty cheap numeric loops.
+
+    Each step is (start, hours, house kWh, PV kWh, export commitment kWh, free
+    import kWh). The last is GRID-SIDE energy a booked free-import window may
+    bring in during the step (v5.112.0) — before it existed, a Happy Hour was
+    handed to the planner as a commitment and then never read, so the overnight
+    charge filled the battery that the free hour needed empty.
     """
     a       = a.astimezone(timezone.utc)
     b       = b.astimezone(timezone.utc)
@@ -657,13 +705,14 @@ def build_steps(inputs, a, b):
             inputs.house.kwh_between(cursor, end),
             inputs.pv.kwh_between(cursor, end),
             _commitment_kwh(inputs.commitments, cursor, end, "export"),
+            _commitment_kwh(inputs.commitments, cursor, end, "import"),
         ))
         cursor = end
     return steps
 
 
-def run_steps(site, steps, start_kwh, serve_house=True, no_charge_until=None):
-    """Walk a prebuilt grid. Returns (end_kwh, min_kwh, unmet_kwh, max_kwh).
+def walk(site, steps, start_kwh, serve_house=True, no_charge_until=None):
+    """Walk a prebuilt grid and return a WalkResult.
 
     Per step, in this order:
       1. PV serves the house directly — that energy never touches the battery,
@@ -671,18 +720,29 @@ def run_steps(site, steps, start_kwh, serve_house=True, no_charge_until=None):
       2. surplus PV serves any export commitment;
       3. the battery covers the rest of the commitment, at the discharge
          efficiency and within the discharge power limit;
-      4. the battery covers the remaining house load, if `serve_house`;
+      4. the battery covers the remaining house load, if `serve_house` — except
+         inside a free-import window, where the grid serves it for nothing;
       5. whatever PV is still spare charges the battery, at the charge efficiency
-         and within the charge power limit, up to capacity.
+         and within the charge power limit, up to capacity. Anything left over is
+         SPILL: sunshine with nowhere to go but the grid;
+      6. inside a free-import window, the grid then fills whatever charge rate
+         and room the sun left, up to the window's budget.
 
     Both power limits bind per step. Without them a 12 kW hour of sun banks 12
     kWh through a 1 kW charger, and the plan rests on energy the inverter could
-    never have moved.
+    never have moved. The sun goes first in step 6 because it is free as well and
+    would otherwise be spilled; the charge limit is one limit shared by both.
+
+    A free window never counts in a step that also carries an export commitment.
+    The manager FAILS CLOSED when a turn-down and a Happy Hour are live together,
+    so a plan that banked the free energy anyway would rest on an import the
+    manager is going to refuse.
 
     `no_charge_until` models the regime an EXPORT decision creates: in mode 5 the
     charge limit is zero, so surplus PV goes to the grid, not the battery. A
     floor worked out assuming that PV would be banked, and then acted on by a
-    decision that prevents the banking, invalidates its own premise.
+    decision that prevents the banking, invalidates its own premise. PV sent to
+    the grid on purpose like that is not counted as spill.
 
     Commitment shortfall is reported, never absorbed.
     """
@@ -691,7 +751,9 @@ def run_steps(site, steps, start_kwh, serve_house=True, no_charge_until=None):
     energy   = max(0.0, min(float(start_kwh), capacity))
     low = high = energy
     unmet    = 0.0
-    for cursor, hours, house, pv, event in steps:
+    spill    = 0.0
+    free_in  = 0.0
+    for cursor, hours, house, pv, event, free in steps:
         max_in  = site.charge_power_w / 1000.0 * hours
         max_out = site.discharge_power_w / 1000.0 * hours
 
@@ -711,18 +773,51 @@ def run_steps(site, steps, start_kwh, serve_house=True, no_charge_until=None):
             if take < need - 1e-9:
                 unmet += (need - take) * eff
 
+        free_step = free > 0 and event <= 0
+        if free_step:
+            house_rem = 0.0           # the grid serves the house, for nothing
+
         if serve_house and house_rem > 0:
             need = house_rem / eff
             take = min(need, energy, out_left)
             energy   -= take
             out_left -= take
 
-        if surplus > 0 and (no_charge_until is None or cursor >= no_charge_until):
-            energy = min(capacity, energy + min(surplus, max_in) * eff)
+        if no_charge_until is None or cursor >= no_charge_until:
+            if surplus > 0:
+                # Same arithmetic as before free windows existed, written so the
+                # part that did not fit can be counted: min(capacity, e + x*eff).
+                wanted  = min(surplus, max_in)
+                room_in = max(0.0, capacity - energy) / eff
+                if wanted >= room_in:
+                    pv_in, energy = room_in, capacity
+                else:
+                    pv_in, energy = wanted, energy + wanted * eff
+                spill += surplus - pv_in
+            else:
+                pv_in = 0.0
+            if free_step and energy < capacity:
+                grid_in = min(free, max(0.0, max_in - pv_in),
+                              max(0.0, capacity - energy) / eff)
+                if grid_in > 0:
+                    energy   = min(capacity, energy + grid_in * eff)
+                    free_in += grid_in
 
         low  = min(low, energy)
         high = max(high, energy)
-    return energy, low, unmet, high
+    return WalkResult(end_kwh=energy, min_kwh=low, unmet_kwh=unmet, max_kwh=high,
+                      spill_kwh=spill, free_in_kwh=free_in)
+
+
+def run_steps(site, steps, start_kwh, serve_house=True, no_charge_until=None):
+    """Walk a prebuilt grid. Returns (end_kwh, min_kwh, unmet_kwh, max_kwh).
+
+    The tuple form every planning caller unpacks; `walk` is the same walk with
+    the spill and free-import totals as well. See `walk` for the order of play.
+    """
+    r = walk(site, steps, start_kwh, serve_house=serve_house,
+             no_charge_until=no_charge_until)
+    return r.end_kwh, r.min_kwh, r.unmet_kwh, r.max_kwh
 
 
 def simulate(inputs, start_kwh, a, b, serve_house=True, no_charge_until=None):
@@ -785,6 +880,18 @@ def _reserve_floor_pct(site):
     """The flat reserve, raised by policy. Never rounded down."""
     return min(100.0, float(math.ceil(max(float(site.reserve_pct),
                                           float(site.policy_floor_pct)))))
+
+
+def reserve_floor_pct(site):
+    """Public alias, for the Weekend Happy Hour booking check (v5.112.0). One
+    reserve rule — a caller outside the planner must not write its own."""
+    return _reserve_floor_pct(site)
+
+
+def local_wall(tz, day, hhmm):
+    """Public alias of `_wall`: local wall time on a local date, returned in UTC,
+    safe across a clock change. For callers outside the planner (v5.112.0)."""
+    return _wall(tz, day, hhmm)
 
 
 def household_floor_pct(inputs, until):
@@ -991,7 +1098,8 @@ def _charge_plan(inputs):
 
     # Headroom: only the NET surplus the sun is expected to put INTO the battery
     # is worth leaving room for. It can never push the target below what the
-    # house and the commitments need.
+    # house and the commitments need. A booked free-import hour is in the walk
+    # too (v5.112.0), so the room it will fill is left empty rather than bought.
     ceiling_kwh = site.capacity_kwh * site.max_charge_soc_pct / 100.0
     _end, _low, _unmet, peak_kwh = simulate(inputs, household_target_kwh,
                                             window_end, horizon_end)
@@ -1102,6 +1210,16 @@ def plan(inputs):
             window_end = next_local(inputs.now, tz, FLUX_CHEAP_END)
             (target_pct, power_w, buy_kwh, margin_p,
              household_kwh, infeasible) = _charge_plan(inputs)
+            # Say so when a booked free hour shaped the charge. An armed state has
+            # to be visible BEFORE it fires, or the first anyone learns of a
+            # smaller overnight charge is a battery that looks under-filled.
+            free_note = ""
+            free_kwh = _commitment_kwh(
+                inputs.commitments, window_end,
+                next_local(window_end, tz, FLUX_CHEAP_START), "import")
+            if free_kwh >= MIN_TRADE_KWH:
+                free_note = (f", leaving room for up to {free_kwh:.0f} kWh of free "
+                             f"Happy Hour electricity later in the day")
             if target_pct is None:
                 return FluxDecision(
                     mode=MODE_HOLD, owns=True, decision_at=inputs.now,
@@ -1114,7 +1232,8 @@ def plan(inputs):
                     margin_p=margin_p, committed_kwh=committed,
                     infeasible_kwh=infeasible,
                     reason=("the cheap window is open and the battery already holds "
-                            "everything the day ahead is forecast to need"))
+                            "everything the day ahead is forecast to need"
+                            + free_note))
             arb_kwh = max(0.0, buy_kwh - household_kwh)
             reason  = (f"cheap window — buying about {buy_kwh:.1f} kWh at "
                        f"{bands.import_cheap_p:.1f}p to {target_pct:.0f}%, of which "
@@ -1123,6 +1242,7 @@ def plan(inputs):
             if arb_kwh >= MIN_TRADE_KWH:
                 reason += (f", and {arb_kwh:.1f} kWh is for the peak window at a "
                            f"{margin_p:.1f}p margin")
+            reason += free_note
             if infeasible > 0:
                 reason += (f". About {infeasible:.1f} kWh of what is needed will not "
                            f"fit in the battery, so the house will import some of it "
