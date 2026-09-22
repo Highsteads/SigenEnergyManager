@@ -242,6 +242,73 @@ class TestCallbackLatency(unittest.TestCase):
                         f"the tick is holding _state_lock across network I/O")
 
 
+class TestDashboardNeverQueuesBehindControl(unittest.TestCase):
+    """v5.111.8. The control stages hold _state_lock across their Modbus writes
+    (8-16 s measured), and /api/status used to queue behind them: 131 of 133
+    Dashboards "status fetch failed: timed out" lines in eight days sat within
+    30 s of a battery command. It now waits DASHBOARD_LOCK_WAIT_S at most and
+    answers from its last snapshot, dated by when that snapshot was taken."""
+
+    def _hold_lock(self, p, seconds):
+        held, done = threading.Event(), threading.Event()
+
+        def holder():
+            with p._state_lock:
+                held.set()
+                done.wait(seconds)
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        self.assertTrue(held.wait(2.0))
+        return t, done
+
+    def test_a_held_lock_is_answered_from_the_last_snapshot(self):
+        p = _mk_plugin()
+        p.latest_inverter_data = {"batterySoc": 61.0}
+        first = p.get_dashboard_data()
+        self.assertEqual(first["battery"]["soc_pct"], 61.0)
+        self.assertEqual(first["snapshot_age_s"], 0.0)
+        p.latest_inverter_data = {"batterySoc": 99.0}   # changed under the lock
+        t, done = self._hold_lock(p, 10)
+        t0 = time.time()
+        reply = p.get_dashboard_data()
+        waited = time.time() - t0
+        done.set()
+        t.join()
+        self.assertLess(waited, plugin.DASHBOARD_LOCK_WAIT_S + 0.5)
+        self.assertEqual(reply["battery"]["soc_pct"], 61.0)
+        self.assertGreaterEqual(reply["snapshot_age_s"], plugin.DASHBOARD_LOCK_WAIT_S - 0.1)
+        self.assertEqual(reply["timestamp"], first["timestamp"])
+
+    def test_a_free_lock_gives_fresh_figures(self):
+        p = _mk_plugin()
+        p.latest_inverter_data = {"batterySoc": 61.0}
+        p.get_dashboard_data()
+        p.latest_inverter_data = {"batterySoc": 72.0}
+        reply = p.get_dashboard_data()
+        self.assertEqual(reply["battery"]["soc_pct"], 72.0)
+        self.assertEqual(reply["snapshot_age_s"], 0.0)
+
+    def test_with_no_snapshot_yet_it_waits_rather_than_guess(self):
+        p = _mk_plugin()
+        p.latest_inverter_data = {"batterySoc": 40.0}
+        t, done = self._hold_lock(p, 10)
+        threading.Timer(1.5, done.set).start()
+        reply = p.get_dashboard_data()
+        t.join()
+        self.assertEqual(reply["battery"]["soc_pct"], 40.0)
+        self.assertEqual(reply["snapshot_age_s"], 0.0)
+
+    def test_the_lock_is_released_after_a_snapshot(self):
+        p = _mk_plugin()
+        p.get_dashboard_data()
+        got = []                          # from ANOTHER thread: an RLock always
+        t = threading.Thread(             # re-enters for the thread that holds it
+            target=lambda: got.append(p._state_lock.acquire(timeout=0.5)))
+        t.start()
+        t.join()
+        self.assertEqual(got, [True])
+
+
 # Module level, NOT class attributes: a staticmethod fetched off the class is
 # a plain function, and assigning it INSIDE a class body rebinds it as an
 # instance method, so self would be passed as poll_s.

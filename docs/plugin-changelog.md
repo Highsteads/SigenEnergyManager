@@ -15,6 +15,25 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.111.8 — 22-09-2026
+
+**`/api/status` no longer queues behind a battery command.**
+
+- **Measured:** 133 Dashboards `[SigenProxy] status fetch failed: timed out` warnings between
+  15 and 22 September, 131 of them within 30 s of a SigenEnergyManager Modbus write, 70 in the
+  16:00 hour when Flux starts its peak export. The endpoint answers in ~5 ms when the lock is
+  free, so every one of those was pure waiting.
+- **Cause:** `get_dashboard_data` takes `_state_lock` for a millisecond snapshot (v5.45.0), and
+  the control stages (`_evaluate_manager` incl. verify+act) hold that lock across their Modbus
+  writes by design — 16 s on 22-Sep 13:40:45 -> 13:41:01. Dashboards gives up at 12 s.
+- **Fix:** wait `DASHBOARD_LOCK_WAIT_S` (1.0 s) for the lock; if it is still held, answer from
+  the last snapshot (`self._dash_snapshot`). `timestamp` is now when the figures were READ, and
+  a new `snapshot_age_s` says how old they are. With no snapshot yet (first request after a
+  start) it waits as before rather than invent one. The control locking is unchanged.
+- **Tests:** `TestDashboardNeverQueuesBehindControl` in `test_concurrency.py` (4). A mutation
+  sweep of five breakages (blocking acquire, no cache write, no release, `now()` timestamp,
+  zero age) turned each red.
+
 ## v5.111.7 — 21-09-2026
 
 **Two faults at the 18:00 hand-over, found reviewing the first evening with a Flux peak, an

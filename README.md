@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.111.7 · Requires Indigo 2025.2 or later
+**Version:** 5.111.8 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -145,6 +145,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.111.8 | 22-Sep-2026 | **The status page no longer goes quiet while the battery is being told what to do.** Each time the plugin changes the battery's settings it takes up to about 16 seconds, and until now anything asking for the live figures had to wait for it to finish, which was long enough for the Dashboards energy page to give up and log a warning. That was 133 warnings in a week, most of them at 4pm when the Flux peak starts. It now waits a second at most and otherwise answers with the figures it read a few seconds earlier, saying how old they are. Nothing about how the battery is controlled changes. |
 | 5.111.7 | 21-Sep-2026 | **Two hand-over faults from the first evening with Flux, an Axle event and a Saving Session together.** Half an hour before an Axle event the plugin stops the battery charging once it holds enough. That step only recognised the export mode Axle's own cloud used to send, so on 21 September it switched off a Saving Session export that was already running, for about 40 seconds until the plugin's own check put it back. It now leaves any running export alone. Separately, the plugin logged a warning about the battery reserve setting whenever the reserve it wanted changed because a grid event had started. That is planned, not a fault, so it is now an ordinary log line, and the warning is kept for a setting the plugin did not write itself. |
 | 5.111.6 | 21-Sep-2026 | **On Octopus Flux the peak export now starts at 4pm, not five minutes later.** When the daytime solar export was running up to 4pm, the Flux controller treated it like something that had taken the battery away and waited five minutes after it stopped before selling. That export only ever gives way at 4pm by the clock, so there is nothing to wait for: the controller now takes over on its first check after 4pm. On a sunny day that is roughly a third of a kWh more sold at the 27.7p peak rate. |
 | 5.111.5 | 20-Sep-2026 | **The plugin has an icon.** It never had one, so anywhere it was listed it fell back to the generic plugin picture. It now carries a proper one, drawn to match the other Highsteads plugins — a battery and a sun on a dark blue rounded square, with the name above and the word Manager below. Nothing about how the plugin works changes. |

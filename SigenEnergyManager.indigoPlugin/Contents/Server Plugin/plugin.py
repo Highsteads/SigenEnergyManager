@@ -27,8 +27,9 @@
 #              Claude Opus 5 (5.111.5 — a Plugin Store icon, at last)
 #              Claude Opus 5 (5.111.6 — the Flux peak starts at 16:00, not 16:05)
 #              Claude Opus 5 (5.111.7 — pre-charge never stops a running export; reserve moves are not drift)
-# Date:        21-09-2026
-# Version:     5.111.7
+#              Claude Opus 5.5 (5.111.8 — /api/status never queues behind a battery command)
+# Date:        22-09-2026
+# Version:     5.111.8
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -271,6 +272,11 @@ else:
 # add a hardcoded version constant here — Info.plist is the single source of truth.
 PLUGIN_NAME        = "Sigenergy Manager"
 WEB_DASHBOARD_PORT = 8179
+# v5.111.8: how long /api/status waits for _state_lock before answering from
+# the last copy it took. The control stages hold that lock across their Modbus
+# writes (8-16 s measured), which is longer than any dashboard will wait; the
+# endpoint itself answers in ~5 ms when the lock is free.
+DASHBOARD_LOCK_WAIT_S = 1.0
 
 # Maps the raw decision action (snake_case) to the camelCase token written to
 # the batteryManager "currentMode" List-enum state. Indigo derives one
@@ -2263,12 +2269,37 @@ class Plugin(indigo.PluginBase):
             # payload builds lock-free from consistent local copies — handler
             # threads used to read store live (torn composite reads
             # possible around the midnight counter reset).
-            with self._state_lock:
-                store  = dict(self.store)
-                inv    = self.latest_inverter_data  or {}
-                fcast  = self.latest_forecast_data  or {}
-                rates  = self.latest_rates_data     or {}
-                dec    = self.latest_decision
+            #
+            # v5.111.8: and never QUEUE for that snapshot behind a control
+            # cycle. _evaluate_manager holds the lock across its Modbus writes
+            # (8-16 s), so every request that arrived meanwhile waited it out -
+            # 131 of 133 Dashboards "status fetch failed: timed out" lines in
+            # eight days sat within 30 s of a battery command. Wait up to
+            # DASHBOARD_LOCK_WAIT_S; if the lock is still busy, answer from the
+            # last snapshot taken, dated by when it was taken. With no snapshot
+            # yet (first request after start) wait as before.
+            snap = None
+            got = self._state_lock.acquire(timeout=DASHBOARD_LOCK_WAIT_S)
+            if not got:
+                cached = getattr(self, "_dash_snapshot", None)
+                if cached is not None:
+                    snap_ts, snap = cached
+                else:
+                    self._state_lock.acquire()
+                    got = True
+            if got:
+                try:
+                    snap_ts = time.time()
+                    snap = (dict(self.store),
+                            self.latest_inverter_data or {},
+                            self.latest_forecast_data or {},
+                            self.latest_rates_data    or {},
+                            self.latest_decision)
+                    self._dash_snapshot = (snap_ts, snap)
+                finally:
+                    self._state_lock.release()
+            store, inv, fcast, rates, dec = snap
+            snapshot_age_s = round(max(0.0, time.time() - snap_ts), 1)
 
             tariff_info = rates.get("tariff_info", {})
             active_today_p, active_tomorrow_p = self._rates_for_tariff(
@@ -2435,7 +2466,10 @@ class Plugin(indigo.PluginBase):
                 storm_release_now = max(storm_release_now, STORM_SOC_YELLOW)
 
             return {
-                "timestamp":  datetime.now().strftime("%H:%M:%S"),
+                # When the figures were read, not when this reply was built:
+                # the two differ only while a battery command holds the lock.
+                "timestamp":  datetime.fromtimestamp(snap_ts).strftime("%H:%M:%S"),
+                "snapshot_age_s": snapshot_age_s,
                 "battery": {
                     "soc_pct":  round(soc, 1),
                     "power_w":  bat_w,
