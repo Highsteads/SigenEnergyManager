@@ -15,6 +15,26 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.3 — 22-09-2026
+
+**Saving the plugin's settings is not a Modbus fault.** (sigenergy_modbus.py 1.16)
+
+- **Live 22-Sep-2026 21:54:** a prefs save ran `_init_modules`, which `disconnect()`s the
+  driver and builds a new `SigenergyModbus`. A `_poll_modbus` cycle was mid-flight on the old
+  one (the read runs unlocked since v5.45.0), every remaining read failed, and the quality check
+  logged `Too many Modbus errors (7/8) - marking disconnected` at ERROR — which Log_Error_Watch
+  pushed to CliveS as a new fault — followed by `[Modbus] Inverter poll failed` at WARNING. The
+  inverter was fine; the plugin had closed its own socket. Five occurrences since 01-Sep, at
+  least two of them prefs saves.
+- **Fix, both layers:** `disconnect()` latches `_closed_on_purpose` (cleared by a successful
+  `connect()`), and the quality check logs that case at DEBUG instead of ERROR. `_poll_modbus`
+  keeps a reference to the driver it read from and discards a `None` from a driver that has since
+  been replaced — good data from it is still used.
+- **Shared module:** sigenergy_modbus.py is mirrored byte-identically into SigenVPP in the same
+  round, or its shared-module CI check goes red.
+- **Tests:** 3 in `test_sigenergy_modbus.py`, 3 in `test_concurrency.py`. Four mutations (no
+  discard, no quiet branch, latch never cleared, discard good data too) each turned one red.
+
 ## v5.112.2 — 22-09-2026
 
 **A clear Flux journal at startup is an INFO line, not a WARNING.**

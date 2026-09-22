@@ -31,8 +31,9 @@
 #              Claude Opus 5.5 (5.112.0 — Weekend Happy Hours booked for you; the overnight charge leaves room)
 #              Claude Opus 5.5 (5.112.1 — the plugin trusts its own bookings; a later second hour is counted)
 #              Claude Opus 5.5 (5.112.2 — a clear Flux journal at startup is not a warning)
+#              Claude Opus 5.5 (5.112.3 — saving the settings is not a Modbus fault)
 # Date:        22-09-2026
-# Version:     5.112.2
+# Version:     5.112.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3487,11 +3488,22 @@ class Plugin(indigo.PluginBase):
         write mid-cycle interleaves safely (the modbus client serialises each
         transaction internally).
         """
-        if not self.modbus:
+        client = self.modbus
+        if not client:
             return
 
-        data = self.modbus.read_all()   # NETWORK — unlocked
+        data = client.read_all()        # NETWORK — unlocked
         with self._state_lock:
+            if data is None and client is not self.modbus:
+                # v5.112.3: a prefs save replaced the driver while this cycle
+                # ran on the old one, so the failure is the plugin's own
+                # disconnect, not the inverter's. Counting it logged "Inverter
+                # poll failed" at WARNING and advanced the failure count toward
+                # the back-off (22-09-2026 21:54); the new driver polls on the
+                # next tick.
+                self.logger.debug("[Modbus] Discarded a read from the replaced "
+                                  "driver — preferences were saved mid-cycle")
+                return
             self._apply_modbus_result(data)
 
     def _apply_modbus_result(self, data):

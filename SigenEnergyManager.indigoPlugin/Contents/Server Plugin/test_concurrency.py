@@ -242,6 +242,51 @@ class TestCallbackLatency(unittest.TestCase):
                         f"the tick is holding _state_lock across network I/O")
 
 
+class TestReadFromAReplacedDriver(unittest.TestCase):
+    """v5.112.3. A prefs save builds a new SigenergyModbus while _poll_modbus is
+    mid-cycle on the old one. The old cycle's None is the plugin's own
+    disconnect, so it must not count as an inverter failure (22-09-2026 21:54
+    logged "Inverter poll failed" for it)."""
+
+    def test_a_failure_from_the_replaced_driver_is_discarded(self):
+        p = _mk_plugin()
+        new_driver = MagicMock()
+
+        class _Old:
+            connected = True
+
+            def read_all(self_inner):
+                p.modbus = new_driver       # the prefs save lands mid-cycle
+                return None
+        p.modbus = _Old()
+        p._apply_modbus_result = MagicMock()
+        p._poll_modbus()
+        p._apply_modbus_result.assert_not_called()
+
+    def test_a_failure_from_the_current_driver_still_counts(self):
+        p = _mk_plugin()
+        p.modbus = MagicMock()
+        p.modbus.read_all.return_value = None
+        p._apply_modbus_result = MagicMock()
+        p._poll_modbus()
+        p._apply_modbus_result.assert_called_once_with(None)
+
+    def test_good_data_from_the_replaced_driver_is_still_used(self):
+        p = _mk_plugin()
+        new_driver = MagicMock()
+
+        class _Old:
+            connected = True
+
+            def read_all(self_inner):
+                p.modbus = new_driver
+                return {"batterySoc": 50.0}
+        p.modbus = _Old()
+        p._apply_modbus_result = MagicMock()
+        p._poll_modbus()
+        p._apply_modbus_result.assert_called_once_with({"batterySoc": 50.0})
+
+
 class TestDashboardNeverQueuesBehindControl(unittest.TestCase):
     """v5.111.8. The control stages hold _state_lock across their Modbus writes
     (8-16 s measured), and /api/status used to queue behind them: 131 of 133

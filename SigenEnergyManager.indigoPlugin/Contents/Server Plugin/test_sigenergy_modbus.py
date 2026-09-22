@@ -11,6 +11,7 @@
 
 import sys
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock
 
 # ============================================================
@@ -802,6 +803,49 @@ class TestReadAllPartial(unittest.TestCase):
             setattr(m, name, lambda *a, **k: None)   # everything fails
         self.assertIsNone(m.read_all())
         self.assertFalse(m._connected)
+
+    # v1.16: a prefs save rebuilds the driver while a poll is mid-cycle on the
+    # old one. That cycle's failures are the owner's own disconnect(), and
+    # logging them at ERROR paged CliveS for nothing (22-09-2026 21:54).
+
+    def _all_failing(self):
+        m = SigenergyModbus("192.168.1.49")
+        m._connected         = True
+        m._last_request_time = 0
+        m._sleep             = lambda _s: None
+        m.logger             = MagicMock()
+        for name in ("_read_uint16", "_read_int16", "_read_int32",
+                     "_read_uint32", "_read_uint64", "_read_block_u16"):
+            setattr(m, name, lambda *a, **k: None)
+        return m
+
+    def test_a_genuine_majority_failure_is_an_error(self):
+        m = self._all_failing()
+        self.assertIsNone(m.read_all())
+        self.assertTrue(m.logger.error.called)
+
+    def test_a_cycle_cut_short_by_our_own_disconnect_is_not_an_error(self):
+        m = self._all_failing()
+        m.disconnect()
+        m._connected = True               # the in-flight cycle got past the guard
+        self.assertIsNone(m.read_all())
+        self.assertFalse(m.logger.error.called)
+        self.assertTrue(any("closed by the plugin" in str(c)
+                            for c in m.logger.debug.call_args_list))
+
+    def test_a_successful_connect_clears_the_latch(self):
+        import sigenergy_modbus as sm
+        m = self._all_failing()
+        m.disconnect()
+        self.assertTrue(m._closed_on_purpose)
+        client = MagicMock()
+        client.connect.return_value = True
+        with unittest.mock.patch.object(sm, "PYMODBUS_AVAILABLE", True), \
+             unittest.mock.patch.object(sm, "ModbusTcpClient", return_value=client, create=True):
+            m._last_connect_attempt = -1e9
+            m._read_uint16 = lambda *a, **k: 2   # the probe read succeeds
+            self.assertTrue(m.connect())
+        self.assertFalse(m._closed_on_purpose)
 
 
 class TestOutageBurstHandling(unittest.TestCase):
