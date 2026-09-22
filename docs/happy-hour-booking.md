@@ -63,6 +63,10 @@ Nothing is ever cancelled. The API has `cancelSavingSessionsWeekendHappyHourBook
 a cancel returns the tokens is not documented and has not been measured, so the rule only books
 what it means to keep.
 
+**The plugin trusts its own bookings (v5.112.1).** Every slot whose booking reply carried the
+matching `bookedEvent` is kept in `happy_hour_booked_codes` and marked booked on every poll, so a
+feed that lags the booking cannot drop the hour from the plan or invite a second booking.
+
 ## Messages (plain English, deduped on structured keys)
 
 - **Booked** — once per booking: which hours, why, and the tokens left.
