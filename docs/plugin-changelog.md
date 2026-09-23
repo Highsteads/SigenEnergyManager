@@ -15,6 +15,23 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.4 — 23-09-2026
+
+**A Saving Session ends with one hand-back, not two.**
+
+- **Live 10-Sep and 16-Sep-2026:** at the end of a session the manager ran the whole hand-back
+  (Remote EMS, mode 0x02, discharge limit, charge limit) and then ran it again nine seconds later —
+  `Saving Session export ended` followed by `Export disabled`. `_drive_vpp_export` sets
+  `export_active` as well as the session flag, so in `ACTION_SELF_CONSUMPTION` the session block
+  called `set_self_consumption()` and the `elif prev_export:` branch called it again. Idempotent,
+  but twice the Modbus writes.
+- **Fix:** the session block records that it handed back this tick, and the generic branch skips
+  its write and its log line. It still clears `export_active`, because the retry for an unconfirmed
+  hand-back (`vpp_handback_pending`) refuses to run while that flag is True. A flood-prevention end
+  still resets its floor and fires its event.
+- **Tests:** 4 in `test_plugin.py` (`TestSavingSessionEndHandsBackOnce`), three watched failing
+  before the fix.
+
 ## v5.112.3 — 22-09-2026
 
 **Saving the plugin's settings is not a Modbus fault.** (sigenergy_modbus.py 1.16)

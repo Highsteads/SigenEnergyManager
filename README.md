@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.112.3 · Requires Indigo 2025.2 or later
+**Version:** 5.112.4 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -149,6 +149,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.112.4 | 23-Sep-2026 | **A Saving Session now ends with one hand-back to the battery, not two.** When a session finished, the plugin put the inverter back to running the house on its own and then, nine seconds later, did the whole thing again, because a second check still thought an export was running. It did no harm, since the second pass changed nothing, but it doubled the commands sent to the inverter. It now hands back once. If that hand-back is not confirmed, the plugin still tries again on the next minute, as before. |
 | 5.112.3 | 22-Sep-2026 | **Saving the plugin's settings no longer reports a fault with the inverter.** When you saved the settings while the plugin was part way through reading the inverter, it closed its own connection and then logged the failed reads as an error, which could send you an alert about a fault that was not there. It now recognises that it closed the connection itself and says nothing. A real connection fault is reported exactly as before. |
 | 5.112.2 | 22-Sep-2026 | **A routine restart no longer logs a warning about the Flux controller.** With Flux switched on, the plugin keeps a small record on disk of whether the controller is holding the battery, and checks the inverter again after every start. It logged that check as a warning every time, 15 times in three days, even when the record itself said nothing was being held. That is now an ordinary line, and the warning is kept for a record that says the controller was holding the battery, or one that cannot be read. What the plugin does at startup has not changed. 2047 to 2051 tests. |
 | 5.112.1 | 22-Sep-2026 | **Two safeguards on the new Happy Hour booking.** The plugin now remembers the slots it has booked itself. If Octopus's list were slow to show a booking, the plugin would otherwise have seen the Sunday as still free, left the booked hour out of its plan, so the battery would not charge in it, and could have spent more tokens booking the same Sunday again. And when a second hour is added to a Sunday that already has one, the message now counts both, where before it read "One free hour is booked, from 1pm to 3pm". 2043 to 2047 tests. |

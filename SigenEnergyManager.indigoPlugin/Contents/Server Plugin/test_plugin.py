@@ -7927,5 +7927,73 @@ class TestVerifyHoldsTheFreeHourDischargeAtZero(unittest.TestCase):
         p.modbus.set_discharge_limit.assert_called_once_with(10000)
 
 
+
+class TestSavingSessionEndHandsBackOnce(unittest.TestCase):
+    """10-Sep and 16-Sep-2026 live: at the end of a Saving Session the manager ran
+    the whole hand-back twice in nine seconds, "Saving Session export ended" and
+    then "Export disabled". The session block handed back, and the generic
+    export-end branch did it again because _drive_vpp_export had also set
+    export_active. One hand-back per tick; the retry path must survive."""
+
+    def _mk(self, confirmed=True, flood_target=None):
+        from battery_manager import Decision
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        m = p.modbus  = MagicMock()
+        m.connected   = True
+        m.set_self_consumption.return_value = confirmed
+        p.latest_inverter_data = {"batterySoc": 66.0, "emsWorkMode": "Discharge PV First"}
+        p.store = {
+            "import_active":                False,
+            "export_active":                True,
+            "saving_session_export_active": True,
+            "happy_hour_import_active":     False,
+            "solar_overflow_active":        False,
+            "flood_prev_target_soc":        flood_target,
+            "import_target_soc":            0.0,
+            "import_scheduled_time":        None,
+            "vpp_handback_pending":         False,
+        }
+        p._trigger_event          = MagicMock()
+        p._set_flood_prev_target  = MagicMock()
+        p._write_policy_floors    = MagicMock(return_value=1.0)
+        decision = Decision(action=plugin.ACTION_SELF_CONSUMPTION, reason="window over")
+        return p, decision
+
+    def test_one_hand_back_when_both_flags_are_set(self):
+        p, d = self._mk()
+        p._act_on_decision(d)
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 1)
+        self.assertFalse(p.store["saving_session_export_active"])
+        self.assertFalse(p.store["export_active"])
+        self.assertFalse(p.store["vpp_handback_pending"])
+
+    def test_an_unconfirmed_hand_back_still_queues_the_retry(self):
+        """The retry refuses to run while export_active is True, so the flag must
+        still clear on the tick whose hand-back failed."""
+        p, d = self._mk(confirmed=False)
+        p._act_on_decision(d)
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 1)
+        self.assertTrue(p.store["vpp_handback_pending"])
+        self.assertFalse(p.store["export_active"])
+
+    def test_an_ordinary_export_end_still_hands_back(self):
+        """Control: with no session running the generic branch does its job."""
+        p, d = self._mk()
+        p.store["saving_session_export_active"] = False
+        p._act_on_decision(d)
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 1)
+        self.assertFalse(p.store["export_active"])
+
+    def test_a_flood_export_end_still_resets_its_floor(self):
+        p, d = self._mk(flood_target=95.0)
+        p._act_on_decision(d)
+        self.assertEqual(p.modbus.set_self_consumption.call_count, 1)
+        p._set_flood_prev_target.assert_called_once_with(None)
+        p._trigger_event.assert_any_call("floodPreventionStopped")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

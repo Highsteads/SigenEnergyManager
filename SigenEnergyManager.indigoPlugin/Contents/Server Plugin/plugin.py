@@ -32,8 +32,9 @@
 #              Claude Opus 5.5 (5.112.1 — the plugin trusts its own bookings; a later second hour is counted)
 #              Claude Opus 5.5 (5.112.2 — a clear Flux journal at startup is not a warning)
 #              Claude Opus 5.5 (5.112.3 — saving the settings is not a Modbus fault)
-# Date:        22-09-2026
-# Version:     5.112.3
+#              Claude Opus 5.5 (5.112.4 — a Saving Session ends with one hand-back, not two)
+# Date:        23-09-2026
+# Version:     5.112.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -7141,10 +7142,15 @@ class Plugin(indigo.PluginBase):
             if self.store.get("happy_hour_import_active"):
                 self._end_happy_hour_import("the free hour ended")
 
+            # One hand-back per tick (v5.112.4). _drive_vpp_export sets export_active
+            # as well, so the generic export-end branch below used to run the whole
+            # sequence a second time nine seconds later (live 10-Sep and 16-Sep-2026).
+            session_handed_back = False
             if self.store.get("saving_session_export_active"):
                 self.store["saving_session_export_active"] = False
                 log("[Manager] Saving Session export ended — returning to self-consumption")
                 if self.modbus and self.modbus.connected:
+                    session_handed_back = True
                     if not self.modbus.set_self_consumption():
                         # Confirm, never assume: an unconfirmed hand-back is what left a
                         # VPP window exporting past its end (v5.64.0). Same lesson here.
@@ -7186,9 +7192,13 @@ class Plugin(indigo.PluginBase):
                     log(f"[Manager] Flood prevention complete "
                         f"(SOC {current_soc:.1f}% reached {flood_target:.0f}% target) "
                         f"— returning to self-consumption")
-                else:
+                elif not session_handed_back:
                     log("[Manager] Export disabled — returning to self-consumption")
-                self.modbus.set_self_consumption()
+                # Still clear export_active below even when the session block has
+                # already handed back: the retry for an unconfirmed hand-back
+                # (vpp_handback_pending) refuses to run while it is True.
+                if not session_handed_back:
+                    self.modbus.set_self_consumption()
                 if flood_target:
                     self._set_flood_prev_target(None)
                     floor = self._write_policy_floors()
