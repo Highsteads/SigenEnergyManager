@@ -7995,5 +7995,69 @@ class TestSavingSessionEndHandsBackOnce(unittest.TestCase):
         p._trigger_event.assert_any_call("floodPreventionStopped")
 
 
+
+class TestSavingSessionFlagEndsWhenAVppWindowOwnsTheExport(unittest.TestCase):
+    """21-Sep-2026: a session ran 18:00-19:00 and an Axle VPP window took the
+    export over at 18:28. Only a SELF_CONSUMPTION decision cleared the session
+    flag, and the manager decided VPP_EXPORT until the VPP window ended, so the
+    flag outlived the session by 33 minutes. The VPP end handed back at 19:32:23
+    but _driven_export_owns_registers() stayed True until the 19:33 tick, which
+    then ran a second, redundant hand-back."""
+
+    def _mk(self, session_live):
+        from battery_manager import Decision
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        m = p.modbus  = MagicMock()
+        m.connected   = True
+        m.set_self_consumption.return_value = True
+        p.latest_inverter_data = {"batterySoc": 70.0, "emsWorkMode": "Max Self Consumption"}
+        p.store = {
+            "import_active":                False,
+            "export_active":                True,
+            "saving_session_export_active": True,
+            "happy_hour_import_active":     False,
+            "solar_overflow_active":        False,
+            "flood_prev_target_soc":        None,
+            "import_target_soc":            0.0,
+            "import_scheduled_time":        None,
+            "vpp_handback_pending":         False,
+            "vpp_state":                    plugin.VPP_ACTIVE,
+        }
+        p._drive_vpp_export       = MagicMock()
+        p._trigger_event          = MagicMock()
+        window = {"id": "s1", "start": None, "end": None} if session_live else None
+        p._saving_session_window  = MagicMock(return_value=window)
+        return p, Decision
+
+    def test_the_flag_clears_once_the_session_has_ended_under_a_vpp_window(self):
+        p, Decision = self._mk(session_live=False)
+        p._act_on_decision(Decision(action=plugin.ACTION_VPP_EXPORT, reason="vpp"))
+        self.assertFalse(p.store["saving_session_export_active"])
+        p._drive_vpp_export.assert_called_once()
+        # The VPP window is still driving, so nothing is written here.
+        p.modbus.set_self_consumption.assert_not_called()
+        self.assertTrue(p._driven_export_owns_registers())   # the VPP owns them
+
+    def test_nothing_owns_the_registers_once_the_vpp_window_ends(self):
+        p, Decision = self._mk(session_live=False)
+        p._act_on_decision(Decision(action=plugin.ACTION_VPP_EXPORT, reason="vpp"))
+        # _end_vpp_export: back to IDLE, export_active cleared, hand-back done.
+        p.store["vpp_state"]     = plugin.VPP_IDLE
+        p.store["export_active"] = False
+        self.assertFalse(p._driven_export_owns_registers())
+        # And the next SELF_CONSUMPTION tick does not hand back a second time.
+        p._act_on_decision(Decision(action=plugin.ACTION_SELF_CONSUMPTION, reason="sc"))
+        p.modbus.set_self_consumption.assert_not_called()
+
+    def test_a_live_session_keeps_its_flag_while_the_vpp_window_runs(self):
+        """Overlapping windows: the session still owns its own tail."""
+        p, Decision = self._mk(session_live=True)
+        p._act_on_decision(Decision(action=plugin.ACTION_VPP_EXPORT, reason="vpp"))
+        self.assertTrue(p.store["saving_session_export_active"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

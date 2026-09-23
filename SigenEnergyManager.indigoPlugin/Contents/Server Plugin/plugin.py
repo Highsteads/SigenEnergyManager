@@ -33,8 +33,9 @@
 #              Claude Opus 5.5 (5.112.2 — a clear Flux journal at startup is not a warning)
 #              Claude Opus 5.5 (5.112.3 — saving the settings is not a Modbus fault)
 #              Claude Opus 5.5 (5.112.4 — a Saving Session ends with one hand-back, not two)
+#              Claude Opus 5.5 (5.112.5 — a session that ends under a VPP window lets go of the registers)
 # Date:        23-09-2026
-# Version:     5.112.4
+# Version:     5.112.5
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6996,6 +6997,20 @@ class Plugin(indigo.PluginBase):
             # identically; their own dispatch is ignored.
             if not prev_export:
                 log(f"[Manager] VPP export — {decision.reason}")
+            # A Saving Session that ENDS under a VPP window hands the export over
+            # to it (v5.112.5). Only a SELF_CONSUMPTION decision used to clear the
+            # session flag, and the manager decides VPP_EXPORT for as long as the
+            # VPP window runs, so the flag outlived the session (21-Sep-2026: a
+            # 19:00 end cleared at 19:33) and _driven_export_owns_registers() kept
+            # vouching for an owner that had gone. No write here: the VPP window is
+            # still driving, and its own end hands back and clears export_active.
+            # While the session window is still live the flag stays, because the
+            # session owns its own tail once the VPP window ends.
+            if (self.store.get("saving_session_export_active")
+                    and not self._saving_session_window()):
+                self.store["saving_session_export_active"] = False
+                log("[Manager] Saving Session ended during an Axle VPP window — "
+                    "the VPP window carries the export and hands back when it ends")
             self._drive_vpp_export()
 
         elif action == ACTION_SAVING_SESSION:

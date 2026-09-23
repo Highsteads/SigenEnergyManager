@@ -15,6 +15,29 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.5 — 23-09-2026
+
+**A Saving Session that ends under an Axle VPP window lets go of the registers.**
+
+- **Live 21-Sep-2026:** session 18:00-19:00, VPP window took the export over at 18:28.
+  `saving_session_export_active` was cleared only in the `ACTION_SELF_CONSUMPTION` branch, and the
+  manager decides `ACTION_VPP_EXPORT` for as long as the VPP window runs, so the flag outlived the
+  session by 33 minutes. The VPP end handed back at 19:32:23; `_driven_export_owns_registers()`
+  stayed True until the 19:33:05 tick, which cleared the flag and ran a second, redundant hand-back
+  ("Saving Session export ended" at 19:33:09). The real exposure was that ~40 s, not the hour: from
+  18:28 to 19:32 the VPP window owned the registers anyway.
+- **Fix:** `ACTION_VPP_EXPORT` clears the session flag, without writing, once
+  `_saving_session_window()` returns None. The VPP window is still driving and its own end hands
+  back and clears `export_active`. While the session window is still live the flag stays, so an
+  overlapping session keeps its tail and Flux still excludes its energy from the reserve.
+- **Not changed, for CliveS to decide:** any OTHER non-self-consumption decision after a session
+  (`SCHEDULE_IMPORT`, `START_EXPORT` while `export_active` is set, solar overflow already active)
+  also leaves the flag set, and there the session's export mode keeps running undriven until a
+  self-consumption decision. Clearing the flag alone there would let the verify pass re-assert
+  0x06, so it needs a hand-back decision, not a flag change. Not seen live.
+- **Tests:** 3 in `test_plugin.py` (`TestSavingSessionFlagEndsWhenAVppWindowOwnsTheExport`), two
+  watched failing before the fix; the third pins the overlapping-session case.
+
 ## v5.112.4 — 23-09-2026
 
 **A Saving Session ends with one hand-back, not two.**
