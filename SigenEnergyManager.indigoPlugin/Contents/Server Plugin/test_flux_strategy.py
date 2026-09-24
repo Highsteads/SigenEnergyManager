@@ -8,6 +8,7 @@
 # Date:        16-09-2026
 # Version:     2.0
 
+import math
 import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -321,6 +322,113 @@ class TestChronologicalBudget(unittest.TestCase):
             fs._wall(LONDON, datetime(2026, 9, 16).date(), fs.time(12, 0)),
             fs._wall(LONDON, datetime(2026, 9, 16).date(), fs.time(13, 0)))
         self.assertNotEqual(end, start)
+
+
+class TestResaleBuyingLeavesRoomForABrighterDay(unittest.TestCase):
+    """v2.2 (5.113.0). Live 21 and 23 Sep-2026: the 02:00 charge bought 15.4 and
+    15.9 kWh to sell at the peak on forecasts of 15.6 and 17.8 kWh. The days
+    brought 31.5 and 23.4, the battery was full by late morning, and 13.0 and
+    7.4 kWh went out before 4pm at the day export rate. The 4pm-7pm sale was the
+    same 11.8 kWh as on days that bought nothing."""
+
+    DAY = datetime(2026, 9, 21, tzinfo=LONDON).date()
+
+    def _bell(self, total_kwh):
+        """A day of sun from 7am to 7pm, peaking at 1pm, like an equinox day."""
+        w = [math.sin(math.pi * (h + 0.5 - 7) / 12) if 7 <= h < 19 else 0.0
+             for h in range(24)]
+        return fs.HourlyPvForecast(
+            {f"{self.DAY + timedelta(days=o):%Y-%m-%d} {h:02d}:00:00":
+             total_kwh * 1000.0 * w[h] / sum(w) for o in range(3) for h in range(24)},
+            LONDON)
+
+    def _displaced(self, pv, start_kwh, house):
+        sim = fs.SimInputs(site=_site(), house=house, pv=pv)
+        r = fs.walk(sim.site, fs.build_steps(sim, fs._wall(LONDON, self.DAY, fs.time(5, 0)),
+                                             fs._wall(LONDON, self.DAY, fs.time(16, 0))),
+                    start_kwh)
+        return r.spill_kwh - r.free_in_kwh
+
+    def _target_kwh(self, decision):
+        if decision.mode != fs.MODE_CHARGE:
+            return None
+        return decision.charge_cutoff_pct / 100.0 * _site().capacity_kwh
+
+    def test_a_brighter_day_than_forecast_would_not_push_the_purchase_out(self):
+        """A busy 30 kWh house on a 31 kWh forecast: the house eats enough of the
+        sun that plenty is left to sell at 4pm on the forecast itself, but a day
+        a third brighter would fill the battery by early afternoon. Without the
+        check this bought 6.5 kWh; with it, 3.6."""
+        pv    = self._bell(31.0)
+        busy  = _profile(30.0)
+        now   = fs._wall(LONDON, self.DAY, fs.time(2, 0))
+        lean  = _bands(self.DAY, now, exp={**EXPORT_P, "peak": 18.0})
+        trade = fs.plan(_inputs((2, 0), soc_pct=30.0, day=(2026, 9, 21), pv=pv, house=busy))
+        house = fs.plan(_inputs((2, 0), soc_pct=30.0, day=(2026, 9, 21), pv=pv, house=busy,
+                                bands=lean))
+        self.assertIn("is for the peak window", trade.reason)
+        top  = self._target_kwh(trade)
+        base = self._target_kwh(house) or 30.0 / 100.0 * _site().capacity_kwh
+        bright = pv.scaled(fs.RESALE_PV_OPTIMISM)
+        pushed_out = (self._displaced(bright, top, busy)
+                      - self._displaced(bright, base, busy))
+        # a whole percent of rounding on the target, on top of the tolerance
+        self.assertLessEqual(pushed_out, fs.RESALE_SPILL_TOLERANCE + 0.4)
+
+    def test_the_night_of_21_september(self):
+        """The live case: 56.7% at 2am, 15.6 kWh forecast, a 21.5 kWh house. The
+        old planner bought 11.6 kWh to sell (logged at 02:00:02); the sun alone
+        left enough at 4pm to fill most of the three-hour sale."""
+        d = fs.plan(_inputs((2, 0), soc_pct=56.7, day=(2026, 9, 21),
+                            pv=self._bell(15.6), house=_profile(21.5)))
+        bought = d.planned_kwh if d.mode == fs.MODE_CHARGE else 0.0
+        self.assertLess(bought, 5.0)
+
+    def test_the_peak_only_buys_what_the_sun_does_not_already_leave_there(self):
+        """With the brighter-day check out of the way, the purchase is still no
+        more than the 4pm-7pm window can sell beyond what the sun leaves."""
+        class NoScale(fs.HourlyPvForecast):
+            scaled = None
+        pv = NoScale({f"{self.DAY + timedelta(days=o):%Y-%m-%d} {h:02d}:00:00":
+                      (18000.0 / 9 if 8 <= h < 17 else 0.0)
+                      for o in range(3) for h in range(24)}, LONDON)
+        inp  = _inputs((2, 0), soc_pct=40.0, day=(2026, 9, 21), pv=pv)
+        site = inp.site
+        a    = fs._wall(LONDON, self.DAY, fs.time(5, 0))
+        peak = fs._wall(LONDON, self.DAY, fs.time(16, 0))
+        room = fs._resale_room_kwh(inp, 20.0, a, fs._wall(LONDON, self.DAY + timedelta(days=1),
+                                                           fs.time(2, 0)), site.capacity_kwh)
+        at_peak, *_ = fs.simulate(inp, 20.0, a, peak)
+        keep, _ = fs.required_start_kwh(
+            inp, peak, fs._wall(LONDON, self.DAY + timedelta(days=1), fs.time(2, 0)),
+            site.capacity_kwh * 0.20, no_charge_until=fs._wall(LONDON, self.DAY, fs.time(19, 0)))
+        sellable = 4.0 * 3 / site.one_way_efficiency
+        self.assertAlmostEqual(room, max(0.0, sellable - max(0.0, at_peak - keep)), places=6)
+        self.assertLess(room, sellable)
+
+    def test_a_dull_day_still_buys_for_the_peak(self):
+        d = fs.plan(_inputs((2, 0), soc_pct=30.0, day=(2026, 10, 20),
+                            pv=_pv(datetime(2026, 10, 20, tzinfo=LONDON).date(), 3.0)))
+        self.assertEqual(d.mode, fs.MODE_CHARGE)
+        self.assertIn("is for the peak window", d.reason)
+
+    def test_the_household_charge_is_not_cut_by_the_brighter_day_check(self):
+        """Only the resale part is sized on a sunnier day; what the house needs is
+        still bought on the forecast itself."""
+        pv   = _pv(self.DAY, 15.0)
+        now  = fs._wall(LONDON, self.DAY, fs.time(2, 0))
+        lean = _bands(self.DAY, now, exp={**EXPORT_P, "peak": 18.0})
+        trade = fs.plan(_inputs((2, 0), soc_pct=22.0, day=(2026, 9, 21), pv=pv))
+        house = fs.plan(_inputs((2, 0), soc_pct=22.0, day=(2026, 9, 21), pv=pv, bands=lean))
+        self.assertEqual(house.mode, fs.MODE_CHARGE)
+        self.assertGreaterEqual(trade.charge_cutoff_pct, house.charge_cutoff_pct)
+
+    def test_scaling_a_forecast_scales_every_hour(self):
+        pv = _pv(self.DAY, 20.0)
+        a, b = fs._wall(LONDON, self.DAY, fs.time(0, 0)), fs._wall(LONDON, self.DAY, fs.time(23, 0))
+        self.assertAlmostEqual(pv.scaled(1.35).kwh_between(a, b), 1.35 * pv.kwh_between(a, b))
+        with self.assertRaises(ValueError):
+            pv.scaled(0)
 
 
 # ================================================================

@@ -35,8 +35,9 @@
 #              Claude Opus 5.5 (5.112.4 — a Saving Session ends with one hand-back, not two)
 #              Claude Opus 5.5 (5.112.5 — a session that ends under a VPP window lets go of the registers)
 #              Claude Opus 5.5 (5.112.6 — a Sunday already booked is never pushed as held back)
+#              Claude Opus 5.5 (5.113.0 — the overnight charge buys to sell only what the sun will not)
 # Date:        24-09-2026
-# Version:     5.112.6
+# Version:     5.113.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

@@ -17,7 +17,11 @@ not additional contingency buffers. Preparation is for standard paired Flux.
 - 02:00–05:00: size charging from chronological household demand, solar forecast,
   losses, battery capacity, available charging time and announced events. Keep
   solar headroom where it is compatible with supplying the house and events.
-  Add discretionary trading energy only when profitable after losses and wear.
+  Add discretionary trading energy only when profitable after losses and wear,
+  and only as much as the 16:00-19:00 sale can use beyond what the sun leaves in
+  the battery by 16:00 on its own, and a day 35% sunnier than forecast would not
+  push back out before 16:00 (5.113.0). The household's own charge is still sized
+  on the forecast itself.
 - 16:00–19:00: export only spare energy above the reserve, remaining household
   demand to the next cheap window and committed events. Account for the fact
   that mode 5 prevents battery charging from the PV the forecast predicts.

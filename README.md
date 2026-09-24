@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.112.6 · Requires Indigo 2025.2 or later
+**Version:** 5.113.0 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -149,6 +149,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.113.0 | 24-Sep-2026 | **The overnight Flux charge no longer buys electricity the sun would have supplied anyway.** On two nights in September it bought about 15 kWh at the cheap rate to sell in the 4pm to 7pm peak, the sun then filled the battery by late morning, and 13 and 7 kWh went out before 4pm at the much lower day export rate. The peak sale was no bigger than on nights that bought nothing, because the export limit caps what three hours can sell. Now a purchase to sell is limited to what the peak can sell beyond what the sun leaves in the battery by 4pm, and to what a day about a third sunnier than forecast would not push back out. The charge the house itself needs is unchanged. |
 | 5.112.6 | 24-Sep-2026 | **A Sunday that already has a free hour booked is never reported as held back.** When the plugin had booked one Happy Hour and later decided a second was not worth a token, it sent "Keeping your free hours for a duller Sunday", which read as though the first booking had been cancelled. It had not: the plugin never cancels. Declining to add an hour now goes in the log once, saying which hour is booked and that it stays booked, with no Pushover. |
 | 5.112.5 | 23-Sep-2026 | **A Saving Session that ends while an Axle VPP window is running now lets go properly.** When a VPP window took over the export part way through a session, the plugin went on treating the session as running until the VPP window had finished as well, 33 minutes after the session ended on 21 September. For most of that time the VPP window was driving the export anyway, but for the last minute nothing was, and the check that puts drifted inverter settings back would have left them alone. It also handed the battery back a second time, 45 seconds after the VPP window had already done so. The session now lets go the moment it ends, and the VPP window hands back once when it finishes. |
 | 5.112.4 | 23-Sep-2026 | **A Saving Session now ends with one hand-back to the battery, not two.** When a session finished, the plugin put the inverter back to running the house on its own and then, nine seconds later, did the whole thing again, because a second check still thought an export was running. It did no harm, since the second pass changed nothing, but it doubled the commands sent to the inverter. It now hands back once. If that hand-back is not confirmed, the plugin still tries again on the next minute, as before. |

@@ -15,6 +15,29 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.113.0 — 24-09-2026
+
+**The overnight charge buys to sell only what the sun will not supply.** (flux_strategy v2.2)
+
+- **Live 21 and 23 Sep-2026:** the 02:00 charge bought 15.4 and 15.9 kWh (11.6 and 10.0 kWh of it
+  "for the peak window") on forecasts of 15.6 and 17.8 kWh. The days brought 31.5 and 23.4; the
+  battery reached 95% at 11:03 and 12:33, and 13.0 and 7.4 kWh left before 16:00 at the 9.7p day
+  export rate. The 16:00-19:00 sale was 11.8 kWh both days, the same as on days that bought
+  nothing (11.4-11.8): a 4 kW export limit sells about 12 kWh in three hours.
+- **Cause:** `_charge_plan` sized the resale buy as `min(spare headroom, sellable)` with
+  `sellable` the full 12 kWh, never subtracting what the sun alone leaves in the battery at 16:00.
+- **Fix:** `_resale_room_kwh` limits the resale part twice, the smaller winning: (1) the peak's
+  sellable energy (battery side) less the solar surplus the forecast leaves at 16:00 above what
+  the house needs to the next 02:00; (2) the largest extra start that a day `RESALE_PV_OPTIMISM`
+  (1.35) sunnier would not displace before 16:00, as spill or crowded-out free Happy Hour import
+  (binary search on `walk`, 0.2 kWh tolerance). 1.35 is the 90th percentile of actual/forecast
+  over the last 90 records (median 0.95, p75 1.12, p90 1.32, worst 2.02 on 21-Sep).
+  `HourlyPvForecast.scaled()` added for it. The household charge is unchanged.
+- **Replayed at 02:00:** 21-Sep 11.6 -> 3.2 kWh; 22-Sep 5.0 -> 0; 23-Sep 10.7 -> 2.6; 24-Sep hold
+  both; a dull 8 kWh autumn day 19.7 -> 20.1; a 3 kWh winter day 26.3 both. Limit (1) is what
+  bites on this house; limit (2) binds on heavier-load days (a 30 kWh house on a 25-34 kWh day).
+- Six tests; each limit mutation-proven (switched off, a named test fails).
+
 ## v5.112.6 — 24-09-2026
 
 **A Sunday already booked is never pushed as held back.**

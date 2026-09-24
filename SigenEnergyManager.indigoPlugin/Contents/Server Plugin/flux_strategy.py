@@ -4,9 +4,21 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1 Claude Opus 5.5
-# Date:        16-09-2026; v2.1 22-09-2026
-# Version:     2.1
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.2 Claude Opus 5.5
+# Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026
+# Version:     2.2
+#
+# v2.2 (SigenEnergyManager 5.113.0) stops the overnight charge buying energy to
+# sell at the peak that the sun would have displaced. On 21 and 23 Sep-2026 it
+# bought 15.4 and 15.9 kWh at 14.6p on forecasts of 15.6 and 17.8 kWh; the days
+# brought 31.5 and 23.4, the battery was full by 11:03 and 12:33, and 13.0 and
+# 7.4 kWh left before 4pm at the 9.7p day export rate. The 4pm-7pm sale was
+# 11.8 kWh on both, the same as on days that bought nothing, because a 4 kW
+# export limit sells about 12 kWh in three hours whatever is in the battery.
+# So a resale purchase is now limited twice: to what the peak can sell beyond
+# what the sun leaves there anyway, and to what a SUNNIER-than-forecast day
+# would not push back out (spill, or a free Happy Hour it would crowd out).
+# The household's own charge is untouched and still sized on the forecast.
 #
 # v2.1 (SigenEnergyManager 5.112.0) puts a booked Weekend Happy Hour INTO the
 # walk. It had been handed over as an "import" commitment since 5.109 and never
@@ -68,6 +80,14 @@ MAX_PROFILE_AGE_S   = 7 * 86400      # rebuilt daily; a week old is a fault
 MAX_FLOW_AGE_S      = 120            # power flows, for site headroom
 
 HOLD_BEFORE_PEAK_MINUTES = 120
+# How much sunnier than forecast a day is assumed to be when deciding what to BUY
+# for resale (v2.2). Measured 24-Sep-2026 over the last 90 forecast/actual pairs
+# in openmeteo_accuracy_records.json: actual/forecast median 0.95, 75th
+# percentile 1.12, 90th 1.32, worst 2.02 (21-Sep). A kWh displaced loses about
+# 14.6p - 9.7p plus losses; a kWh not bought forgoes the 10.1p margin, so the
+# guard sits near the 90th percentile rather than at the worst case.
+RESALE_PV_OPTIMISM       = 1.35
+RESALE_SPILL_TOLERANCE   = 0.2          # kWh of displaced energy ignored
 MIN_TRADE_KWH            = 0.5
 SIM_STEP_MINUTES         = 30
 SEARCH_TOLERANCE_KWH     = 1e-6      # the binary search's own convergence error
@@ -431,6 +451,20 @@ class HourlyPvForecast:
                 continue
             parsed[(start.date(), start.hour)] = value
         self.buckets = parsed
+
+    def scaled(self, factor):
+        """The same forecast with every hour multiplied by `factor` (v2.2).
+
+        For asking "what if the day is sunnier than forecast" without inventing a
+        second forecast. The per-day corrections are kept and scaled with it.
+        """
+        f = float(factor)
+        if not math.isfinite(f) or f <= 0:
+            raise ValueError("a forecast can only be scaled by a positive number")
+        out = HourlyPvForecast({}, self.tz, bias=self.bias * f,
+                               bias_by_date={d: v * f for d, v in self.bias_by_date.items()})
+        out.buckets = dict(self.buckets)
+        return out
 
     def _bucket(self, instant):
         local = instant.astimezone(self.tz)
@@ -1110,10 +1144,11 @@ def _charge_plan(inputs):
     profitable, margin_p = _export_is_profitable(bands, site)
     arb_kwh = 0.0
     if profitable:
-        peak_hours = (FLUX_PEAK_END.hour - FLUX_PEAK_START.hour)
-        sellable   = min(site.discharge_power_w, site.export_limit_w) / 1000.0 * peak_hours
-        spare      = max(0.0, headroom_ceiling - max(have_kwh, household_target_kwh))
-        arb_kwh    = max(0.0, min(spare, sellable))
+        room_kwh = min(max(0.0, headroom_ceiling - household_target_kwh),
+                       _resale_room_kwh(inputs, household_target_kwh, window_end,
+                                        horizon_end, ceiling_kwh))
+        arb_kwh = max(0.0, household_target_kwh + room_kwh
+                      - max(have_kwh, household_target_kwh))
 
     buy_kwh = household_buy_kwh + arb_kwh
     if buy_kwh < MIN_TRADE_KWH:
@@ -1142,6 +1177,68 @@ def _charge_plan(inputs):
     deliverable = available / 1000.0 * hours_left * eff
     infeasible += max(0.0, buy_kwh - deliverable)
     return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible
+
+
+def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
+    """Battery kWh above `base_kwh` worth buying at 02:00-05:00 to sell 4pm-7pm (v2.2).
+
+    Two limits, and the smaller wins:
+
+      * THE PEAK CAN ONLY SELL SO MUCH. Export is capped, so three hours sell a
+        fixed amount. Whatever the sun leaves in the battery at 4pm above what the
+        house needs until the next cheap window is sold first, and a purchase can
+        only add the rest. Worked on the forecast, like the household charge.
+      * THE SUN MUST NOT PUSH IT BACK OUT. The day is re-walked with the forecast
+        raised by RESALE_PV_OPTIMISM, and the purchase is limited to what that
+        brighter day would still find room for before 4pm: bought energy that
+        makes the sun spill, or crowds out a free Happy Hour, is energy bought at
+        the cheap rate and sold at the day rate, or not needed at all.
+    """
+    site     = inputs.site
+    eff      = site.one_way_efficiency
+    tz       = inputs.local_tz
+    peak_at  = next_local(window_end, tz, FLUX_PEAK_START)
+    peak_end = next_local(peak_at, tz, FLUX_PEAK_END)
+    top      = max(0.0, ceiling_kwh - base_kwh)
+    if top <= 0 or peak_at >= horizon_end:
+        return 0.0
+
+    # 1. What the peak can still sell, battery side.
+    peak_hours  = (peak_end - peak_at).total_seconds() / 3600.0
+    sellable    = min(site.discharge_power_w, site.export_limit_w) / 1000.0 * peak_hours
+    at_peak, _low, _unmet, _high = simulate(inputs, base_kwh, window_end, peak_at)
+    floor_kwh   = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
+    keep, _inf  = required_start_kwh(inputs, peak_at, horizon_end, floor_kwh,
+                                     no_charge_until=peak_end)
+    solar_spare = max(0.0, at_peak - keep)
+    by_peak     = max(0.0, sellable / eff - solar_spare)
+    if by_peak <= 0:
+        return 0.0
+
+    # 2. What a sunnier day would not push out before the peak.
+    scale = getattr(inputs.pv, "scaled", None)
+    if scale is None:
+        return min(top, by_peak)
+    bright = SimInputs(site=site, house=inputs.house, pv=scale(RESALE_PV_OPTIMISM),
+                       commitments=inputs.commitments)
+    steps  = build_steps(bright, window_end, peak_at)
+
+    def displaced(extra):
+        r = walk(site, steps, base_kwh + extra)
+        return r.spill_kwh - r.free_in_kwh
+
+    base = displaced(0.0)
+    hi   = min(top, by_peak)
+    if displaced(hi) - base <= RESALE_SPILL_TOLERANCE:
+        return hi
+    lo = 0.0
+    for _ in range(30):
+        mid = (lo + hi) / 2.0
+        if displaced(mid) - base <= RESALE_SPILL_TOLERANCE:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _export_plan(inputs):
