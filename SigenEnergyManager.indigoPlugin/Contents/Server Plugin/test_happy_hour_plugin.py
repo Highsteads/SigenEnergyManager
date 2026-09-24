@@ -158,6 +158,22 @@ class TestAutoBooking(unittest.TestCase):
         self.assertEqual(p._send_pushover.call_args.args[0],
                          "Keeping your free hours for a duller Sunday")
 
+    def test_a_hold_after_a_booking_is_logged_but_never_pushed(self):
+        """24-Sep-2026 live: 19:06 booked 2pm, 20:07 pushed 'Keeping your free hours
+        for a duller Sunday' about the second hour. Octopus still had 2pm booked;
+        the push read as a cancellation. Declining to ADD an hour is not news."""
+        p = _mk(pv_kwh=40.0)
+        data = {"token_balance": 6, "events": _slot_events(joined=(14,))}
+        with patch.object(plugin, "log") as logged:
+            for hours in (0, 1, 2):
+                p._auto_book_happy_hours(data, THURSDAY + timedelta(hours=hours))
+        p.octopus.book_happy_hour_event.assert_not_called()
+        p._send_pushover.assert_not_called()
+        lines = [c.args[0] for c in logged.call_args_list
+                 if "stays at one free hour" in c.args[0]]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("from 2pm to 3pm, and it stays booked.", lines[0])
+
     def test_a_permanent_refusal_is_remembered_and_the_other_slot_still_booked(self):
         p = _mk(pv_kwh=8.0)
         refusal = {"ok": False, "already": False, "permanent": True,

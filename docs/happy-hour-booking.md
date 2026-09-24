@@ -71,7 +71,10 @@ feed that lags the booking cannot drop the hour from the plan or invite a second
 
 - **Booked** — once per booking: which hours, why, and the tokens left.
 - **Holding** — once per Sunday and reason: bookings are open, the day is bright enough to fill
-  the battery, the tokens are kept, and how many Sundays remain.
+  the battery, the tokens are kept, and how many Sundays remain. Only on a day with NOTHING
+  booked: where an hour is already booked and a further one is not worth a token, the plugin
+  logs that once, naming the booked hour and saying it stays, and sends no push (5.112.6 — the
+  push read as a cancellation).
 - **Morning** — from 8am on a booked day: the free hours and a nudge to run the washing machine,
   tumble dryer and dishwasher. Skipped if the booking itself was made that day.
 - **Result** — after the day's last booked hour: the kWh the house took free and what that much

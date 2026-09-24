@@ -5,8 +5,8 @@
 #              in plain English. Pure: slots, tokens, a solar forecast, the house
 #              profile and the battery in; a booking plan and its messages out.
 # Author:      CliveS & Claude Opus 5.5
-# Date:        22-09-2026
-# Version:     1.0
+# Date:        24-09-2026
+# Version:     1.1  (SigenEnergyManager 5.112.6: a hold on a day already booked names the booking)
 #
 # SigenEnergyManager 5.112.0. The rules, agreed with CliveS on 22-Sep-2026:
 #
@@ -387,6 +387,28 @@ def hold_message(plan, tz, today, scheme_end):
                 f"every hour until the slots start. You have {counts} to use by "
                 f"{_end_words(scheme_end)}.")
         return title, body
+    if plan.booked:
+        # A day that already has a booking is NOT being held back: the plugin is
+        # only declining to ADD an hour. The plain hold wording read, the hour
+        # after a booking, as though that booking had been undone (24-Sep-2026).
+        booked = len(plan.booked)
+        name  = _cap(when) if when in ("today", "tomorrow") else f"{plan.day:%A}"
+        title = f"{name} stays at {_plural(booked, 'free hour')}"
+        parts = [f"{_cap(_plural(booked, 'free hour'))} "
+                 f"{'is' if booked == 1 else 'are'} already booked for {when}, "
+                 f"{span_words(plan.booked, tz)}, and "
+                 f"{'it stays' if booked == 1 else 'they stay'} booked."]
+        extra = "A second hour" if booked == 1 else "Another hour"
+        if plan.best_single_kwh is not None and plan.best_single_kwh >= 1.0:
+            parts.append(f"{extra} is not worth a token: the battery could use only "
+                         f"about {_kwh(plan.best_single_kwh)} more of it.")
+        else:
+            parts.append(f"{extra} is not worth a token: the battery would have almost "
+                         f"no room left for it.")
+        parts.append(f"The plugin is keeping your {counts} for a duller day, and will "
+                     f"look again every hour until the slots start.")
+        parts.append(later)
+        return title, " ".join(parts)
     title = "Keeping your free hours for a duller Sunday"
     parts = [f"Octopus have opened bookings for {when}."]
     if plan.pv_day_kwh is not None:

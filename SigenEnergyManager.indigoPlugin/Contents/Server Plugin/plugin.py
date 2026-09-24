@@ -34,8 +34,9 @@
 #              Claude Opus 5.5 (5.112.3 — saving the settings is not a Modbus fault)
 #              Claude Opus 5.5 (5.112.4 — a Saving Session ends with one hand-back, not two)
 #              Claude Opus 5.5 (5.112.5 — a session that ends under a VPP window lets go of the registers)
-# Date:        23-09-2026
-# Version:     5.112.5
+#              Claude Opus 5.5 (5.112.6 — a Sunday already booked is never pushed as held back)
+# Date:        24-09-2026
+# Version:     5.112.6
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6221,7 +6222,14 @@ class Plugin(indigo.PluginBase):
             elif plan.outcome in (_hh_booking.HOLD_BRIGHT, _hh_booking.HOLD_NO_FORECAST):
                 title, body = _hh_booking.hold_message(plan, tz, today,
                                                        HAPPY_HOUR_SCHEME_END)
-                self._send_happy_hour_note(f"hold:{day}:{plan.outcome}", title, body)
+                if plan.booked:
+                    # Not adding to a day already booked is not news: the booking
+                    # message said what will happen. Once in the log, no push — a
+                    # push here read as the booking being undone (24-Sep-2026).
+                    if self._mark_happy_hour_note_sent(f"hold:{day}:{plan.outcome}:booked"):
+                        log(f"[HappyHour] {title}. {_ascii_plain(body)}")
+                else:
+                    self._send_happy_hour_note(f"hold:{day}:{plan.outcome}", title, body)
             elif plan.outcome == _hh_booking.NOTHING_BOOKABLE and plan.hours_held > \
                     2 * plan.sundays_after:
                 # Tokens that cannot wait for a later Sunday and nowhere to put

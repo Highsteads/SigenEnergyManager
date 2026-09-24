@@ -294,6 +294,21 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         self.assertIn("Four more Sundays are left before the offer ends on 1 November.", body)
         self.assertIn("almost no room for it.", body)
 
+    def test_a_hold_on_a_day_already_booked_says_the_booking_stands(self):
+        """24-Sep-2026: the hour after booking 2pm, a hold on the SECOND hour went
+        out as 'Keeping your free hours for a duller Sunday', which read as the
+        booking being undone. It must name the booking and say it stays."""
+        p = _plan(pv_kwh=40.0, slots=_slots(booked=(14,)), tokens=6)
+        self.assertEqual(p.outcome, hb.HOLD_BRIGHT)
+        title, body = hb.hold_message(p, LONDON, self.TODAY, SCHEME_END)
+        self._check(title, body)
+        self.assertEqual(title, "Sunday stays at one free hour")
+        self.assertIn("One free hour is already booked for Sunday 27 September, "
+                      "from 2pm to 3pm, and it stays booked.", body)
+        self.assertIn("A second hour is not worth a token", body)
+        self.assertNotIn("duller Sunday", title + body)
+        self.assertNotIn("fill the battery by itself", body)
+
     def test_the_waiting_for_a_forecast_message(self):
         p = _plan(pv=fs.HourlyPvForecast({}, LONDON))
         title, body = hb.hold_message(p, LONDON, self.TODAY, SCHEME_END)

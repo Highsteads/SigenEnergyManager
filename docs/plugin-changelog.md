@@ -15,6 +15,21 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.112.6 — 24-09-2026
+
+**A Sunday already booked is never pushed as held back.**
+
+- **Live 24-Sep-2026:** 19:06 booked EVENT_90_270926 (2pm-3pm, 26 kWh forecast, ~9 kWh useful).
+  20:07 the hourly re-plan found the best SECOND hour worth ~4 kWh, under the 5 kWh bar, so
+  `plan_day` returned `HOLD_BRIGHT` with `plan.booked` holding the 2pm slot. `hold_message`
+  never read `plan.booked`, so the push said "Keeping your free hours for a duller Sunday ...
+  enough to fill the battery by itself" — which read as the booking being undone. Octopus still
+  had 2pm booked, correctly. (21:07, on a duller forecast, the plugin added 1pm-2pm as designed.)
+- **Fix:** `hold_message` names the booked hours and says they stay booked when `plan.booked` is
+  non-empty (title "Sunday stays at one free hour"). The plugin logs that once per day and outcome
+  (key `hold:<day>:<outcome>:booked`) and sends no Pushover: not adding an hour is not news.
+- Two tests, both watched failing on 5.112.5.
+
 ## v5.112.5 — 23-09-2026
 
 **A Saving Session that ends under an Axle VPP window lets go of the registers.**
