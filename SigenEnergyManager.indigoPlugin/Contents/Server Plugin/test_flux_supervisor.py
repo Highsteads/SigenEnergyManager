@@ -2662,6 +2662,7 @@ class TestDayRateImportStopsThePeakExport(_FluxCase):
         p.modbus = MagicMock()
         p.modbus.force_charge.return_value = True
         p._note_day_rate_import = MagicMock()
+        p._flux_owns_cheap_window = MagicMock(return_value=False)   # the fallback path
         p.store["import_scheduled_time"] = when.astimezone(timezone.utc) - timedelta(minutes=1)
         p.store["import_target_soc"] = 40.0
         p._check_scheduled_import_impl()
@@ -2688,6 +2689,70 @@ class TestDayRateImportStopsThePeakExport(_FluxCase):
                         scheduled_time=when, reason="test")
         p._act_on_decision(dec)
         p._note_day_rate_import.assert_not_called()
+
+
+class TestFluxOwnsTheCheapWindow(_FluxCase):
+    """5.115.0 (CliveS, 26-Sep-2026: "let Flux own 2am"). The manager leaves the
+    cheap-window charge to Flux while Flux can plan, and keeps its own import as the
+    fallback when it cannot."""
+
+    _call_at = TestDayRateImportStopsThePeakExport._call_at
+
+    def _owns(self, p, when):
+        return self._call_at(p, when, p._flux_owns_cheap_window)
+
+    def test_outside_the_window_the_2am_charge_is_left_to_flux(self):
+        p, when = self._at((20, 0), soc=30.0)
+        self.assertTrue(self._owns(p, when))
+
+    def test_inside_the_window_flux_must_be_planning_a_charge_or_hold(self):
+        p, when = self._at((2, 30), soc=25.0)
+        for mode, expected in ((fs.MODE_CHARGE, True), (fs.MODE_HOLD, True),
+                               (fs.MODE_DEFER, False), (fs.MODE_SOLAR, False)):
+            p.store["flux_decision"] = fs.FluxDecision(mode=mode, owns=True, reason="t")
+            self.assertEqual(self._owns(p, when), expected, mode)
+
+    def test_no_flux_plan_yet_is_not_ownership(self):
+        p, when = self._at((2, 30), soc=25.0)
+        p.store["flux_decision"] = None
+        self.assertFalse(self._owns(p, when))
+
+    def test_something_outranking_flux_hands_the_window_back(self):
+        p, when = self._at((2, 30), soc=25.0, storm_level="amber")
+        p.store["flux_decision"] = fs.FluxDecision(mode=fs.MODE_CHARGE, owns=True, reason="t")
+        self.assertFalse(self._owns(p, when))
+
+    def test_a_manager_import_in_flight_is_left_to_finish(self):
+        p, when = self._at((2, 30), soc=25.0, import_active=True)
+        p.store["flux_decision"] = fs.FluxDecision(mode=fs.MODE_CHARGE, owns=True, reason="t")
+        self.assertFalse(self._owns(p, when))
+
+    def test_disarmed_flux_or_another_tariff_leaves_it_with_the_manager(self):
+        p, when = self._at((20, 0), soc=30.0, prefs=_flux_prefs(fluxEnabled=False))
+        self.assertFalse(self._owns(p, when))
+        p, when = self._at((20, 0), soc=30.0)
+        p.latest_rates_data["tariff_info"]["tariff_key"] = "go"
+        self.assertFalse(self._owns(p, when))
+
+    def test_a_schedule_queued_earlier_is_dropped_not_fired(self):
+        p, when = self._at((2, 1), soc=25.0)
+        p.modbus = MagicMock()
+        p._flux_owns_cheap_window = MagicMock(return_value=True)
+        p.store["import_scheduled_time"] = when.astimezone(timezone.utc) - timedelta(minutes=1)
+        p.store["import_target_soc"] = 40.0
+        p._check_scheduled_import_impl()
+        p.modbus.force_charge.assert_not_called()
+        self.assertIsNone(p.store["import_scheduled_time"])
+        self.assertFalse(p.store.get("import_active"))
+
+    def test_the_manager_snapshot_carries_the_flag(self):
+        p, when = self._at((20, 0), soc=30.0, vpp_active=False,
+                           solar_overflow_charge_cap_w=0)
+        for value in (True, False):
+            p._flux_owns_cheap_window = MagicMock(return_value=value)
+            snap = self._call_at(p, when,
+                                 lambda: p._build_manager_snapshot(30.0, True, 0.0))
+            self.assertIs(snap.flux_owns_cheap_window, value)
 
 if __name__ == "__main__":
     unittest.main()

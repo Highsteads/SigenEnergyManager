@@ -18,6 +18,7 @@ from battery_manager import (
     TariffData,
     ACTION_START_IMPORT,
     ACTION_SCHEDULE_IMPORT,
+    ACTION_SELF_CONSUMPTION,
     PEAK_TOPUP_BUFFER_KWH,
     MIN_IMPORT_KWH,
     TARIFF_GO,
@@ -46,7 +47,8 @@ def _flux(peak_p=34.10, day_p=24.35, cheap_p=14.62):
 
 
 def _snap(soc, local_hh, local_mm=0, tariff=None, reserve=20.0, p50=None,
-          import_pending=False, tomorrow_kwh=0.0, tracking=1.0):
+          import_pending=False, tomorrow_kwh=0.0, tracking=1.0, flux_owns=False,
+          dawn_target=10.0):
     return ManagerSnapshot(
         current_soc_pct     = soc,
         capacity_kwh        = CAP,
@@ -62,6 +64,8 @@ def _snap(soc, local_hh, local_mm=0, tariff=None, reserve=20.0, p50=None,
         dawn_times          = {"2026-09-26": _utc(26, 7), "2026-09-27": _utc(27, 7)},
         consumption_profile = [SLOT] * 48,
         pv_tracking_factor  = tracking,
+        flux_owns_cheap_window = flux_owns,
+        dawn_target_pct     = dawn_target,
         now                 = _utc(26, local_hh, local_mm),
     )
 
@@ -194,6 +198,87 @@ class TestImportNeededHysteresis(unittest.TestCase):
     def test_the_start_threshold_is_unchanged(self):
         b = self._short_by(MIN_IMPORT_KWH + 0.1, pending=False)
         self.assertTrue(b.import_needed)
+
+
+
+class TestDullAfternoonDrainsTheBattery(unittest.TestCase):
+    """battery_manager 3.13: the house using more than the panels make before dusk
+    comes off the dawn projection. It used to be max(0, solar - home)."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _dawn(self, wh_per_hour, soc=50.0, tracking=1.0):
+        # Hours 07-17 at or above the 500 Wh dusk threshold, so it is daytime and
+        # dusk is 18:00; `tracking` is the day's measured shortfall against forecast.
+        p50 = {f"2026-09-26 {h:02d}:00:00": wh_per_hour for h in range(7, 18)}
+        return self.bm._calculate_24h_balance(
+            _snap(soc, 12, 0, p50=p50, tracking=tracking))
+
+    def test_a_dull_afternoon_is_a_drain_not_a_zero(self):
+        b = self._dawn(600, tracking=0.4)   # ~1.3 kWh of sun against 3.6 of house
+        self.assertTrue(b.is_daytime)
+        deficit = b.remaining_home_to_dusk_kwh - b.remaining_solar_kwh
+        self.assertGreater(deficit, 1.5)
+        overnight = self.bm._estimate_consumption_until(
+            b.dusk_dt, b.dawn_dt, [SLOT] * 48)
+        expected = 0.5 * CAP - deficit - overnight
+        self.assertAlmostEqual(b.battery_at_dawn_kwh, round(expected, 2), places=2)
+
+    def test_a_sunny_afternoon_still_charges(self):
+        b = self._dawn(3000)
+        surplus = b.remaining_solar_kwh - b.remaining_home_to_dusk_kwh
+        self.assertGreater(surplus, 0.0)
+        overnight = self.bm._estimate_consumption_until(
+            b.dusk_dt, b.dawn_dt, [SLOT] * 48)
+        expected = min(CAP, 0.5 * CAP + surplus) - overnight
+        self.assertAlmostEqual(b.battery_at_dawn_kwh, round(expected, 2), places=2)
+
+    def test_the_dusk_level_never_goes_below_the_floor(self):
+        b = self._dawn(600, soc=3.0, tracking=0.4)
+        self.assertTrue(b.is_daytime)
+        self.assertAlmostEqual(b.battery_at_dawn_kwh, round(0.01 * CAP, 2), places=2)
+
+
+
+class TestFluxOwnsTheCheapWindow(unittest.TestCase):
+    """battery_manager 3.13: with Flux armed the manager leaves the 2am charge to it."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def test_the_manager_no_longer_schedules_its_own_2am_charge(self):
+        d = self.bm.evaluate(_snap(35.0, 11, 30, flux_owns=True))
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("Flux controller buys it in the cheap window from 2am", d.reason)
+
+    def test_nor_starts_one_inside_the_window(self):
+        d = self.bm.evaluate(_snap(12.0, 3, 0, flux_owns=True))
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("buys it now", d.reason)
+
+    def test_the_day_rate_peak_top_up_is_still_the_managers(self):
+        d = self.bm.evaluate(_snap(25.0, 11, 30, flux_owns=True))
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+        self.assertIn("peak", d.reason)
+
+    def test_without_flux_the_manager_still_buys_in_the_window(self):
+        d = self.bm.evaluate(_snap(12.0, 3, 0, flux_owns=False))
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+
+    def test_the_resilience_top_up_is_left_to_flux_too(self):
+        # Tomorrow covered by sun, SOC under the 20% reserve target, 03:00.
+        plain = self.bm._check_resilience_buffer(
+            _snap(15.0, 3, 0, tomorrow_kwh=40.0, dawn_target=20.0),
+            self.bm._calculate_24h_balance(
+                _snap(15.0, 3, 0, tomorrow_kwh=40.0, dawn_target=20.0)))
+        owned = self.bm._check_resilience_buffer(
+            _snap(15.0, 3, 0, tomorrow_kwh=40.0, dawn_target=20.0, flux_owns=True),
+            self.bm._calculate_24h_balance(
+                _snap(15.0, 3, 0, tomorrow_kwh=40.0, dawn_target=20.0, flux_owns=True)))
+        self.assertIsNotNone(plain, "control: without Flux the reserve is bought")
+        self.assertEqual(plain.action, ACTION_START_IMPORT)
+        self.assertIsNone(owned)
 
 
 if __name__ == "__main__":

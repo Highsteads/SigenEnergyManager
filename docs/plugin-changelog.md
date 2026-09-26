@@ -15,6 +15,29 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.115.0 — 26-09-2026
+
+**Flux owns the 2am charge; a dull afternoon drains the dawn projection.** (battery_manager 3.13)
+
+- **The cheap window is the Flux controller's (CliveS: "let Flux own 2am").** Live 26-Sep-2026
+  02:00:03 Flux planned "buying about 4.0 kWh at 14.6p to 34%"; at 02:00:37 the manager's
+  scheduled import fired, `_flux_preempt` pushed Flux aside and the manager charged to 33%, then
+  37.5% at 02:36. `ManagerSnapshot.flux_owns_cheap_window` (plugin `_flux_owns_cheap_window`):
+  True while Flux is armed on a Flux account; inside the window only while the latest Flux plan
+  is CHARGE or HOLD and `_flux_other_owner()` is empty (so a storm, a VPP window or the
+  manager's own import in flight hands it back). With it set, `_plan_tou_import` returns
+  SELF_CONSUMPTION via `_leave_cheap_window_to_flux` (which also retracts a queued schedule),
+  `_check_resilience_buffer` stands down in the window, and `_check_scheduled_import_impl` drops
+  a schedule queued earlier rather than firing it (the retraction in `_act_on_decision` cannot
+  run while Flux holds the inverter from 2pm). The day-rate peak top-up stays with the manager.
+- **The dawn projection counts a dull afternoon.** `battery_at_dusk` used
+  `max(0, solar - home)`, so a house outrunning the panels before dusk drained nothing. Now
+  signed and floored at the health cutoff. No existing test covered the deficit direction;
+  the whole suite passed unchanged before the new tests were added.
+- **Tests:** 2,100 -> 2,116. Mutation sweep 10 of 11 killed plus the snapshot wiring on a
+  second pass; the survivor is the dusk floor clamp, which is equivalent because the dawn value
+  is clamped at the same floor straight after.
+
 ## v5.114.0 — 26-09-2026
 
 **The day rate buys only the peak; no peak export after it; Flux takes the inverter back.**

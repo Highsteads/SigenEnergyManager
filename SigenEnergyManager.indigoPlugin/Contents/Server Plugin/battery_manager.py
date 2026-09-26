@@ -4,9 +4,17 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 5; 3.12 Claude Opus 5.5
-# Date:        05-08-2026; 3.12 26-09-2026
-# Version:     3.12
+# Author:      CliveS & Claude Opus 5; 3.12-3.13 Claude Opus 5.5
+# Date:        05-08-2026; 3.12-3.13 26-09-2026
+# Version:     3.13
+# 3.13 — (1) THE DAWN PROJECTION COUNTS A DULL AFTERNOON. battery_at_dusk used
+#       max(0, solar - home), so a house that outran the panels before dusk drained
+#       nothing and the projection kept energy already spent. Now signed, floored at
+#       the health cutoff. (2) THE CHEAP WINDOW IS THE FLUX CONTROLLER'S. With
+#       snapshot.flux_owns_cheap_window the TOU planner and the resilience top-up
+#       leave tomorrow's charge to Flux instead of scheduling their own, which used
+#       to pre-empt Flux at 02:00 and charge to the manager's smaller target (live
+#       26-Sep-2026). The day-rate peak top-up stays with the manager.
 # 3.12 — THE DAY RATE BUYS ONLY THE PEAK. On Go/Flux, a battery that could not last to
 #       the cheap window bought tomorrow's whole shortfall at once at the day rate. But
 #       running out first only puts the house on the grid at that same day rate, so the
@@ -780,6 +788,12 @@ class ManagerSnapshot:
     # shortfall is genuinely gone, so a forecast wobble across MIN_IMPORT_KWH cannot
     # flip the plan off and on (26-Sep-2026: 11:24 on, 11:30 off, 11:36 on).
     import_pending:      bool = False
+    # v3.13 — the cheap window belongs to the Flux controller. plugin.py sets this
+    # while Flux is armed on a Flux account and, inside the window, only while its
+    # own plan is a charge or a hold with nothing outranking it. False on every
+    # other tariff and whenever Flux cannot plan, so the manager's own cheap-window
+    # import stays as the fallback (CliveS, 26-Sep-2026: "let Flux own 2am").
+    flux_owns_cheap_window: bool = False
 
 
 @dataclass
@@ -1309,6 +1323,9 @@ class BatteryManager:
             if not self._time_in_window(now_hm, snapshot.tariff.cheap_start,
                                         snapshot.tariff.cheap_end):
                 return None
+            # v3.13: the Flux controller's charge already holds its reserve.
+            if snapshot.flux_owns_cheap_window:
+                return None
 
         buffer_pct    = snapshot.dawn_target_pct          # default 15%, minimum 15
         buffer_target = min(buffer_pct + 2.0, 98.0)       # +2% prevents cycling
@@ -1551,9 +1568,13 @@ class BatteryManager:
 
         # ── Battery at dawn ─────────────────────────────────────────────────
         if is_daytime:
-            # Remaining solar (net of home load) charges the battery during the day
-            net_to_battery  = max(0.0, remaining_solar_kwh - remaining_home_to_dusk_kwh)
-            battery_at_dusk = min(cap_kwh, current_soc_kwh + net_to_battery)
+            # Remaining solar net of home load, in BOTH directions (v3.13). It used to
+            # be max(0, solar - home): a sunny afternoon charged the battery, but a dull
+            # one where the house outran the panels drained nothing, so the dawn
+            # projection kept kWh the house had already spent by dusk. Found on the
+            # dull 26-Sep-2026 (solar tracking 0.6 of forecast from late morning).
+            net_to_battery  = remaining_solar_kwh - remaining_home_to_dusk_kwh
+            battery_at_dusk = min(cap_kwh, max(health_floor, current_soc_kwh + net_to_battery))
 
             # Overnight drain from dusk to dawn
             if dusk_dt is not None:
@@ -1799,6 +1820,9 @@ class BatteryManager:
         # or the test is an hour off in BST (mirrors the _plan_tracker_import path).
         now_hm = self._to_local(now).strftime("%H:%M")
         if self._time_in_window(now_hm, cheap_start, cheap_end):
+            if snapshot.flux_owns_cheap_window:
+                return self._leave_cheap_window_to_flux(balance, cheap_start, cheap_end,
+                                                        now_open=True)
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = (
@@ -1826,6 +1850,9 @@ class BatteryManager:
         topup = self._plan_peak_topup(snapshot, next_window_dt)
         if topup is not None:
             return topup
+        if snapshot.flux_owns_cheap_window:
+            return self._leave_cheap_window_to_flux(balance, cheap_start, cheap_end,
+                                                    now_open=False)
 
         # Does the battery last until the cheap window? Only the wording depends on
         # it now: either way the right move is to wait.
@@ -1848,6 +1875,28 @@ class BatteryManager:
             power_watts    = 10000,
             target_soc_pct = target_soc,
             scheduled_time = next_window_dt,
+        )
+
+    @staticmethod
+    def _leave_cheap_window_to_flux(balance: SufficiencyBalance, cheap_start: str,
+                                    cheap_end: str, now_open: bool) -> Decision:
+        """Tomorrow is short, and the Flux controller buys it (v3.13).
+
+        Until 5.115.0 the manager scheduled its own cheap-window import as well, and
+        when it fired it pre-empted Flux and charged to its own, usually smaller,
+        target: live 26-Sep-2026 02:01, Flux planned a charge to 34% with resale and
+        was pushed aside for a manager charge to 33%, then 37.5%. Flux sizes the
+        charge for the house, its commitments and the peak in one walk, so the
+        window is its job. SELF_CONSUMPTION also retracts any schedule the manager
+        queued before this took effect.
+        """
+        when = (f"now, in the cheap window ({_spoken_hm(cheap_start)} to "
+                f"{_spoken_hm(cheap_end)})" if now_open
+                else f"in the cheap window from {_spoken_hm(cheap_start)}")
+        return Decision(
+            action = ACTION_SELF_CONSUMPTION,
+            reason = (f"Tomorrow is short by about {balance.import_kwh_grid:.0f} kWh. "
+                      f"The Flux controller buys it {when}"),
         )
 
     def _plan_peak_topup(

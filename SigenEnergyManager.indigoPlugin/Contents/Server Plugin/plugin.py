@@ -37,8 +37,9 @@
 #              Claude Opus 5.5 (5.112.6 — a Sunday already booked is never pushed as held back)
 #              Claude Opus 5.5 (5.113.0 — the overnight charge buys to sell only what the sun will not)
 #              Claude Opus 5.5 (5.114.0 — the day rate buys only the peak; no peak export after it; Flux reclaims)
+#              Claude Opus 5.5 (5.115.0 — Flux owns the 2am charge; a dull afternoon drains the dawn projection)
 # Date:        26-09-2026
-# Version:     5.114.0
+# Version:     5.115.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -4967,6 +4968,7 @@ class Plugin(indigo.PluginBase):
             wear_p_per_kwh     = self._wear_p_per_kwh(),
             import_pending     = bool(self.store.get("import_active")
                                       or self.store.get("import_scheduled_time") is not None),
+            flux_owns_cheap_window = self._flux_owns_cheap_window(),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
             inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
@@ -7732,6 +7734,16 @@ class Plugin(indigo.PluginBase):
             scheduled = localised.astimezone(timezone.utc)
 
         if now_utc >= scheduled:
+            # 5.115.0: the cheap window is the Flux controller's. The retraction in
+            # _act_on_decision cannot run while Flux holds the inverter (from 2pm for
+            # the peak), so a schedule queued earlier would otherwise still fire here
+            # and push Flux aside, as it did at 02:01 on 26-Sep-2026.
+            if self._flux_owns_cheap_window():
+                log("[Manager] Scheduled import dropped — the Flux controller is "
+                    "doing the cheap-window charge")
+                self.store["import_scheduled_time"]   = None
+                self.store["import_scheduled_logged"] = False
+                return
             log("[Manager] Scheduled import window reached - starting import")
             # This path writes to the inverter straight from the tick, outside
             # the manager's evaluate, so it needs its own pre-emption: Flux lets
@@ -13324,6 +13336,38 @@ class Plugin(indigo.PluginBase):
                     "exported in the 4pm to 7pm peak today. Selling day-rate energy "
                     "back at the peak price loses money once charging losses and wear "
                     "are counted")
+
+    def _flux_owns_cheap_window(self):
+        """Should the manager leave tomorrow's cheap-window charge to Flux? (5.115.0)
+
+        Yes while Flux is armed on a Flux account — except inside the window itself,
+        where it must be seen to be doing the job: its latest plan a charge or a
+        hold, and nothing outranking it. Otherwise the manager's own import stays
+        as the fallback, so a Flux that cannot plan (stale rates, an unverified
+        account, a storm) never leaves tomorrow unbought.
+
+        "Something outranks Flux" includes the manager's own import in flight, so an
+        import already running is never talked out of finishing.
+        """
+        if not FLUX_AVAILABLE or not self._flux_armed():
+            return False
+        tariff_key = (self.latest_rates_data or {}).get("tariff_info", {}).get("tariff_key")
+        if tariff_key != TARIFF_FLUX:
+            return False
+        try:
+            in_cheap = _flux_strategy.in_window(
+                datetime.now(timezone.utc), _london_tz(),
+                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] cheap-window check failed: {exc!r}")
+            return False
+        if not in_cheap:
+            return True
+        if self._flux_other_owner():
+            return False
+        decision = self.store.get("flux_decision")
+        return bool(decision is not None and getattr(decision, "mode", None)
+                    in (_flux_strategy.MODE_CHARGE, _flux_strategy.MODE_HOLD))
 
     def _day_rate_import_today(self):
         return self.pluginPrefs.get("dayRateImportDate", "") == _local_today_str()
