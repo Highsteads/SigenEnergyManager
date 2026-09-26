@@ -38,8 +38,9 @@
 #              Claude Opus 5.5 (5.113.0 — the overnight charge buys to sell only what the sun will not)
 #              Claude Opus 5.5 (5.114.0 — the day rate buys only the peak; no peak export after it; Flux reclaims)
 #              Claude Opus 5.5 (5.115.0 — Flux owns the 2am charge; a dull afternoon drains the dawn projection)
+#              Claude Opus 5.5 (5.116.0 — every session's result published; free-hour credits chased until paid)
 # Date:        26-09-2026
-# Version:     5.115.0
+# Version:     5.116.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -283,6 +284,14 @@ try:
 except Exception:                           # noqa: BLE001
     _hh_booking = None
 
+# What Octopus owes back for a booked free hour, and whether it has paid (v5.116.0).
+# Pure module; a missing one means the check does not run, never a plugin that
+# will not start.
+try:
+    import free_hour_credits as _fh_credits
+except Exception:                           # noqa: BLE001
+    _fh_credits = None
+
 # ============================================================
 # Constants
 # ============================================================
@@ -511,6 +520,11 @@ STORM_WATCH_INTERVAL = 7200  # 2 hours
 SAVING_SESSIONS_INTERVAL = 3600  # 1 hour
 SAVING_SESSIONS_SOON_INTERVAL = 600   # 10 min once a session is imminent
 SAVING_SESSIONS_SOON_HOURS    = 2.0   # how far ahead counts as imminent
+# v5.116.0: how often the free-hour credit check runs. CliveS asked for "every
+# day"; four times a day costs two small requests each and means a credit posted
+# in the morning shows the same day.
+FREE_HOUR_CHECK_INTERVAL      = 6 * 3600
+SESSION_HISTORY_DAYS          = 45    # how far back the Energy page lists results
 
 
 def _away_seed_profile(daily_kwh):
@@ -1484,6 +1498,10 @@ class _FluxRawDriver:
 
 
 class Plugin(indigo.PluginBase):
+
+    # Serialises load-modify-save of free_hour_credits.json: the tick's daily check
+    # and the end of a Happy Hour import can both write it.
+    _free_hour_lock = threading.Lock()
     """SigenEnergyManager Indigo Plugin.
 
     Manages a Sigenergy solar/battery system with self-sufficiency as the
@@ -2689,6 +2707,12 @@ class Plugin(indigo.PluginBase):
                     # session is absent from that list entirely — the absent-state
                     # trap, where silence reads as all-clear.
                     "upcoming":   store.get("saving_sessions_upcoming") or [],
+                    # v5.116.0, display only: every joined event with Octopus's
+                    # own result, the balances, and what is owed for free hours.
+                    "history":        store.get("saving_sessions_history") or [],
+                    "token_balance":  store.get("happy_hour_tokens"),
+                    "points_balance": store.get("octopoints_balance"),
+                    "free_hour_credits": store.get("free_hour_credits") or [],
                 },
                 "hourly_forecast": hourly,
             }
@@ -3409,6 +3433,12 @@ class Plugin(indigo.PluginBase):
         if now - self.store["last_saving_sessions"] >= self._saving_sessions_interval():
             self._check_saving_sessions()
             self.store["last_saving_sessions"] = now
+
+        # 10c. Free-hour credits (v5.116.0): has Octopus paid back the electricity
+        # used in a booked free hour? Network I/O unlocked, like 10b.
+        if now - self.store.get("last_free_hour_check", 0.0) >= FREE_HOUR_CHECK_INTERVAL:
+            self._check_free_hour_credits()
+            self.store["last_free_hour_check"] = now
 
         # 11. Write energy summary to Indigo variables + SQLite (every 30 min)
         if now - self.store["last_energy_var"] >= ENERGY_VAR_INTERVAL:
@@ -6387,6 +6417,153 @@ class Plugin(indigo.PluginBase):
             return True
         return ours in regions
 
+    # ── Free-hour credits (v5.116.0) ─────────────────────────────────────────
+    # CliveS, 26-Sep-2026: check the Octopus account every day that the money for
+    # electricity used in a booked free hour has been paid back, and keep showing
+    # it until it has. The judgement lives in free_hour_credits.py; this is only
+    # the wiring — the file, the Octopus calls and the Pushover.
+
+    def _free_hour_ledger_path(self):
+        return os.path.join(self.data_dir, "free_hour_credits.json")
+
+    def _load_free_hour_ledger(self):
+        path = self._free_hour_ledger_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("claims"), dict):
+                data.setdefault("assigned_credit_ids", [])
+                return data
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            log(f"[FreeHour] could not read {path}: {exc} - starting a new record",
+                level="WARNING")
+        return _fh_credits.new_ledger()
+
+    def _save_free_hour_ledger(self, ledger):
+        try:
+            _atomic_write_json(self._free_hour_ledger_path(), ledger)
+        except OSError as exc:
+            log(f"[FreeHour] could not save the free-hour record: {exc}", level="WARNING")
+
+    def _import_rate_at(self, when_utc):
+        """The import unit price in force at a moment, pence inc VAT, or None.
+
+        Flux: the published band for that half hour. Anything else: the rate in
+        force now, which is the same thing for a flat tariff and for a free hour
+        recorded within the hour after it ends.
+        """
+        if FLUX_AVAILABLE:
+            try:
+                p = self._flux_import_band_p(when_utc)
+                if p is not None:
+                    return p
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[FreeHour] Flux band lookup failed: {exc!r}")
+        try:
+            return self._build_tariff_data().today_rate_p
+        except Exception:                               # noqa: BLE001
+            return None
+
+    def _recent_session_history(self, history):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SESSION_HISTORY_DAYS)
+        out = []
+        for row in history:
+            try:
+                start = datetime.fromisoformat(str(row.get("start")).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if start >= cutoff:
+                out.append(row)
+        return out
+
+    def _record_free_hour_claims(self, events):
+        """Start a claim for each booked free hour that has ended."""
+        if _fh_credits is None:
+            return
+        now = datetime.now(timezone.utc)
+        hours = [{"id": e.get("id"), "start": e.get("start_at"), "end": e.get("end_at"),
+                  "rate_p": self._import_rate_at(e.get("start_at"))}
+                 for e in events
+                 if e.get("joined") and e.get("direction") == "WEEKEND_HAPPY_HOUR"
+                 and e.get("end_at") is not None and e["end_at"] <= now]
+        if not hours:
+            return
+        with self._free_hour_lock:
+            ledger = self._load_free_hour_ledger()
+            before = json.dumps(ledger, sort_keys=True)
+            _fh_credits.record_hours(ledger, hours, now,
+                                     lambda dt: _to_london(dt).strftime("%Y-%m-%d"))
+            if json.dumps(ledger, sort_keys=True) != before:
+                self._save_free_hour_ledger(ledger)
+                self.store["last_free_hour_check"] = 0.0     # show it on the next tick
+
+    def _note_free_hour_kwh(self, kwh):
+        """The inverter's reading of what a Happy Hour import took, for the claim
+        until Octopus's own meter reading settles."""
+        if _fh_credits is None or kwh is None:
+            return
+        with self._free_hour_lock:
+            ledger = self._load_free_hour_ledger()
+            _fh_credits.add_inverter_kwh(ledger, _local_today_str(), kwh)
+            self._save_free_hour_ledger(ledger)
+        self.store["last_free_hour_check"] = 0.0
+
+    def _check_free_hour_credits(self):
+        """Read the meter and the account, match credits, and say so once."""
+        if _fh_credits is None or not self.octopus:
+            return
+        now = datetime.now(timezone.utc)
+        with self._free_hour_lock:
+            ledger = self._load_free_hour_ledger()
+        if not ledger.get("claims"):
+            self.store["free_hour_credits"] = []
+            return
+        # Network I/O outside the file lock: meter readings first, then credits.
+        readings = {}
+        for hid, start, end in _fh_credits.hours_needing_meter(ledger, now):
+            try:
+                kwh = self.octopus.get_import_kwh_between(start, end)
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[FreeHour] meter read failed: {exc!r}")
+                kwh = None
+            if kwh is not None:
+                readings[hid] = kwh
+        credits = None
+        needs_credits = any(
+            _fh_credits.status(c, now)["state"] in (_fh_credits.STATE_AWAITING,
+                                                    _fh_credits.STATE_LATE,
+                                                    _fh_credits.STATE_SHORT,
+                                                    _fh_credits.STATE_MEASURING)
+            for c in ledger["claims"].values())
+        if needs_credits:
+            try:
+                credits = self.octopus.get_account_credits()
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[FreeHour] account credits failed: {exc!r}")
+        with self._free_hour_lock:
+            ledger = self._load_free_hour_ledger()      # re-read: the import may have written
+            for hid, kwh in readings.items():
+                _fh_credits.set_meter_kwh(ledger, hid, kwh)
+            if credits is not None:
+                for c in _fh_credits.assign_credits(ledger, credits):
+                    log(f"[FreeHour] Octopus credit of {_fh_credits.money(c['amount_p'])} "
+                        f"on {c['posted']} ('{c.get('title')}') matched to a free hour")
+                self.store["account_credits"] = credits
+            # Held, not dropped, in quiet hours: notifications() marks what it
+            # returns as sent, so it is only asked once a message can go out.
+            messages = ([] if self._is_in_quiet_hours()
+                        else _fh_credits.notifications(ledger, now))
+            display = _fh_credits.for_display(ledger, now,
+                                              self.store.get("account_credits") or [])
+            _fh_credits.prune(ledger, now)
+            self._save_free_hour_ledger(ledger)
+        self.store["free_hour_credits"] = display
+        for title, body in messages:
+            log(f"[FreeHour] {title}. {body}")
+            self._send_pushover(title, body)
+
     def _check_saving_sessions(self):
         """Notify on newly-announced Octopus Saving Sessions events.
 
@@ -6418,6 +6595,12 @@ class Plugin(indigo.PluginBase):
         # has_joined early-return below, because the token count is just as true for an
         # account that has not joined the campaign.
         self.store["happy_hour_tokens"] = data.get("token_balance")
+        # v5.116.0: every joined event with Octopus's own result, and the OctoPoints
+        # balance, for the Energy page. Display only — nothing drives off them.
+        self.store["saving_sessions_history"] = self._recent_session_history(
+            data.get("history") or [])
+        self.store["octopoints_balance"] = data.get("points_balance")
+        self._record_free_hour_claims(data.get("events") or [])
         if not data.get("has_joined"):
             # A REAL answer now, not the "couldn't tell" case — that returns None above and
             # warns from the API layer. Say it once per plugin start: an account that has
@@ -6711,6 +6894,10 @@ class Plugin(indigo.PluginBase):
         if anchor is not None:
             banked = max(0.0, float(self.store.get("grid_import_daily_kwh", 0.0)) - float(anchor))
             self.store["happy_hour_free_kwh"] = round(banked, 2)
+            try:
+                self._note_free_hour_kwh(banked)
+            except Exception as exc:                    # noqa: BLE001 — never block the hand-back
+                self.logger.debug(f"[FreeHour] could not note the free kWh: {exc!r}")
         self.store["happy_hour_import_active"] = False
         self.store["happy_hour_anchor_kwh"]    = None
         self.store["import_active"]            = False

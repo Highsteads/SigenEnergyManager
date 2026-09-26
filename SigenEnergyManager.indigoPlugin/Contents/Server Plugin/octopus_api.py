@@ -261,6 +261,48 @@ def _region_ids(raw):
     return sorted(out)
 
 
+def _joined_history(joined):
+    """Every event this account joined, with Octopus's own result for it (v5.116.0).
+
+    Octopus scores a Power Down about three working days later: `results` is
+    CALCULATING until then, and SUCCESS or FAIL after. Each figure is carried
+    exactly as sent — None stays None, because "not scored yet" is not zero.
+    Newest first.
+    """
+    def _f(v):
+        if isinstance(v, bool):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _i(v):
+        f = _f(v)
+        return int(f) if f is not None else None
+
+    out = []
+    for e in joined:
+        out.append({
+            "id":               e.get("eventId"),
+            "start":            e.get("startAt"),
+            "end":              e.get("endAt"),
+            "direction":        e.get("eventType") or "UNKNOWN",
+            "status":           e.get("eventStatus"),        # UPCOMING | ... | DONE
+            "results":          e.get("resultsStatus"),      # CALCULATING | SUCCESS | FAIL
+            "points":           _i(e.get("rewardGivenInOctoPoints")),
+            "pence":            _i(e.get("rewardGivenInPence")),
+            "energy_delta_kwh": _f(e.get("energyDeltaKwh")),
+            "baseline_kwh":     _f(e.get("baselineConsumptionDeltaKwh")),
+            "consumption_kwh":  _f(e.get("consumptionDeltaKwh")),
+            "energy_used_kwh":  _f(e.get("energyUsedInKwh")),
+            "co2_g":            _f(e.get("co2SavedInGrams")),
+            "results_set_at":   e.get("resultsSetAt"),
+        })
+    out.sort(key=lambda r: str(r.get("start") or ""), reverse=True)
+    return out
+
+
 class OctopusAPI:
     """Octopus Energy API client for SigenEnergyManager.
 
@@ -1079,7 +1121,10 @@ class OctopusAPI:
             "query": (
                 "query ($a: String!) { savingSessions {"
                 "  account(accountNumber: $a) { hasJoinedCampaign tokenBalance"
-                "    joinedEvents { eventId } }"
+                "    joinedEvents { eventId startAt endAt eventType eventStatus resultsStatus"
+                "      rewardGivenInOctoPoints rewardGivenInPence energyDeltaKwh"
+                "      baselineConsumptionDeltaKwh consumptionDeltaKwh energyUsedInKwh"
+                "      co2SavedInGrams resultsSetAt } }"
                 "  events { id code startAt endAt eventType capacityStatus"
                 "           rewardPerKwhInOctoPoints targetRegion { regionId } }"
                 "}}"
@@ -1204,11 +1249,124 @@ class OctopusAPI:
         events.sort(key=lambda ev: ev["start_at"])
 
         result = {"has_joined": has_joined, "events": events, "fetched_at": now,
-                  "token_balance": token_balance}
+                  "token_balance": token_balance,
+                  "history": _joined_history(acct.get("joinedEvents") or []),
+                  "points_balance": self._points_balance(token)}
         self._saving_sessions_cache    = result
         self._saving_sessions_cache_at = now
         self._saving_sessions_neg_at   = 0.0
         return result
+
+    def _points_balance(self, token):
+        """OctoPoints balance, or None. Backend host, RAW token (see
+        get_saving_sessions). Measured 26-Sep-2026: 3,524. Never raises."""
+        if not self._record_request():
+            return None
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL_BACKEND,
+                data=json.dumps({"query": "query ($a: String!) { loyaltyPointsBalance"
+                                          "(accountNumber: $a) { balance } }",
+                                 "variables": {"a": self.account_id}}).encode(),
+                headers={"Content-Type": "application/json", "Authorization": token},
+                timeout=REQUEST_TIMEOUT)
+            if not response.ok:
+                return None
+            bal = (((response.json() or {}).get("data") or {})
+                   .get("loyaltyPointsBalance") or {}).get("balance")
+            return int(bal) if bal is not None and not isinstance(bal, bool) else None
+        except (requests.RequestException, ValueError, TypeError) as e:
+            self.logger.debug(f"OctoPoints balance error: {e}")
+            return None
+
+    def get_account_credits(self, first=40):
+        """Recent CREDIT transactions on the account, newest first, or None on failure.
+
+        [{"id", "posted": "YYYY-MM-DD", "amount_p": int, "title", "reason", "note",
+          "reversed": bool}]. Main host, JWT auth (the mirror image of the backend).
+        Used to find Octopus's payment for the electricity used in a booked free
+        hour (v5.116.0). Charges, payments and refunds are left out: a refund is money
+        sent to the bank, not a credit against the bill.
+        """
+        if not self.api_key or not self.account_id:
+            return None
+        token = self._get_kraken_token()
+        if not token or not self._record_request():
+            return None
+        query = json.dumps({
+            "query": ("query ($a: String!, $n: Int!) { account(accountNumber: $a) {"
+                      "  transactions(first: $n) { edges { node { __typename id postedDate"
+                      "    amount title note reasonCode isReversed } } } } }"),
+            "variables": {"a": self.account_id, "n": int(first)},
+        })
+        try:
+            response = requests.post(
+                KRAKEN_GRAPHQL, data=query.encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"JWT {token}"},
+                timeout=REQUEST_TIMEOUT)
+            if not response.ok:
+                if response.status_code in (401, 403):
+                    self._kraken_token = None
+                return None
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            self.logger.debug(f"Account credits error: {e}")
+            return None
+        if (payload or {}).get("errors"):
+            self.logger.debug(f"Account credits GraphQL errors: {payload['errors']}")
+            self._kraken_token = None
+            return None
+        edges = ((((payload or {}).get("data") or {}).get("account") or {})
+                 .get("transactions") or {}).get("edges")
+        if edges is None:
+            return None
+        out = []
+        for edge in edges:
+            n = (edge or {}).get("node") or {}
+            if n.get("__typename") != "Credit":
+                continue
+            try:
+                amount = int(n.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            out.append({"id": str(n.get("id")), "posted": str(n.get("postedDate") or ""),
+                        "amount_p": amount, "title": n.get("title") or "",
+                        "reason": n.get("reasonCode") or "", "note": n.get("note") or "",
+                        "reversed": bool(n.get("isReversed"))})
+        return out
+
+    def get_import_kwh_between(self, start_utc, end_utc):
+        """Metered grid import between two instants, from Octopus's own half-hourly
+        readings — what they bill on. None until every half hour has settled, and on
+        any failure. Never a partial figure: a half-read hour is not a smaller hour."""
+        if not self.mpan or not self.serial or start_utc is None or end_utc is None:
+            return None
+        url = (f"{OCTOPUS_API_BASE}/electricity-meter-points/{self.mpan}/"
+               f"meters/{self.serial}/consumption/")
+        params = {
+            "period_from": start_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "period_to":   end_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "page_size":   100, "order_by": "period",
+        }
+        try:
+            intervals = self._paginate(url, params, authenticated=True)
+        except Exception as exc:                      # noqa: BLE001
+            self.logger.debug(f"[Octopus] Import fetch failed {start_utc}-{end_utc}: {exc}")
+            return None
+        if not intervals:
+            return None
+        want = int(round((end_utc - start_utc).total_seconds() / 1800.0))
+        total, slots = 0.0, 0
+        for interval in intervals:
+            try:
+                v = float(interval.get("consumption"))
+            except (TypeError, ValueError):
+                continue
+            if v >= 0:
+                total += v
+                slots += 1
+        return round(total, 3) if slots >= want else None
 
     @property
     def saving_session_region_id(self):

@@ -2449,6 +2449,12 @@ class TestCheckSavingSessions(unittest.TestCase):
         _happy_hour_morning_note  = plugin.Plugin._happy_hour_morning_note
         _happy_hour_slots_by_day  = plugin.Plugin._happy_hour_slots_by_day
         _apply_local_happy_hour_bookings = plugin.Plugin._apply_local_happy_hour_bookings
+        # v5.116.0: the history trim is real; claim recording is captured, not run,
+        # because it writes a file the stub has no folder for.
+        _recent_session_history = plugin.Plugin._recent_session_history
+
+        def _record_free_hour_claims(self, events):
+            self.free_hour_events = list(events)
         # staticmethod() is required: aliasing a @staticmethod as a bare class
         # attribute rebinds it as an INSTANCE method, so the stub arrives as the
         # first positional argument. It fails as a TypeError on a date compare,
@@ -7660,6 +7666,13 @@ class TestUpcomingSessionsForDisplay(unittest.TestCase):
         _apply_local_happy_hour_bookings = plugin.Plugin._apply_local_happy_hour_bookings
         _auto_book_happy_hours    = plugin.Plugin._auto_book_happy_hours
         _happy_hour_morning_note  = plugin.Plugin._happy_hour_morning_note
+
+        # v5.116.0: the history trim is real; claim recording is captured, not run,
+        # because it writes a file the stub has no folder for.
+        _recent_session_history = plugin.Plugin._recent_session_history
+
+        def _record_free_hour_claims(self, events):
+            self.free_hour_events = list(events)
         _happy_hour_slots_by_day  = plugin.Plugin._happy_hour_slots_by_day
 
     def _event(self, direction="TURN_DOWN", joined=True, hours=6, event_id="1",

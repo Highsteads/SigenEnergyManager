@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.115.0 · Requires Indigo 2025.2 or later
+**Version:** 5.116.0 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -149,6 +149,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.116.0 | 26-Sep-2026 | **The plugin now chases the money Octopus owes for a free hour, and publishes every session's result.** A booked Weekend Happy Hour is free up to 16 kWh, and Octopus pays it back as a credit on the account. Four times a day the plugin works out what each Sunday's free hours are owed, from Octopus's own meter reading once it has arrived (the inverter's figure until then) at the price in force at the time. It looks for the matching credit on the account and keeps the amount on show until it is paid. You get one Pushover when it is paid, one if it arrives more than 5p short, and one if nothing has come after two weeks. Any other credit posted since the free hour is shown beside it, so a payment under an unfamiliar name is not missed. The plugin also now reads Octopus's own result for every Power Down you joined: whether it was won, what your usage usually is, what it was this time, the energy counted and the points paid. It reads the OctoPoints balance as well, and the Dashboards Energy page (3.49.0) shows all of it. |
 | 5.115.0 | 26-Sep-2026 | **On Octopus Flux the Flux controller now does the 2am charge on its own.** The plugin's older battery manager used to queue its own cheap-rate charge as well, and at 2am it took the battery away from the Flux controller and charged to its own, usually smaller, target. On 26 September that left the battery at 37% on a day that needed far more. The manager now leaves the cheap window to the Flux controller, and only buys in it itself if the Flux controller cannot plan (missing prices, an unverified account, a storm warning). Also fixed: on a dull afternoon, when the house uses more than the panels make, the plugin now counts that drain when it works out what will be left in the battery at dawn. It used to count a sunny afternoon's surplus but treat a shortfall as zero, so it expected more in the battery at dawn than there would be. |
 | 5.114.0 | 26-Sep-2026 | **On Octopus Flux, a dull day no longer buys tomorrow's electricity at the day rate.** When the battery looked unable to last until the 2am cheap rate, the plugin used to buy the whole of tomorrow's shortfall straight away at the day rate. On 26 September it did that four times before midday, each time aiming a little higher, from 34% up to 54%, with the cheap rate twelve hours away. A battery that runs low before 2am does not leave the house without power: the house simply uses the grid at the day rate, the same price as buying early, without the charging loss. Now the plugin buys at the day rate only what the battery needs to get through the 4pm to 7pm peak, when the grid costs more, and only when that saves money after charging losses and wear. Everything else waits for 2am. A top-up now has to be worth at least 1 kWh before it starts and buys half a kWh extra, so it no longer stops and starts every few minutes. On a day that has bought at the day rate, nothing is exported in the 4pm to 7pm peak: day-rate electricity sold at the peak export price loses money once losses are counted, so the battery runs the house instead. Also fixed: after anything took the battery over from the Flux controller, even for a moment, the controller never took it back until the plugin was restarted. It happened at 2am on 26 September, so that night's cheap-rate charge was the smaller one the manager had planned. |
 | 5.113.0 | 24-Sep-2026 | **The overnight Flux charge no longer buys electricity the sun would have supplied anyway.** On two nights in September it bought about 15 kWh at the cheap rate to sell in the 4pm to 7pm peak, the sun then filled the battery by late morning, and 13 and 7 kWh went out before 4pm at the much lower day export rate. The peak sale was no bigger than on nights that bought nothing, because the export limit caps what three hours can sell. Now a purchase to sell is limited to what the peak can sell beyond what the sun leaves in the battery by 4pm, and to what a day about a third sunnier than forecast would not push back out. The charge the house itself needs is unchanged. |
@@ -857,7 +858,7 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m pytest -q          # or: python3 -m unittest discover -p 'test_*.py' -v
 ```
 
-**2,116 tests** across thirty test files inside the bundle, plus ten in the repository's `tests/` folder, all passing without Indigo installed —
+**2,156 tests** across thirty-two test files inside the bundle, plus ten in the repository's `tests/` folder, all passing without Indigo installed —
 `indigo`, `pymodbus` and `requests` are mocked, so nothing touches the network
 or the inverter:
 
@@ -867,13 +868,15 @@ or the inverter:
 | `test_battery_manager.py` | 193 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (refill-day + VPP-aware cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
 | `test_flux_supervisor.py` | 211 | The plugin side of the Flux controller: who owns the inverter, pre-emption and the stand-down, the reserve floors, the paired-account check, the peak export rule after a day-rate buy |
 | `test_flux_strategy.py` | 112 | The Flux planner: event commitments, chronological energy budgets, the household and export floors, strict input validation, clock changes, resale sizing, no peak export after a day-rate buy |
-| `test_octopus_api.py` | 104 | Kraken account-ledger parsing, per-day import and gas consumption, m³→kWh calorific conversion, error paths and classification |
+| `test_octopus_api.py` | 109 | Kraken account-ledger parsing, per-day import and gas consumption, m³→kWh calorific conversion, error paths and classification |
 | `test_sigenergy_modbus.py` | 93 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation, signed decode boundaries, write-back verification |
 | `test_vpp_ledger.py` | 84 | VPP event ledger — accrual, settlement, midnight-spanning events, replay and corruption paths |
 | `test_openmeteo_forecast.py` | 59 | kWh-weighted bias correction formula, magnitude-conditional band table, per-day factor application across hourly slots, day-shifted cache rejection, live-data replay |
 | `test_economics.py` | 50 | Whole-house cost settlement and the daily, yesterday, period and calendar summaries, each term of the cost card pinned independently |
 | `test_axle_account.py` | 47 | The direct Axle account reader: the token harvest, settlement parsing, error paths |
 | `test_agile_readiness.py` | 41 | The Agile import path on real winter prices: block-cost start selection, the power-cut reserve, every import exit restoring the cutoff |
+| `test_free_hour_credits.py` | 26 | What Octopus owes back for a booked free hour: the meter replacing the estimate, the 16 kWh cap, which credits count as the payment, paid, short and late, each message once and in plain English |
+| `test_free_hour_plugin.py` | 9 | The plugin's wiring of the free-hour check: claims started from the sessions poll, the inverter's reading kept, one Pushover per piece of news and none lost to quiet hours |
 | `test_happy_hour_booking.py` | 40 | The Weekend Happy Hour booking plan: which hours are worth booking and what the overnight charge must leave room for |
 | `test_happy_hour_plugin.py` | 38 | The plugin's side of Happy Hour booking: bookings, the free-hour import and its hand-back |
 | `test_web_dashboard.py` | 34 | The seven JSON endpoints, loopback-vs-network binding, token acceptance across header, query and cookie |

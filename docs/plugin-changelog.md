@@ -15,6 +15,39 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.116.0 — 26-09-2026
+
+**Every session's result published; free-hour credits chased until paid.** (free_hour_credits 1.0)
+
+- **CliveS:** show every detail of the Saving Sessions, and check the Octopus account every day
+  that the free-hour electricity has been paid back, showing it until it is. Chase only the
+  free-hour credit; Pushover when paid, late or short.
+- **What Octopus exposes (probed 26-Sep-2026, read-only):** `SavingSessionsAccountJoinedEventsType`
+  carries `resultsStatus` (CALCULATING/SUCCESS/FAIL), `rewardGivenInOctoPoints`,
+  `rewardGivenInPence` (null on this account), `energyDeltaKwh`, `baselineConsumptionDeltaKwh`,
+  `consumptionDeltaKwh`, `energyUsedInKwh`, `co2SavedInGrams` (null) and `resultsSetAt`. Points are
+  per SESSION (200-328 here), not per kWh. `loyaltyPointsBalance(accountNumber)` works on the
+  backend host with the raw token (3,524); `loyaltyPointLedgers` is refused (KT-CT-1111) to an
+  API-key token. Account `transactions` on the main host give Credit/Charge/Payment/Refund with
+  `reasonCode`; Charge lines carry `consumption{quantity usageCost}`.
+- **No free hour has yet been seen paid.** 16-Aug-2026 left no credit line (2.33 kWh imported in
+  the whole bill period). Older free-electricity sessions came as Credit `FREE_ELECTRICITY_REWARD`
+  (Sep/Oct 2025), so that is matched first, with looser title/reason matches beside it; every
+  other credit since the hour is published so an unfamiliar one is visible. If Octopus zero-rates
+  the units on the bill instead, the claim goes LATE at 14 days — the signal to change the matcher.
+- **`free_hour_credits.py` (pure):** one claim per Sunday; kWh from `get_import_kwh_between`
+  (Octopus's half-hourly meter data, all half hours or nothing) once 24 h have passed, the inverter's
+  `_end_happy_hour_import` reading until then; each hour capped at 16 kWh and priced at
+  `_import_rate_at` (the Flux band for that moment). Credits matched oldest claim first, never before
+  the claim's date, never twice. paid within 5p, short beyond, late at 14 days; a paid claim stays
+  14 days. Notifications are deduped on claim + kind (short re-notifies only when the amount paid
+  changes), and are not asked for in quiet hours, so nothing is marked sent that never went.
+- **Plugin:** `_check_free_hour_credits` on the tick every 6 h (and on the next tick after a new
+  claim), network I/O unlocked, file load-modify-save under `_free_hour_lock`. Status gains
+  `octopus_sessions.history` (45 days), `token_balance`, `points_balance`, `free_hour_credits`.
+- **Tests:** 2,116 -> 2,156. Mutation sweep 15 of 16 killed; the survivor (open claims never
+  pruned) is equivalent, since only paid or nothing-owed claims are ever given a close date.
+
 ## v5.115.0 — 26-09-2026
 
 **Flux owns the 2am charge; a dull afternoon drains the dawn projection.** (battery_manager 3.13)

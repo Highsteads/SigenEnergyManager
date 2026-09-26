@@ -1154,5 +1154,104 @@ class TestJoinSavingSessionEvent(unittest.TestCase):
         self.assertEqual(self.api._saving_sessions_cache_at, 0.0)
 
 
+
+class TestSessionResultsAndCredits(unittest.TestCase):
+    """v5.116.0: Octopus's own result for each joined event, the OctoPoints balance,
+    the account's credits and the metered kWh for an hour. Shapes taken from the
+    live account on 26-Sep-2026."""
+
+    JOINED = [
+        {"eventId": 6300, "startAt": "2026-09-21T17:00:00+00:00",
+         "endAt": "2026-09-21T18:00:00+00:00", "eventType": "TURN_DOWN",
+         "eventStatus": "DONE", "resultsStatus": "SUCCESS",
+         "rewardGivenInOctoPoints": 256, "rewardGivenInPence": None,
+         "energyDeltaKwh": 3.4133, "baselineConsumptionDeltaKwh": -0.53,
+         "consumptionDeltaKwh": -3.9, "energyUsedInKwh": None, "co2SavedInGrams": None,
+         "resultsSetAt": "2026-09-25T18:43:00+00:00"},
+        {"eventId": 6400, "startAt": "2026-09-25T17:00:00+00:00",
+         "endAt": "2026-09-25T18:00:00+00:00", "eventType": "TURN_DOWN",
+         "eventStatus": "DONE", "resultsStatus": "CALCULATING",
+         "rewardGivenInOctoPoints": None, "rewardGivenInPence": None,
+         "energyDeltaKwh": None, "baselineConsumptionDeltaKwh": None,
+         "consumptionDeltaKwh": None, "energyUsedInKwh": None, "co2SavedInGrams": None,
+         "resultsSetAt": None},
+    ]
+
+    def test_history_keeps_none_as_none_and_is_newest_first(self):
+        h = octopus_api._joined_history(self.JOINED)
+        self.assertEqual([r["id"] for r in h], [6400, 6300])
+        self.assertEqual(h[1]["points"], 256)
+        self.assertEqual(h[1]["results"], "SUCCESS")
+        self.assertIsNone(h[0]["points"], "not scored yet is not zero")
+        self.assertIsNone(h[1]["pence"])
+
+    def test_saving_sessions_carries_history_and_points(self):
+        api = _make_api()
+        orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+        payload = {"data": {"savingSessions": {
+            "account": {"hasJoinedCampaign": True, "tokenBalance": 5,
+                        "joinedEvents": self.JOINED},
+            "events": []}}}
+        octopus_api.requests.post.side_effect = [
+            _FakeResp(payload), _FakeResp({"data": {"loyaltyPointsBalance": {"balance": 3524}}})]
+        try:
+            data = api.get_saving_sessions(force=True)
+        finally:
+            octopus_api.requests = orig
+        self.assertEqual(data["points_balance"], 3524)
+        self.assertEqual(len(data["history"]), 2)
+
+    def test_a_failed_points_read_is_none_not_zero(self):
+        api = _make_api()
+        orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+        octopus_api.requests.RequestException = orig.RequestException
+        octopus_api.requests.post.return_value = _FakeResp({}, ok=False, status=500)
+        try:
+            self.assertIsNone(api._points_balance("tok"))
+        finally:
+            octopus_api.requests = orig
+
+    def test_credits_are_credits_only(self):
+        api = _make_api()
+        orig = octopus_api.requests
+        octopus_api.requests = MagicMock()
+        nodes = [
+            {"__typename": "Charge", "id": "1", "postedDate": "2026-09-22", "amount": 2713,
+             "title": "Gas", "note": "", "reasonCode": None, "isReversed": False},
+            {"__typename": "Credit", "id": "2", "postedDate": "2026-09-30", "amount": 779,
+             "title": "Free Electricity Reward", "note": "", "reasonCode":
+             "FREE_ELECTRICITY_REWARD", "isReversed": False},
+            {"__typename": "Payment", "id": "3", "postedDate": "2026-09-11", "amount": 3000,
+             "title": "Direct debit", "note": "", "reasonCode": None, "isReversed": False},
+        ]
+        octopus_api.requests.post.return_value = _FakeResp(
+            {"data": {"account": {"transactions": {"edges": [{"node": n} for n in nodes]}}}})
+        try:
+            out = api.get_account_credits()
+            url = octopus_api.requests.post.call_args[0][0]
+            auth = octopus_api.requests.post.call_args[1]["headers"]["Authorization"]
+        finally:
+            octopus_api.requests = orig
+        self.assertEqual(out, [{"id": "2", "posted": "2026-09-30", "amount_p": 779,
+                                "title": "Free Electricity Reward",
+                                "reason": "FREE_ELECTRICITY_REWARD", "note": "",
+                                "reversed": False}])
+        self.assertEqual(url, octopus_api.KRAKEN_GRAPHQL)
+        self.assertEqual(auth, "JWT tok")
+
+    def test_a_half_settled_hour_is_not_a_smaller_hour(self):
+        from datetime import datetime, timezone
+        api = _make_api()
+        start = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 27, 13, tzinfo=timezone.utc)
+        api._paginate = lambda url, params, authenticated=False: [{"consumption": 8.1}]
+        self.assertIsNone(api.get_import_kwh_between(start, end))
+        api._paginate = lambda url, params, authenticated=False: [
+            {"consumption": 8.1}, {"consumption": 7.9}]
+        self.assertEqual(api.get_import_kwh_between(start, end), 16.0)
+
+
 if __name__ == "__main__":
     unittest.main()
