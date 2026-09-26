@@ -36,8 +36,9 @@
 #              Claude Opus 5.5 (5.112.5 — a session that ends under a VPP window lets go of the registers)
 #              Claude Opus 5.5 (5.112.6 — a Sunday already booked is never pushed as held back)
 #              Claude Opus 5.5 (5.113.0 — the overnight charge buys to sell only what the sun will not)
-# Date:        24-09-2026
-# Version:     5.113.0
+#              Claude Opus 5.5 (5.114.0 — the day rate buys only the peak; no peak export after it; Flux reclaims)
+# Date:        26-09-2026
+# Version:     5.114.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1747,6 +1748,7 @@ class Plugin(indigo.PluginBase):
         self.store["flux_last_result"]   = ""     # applied / released / pending / supervisor
         self.store["flux_owner_reason"]  = ""     # who outranks us right now
         self.store["flux_preempted_at"]  = 0.0
+        self.store["flux_manual_preempt_at"] = 0.0
         self.store["flux_clear_ticks"]   = 0
         self.store["flux_pending_since"] = 0.0
         self.store["flux_status"]        = "off"
@@ -4958,6 +4960,13 @@ class Plugin(indigo.PluginBase):
             efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
             dawn_target_pct    = self._dawn_target_pct(),                      # v4.0: retained for VPP/storm
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
+            # v5.114.0: the floor the house really stops at while the grid is up
+            # (the Flux backup reserve once armed), the wear figure the Flux
+            # planner prices with, and whether an import is running or queued.
+            reserve_floor_pct  = self._policy_discharge_floor_pct(),
+            wear_p_per_kwh     = self._wear_p_per_kwh(),
+            import_pending     = bool(self.store.get("import_active")
+                                      or self.store.get("import_scheduled_time") is not None),
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
             inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
@@ -6890,6 +6899,10 @@ class Plugin(indigo.PluginBase):
             cheap_end       = tou.get("cheap_end"),
             cheap_rate_p    = tou.get("cheap_p"),
             agile_slots     = rates.get("agile_slots", []),
+            day_rate_p      = tou.get("standard_p"),
+            peak_start      = tou.get("peak_start"),
+            peak_end        = tou.get("peak_end"),
+            peak_rate_p     = tou.get("peak_p"),
         )
 
     def _act_on_decision(self, decision):
@@ -6900,6 +6913,18 @@ class Plugin(indigo.PluginBase):
         action      = decision.action
         prev_import = self.store["import_active"]
         prev_export = self.store["export_active"]
+
+        # v5.114.0: a grid charge this process did not start is one left running
+        # across a restart, and the restart has wiped the fact that it was bought
+        # at the day rate. Record it so Flux still holds back the peak export.
+        # (Never reached while Flux holds the inverter, so its own cheap-window
+        # charge is not mistaken for one; _note_day_rate_import ignores the cheap
+        # window regardless. VPP pre-charge and a free Happy Hour own their charge.)
+        if (not prev_import
+                and self.latest_inverter_data.get("emsWorkMode", "") == "Charge Grid First"
+                and not self.store.get("happy_hour_import_active")
+                and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE):
+            self._note_day_rate_import()
 
         # ── Retract a stale scheduled import (v5.65.0) ──────────────────────
         # ACTION_SCHEDULE_IMPORT armed a stored time that NOTHING ever cleared
@@ -6941,6 +6966,7 @@ class Plugin(indigo.PluginBase):
                     self.store["import_target_soc"] = decision.target_soc_pct
                     self.store["export_active"]     = False
                     self.store["had_import_today"]  = True   # daily history flag
+                    self._note_day_rate_import()
                     self._set_import_cutoff(cutoff)
                     self._trigger_event("emergencyImportTriggered")
 
@@ -7726,6 +7752,7 @@ class Plugin(indigo.PluginBase):
                 self.store["import_target_soc"]  = target_soc
                 self.store["import_scheduled_time"] = None
                 self.store["had_import_today"]   = True   # daily history flag
+                self._note_day_rate_import()
                 self._set_import_cutoff(cutoff)
                 self._trigger_event("emergencyImportTriggered")
 
@@ -13262,6 +13289,45 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[Flux] no usable solar forecast: {exc}")
             return None
 
+    def _wear_p_per_kwh(self):
+        """Battery wear in pence per kWh cycled. One owner: the Flux planner and the
+        manager's day-rate peak top-up price a stored kWh with the same figure."""
+        default = (_flux_strategy.DEFAULT_WEAR_P_PER_KWH if FLUX_AVAILABLE else 5.0)
+        return _as_float(self.pluginPrefs.get("fluxWearPencePerKwh"), default)
+
+    def _note_day_rate_import(self):
+        """Record that a grid import began OUTSIDE the Flux cheap window today.
+
+        v5.114.0 (CliveS, 26-Sep-2026): energy bought at the day rate is never sold
+        back in the 4pm-7pm window — 24.4p in, 27.7p out, and the round trip plus
+        wear eats the difference. Flux reads this and stands its peak export down
+        for the rest of the day. Persisted to pluginPrefs as a local DATE, so a
+        restart mid-afternoon cannot forget it and midnight clears it by itself.
+        A cheap-window import (and a free Happy Hour, which never comes through
+        here) leaves it alone: buying at 14.6p to sell at 27.7p is the trade.
+        """
+        if not FLUX_AVAILABLE:
+            return
+        try:
+            now = datetime.now(timezone.utc)
+            if _flux_strategy.in_window(now, _london_tz(), _flux_strategy.FLUX_CHEAP_START,
+                                        _flux_strategy.FLUX_CHEAP_END):
+                return
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] cheap-window check failed: {exc!r}")
+            return
+        today = _local_today_str()
+        if self.pluginPrefs.get("dayRateImportDate", "") != today:
+            self.pluginPrefs["dayRateImportDate"] = today
+            if self._flux_armed():
+                log("[Flux] Bought from the grid at the day rate, so nothing will be "
+                    "exported in the 4pm to 7pm peak today. Selling day-rate energy "
+                    "back at the peak price loses money once charging losses and wear "
+                    "are counted")
+
+    def _day_rate_import_today(self):
+        return self.pluginPrefs.get("dayRateImportDate", "") == _local_today_str()
+
     def _flux_site(self):
         """The battery and site limits as the planner reads them. One owner
         (v5.112.0): the Happy Hour booking check simulates with these too."""
@@ -13277,8 +13343,7 @@ class Plugin(indigo.PluginBase):
             import_limit_w        = import_limit_w,
             import_limit_verified = _as_bool(prefs.get("fluxSiteImportVerified", False)),
             efficiency            = _as_float(prefs.get("batteryEfficiency"), 94.0) / 100.0,
-            wear_p_per_kwh        = _as_float(prefs.get("fluxWearPencePerKwh"),
-                                              _flux_strategy.DEFAULT_WEAR_P_PER_KWH),
+            wear_p_per_kwh        = self._wear_p_per_kwh(),
             reserve_pct           = _as_float(prefs.get("fluxReservePct"),
                                               _flux_strategy.DEFAULT_RESERVE_PCT),
             policy_floor_pct      = self._flux_planner_floor_pct(),
@@ -13341,6 +13406,7 @@ class Plugin(indigo.PluginBase):
             profile_age_s   = age(profile_at),
             telemetry_age_s = max(0.0, time.time() - observed_at),
             flows_age_s     = max(0.0, time.time() - observed_at),
+            day_rate_import_today = self._day_rate_import_today(),
         )
 
     def _flux_target(self, decision, observed_at):
@@ -13445,7 +13511,13 @@ class Plugin(indigo.PluginBase):
 
         Cheap and safe when Flux is off.
         """
-        self.store["flux_manual_preempt"] = reason
+        self.store["flux_manual_preempt"]    = reason
+        # Its OWN stamp (v5.114.0). The expiry used to read flux_preempted_at, which
+        # the supervisor re-stamps on every tick an owner stands — and this flag IS
+        # an owner — so the five minutes restarted every tick and never ran out.
+        # Live 21-Sep 18:01 and 26-Sep 02:01: Flux stood aside until the next
+        # plugin restart, missing a cheap-window charge and a peak.
+        self.store["flux_manual_preempt_at"] = time.time()
         ex = getattr(self, "flux_executor", None)
         if ex is None or not ex.owns_control:
             self.store["flux_preempted_at"] = time.time()
@@ -13561,7 +13633,7 @@ class Plugin(indigo.PluginBase):
         # STATE it leaves behind (an import in flight, a paused manager) keeps its
         # own entry below for as long as it is really true.
         if (self.store.get("flux_manual_preempt")
-                and time.time() - float(self.store.get("flux_preempted_at") or 0.0)
+                and time.time() - float(self.store.get("flux_manual_preempt_at") or 0.0)
                 >= FLUX_PREEMPT_COOLDOWN_S):
             self._flux_clear_preempt()
 

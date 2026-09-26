@@ -2,7 +2,7 @@
 
 **Indigo home automation plugin for Sigenergy solar / battery systems.**
 
-**Version:** 5.113.0 · Requires Indigo 2025.2 or later
+**Version:** 5.114.0 · Requires Indigo 2025.2 or later
 
 A self-sufficiency-first battery manager: every 60 seconds it reads the inverter
 over Modbus TCP, projects battery SOC at the next dawn against a half-hourly
@@ -149,6 +149,7 @@ it was fixed and the test suite grown to 246 to lock the fixes in.
 
 | Version | Date | Notes |
 |---------|------|-------|
+| 5.114.0 | 26-Sep-2026 | **On Octopus Flux, a dull day no longer buys tomorrow's electricity at the day rate.** When the battery looked unable to last until the 2am cheap rate, the plugin used to buy the whole of tomorrow's shortfall straight away at the day rate. On 26 September it did that four times before midday, each time aiming a little higher, from 34% up to 54%, with the cheap rate twelve hours away. A battery that runs low before 2am does not leave the house without power: the house simply uses the grid at the day rate, the same price as buying early, without the charging loss. Now the plugin buys at the day rate only what the battery needs to get through the 4pm to 7pm peak, when the grid costs more, and only when that saves money after charging losses and wear. Everything else waits for 2am. A top-up now has to be worth at least 1 kWh before it starts and buys half a kWh extra, so it no longer stops and starts every few minutes. On a day that has bought at the day rate, nothing is exported in the 4pm to 7pm peak: day-rate electricity sold at the peak export price loses money once losses are counted, so the battery runs the house instead. Also fixed: after anything took the battery over from the Flux controller, even for a moment, the controller never took it back until the plugin was restarted. It happened at 2am on 26 September, so that night's cheap-rate charge was the smaller one the manager had planned. |
 | 5.113.0 | 24-Sep-2026 | **The overnight Flux charge no longer buys electricity the sun would have supplied anyway.** On two nights in September it bought about 15 kWh at the cheap rate to sell in the 4pm to 7pm peak, the sun then filled the battery by late morning, and 13 and 7 kWh went out before 4pm at the much lower day export rate. The peak sale was no bigger than on nights that bought nothing, because the export limit caps what three hours can sell. Now a purchase to sell is limited to what the peak can sell beyond what the sun leaves in the battery by 4pm, and to what a day about a third sunnier than forecast would not push back out. The charge the house itself needs is unchanged. |
 | 5.112.6 | 24-Sep-2026 | **A Sunday that already has a free hour booked is never reported as held back.** When the plugin had booked one Happy Hour and later decided a second was not worth a token, it sent "Keeping your free hours for a duller Sunday", which read as though the first booking had been cancelled. It had not: the plugin never cancels. Declining to add an hour now goes in the log once, saying which hour is booked and that it stays booked, with no Pushover. |
 | 5.112.5 | 23-Sep-2026 | **A Saving Session that ends while an Axle VPP window is running now lets go properly.** When a VPP window took over the export part way through a session, the plugin went on treating the session as running until the VPP window had finished as well, 33 minutes after the session ended on 21 September. For most of that time the VPP window was driving the export anyway, but for the last minute nothing was, and the check that puts drifted inverter settings back would have left them alone. It also handed the battery back a second time, 45 seconds after the VPP window had already done so. The session now lets go the moment it ends, and the VPP window hands back once when it finishes. |
@@ -608,8 +609,8 @@ The plugin guards against register drift at three layers:
 | Tariff | Import strategy |
 |--------|----------------|
 | Tracker | Import now, or defer to midnight if tomorrow is 10%+ cheaper |
-| Go / iGo | Defer to cheap window (00:30-05:30) if battery can reach it |
-| Flux / iFlux | Defer to cheap window (02:00-05:00) |
+| Go / iGo | Buy tomorrow's shortfall in the cheap window (00:30-05:30). A battery that runs out first leaves the house on the grid at the day rate rather than buying early |
+| Flux / iFlux | Buy tomorrow's shortfall in the cheap window (02:00-05:00). Before the 16:00-19:00 peak, buy at the day rate only what the battery needs to last through the peak, when that beats the peak rate after losses and wear; a day that did so exports nothing in the peak |
 | Agile | Start the charge where the whole run of half-hours is cheapest before dawn, gated on tomorrow's daytime average; hold, and say so, when no price can be found |
 
 ### VPP (Axle) integration
@@ -855,27 +856,42 @@ cd SigenEnergyManager.indigoPlugin/Contents/Server\ Plugin
 python3 -m pytest -q          # or: python3 -m unittest discover -p 'test_*.py' -v
 ```
 
-**878 tests** across fifteen test files, all passing without Indigo installed —
+**2,100 tests** across thirty test files inside the bundle, plus ten in the repository's `tests/` folder, all passing without Indigo installed —
 `indigo`, `pymodbus` and `requests` are mocked, so nothing touches the network
 or the inverter:
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `test_plugin.py` | 351 | Config coercion (`_as_float` / `_as_int`), VPP export drive and its start latch, power-cut export lockout and SOC floor, solar-refill release, safe-baseline disengage, whole-house cost card and settlement, cost + energy-summary variable writes, inverter device updates |
-| `test_battery_manager.py` | 133 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (refill-day + VPP-aware cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
-| `test_sigenergy_modbus.py` | 58 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation, signed decode boundaries, write-back verification |
-| `test_openmeteo_forecast.py` | 41 | kWh-weighted bias correction formula, magnitude-conditional band table, per-day factor application across hourly slots, day-shifted cache rejection, live-data replay |
-| `test_octopus_api.py` | 51 | Kraken account-ledger parsing, per-day import and gas consumption, m³→kWh calorific conversion, error paths and classification |
-| `test_storm_watch.py` | 20 | MeteoAlarm CAP parsing on the current schema and the legacy fallback, polygon filtering, empty feed, schema-drift guard |
-| `test_axle_api.py` | 27 | `get_next_event` against a misbehaving upstream — null body, 204, 401, malformed JSON, odd timestamps, missing optional fields |
-| `test_concurrency.py` | 7 | Locking contract — network I/O runs unlocked, the evaluate/verify/act path stays locked, outage back-off, callback latency |
+| `test_plugin.py` | 680 | Config coercion (`_as_float` / `_as_int`), VPP export drive and its start latch, power-cut export lockout and SOC floor, solar-refill release, safe-baseline disengage, whole-house cost card and settlement, cost + energy-summary variable writes, inverter device updates |
+| `test_battery_manager.py` | 193 | Dawn viability, import scheduling (Tracker/Go/Flux/Agile), flood prevention (refill-day + VPP-aware cases), legacy migration paths, VPP suppression, seasonal logic, tariff midnight handling |
+| `test_flux_supervisor.py` | 203 | The plugin side of the Flux controller: who owns the inverter, pre-emption and the stand-down, the reserve floors, the paired-account check, the peak export rule after a day-rate buy |
+| `test_flux_strategy.py` | 112 | The Flux planner: event commitments, chronological energy budgets, the household and export floors, strict input validation, clock changes, resale sizing, no peak export after a day-rate buy |
+| `test_octopus_api.py` | 104 | Kraken account-ledger parsing, per-day import and gas consumption, m³→kWh calorific conversion, error paths and classification |
+| `test_sigenergy_modbus.py` | 93 | `set_self_consumption()` register resets, force_discharge/force_charge sequences, read_discharge_limit/read_charge_limit, export limit validation, signed decode boundaries, write-back verification |
+| `test_vpp_ledger.py` | 84 | VPP event ledger — accrual, settlement, midnight-spanning events, replay and corruption paths |
+| `test_openmeteo_forecast.py` | 59 | kWh-weighted bias correction formula, magnitude-conditional band table, per-day factor application across hourly slots, day-shifted cache rejection, live-data replay |
 | `test_economics.py` | 50 | Whole-house cost settlement and the daily, yesterday, period and calendar summaries, each term of the cost card pinned independently |
-| `test_vpp_ledger.py` | 56 | VPP event ledger — accrual, settlement, midnight-spanning events, replay and corruption paths |
+| `test_axle_account.py` | 47 | The direct Axle account reader: the token harvest, settlement parsing, error paths |
+| `test_agile_readiness.py` | 41 | The Agile import path on real winter prices: block-cost start selection, the power-cut reserve, every import exit restoring the cutoff |
+| `test_happy_hour_booking.py` | 40 | The Weekend Happy Hour booking plan: which hours are worth booking and what the overnight charge must leave room for |
+| `test_happy_hour_plugin.py` | 38 | The plugin's side of Happy Hour booking: bookings, the free-hour import and its hand-back |
 | `test_web_dashboard.py` | 34 | The seven JSON endpoints, loopback-vs-network binding, token acceptance across header, query and cookie |
+| `test_axle_api.py` | 31 | `get_next_event` against a misbehaving upstream — null body, 204, 401, malformed JSON, odd timestamps, missing optional fields |
+| `test_axle_email.py` | 31 | The Axle settlement-email parser, built from real emails |
+| `test_daily_energy.py` | 28 | The lifetime-anchor daily energy model: midnight boundaries, restarts, partial days |
+| `test_flux_review_contract.py` | 28 | Contract tests written from the Codex review of the Flux controller |
+| `test_flux_execution.py` | 27 | The Flux executor: leases, claims, read-back and release |
+| `test_plugin_export_feedback.py` | 26 | The intraday export feedback loop: measured solar against the forecast |
 | `test_away_profile.py` | 25 | The second consumption profile for an empty house — learning, seeding, the suppressed weekend uplift, failing towards occupied |
+| `test_concurrency.py` | 21 | Locking contract — network I/O runs unlocked, the evaluate/verify/act path stays locked, outage back-off, callback latency |
+| `test_storm_watch.py` | 20 | MeteoAlarm CAP parsing on the current schema and the legacy fallback, polygon filtering, empty feed, schema-drift guard |
+| `test_plugin_daily_energy.py` | 19 | The plugin's wiring of the daily energy model |
+| `test_profile_window.py` | 17 | The rolling consumption window and its day-type buckets |
+| `test_tou_peak_topup.py` | 16 | The day-rate import on Go and Flux: buy only what the peak needs, never tomorrow's shortfall, no stop-start, and the import-needed hysteresis |
 | `test_london_time.py` | 15 | One shared local-time conversion — the BST/GMT fold, the LMT trap, and the zoneinfo/pytz split |
-| `test_config_xml.py` | 5 | Every dialog XML parses, no duplicate or missing field ID, every `visibleBindingId` resolves — and its own glob matched something |
-| `test_version_consistency.py` | 5 | Info.plist, the plugin.py header and the README changelog all name the same version; the six required Info.plist keys are present |
+| `test_config_xml.py` | 9 | Every dialog XML parses, no duplicate or missing field ID, every `visibleBindingId` resolves — and its own glob matched something |
+| `test_version_consistency.py` | 7 | Info.plist, the plugin.py header and the README changelog all name the same version; the six required Info.plist keys are present |
+| `test_no_stray_artefacts.py` | 2 | The suite leaves nothing behind inside the plugin bundle |
 
 ---
 

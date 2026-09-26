@@ -15,6 +15,53 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.114.0 — 26-09-2026
+
+**The day rate buys only the peak; no peak export after it; Flux takes the inverter back.**
+(battery_manager 3.12, flux_strategy 2.3)
+
+- **Live 26-Sep-2026, a dull Flux day** (forecast 31.6 kWh at 02:05, about 6 kWh arrived):
+  `_plan_tou_import` found the battery could not reach 02:00 above the 1% floor and bought
+  tomorrow's shortfall at once at 24.4p. Starts at 11:24, 11:36, 11:46 with the target
+  `current SOC + import_kwh` — it rose with the battery, 34% -> 40.3% -> 37% -> 53.6%, and
+  `import_needed` flipped True/False/True across MIN_IMPORT_KWH in the same twelve minutes.
+- **Why it was wrong:** running out before the cheap window puts the house on the grid at the
+  same day rate. Buying early adds the round-trip loss. Only energy that would otherwise be
+  bought at the PEAK rate is worth buying at the day rate.
+- **Fix 1 — `_plan_peak_topup`:** on a tariff with a peak band (TariffData gains `day_rate_p`,
+  `peak_start`, `peak_end`, `peak_rate_p` from octopus_api's `standard_p`/`peak_*`), buy
+  `reserve + peak demand - (battery + solar before the peak - house before the peak)`, only
+  when `peak_p - (day_p / efficiency + wear) >= PEAK_TOPUP_MIN_MARGIN_P` (1p) and the peak
+  opens before the next cheap window. Otherwise SCHEDULE_IMPORT for the cheap window, whether
+  or not the battery lasts that long. The floor is the policy discharge floor
+  (`reserve_floor_pct`, the 20% Flux backup reserve), not the 1% health floor.
+  `_forecast_solar_kwh` is the one owner of the corrected P50 sum; the 24h balance uses it too.
+- **Fix 2 — no stop-start:** the top-up target is an absolute level, it starts only at a
+  PEAK_TOPUP_MIN_KWH (1.0) gap and buys PEAK_TOPUP_BUFFER_KWH (0.5) over, so a restart needs
+  the requirement to grow 1.5 kWh. `import_needed` holds while `import_pending` (import running
+  or queued) until the shortfall is zero.
+- **Fix 3 — the words:** every TOU reason now says what is short and when it will be bought
+  ("Tomorrow is short by about 9 kWh, buying it in the cheap window from 2am").
+- **Fix 4 — no peak export after a day-rate buy (CliveS's rule):** `_note_day_rate_import`
+  stamps `pluginPrefs["dayRateImportDate"]` (a local date, so restarts keep it and midnight
+  clears it) when a manager import starts outside the Flux cheap window, from START_IMPORT,
+  the scheduled firing, or a grid charge found on the inverter that this process did not
+  start (a crash mid-import). `FluxInputs.day_rate_import_today` sends the peak window down the
+  no-export branch: SUPPLY_HOUSE, or SOLAR when the roof is still generating.
+- **Fix 5 — Flux never reclaimed after a pre-emption.** `_flux_preempt` sets
+  `flux_manual_preempt` and the expiry read `flux_preempted_at` — which the supervisor re-stamps
+  on every tick an owner stands, and the flag IS an owner. So the five minutes restarted every
+  tick. Live 21-Sep 18:01 and 26-Sep 02:01: stood aside until the next restart, so the 26th's
+  cheap window ran the manager's smaller charge (to 37.5%) instead of Flux's. The flag has its
+  own stamp, `flux_manual_preempt_at`.
+- **Tests:** 2,072 -> 2,100. `test_tou_peak_topup.py` (16), plus the Flux strategy, supervisor
+  and wiring tests. Two old tests pinned the removed behaviour and were rewritten:
+  `test_go_import_now_if_margin_too_low_for_cheap_window` (now waits) and
+  `test_the_manual_flag_holds_for_the_cooldown` (reads the new stamp). Mutation sweep: 14 of 14
+  killed, including each start path's `_note_day_rate_import()` call.
+- **Not changed:** the manager's own 02:00 schedule still pre-empts the Flux cheap-window
+  charge when both want it. Which planner should own that window is an open decision.
+
 ## v5.113.0 — 24-09-2026
 
 **The overnight charge buys to sell only what the sun will not supply.** (flux_strategy v2.2)

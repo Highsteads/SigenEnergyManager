@@ -1296,5 +1296,36 @@ class TestFreeImportWindows(unittest.TestCase):
         self.assertAlmostEqual(need - floor, 8.0 / sim.site.one_way_efficiency, places=3)
 
 
+
+class TestNoPeakExportAfterADayRateBuy(unittest.TestCase):
+    """v2.3 (CliveS, 26-Sep-2026): "If this happens again then the 4-7pm export
+    should be cancelled instead of importing at 24p as we only get 27p export so
+    with losses nothing is gained." A day that has bought at the day rate runs the
+    house from the battery through the peak and sells nothing."""
+
+    def test_a_full_battery_exports_on_an_ordinary_day(self):
+        d = fs.plan(_inputs((16, 30), soc_pct=95.0))
+        self.assertEqual(d.mode, fs.MODE_EXPORT)
+
+    def test_the_same_battery_does_not_export_after_a_day_rate_buy(self):
+        d = fs.plan(_inputs((16, 30), soc_pct=95.0, day_rate_import_today=True))
+        self.assertEqual(d.mode, fs.MODE_SUPPLY_HOUSE)
+        self.assertNotEqual(d.ems_mode, fs.EMS_DISCHARGE_PV)
+        self.assertGreater(d.discharge_limit_w, 0, "the battery must still run the house")
+        self.assertIn("day rate", d.reason)
+
+    def test_a_sunny_peak_after_a_day_rate_buy_still_banks_the_solar(self):
+        day = datetime(2026, 9, 16, tzinfo=LONDON).date()
+        d = fs.plan(_inputs((16, 30), soc_pct=95.0, day_rate_import_today=True,
+                            pv=_pv(day, 60.0, first_hour=8, last_hour=19)))
+        self.assertEqual(d.mode, fs.MODE_SOLAR)
+        self.assertFalse(d.owns)
+        self.assertIn("day rate", d.reason)
+
+    def test_the_cheap_window_charge_is_unaffected(self):
+        plain = fs.plan(_inputs((2, 30), soc_pct=25.0))
+        flag  = fs.plan(_inputs((2, 30), soc_pct=25.0, day_rate_import_today=True))
+        self.assertEqual(plain.control_key(), flag.control_key())
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,9 +4,21 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 5
-# Date:        05-08-2026
-# Version:     3.11
+# Author:      CliveS & Claude Opus 5; 3.12 Claude Opus 5.5
+# Date:        05-08-2026; 3.12 26-09-2026
+# Version:     3.12
+# 3.12 — THE DAY RATE BUYS ONLY THE PEAK. On Go/Flux, a battery that could not last to
+#       the cheap window bought tomorrow's whole shortfall at once at the day rate. But
+#       running out first only puts the house on the grid at that same day rate, so the
+#       early purchase added the round-trip loss and nothing else. Live 26-Sep-2026: four
+#       starts before midday, target 34% -> 40% -> 37% -> 54% (it was current SOC plus
+#       tomorrow's gap, so it rose with the battery), 2am 14.6p twelve hours away. Now
+#       tomorrow always waits for the cheap window, and _plan_peak_topup buys at the day
+#       rate only what the Flux peak would otherwise cost at the peak rate, when that beats
+#       day_rate / efficiency + wear by PEAK_TOPUP_MIN_MARGIN_P. The target is an absolute
+#       level (reserve + peak demand + the run-up) and the start needs a 1 kWh gap and buys
+#       0.5 kWh over, so it cannot ratchet or stop-start. import_needed also holds on, once
+#       a plan is running or queued, until the shortfall is genuinely gone.
 # 3.11 — BANK-FIRST export hold. The daytime overflow gate decided to sell on a
 #       FORECAST, and the forecast is not good enough to bear that weight: over the
 #       plugin's own 132 accuracy records the mean absolute error is 7.54 kWh (median
@@ -345,6 +357,22 @@ TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper
 # Minimum import quantity — below this don't bother charging
 MIN_IMPORT_KWH = 0.5
 
+# v3.12 — the day-rate peak top-up. On a time-of-use tariff with a peak band, a
+# battery that will run out before the cheap window buys at the DAY rate only what
+# the peak would otherwise cost at the PEAK rate. Everything after the peak costs
+# the day rate either way, and passing it through the battery first only loses the
+# round trip, so it waits for the cheap window like the rest of tomorrow's need.
+#
+# The two figures are a deadband, which is what stops the stop/start seen on
+# 26-Sep-2026 (four starts in 25 minutes, targets 34% -> 40% -> 37% -> 54%): a
+# top-up starts only once the peak is short by PEAK_TOPUP_MIN_KWH, and buys the
+# shortfall plus PEAK_TOPUP_BUFFER_KWH. After it finishes the battery sits the
+# buffer ABOVE the requirement, so a new one needs the requirement to grow by
+# min + buffer — 1.5 kWh — before anything restarts.
+PEAK_TOPUP_MIN_KWH      = 1.0
+PEAK_TOPUP_BUFFER_KWH   = 0.5
+PEAK_TOPUP_MIN_MARGIN_P = 1.0    # pence per kWh the peak must beat stored day-rate energy by
+
 # Minimum 24h surplus before daytime export is allowed.
 # Below this the battery has barely enough for 24h — every kWh is worth more
 # overnight (20p+) than as daytime export (12p flat).
@@ -574,6 +602,13 @@ class TariffData:
     cheap_end:        Optional[str]   = None   # "HH:MM"
     cheap_rate_p:     Optional[float] = None   # cheap window rate (Go/Flux)
     agile_slots:      List[Tuple[datetime, float]] = field(default_factory=list)
+    # v3.12 — the other two Flux bands. `today_rate_p` is the rate in force NOW, so
+    # at 03:00 it is the cheap rate; a day-rate purchase has to be priced on the
+    # day band itself. None on Go (no peak) and on every non-TOU tariff.
+    day_rate_p:       Optional[float] = None   # standard band (Go/Flux)
+    peak_start:       Optional[str]   = None   # "HH:MM" local (Flux 16:00)
+    peak_end:         Optional[str]   = None   # "HH:MM" local (Flux 19:00)
+    peak_rate_p:      Optional[float] = None   # peak band import rate (Flux)
 
 
 @dataclass
@@ -734,6 +769,18 @@ class ManagerSnapshot:
     home_today_kwh:      Optional[float] = None  # house use so far today (kWh); None = unknown
     home_today_partial:  bool = False            # True when the plugin missed part of today
 
+    # v3.12 — the day-rate peak top-up (see _plan_peak_topup).
+    # reserve_floor_pct: the lowest SOC the house may draw the battery to while the
+    # grid is up — plugin.py's _policy_discharge_floor_pct, i.e. the Flux backup
+    # reserve when Flux is armed. 0.0 means "use health_cutoff_pct", which is what
+    # every older harness gets.
+    reserve_floor_pct:   float = 0.0
+    wear_p_per_kwh:      float = 2.0             # battery wear, pence per kWh cycled
+    # True while an import is running or queued. Holds import_needed on until the
+    # shortfall is genuinely gone, so a forecast wobble across MIN_IMPORT_KWH cannot
+    # flip the plan off and on (26-Sep-2026: 11:24 on, 11:30 off, 11:36 on).
+    import_pending:      bool = False
+
 
 @dataclass
 class SufficiencyBalance:
@@ -818,6 +865,21 @@ class Decision:
 # ============================================================
 # BatteryManager
 # ============================================================
+
+def _spoken_hm(hm):
+    """ "16:00" -> "4pm", "02:30" -> "2:30am": a tariff boundary as a person says it."""
+    try:
+        h, m = (int(x) for x in str(hm).split(":"))
+    except (TypeError, ValueError):
+        return str(hm)
+    if h == 12 and m == 0:
+        return "midday"
+    if h == 0 and m == 0:
+        return "midnight"
+    suffix = "am" if h < 12 else "pm"
+    h12 = h % 12 or 12
+    return f"{h12}{suffix}" if m == 0 else f"{h12}:{m:02d}{suffix}"
+
 
 def _balance_extras(balance):
     """v5.90.0 suffix for reason/audit lines: the tracking factor when it is
@@ -1443,32 +1505,8 @@ class BatteryManager:
         # ── Remaining solar (now → dusk, bias-corrected) ────────────────────
         remaining_solar_kwh = 0.0
         if is_daytime and today_p50 and dusk_hour_naive is not None:
-            now_naive = local_now.replace(tzinfo=None)
-            now_hour  = now_naive.replace(minute=0, second=0, microsecond=0)
-            for key, wh in today_p50.items():
-                try:
-                    key_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    continue
-                if now_hour <= key_dt <= dusk_hour_naive:
-                    # Pro-rate the current hour by minutes remaining — late in
-                    # the hour most of its energy has already been generated
-                    # and is either consumed or banked in current_soc_pct, so
-                    # counting the full slot double-counts it in surplus_kwh
-                    # and battery_at_dawn.
-                    if key_dt == now_hour:
-                        wh *= max(0.0, (60 - now_naive.minute) / 60.0)
-                    remaining_solar_kwh += wh / 1000.0
-            # Per-day band, NOT the global scalar — see bias_factor_today on the
-            # snapshot. These buckets are the same _hourly_p50_today the dashboard
-            # scales by biasFactorToday, so this is the codebase's own convention;
-            # the engine was the one place not following it.
-            remaining_solar_kwh *= snapshot.bias_factor_today
-            # v5.90.0: the day's own evidence. Computed plugin-side from measured
-            # PV against the forecast for the same elapsed hours (unclipped minutes
-            # only), damped and clamped — see pv_tracking_factor(). Neutral (1.0)
-            # until enough of the day has passed to judge.
-            remaining_solar_kwh *= float(snapshot.pv_tracking_factor or 1.0)
+            remaining_solar_kwh = self._forecast_solar_kwh(
+                snapshot, local_now, dusk_hour_naive + timedelta(hours=1))
 
         # ── 24h surplus (export eligibility) ───────────────────────────────
         # DELIBERATELY CONSERVATIVE (owner decision, 02-07-2026, closing the
@@ -1535,7 +1573,14 @@ class BatteryManager:
         available_tomorrow_kwh = battery_at_dawn + tomorrow_solar_kwh
         import_kwh             = max(0.0, tomorrow_need_kwh - available_tomorrow_kwh)
         import_kwh_grid        = import_kwh / max(0.01, snapshot.efficiency)
-        import_needed          = import_kwh_grid >= MIN_IMPORT_KWH
+        # v3.12 hysteresis: MIN_IMPORT_KWH to START a plan, any shortfall at all to
+        # KEEP one. A plan already running or queued only lets go once the
+        # shortfall is genuinely gone, so a 1.6 -> 0.4 kWh wobble in the forecast
+        # no longer switches it off and back on six minutes later.
+        if snapshot.import_pending:
+            import_needed = import_kwh_grid > 0.0
+        else:
+            import_needed = import_kwh_grid >= MIN_IMPORT_KWH
 
         return SufficiencyBalance(
             battery_kwh              = round(current_soc_kwh, 2),
@@ -1562,6 +1607,49 @@ class BatteryManager:
                                         if need_today_used_kwh is not None else None),
             need_today_measured      = need_today_measured,
         )
+
+    # ================================================================
+    # Solar Helper
+    # ================================================================
+
+    @staticmethod
+    def _forecast_solar_kwh(snapshot: ManagerSnapshot, local_now: datetime,
+                            end_local_naive: datetime) -> float:
+        """Corrected P50 solar from now to `end_local_naive` (today only), in kWh.
+
+        Hourly buckets whose START falls in [this hour, end). The one owner of that
+        sum: the 24h balance asks it for now -> dusk and the peak top-up for now ->
+        the start of the peak, so the two can never correct the forecast differently.
+        """
+        today_str = local_now.date().strftime("%Y-%m-%d")
+        now_naive = local_now.replace(tzinfo=None)
+        now_hour  = now_naive.replace(minute=0, second=0, microsecond=0)
+        total_kwh = 0.0
+        for key, wh in snapshot.forecast_p50.items():
+            if not key.startswith(today_str):
+                continue
+            try:
+                key_dt = datetime.strptime(key, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if now_hour <= key_dt < end_local_naive:
+                # Pro-rate the current hour by minutes remaining — late in the hour
+                # most of its energy has already been generated and is either
+                # consumed or banked in current_soc_pct, so counting the full slot
+                # double-counts it in surplus_kwh and battery_at_dawn.
+                if key_dt == now_hour:
+                    wh *= max(0.0, (60 - now_naive.minute) / 60.0)
+                total_kwh += wh / 1000.0
+        # Per-day band, NOT the global scalar — see bias_factor_today on the
+        # snapshot. These buckets are the same _hourly_p50_today the dashboard
+        # scales by biasFactorToday, so this is the codebase's own convention.
+        total_kwh *= snapshot.bias_factor_today
+        # v5.90.0: the day's own evidence. Computed plugin-side from measured PV
+        # against the forecast for the same elapsed hours (unclipped minutes only),
+        # damped and clamped — see pv_tracking_factor(). Neutral (1.0) until enough
+        # of the day has passed to judge.
+        total_kwh *= float(snapshot.pv_tracking_factor or 1.0)
+        return total_kwh
 
     # ================================================================
     # Consumption Helper
@@ -1675,20 +1763,33 @@ class BatteryManager:
         balance:    SufficiencyBalance,
         target_soc: float,
     ) -> Decision:
-        """Plan import for Go/Flux/iGo/iFlux — wait for cheap window if possible."""
-        tariff    = snapshot.tariff
-        now       = snapshot.now
-        dawn_dt   = balance.dawn_dt
-        cap_kwh   = snapshot.capacity_kwh
-        floor_kwh = snapshot.health_cutoff_pct / 100.0 * cap_kwh
+        """Plan tomorrow's import on Go/Flux/iGo/iFlux: buy it in the cheap window.
 
+        v3.12. The old rule was "if the battery cannot last until the cheap window,
+        buy tomorrow's whole shortfall NOW at the day rate". A battery that runs out
+        before the cheap window does not black the house out — the house draws from
+        the grid at the day rate, which is the same price as buying now, minus the
+        round-trip loss. So the day rate is only worth paying for energy that would
+        otherwise be bought at a HIGHER rate: the Flux peak. That part is sized by
+        _plan_peak_topup; tomorrow's shortfall always waits for the cheap window.
+        Live 26-Sep-2026: a dull day ran the old rule four times before midday,
+        ratcheting the target from 34% to 54% at 24.4p with 2am 14.6p twelve hours
+        away.
+        """
+        tariff      = snapshot.tariff
+        now         = snapshot.now
+        dawn_dt     = balance.dawn_dt
         cheap_start = tariff.cheap_start
         cheap_end   = tariff.cheap_end
+        short_kwh   = balance.import_kwh_grid
 
         if not cheap_start or not cheap_end:
             return Decision(
                 action         = ACTION_START_IMPORT,
-                reason         = "Tomorrow at risk — Go/Flux cheap window unavailable, importing now",
+                reason         = (
+                    f"Tomorrow is short by about {short_kwh:.0f} kWh and the cheap "
+                    f"window times are not known, so buying it now"
+                ),
                 power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
@@ -1701,41 +1802,114 @@ class BatteryManager:
             return Decision(
                 action         = ACTION_START_IMPORT,
                 reason         = (
-                    f"Tomorrow at risk — in cheap window ({cheap_start}–{cheap_end}), "
-                    f"importing now"
+                    f"Tomorrow is short by about {short_kwh:.0f} kWh, buying it now in "
+                    f"the cheap window ({_spoken_hm(cheap_start)} to "
+                    f"{_spoken_hm(cheap_end)})"
                 ),
                 power_watts    = 10000,
                 target_soc_pct = target_soc,
             )
 
-        # Check: can we safely wait until the cheap window starts?
         next_window_dt = self._next_window_start(now, cheap_start)
-        if next_window_dt and dawn_dt:
-            drain_to_window   = self._estimate_consumption_until(
-                now, next_window_dt, snapshot.consumption_profile
+        if next_window_dt is None or (dawn_dt is not None and next_window_dt >= dawn_dt):
+            # Not reachable with any Go/Flux window today; kept for a malformed one.
+            return Decision(
+                action         = ACTION_START_IMPORT,
+                reason         = (
+                    f"Tomorrow is short by about {short_kwh:.0f} kWh and the cheap "
+                    f"window opens after sunrise, so buying it now"
+                ),
+                power_watts    = 10000,
+                target_soc_pct = target_soc,
             )
-            soc_at_window_kwh = (snapshot.current_soc_pct / 100.0 * cap_kwh) - drain_to_window
-            can_wait = (
-                soc_at_window_kwh >= floor_kwh
-                and next_window_dt < dawn_dt
-            )
-            if can_wait:
-                return Decision(
-                    action         = ACTION_SCHEDULE_IMPORT,
-                    reason         = (
-                        f"Tomorrow at risk — waiting for cheap window at {cheap_start}"
-                    ),
-                    power_watts    = 10000,
-                    target_soc_pct = target_soc,
-                    scheduled_time = next_window_dt,
-                )
 
-        # Cannot safely wait — import now (survival beats cheapness)
+        topup = self._plan_peak_topup(snapshot, next_window_dt)
+        if topup is not None:
+            return topup
+
+        # Does the battery last until the cheap window? Only the wording depends on
+        # it now: either way the right move is to wait.
+        cap_kwh   = snapshot.capacity_kwh
+        floor_pct = max(snapshot.health_cutoff_pct, snapshot.reserve_floor_pct)
+        floor_kwh = floor_pct / 100.0 * cap_kwh
+        drain     = self._estimate_consumption_until(
+            now, next_window_dt, snapshot.consumption_profile)
+        lasts     = (snapshot.current_soc_pct / 100.0 * cap_kwh) - drain >= floor_kwh
+        window_words = _spoken_hm(cheap_start)
+        reason = (f"Tomorrow is short by about {short_kwh:.0f} kWh, buying it in the "
+                  f"cheap window from {window_words}")
+        if not lasts:
+            reason += (". The battery will run low before then and the house will "
+                       "use the grid at the normal rate for a while, which costs the "
+                       "same as buying it now without the charging loss")
+        return Decision(
+            action         = ACTION_SCHEDULE_IMPORT,
+            reason         = reason,
+            power_watts    = 10000,
+            target_soc_pct = target_soc,
+            scheduled_time = next_window_dt,
+        )
+
+    def _plan_peak_topup(
+        self,
+        snapshot:       ManagerSnapshot,
+        next_window_dt: datetime,
+    ) -> Optional[Decision]:
+        """A day-rate import sized to carry the house through the peak, or None.
+
+        Worth it only when the peak import rate beats a stored day-rate kWh (the
+        day rate over the round trip, plus wear) by PEAK_TOPUP_MIN_MARGIN_P, and
+        only for a peak that opens before the next cheap window. The battery must
+        hold, at the start of the peak, the peak's own demand above the reserve
+        floor; the purchase is whatever the projection falls short of that by.
+        Solar before the peak counts; solar DURING it is ignored, which errs towards
+        buying a little more for a window where a kWh short costs the peak rate.
+        """
+        tariff = snapshot.tariff
+        if not (tariff.peak_start and tariff.peak_end
+                and tariff.peak_rate_p and tariff.day_rate_p):
+            return None
+        now = snapshot.now
+        peak_start_dt = self._next_window_start(now, tariff.peak_start)
+        if peak_start_dt is None or peak_start_dt >= next_window_dt:
+            return None                          # no peak before the cheap window
+        peak_end_dt = self._next_window_start(peak_start_dt, tariff.peak_end)
+        if peak_end_dt is None or peak_end_dt <= peak_start_dt:
+            return None
+
+        eff       = max(0.01, snapshot.efficiency)
+        stored_p  = tariff.day_rate_p / eff + snapshot.wear_p_per_kwh
+        margin_p  = tariff.peak_rate_p - stored_p
+        if margin_p < PEAK_TOPUP_MIN_MARGIN_P:
+            return None
+
+        cap_kwh     = snapshot.capacity_kwh
+        battery_kwh = snapshot.current_soc_pct / 100.0 * cap_kwh
+        floor_pct   = max(snapshot.health_cutoff_pct, snapshot.reserve_floor_pct)
+        floor_kwh   = floor_pct / 100.0 * cap_kwh
+        profile     = snapshot.consumption_profile
+        peak_need   = self._estimate_consumption_until(peak_start_dt, peak_end_dt, profile)
+        home_before = self._estimate_consumption_until(now, peak_start_dt, profile)
+        solar_before = self._forecast_solar_kwh(
+            snapshot, self._to_local(now),
+            self._to_local(peak_start_dt).replace(tzinfo=None))
+        projected   = battery_kwh + solar_before - home_before
+        shortfall   = floor_kwh + peak_need - projected
+        if shortfall < PEAK_TOPUP_MIN_KWH:
+            return None
+
+        buy_kwh    = shortfall + PEAK_TOPUP_BUFFER_KWH
+        target_soc = min(98.0, (battery_kwh + buy_kwh) / max(1.0, cap_kwh) * 100.0)
+        if target_soc <= snapshot.current_soc_pct:
+            return None
         return Decision(
             action         = ACTION_START_IMPORT,
             reason         = (
-                "Tomorrow at risk — cannot wait for cheap window (battery too low), "
-                "importing now"
+                f"Buying about {buy_kwh:.0f} kWh now at {tariff.day_rate_p:.1f}p so the "
+                f"battery lasts through the {_spoken_hm(tariff.peak_start)} to "
+                f"{_spoken_hm(tariff.peak_end)} peak, when the grid costs "
+                f"{tariff.peak_rate_p:.1f}p. The rest of tomorrow's need waits for "
+                f"the cheap window"
             ),
             power_watts    = 10000,
             target_soc_pct = target_soc,

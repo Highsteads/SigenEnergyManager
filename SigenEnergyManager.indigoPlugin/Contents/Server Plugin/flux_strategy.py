@@ -4,9 +4,14 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.2 Claude Opus 5.5
-# Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026
-# Version:     2.2
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.3 Claude Opus 5.5
+# Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026
+# Version:     2.3
+#
+# v2.3 (SigenEnergyManager 5.114.0) does not export in the peak on a day the manager has
+# bought at the day rate (inputs.day_rate_import_today). CliveS, 26-Sep-2026: 24.4p in
+# against 27.7p out gains nothing once the round trip and wear are paid. The battery runs
+# the house through the peak instead, which is what the day-rate purchase was for.
 #
 # v2.2 (SigenEnergyManager 5.113.0) stops the overnight charge buying energy to
 # sell at the peak that the sun would have displaced. On 21 and 23 Sep-2026 it
@@ -256,6 +261,9 @@ class FluxInputs:
     telemetry_age_s:  Optional[float] = None
     flows_age_s:      Optional[float] = None
     profile_age_s:    Optional[float] = None
+    # v2.3: True once the manager has bought from the grid at the DAY rate today.
+    # That energy is never sold in the peak — see the peak window in plan().
+    day_rate_import_today: bool = False
 
 
 @dataclass(frozen=True)
@@ -1367,7 +1375,14 @@ def plan(inputs):
                                    "worked out")
             profitable, margin_p = _export_is_profitable(bands, site)
             sell_floor, power_w, surplus_kwh, committed = _export_plan(inputs)
-            if (not profitable) or surplus_kwh < MIN_TRADE_KWH or power_w <= 0:
+            # v2.3 (CliveS, 26-Sep-2026): a day that has bought at the day rate
+            # does not export in the peak. What is in the battery is then partly
+            # day-rate energy, and 24.4p in against 27.7p out loses money after the
+            # round trip and wear. The battery runs the house through the peak
+            # instead, which is what the day-rate purchase was for.
+            day_rate_bought = bool(inputs.day_rate_import_today)
+            if (day_rate_bought or (not profitable) or surplus_kwh < MIN_TRADE_KWH
+                    or power_w <= 0):
                 # NOT exporting means mode 2 with the charge limit at zero, and
                 # that would throw away any PV the roof is still making. If the
                 # sun is working, hand back instead: the existing manager runs
@@ -1375,18 +1390,21 @@ def plan(inputs):
                 # the one thing a single-direction target cannot express.
                 pv_left = inputs.pv.kwh_between(inputs.now, window_end)
                 house_left = inputs.house.kwh_between(inputs.now, window_end)
+                why = ("the battery was topped up at the day rate today, and "
+                       "selling that back at the peak price loses money after "
+                       "losses and wear" if day_rate_bought else
+                       "selling does not cover what it cost to store, after losses "
+                       "and wear" if not profitable else
+                       "there is nothing spare above what the house and its "
+                       "commitments need before the cheap rate comes back")
                 if (pv_left - house_left) >= MIN_TRADE_KWH:
                     return FluxDecision(
                         mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
                         protect_soc_pct=sell_floor, household_floor_pct=house_floor,
                         committed_kwh=committed, margin_p=margin_p,
-                        reason=("peak window, but there is nothing worth selling and "
-                                "the roof is still generating, so the existing "
-                                "manager keeps the inverter and banks the solar"))
-                why = ("selling does not cover what it cost to store, after losses "
-                       "and wear" if not profitable else
-                       "there is nothing spare above what the house and its "
-                       "commitments need before the cheap rate comes back")
+                        reason=(f"peak window, but {why}, and the roof is still "
+                                f"generating, so the existing manager keeps the "
+                                f"inverter and banks the solar"))
                 return FluxDecision(
                     mode=MODE_SUPPLY_HOUSE, owns=True, decision_at=inputs.now,
                     ems_mode=EMS_SELF_CONSUMPTION,

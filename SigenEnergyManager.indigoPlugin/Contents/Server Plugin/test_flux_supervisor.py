@@ -1459,10 +1459,46 @@ class TestSupervisorStep(_FluxCase):
 
     def test_the_manual_flag_holds_for_the_cooldown(self):
         p, when = self._at((2, 30), soc=25.0)
-        p.store["flux_manual_preempt"] = "a Set Self-Consumption action"
-        p.store["flux_preempted_at"]   = when.timestamp()
+        p.store["flux_manual_preempt"]    = "a Set Self-Consumption action"
+        p.store["flux_manual_preempt_at"] = when.timestamp()
         self._run(p, when)
         self.assertNotEqual(p.store["flux_manual_preempt"], "")
+
+    def test_a_pre_emption_expires_while_the_supervisor_keeps_ticking(self):
+        """Live 21-Sep 18:01 and 26-Sep 02:01: Flux stood aside until a restart.
+
+        The flag is an owner, and every tick an owner stands re-stamped
+        flux_preempted_at — which is what the expiry used to read. So the five
+        minutes restarted on every tick. Tick through the cooldown the way the
+        plugin does, then check the flag has gone and Flux takes the inverter back.
+        """
+        p, when = self._at((2, 30), soc=25.0)
+        real_time = plugin.time
+
+        class _Frozen:
+            def __getattr__(self_inner, name):
+                return getattr(real_time, name)
+
+            @staticmethod
+            def time():
+                return when.timestamp()
+
+        plugin.time = _Frozen()
+        try:
+            p._flux_preempt("a scheduled grid import")
+        finally:
+            plugin.time = real_time
+        self.assertEqual(p._flux_other_owner(), "a scheduled grid import")
+        step = 60
+        for i in range(1, (plugin.FLUX_PREEMPT_COOLDOWN_S // step)
+                       + plugin.FLUX_RECLAIM_TICKS + 3):
+            at = when + timedelta(seconds=i * step)
+            p.latest_inverter_data["_read_at"] = at.timestamp() - 1
+            self._run(p, when, at=at)
+        self.assertEqual(p.store["flux_manual_preempt"], "")
+        self.assertEqual(p.store["flux_owner_reason"], "")
+        self.assertTrue(p.flux_executor.targets(),
+                        "Flux never took the inverter back after the stand-down")
 
 
 class TestPeakClaimedAtFourNotFive(_FluxCase):
@@ -2553,6 +2589,105 @@ class TestBackupReserveMoveIsNotDrift(unittest.TestCase):
         self.assertTrue(d.set_discharge_cutoff(37.6))
         self.assertEqual(seen, [37.6])
 
+
+
+class TestDayRateImportStopsThePeakExport(_FluxCase):
+    """The plugin half of flux_strategy v2.3: the manager records a day-rate import
+    as a local DATE in pluginPrefs, and Flux reads it into its inputs."""
+
+    def _call_at(self, p, when, fn):
+        real_dt, real_time = plugin.datetime, plugin.time
+
+        class _Clock(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return when.astimezone(tz or timezone.utc)
+
+        class _Time:
+            def __getattr__(self_inner, name):
+                return getattr(real_time, name)
+
+            @staticmethod
+            def time():
+                return when.timestamp()
+
+        plugin.datetime, plugin.time = _Clock, _Time()
+        try:
+            return fn()
+        finally:
+            plugin.datetime, plugin.time = real_dt, real_time
+
+    def test_a_morning_import_is_recorded_as_day_rate(self):
+        p, when = self._at((11, 30), soc=25.0)
+        self._call_at(p, when, p._note_day_rate_import)
+        self.assertEqual(p.pluginPrefs.get("dayRateImportDate"), "2026-09-16")
+        self.assertTrue(self._call_at(p, when, p._day_rate_import_today))
+
+    def test_a_cheap_window_import_is_not(self):
+        p, when = self._at((3, 0), soc=25.0)
+        self._call_at(p, when, p._note_day_rate_import)
+        self.assertEqual(p.pluginPrefs.get("dayRateImportDate", ""), "")
+
+    def test_yesterdays_record_does_not_hold_today(self):
+        p, when = self._at((16, 30), soc=95.0)
+        p.pluginPrefs["dayRateImportDate"] = "2026-09-15"
+        self.assertFalse(self._call_at(p, when, p._day_rate_import_today))
+
+    def test_the_peak_does_not_export_on_a_day_rate_day(self):
+        p, when = self._at((16, 30), soc=95.0)
+        self._run(p, when)
+        exported = p.store["flux_decision"]
+        self.assertEqual(exported.mode, fs.MODE_EXPORT, "control: an ordinary day sells")
+
+        p, when = self._at((16, 30), soc=95.0)
+        p.pluginPrefs["dayRateImportDate"] = "2026-09-16"
+        self._run(p, when)
+        held = p.store["flux_decision"]
+        self.assertEqual(held.mode, fs.MODE_SUPPLY_HOUSE)
+        self.assertIn("day rate", held.reason)
+
+    def test_both_manager_import_paths_record_the_purchase(self):
+        """START_IMPORT and a scheduled import firing are the two ways the manager
+        starts a grid charge; each must tell Flux, or the guard never arms."""
+        p, when = self._at((11, 30), soc=25.0)
+        p.modbus = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p._note_day_rate_import = MagicMock()
+        dec = MagicMock(action=plugin.ACTION_START_IMPORT, power_watts=10000,
+                        target_soc_pct=40.0, reason="test")
+        p._act_on_decision(dec)
+        p._note_day_rate_import.assert_called_once()
+
+        p, when = self._at((11, 30), soc=25.0)
+        p.modbus = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p._note_day_rate_import = MagicMock()
+        p.store["import_scheduled_time"] = when.astimezone(timezone.utc) - timedelta(minutes=1)
+        p.store["import_target_soc"] = 40.0
+        p._check_scheduled_import_impl()
+        p._note_day_rate_import.assert_called_once()
+
+    def test_a_grid_charge_left_running_across_a_restart_is_recorded(self):
+        """The restart wipes import_active, and with it the knowledge that the
+        charge still on the inverter was bought at the day rate."""
+        p, when = self._at((12, 5), soc=45.0)
+        p.modbus = MagicMock()
+        p._note_day_rate_import = MagicMock()
+        p.latest_inverter_data["emsWorkMode"] = "Charge Grid First"
+        dec = MagicMock(action=plugin.ACTION_SCHEDULE_IMPORT, target_soc_pct=40.0,
+                        scheduled_time=when, reason="test")
+        p._act_on_decision(dec)
+        p._note_day_rate_import.assert_called_once()
+
+    def test_self_consumption_on_the_inverter_records_nothing(self):
+        p, when = self._at((12, 5), soc=45.0)
+        p.modbus = MagicMock()
+        p._note_day_rate_import = MagicMock()
+        p.latest_inverter_data["emsWorkMode"] = "Max Self Consumption"
+        dec = MagicMock(action=plugin.ACTION_SCHEDULE_IMPORT, target_soc_pct=40.0,
+                        scheduled_time=when, reason="test")
+        p._act_on_decision(dec)
+        p._note_day_rate_import.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

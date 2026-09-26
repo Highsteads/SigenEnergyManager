@@ -421,10 +421,15 @@ class TestGoFluxImportDecisions(unittest.TestCase):
         local_sched = decision.scheduled_time.astimezone(ZoneInfo("Europe/London"))
         self.assertEqual((local_sched.hour, local_sched.minute), (0, 30))
 
-    def test_go_import_now_if_margin_too_low_for_cheap_window(self):
-        """On Go tariff, import immediately if battery cannot reach cheap window."""
-        # 12% SOC = 4.2 kWh, drain to 00:30 = 4.5h * 0.6 = 2.7 kWh
-        # SOC at 00:30 = 4.2 - 2.7 = 1.5 kWh < 3.504 floor -> must import now
+    def test_go_waits_for_cheap_window_even_when_battery_runs_out_first(self):
+        """On Go, a battery that cannot reach the cheap window still WAITS for it.
+
+        12% SOC = 4.2 kWh, drain to 00:30 = 4.5h * 0.6 = 2.7 kWh, so the battery
+        reaches the floor first. Until v3.12 that bought tomorrow's shortfall NOW at
+        the day rate. But the house then draws from the grid at the same day rate,
+        so buying now only adds the round-trip loss, and tomorrow's energy costs
+        the cheap rate at 00:30 (26-Sep-2026, battery_manager 3.12).
+        """
         snapshot = _make_snapshot(
             soc_pct         = 12.0,
             tariff_key      = TARIFF_GO,
@@ -434,12 +439,8 @@ class TestGoFluxImportDecisions(unittest.TestCase):
             now_hour        = 20,
         )
         decision = self.bm.evaluate(snapshot)
-
-        # Cannot wait (SOC at window start below the health floor) -> must
-        # import NOW. Pinned to START_IMPORT — the old either-of-two assertion
-        # would have let a regression that re-defers an unreachable-window
-        # import pass silently.
-        self.assertEqual(decision.action, ACTION_START_IMPORT)
+        self.assertEqual(decision.action, ACTION_SCHEDULE_IMPORT)
+        self.assertIn("normal rate", decision.reason)
 
     def test_import_during_cheap_window(self):
         """When in cheap window and import needed, import immediately."""
