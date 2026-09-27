@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.122.0 — 27 September 2026
+
+- **The daily patterns are published for the Dashboards Energy page.** Dashboards 3.51.0 adds a "Through the day" card that charts each kind of day's use hour by hour against the everyday pattern, and says in words where they differ. Nothing about how the battery is run has changed.
+
 ## 5.121.0 — 27 September 2026
 
 - **Tuesday to Friday now have a pattern of use measured from those days alone.** Until now they used the everyday pattern, which is an average over the whole week and so carried some of the weekend's busy mornings and afternoons. Here a Tuesday to Friday uses about 0.8 kWh an hour from 10am to 1pm where the everyday pattern said 0.9 to 1.0, and about 1.0 kWh an hour at 5pm, 8pm and 10pm where it said 0.8 to 0.9. The total for those days does not change.

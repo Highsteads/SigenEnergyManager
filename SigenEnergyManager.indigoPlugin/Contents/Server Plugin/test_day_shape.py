@@ -579,6 +579,63 @@ class TestPluginWiring(unittest.TestCase):
         self.assertIn("_refresh_day_shapes", called)
 
 
+class TestDayPatternsForTheDashboard(unittest.TestCase):
+    """5.122.0: /api/day-patterns, charted on the Dashboards Energy page."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.p = _mk(self._tmp.name)
+        self.p._measured_day_uplifts = lambda: (1.06, 1.2, 1.1)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_one_group_each_with_its_own_or_the_everyday_pattern(self):
+        sunday = [0.0] * 48
+        sunday[30] = 1.0
+        self.p.store["day_shapes"]     = {6: sunday}
+        self.p.store["day_shape_days"] = {0: 3, 1: 60, 2: 60, 3: 60, 4: 60, 5: 17, 6: 17}
+        out = self.p.get_dashboard_day_patterns()
+        self.assertTrue(out["available"])
+        self.assertIn(out["today_weekday"], range(7))
+        by_key = {g["key"]: g for g in out["groups"]}
+        self.assertEqual(list(by_key), ["mon", "tue-fri", "sat", "sun"])
+        self.assertEqual(by_key["tue-fri"]["label"], "Tuesdays to Fridays")
+        self.assertEqual(by_key["tue-fri"]["weekdays"], [1, 2, 3, 4])
+        scales = plugin._need_scales(1.06, 1.2, 1.1)
+        for key, idx in (("mon", 1), ("tue-fri", 0), ("sat", 2), ("sun", 3)):
+            g = by_key[key]
+            self.assertEqual(len(g["kwh"]), 48)
+            self.assertAlmostEqual(g["total_kwh"], sum(FLAT) * scales[idx], places=2)
+            self.assertAlmostEqual(sum(g["kwh"]), g["total_kwh"], places=1)
+            self.assertAlmostEqual(sum(g["everyday_kwh"]), g["total_kwh"], places=1)
+        self.assertTrue(by_key["sun"]["own_pattern"])
+        self.assertAlmostEqual(by_key["sun"]["kwh"][30], by_key["sun"]["total_kwh"], places=2)
+        self.assertFalse(by_key["mon"]["own_pattern"])
+        self.assertEqual(by_key["mon"]["kwh"], by_key["mon"]["everyday_kwh"])
+        self.assertEqual(by_key["mon"]["days_used"], 3)
+
+    def test_while_the_house_is_empty_no_day_has_its_own(self):
+        self.p.store["day_shapes"]  = {6: [1 / 48.0] * 48}
+        self.p.store["away_active"] = True
+        out = self.p.get_dashboard_day_patterns()
+        self.assertTrue(out["away"])
+        self.assertFalse(any(g["own_pattern"] for g in out["groups"]))
+        for g in out["groups"]:
+            self.assertAlmostEqual(g["total_kwh"], sum(FLAT), places=2)
+
+    def test_no_profile_yet_says_so(self):
+        self.p.store["consumption_profile"] = []
+        out = self.p.get_dashboard_day_patterns()
+        self.assertFalse(out["available"])
+        self.assertEqual(out["groups"], [])
+        self.assertTrue(out["reason"])
+
+    def test_the_payload_is_plain_json(self):
+        self.p.store["day_shapes"] = {wd: [1 / 48.0] * 48 for wd in range(7)}
+        json.dumps(self.p.get_dashboard_day_patterns())
+
+
 class TestRecorderIsHonestAtMidnight(unittest.TestCase):
     """5.119.0: the half-hourly rows say when their energy was really used."""
 

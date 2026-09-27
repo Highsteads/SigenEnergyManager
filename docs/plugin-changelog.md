@@ -21,6 +21,18 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.122.0 — 27-09-2026
+
+- **`/api/day-patterns`** (web_dashboard.py) -> `get_dashboard_day_patterns()`: one entry per
+  `DAY_SHAPE_GROUPS` group with `key` (mon / tue-fri / sat / sun), `label`, `weekdays`,
+  `own_pattern`, `days_used`, `min_days`, `total_kwh`, `kwh` (48, what the plan uses) and
+  `everyday_kwh` (the blend scaled to the same total); plus `available`, `away`, `window_days`,
+  `today_weekday`. Totals are the automatic day figures, as in sigen_site_config.json. While
+  away every group is the away profile and `own_pattern` is false. Its own path because it
+  changes once a day and `/api/status` is polled every few seconds. Dashboards 3.51.0 proxies it.
+- Tests: payload shape and totals, away, no profile yet, JSON-serialisable; the web API surface
+  test now lists eight endpoints.
+
 ## v5.121.0 — 27-09-2026
 
 - **Tuesday to Friday shaped, as ONE group.** `DAY_SHAPE_GROUPS = ((0,), (1, 2, 3, 4), (5,), (6,))`;

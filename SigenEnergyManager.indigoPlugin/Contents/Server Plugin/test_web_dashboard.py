@@ -222,10 +222,11 @@ class _StubPlugin:
     def get_dashboard_calendar(self, year):    return {"months": [], "year": year}
     def get_dashboard_years(self):     return {"years": [2026]}
     def get_dashboard_vpp(self):       return {"events": []}
+    def get_dashboard_day_patterns(self): return {"available": True, "groups": []}
 
 
 class TestApiSurface(unittest.TestCase):
-    """The seven JSON endpoints the Dashboards plugin proxies to.
+    """The eight JSON endpoints the Dashboards plugin proxies to.
 
     v5.76.0 stripped this server's own page back to an outage view and moved the
     charts to the Dashboards energy page. The PAGE shrank; the API must not. If
@@ -238,7 +239,7 @@ class TestApiSurface(unittest.TestCase):
 
     # Mirrors Dashboards' _SIGEN_ALLOWED_PATHS.
     REQUIRED = ["/api/status", "/api/history", "/api/daily", "/api/export-sync",
-                "/api/years", "/api/calendar", "/api/vpp"]
+                "/api/years", "/api/calendar", "/api/vpp", "/api/day-patterns"]
 
     @classmethod
     def setUpClass(cls):

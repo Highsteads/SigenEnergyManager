@@ -46,8 +46,9 @@
 #              Claude Opus 5.5 (5.119.1 — the day-pattern note is logged once, not on every restart)
 #              Claude Opus 5.5 (5.120.0 — Mondays get their own half-hourly pattern too)
 #              Claude Opus 5.5 (5.121.0 — Tuesday to Friday share one measured pattern; every day now has one)
+#              Claude Opus 5.5 (5.122.0 — /api/day-patterns: the day patterns, for the Dashboards Energy page)
 # Date:        27-09-2026
-# Version:     5.121.0
+# Version:     5.122.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -12461,6 +12462,56 @@ class Plugin(indigo.PluginBase):
             # Non-None when Axle's stored headline is older than the rows
             # beneath it - see vpp_ledger.summarise.
             "balance_behind_gbp": s.get("balance_behind_gbp"),
+        }
+
+    def get_dashboard_day_patterns(self):
+        """The /api/day-patterns payload (5.122.0): how the house uses electricity
+        through each kind of day, for the Dashboards Energy page.
+
+        One entry per DAY_SHAPE_GROUPS group, each with 48 half-hourly kWh:
+          kwh           what the plugin plans that day with — its own measured
+                        pattern when it has one, else the everyday one;
+          everyday_kwh  the everyday (all-days) pattern scaled to the same total,
+                        so the page can show what the day's own pattern changed.
+        The totals are the automatic day figures, the same ones
+        sigen_site_config.json publishes. `today_weekday` lets the page open on
+        today's group. While the house is marked empty the plugin plans from the
+        empty-house pattern and no day has its own, which `away` says.
+        """
+        profile = [float(v) for v in (self.store.get("consumption_profile") or [])]
+        if len(profile) != 48 or sum(profile) <= 0.0:
+            return {"available": False, "groups": [],
+                    "reason": "the plugin has not built a consumption pattern yet"}
+        live_daily = sum(profile)
+        away = bool(self.store.get("away_active"))
+        scales = (1.0, 1.0, 1.0, 1.0) if away else _need_scales(*self._measured_day_uplifts())
+        shaped = self._day_profiles()
+        used   = self.store.get("day_shape_days") or {}
+        groups = []
+        for group in DAY_SHAPE_GROUPS:
+            wd    = group[0]
+            level = live_daily * scales[_NEED_SCALE_INDEX.get(wd, 0)]
+            everyday = [round(v * level / live_daily, 4) for v in profile]
+            own   = shaped.get(wd)
+            label, _noun = _day_group_words(group)
+            groups.append({
+                "key":          "-".join(dict.fromkeys(
+                                    (_WEEKDAY_NAMES[group[0]][:3], _WEEKDAY_NAMES[group[-1]][:3]))).lower(),
+                "label":        label,
+                "weekdays":     list(group),
+                "own_pattern":  own is not None,
+                "days_used":    int(used.get(wd, 0) or 0),
+                "min_days":     DAY_SHAPE_MIN_DAYS,
+                "total_kwh":    round(level, 2),
+                "kwh":          list(own) if own is not None else everyday,
+                "everyday_kwh": everyday,
+            })
+        return {
+            "available":     True,
+            "away":          away,
+            "window_days":   DAY_UPLIFT_WINDOW_DAYS,
+            "today_weekday": _to_london(datetime.now(timezone.utc)).weekday(),
+            "groups":        groups,
         }
 
     def get_dashboard_vpp(self):

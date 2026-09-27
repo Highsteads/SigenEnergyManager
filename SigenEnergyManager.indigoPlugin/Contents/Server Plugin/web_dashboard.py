@@ -289,6 +289,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             # around.
             self._send_api(lambda: self._plugin_ref.get_dashboard_vpp())
 
+        elif path == "/api/day-patterns":
+            # 5.122.0: each kind of day's half-hourly use, for the Energy page.
+            # Its own path: the patterns change once a day, and the status
+            # payload is polled every few seconds.
+            self._send_api(lambda: self._plugin_ref.get_dashboard_day_patterns())
+
         else:
             self._send(404, "text/plain", b"Not found")
 
