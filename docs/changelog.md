@@ -9,7 +9,7 @@ The newest version is at the top. A fuller, technical record of the recent versi
 
 ## 5.118.0 — 27 September 2026
 
-- **Sundays now have their own pattern of use through the day.** The plugin used one pattern for every day of the week, so a Sunday roast, the microwaves and the week's wash were spread across the whole day rather than planned for in the afternoon. Over the last 18 Sundays here, 2pm to 5pm used about half as much again as the everyday pattern said, and the late morning less. The plugin now measures a Sunday's pattern from the inverter's own half-hourly records for the last 18 weeks, and uses it for the overnight charge, the Flux plan, the free Happy Hour bookings and the battery's own forecasts.
+- **Sundays now have their own pattern of use through the day.** The plugin used one pattern for every day of the week, so a Sunday roast, the microwaves and the week's wash were spread across the whole day rather than planned for in the afternoon. Over the last 18 Sundays here, 2pm to 4pm used about 1.4 kWh an hour where the everyday pattern said 0.9, and the late morning less. The plugin now measures a Sunday's pattern from the inverter's own half-hourly records for the last 18 weeks, and uses it for the overnight charge, the Flux plan, the free Happy Hour bookings and the battery's own forecasts.
 - The total for a Sunday does not change: it is still the measured Sunday figure. Only the timing moves.
 - It needs six whole Sundays before it is used, leaves out the Sundays the clocks change, and is not used while the house is marked as empty. The Event Log says once when Sundays start or stop using their own pattern.
 

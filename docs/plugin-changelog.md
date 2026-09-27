@@ -26,7 +26,8 @@ New entries go at the top, as they were kept in the file.
 **A Sunday's own half-hourly shape.** CliveS: the roast, both microwaves and the wash put a
 Sunday's load in the afternoon. The planning profile is ONE 48-slot curve blended over every day;
 the four day types (5.104.0/5.105.0) only ever set the daily TOTAL. Measured over 18 Sundays to
-20-Sep-2026: 2pm-5pm about 1.3-1.4 kWh an hour against 0.9 on the blend, the late morning lighter.
+20-Sep-2026 (live, 27-Sep): 2pm-4pm 1.26 and 1.45 kWh an hour against 0.90 and 0.90 on the blend
+at the same Sunday total, 10am-1pm about 0.2 kWh an hour lighter.
 
 - **New pure module `sunday_shape.py`.** `sunday_shape(rows, dates, tz, min_days)` returns 48
   fractions summing to 1 (or None) from `energy_timeseries.db` `halfhourly` rows. Rows carry no
