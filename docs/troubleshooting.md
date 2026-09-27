@@ -19,12 +19,12 @@ When the readings come back, the plugin carries on by itself.
 
 ## The Event Log says "No site coordinates configured"
 
-The plugin has no position for your roof, so it has no solar forecast. Fill in **Site latitude** and **Site longitude** in the settings.
+The plugin has no position for your roof, so it has no solar forecast and does not check for storm warnings. Fill in **Site latitude** and **Site longitude** in the settings.
 
 ## The solar forecast is well out
 
 - Describe your own arrays in **PV array specs**. Left blank, the plugin uses the arrays on my roof — the [Settings](settings.md) page shows the format.
-- If you use the shared secrets file, check `LATITUDE` and `LONGITUDE` in it are your own position and not the `0.0` from the example file. The file wins over the settings.
+- If you use the shared secrets file and have put a position in it, check `LATITUDE` and `LONGITUDE` are your own. The file wins over the settings.
 - Give it a few weeks. Each night it compares the forecast with what the panels made and corrects for the difference, so it gets better with time.
 
 ## The tariff shows as unknown, or you get "Battery import held tonight"

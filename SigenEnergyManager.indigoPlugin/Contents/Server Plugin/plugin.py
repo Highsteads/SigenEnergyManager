@@ -39,8 +39,10 @@
 #              Claude Opus 5.5 (5.114.0 — the day rate buys only the peak; no peak export after it; Flux reclaims)
 #              Claude Opus 5.5 (5.115.0 — Flux owns the 2am charge; a dull afternoon drains the dawn projection)
 #              Claude Opus 5.5 (5.116.0 — every session's result published; free-hour credits chased until paid)
-# Date:        26-09-2026
-# Version:     5.116.0
+#              Claude Opus 5.5 (5.117.0 — guide faults: 0,0 secrets position unset, emergency event only for the reserve, labels,
+#              no storm check without a position)
+# Date:        27-09-2026
+# Version:     5.117.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -130,7 +132,7 @@ try:
     from IndigoSecrets import SIGEN_DASHBOARD_TOKEN
 except ImportError:
     SIGEN_DASHBOARD_TOKEN = ""
-# Site coordinates — IndigoSecrets first, PluginConfig fallback, Big Ben default.
+# Site coordinates — IndigoSecrets first, PluginConfig fallback, no built-in default.
 # Names match the existing IndigoSecrets convention (LATITUDE / LONGITUDE).
 try:
     from IndigoSecrets import LATITUDE as SITE_LATITUDE
@@ -140,6 +142,43 @@ try:
     from IndigoSecrets import LONGITUDE as SITE_LONGITUDE
 except ImportError:
     SITE_LONGITUDE = None
+
+
+def _usable_secrets_coords(lat, lon):
+    """(lat, lon) from IndigoSecrets.py, with 0.0, 0.0 read as NOT SET.
+
+    The shared example file ships LATITUDE = 0.0 and LONGITUDE = 0.0, and the
+    file wins over the Configure dialog, so anyone who copied it and filled in
+    the dialog instead had the roof put in the sea off West Africa (5.117.0).
+    Nobody's house is at exactly 0,0, so both zero means "left at the
+    template", and the dialog's figures are used. A blank string counts as not
+    set too. Anything else is passed through unchanged for the callers' own
+    guarded conversion.
+    """
+    if isinstance(lat, str) and not lat.strip():
+        lat = None
+    if isinstance(lon, str) and not lon.strip():
+        lon = None
+    try:
+        if float(lat) == 0.0 and float(lon) == 0.0:
+            return None, None
+    except (TypeError, ValueError):
+        pass
+    return lat, lon
+
+
+SITE_LATITUDE, SITE_LONGITUDE = _usable_secrets_coords(SITE_LATITUDE, SITE_LONGITUDE)
+
+
+def _is_reserve_import(purpose):
+    """True for a grid charge bought to hold the power-cut reserve.
+
+    The only import the Emergency Import Triggered event is for (5.117.0).
+    battery_manager tags it import_purpose "reserve": the flat/TOU resilience
+    buffer and the Agile reserve block. Tomorrow's shortfall and the Flux peak
+    top-up are economics, not emergencies.
+    """
+    return isinstance(purpose, str) and purpose == "reserve"
 # Unified Dashboards plugin: menuOpenDashboard now points at the Dashboards
 # hub rather than Sigenergy's internal mini-dashboard on WEB_DASHBOARD_PORT.
 try:
@@ -5638,12 +5677,18 @@ class Plugin(indigo.PluginBase):
                     else _as_float(self.pluginPrefs.get("siteLatitude"), None))
         site_lon = (SITE_LONGITUDE if SITE_LONGITUDE is not None
                     else _as_float(self.pluginPrefs.get("siteLongitude"), None))
+        if site_lat is None or site_lon is None:
+            # 5.117.0: no position anywhere means no storm check. This used to
+            # fall back to coordinates baked into storm_watch.py, so a user with
+            # none set got warnings for somebody else's area. One line per run.
+            if not self.store.get("storm_no_position_logged"):
+                self.store["storm_no_position_logged"] = True
+                log("[Storm] Storm check skipped — it needs your site latitude and "
+                    "longitude in Plugins → Sigenergy Manager → Configure")
+            return
+        self.store["storm_no_position_logged"] = False
         try:
-            if site_lat is not None and site_lon is not None:
-                new_level, reason = check_storm_level(site_lat, site_lon, loc_name)
-            else:
-                # No configured coordinates — fall back to storm_watch's defaults.
-                new_level, reason = check_storm_level(location_name=loc_name)
+            new_level, reason = check_storm_level(site_lat, site_lon, loc_name)
         except Exception as exc:
             log(f"[Storm] check_storm_level() raised: {exc}", level="WARNING")
             return
@@ -7157,7 +7202,11 @@ class Plugin(indigo.PluginBase):
                     self.store["had_import_today"]  = True   # daily history flag
                     self._note_day_rate_import()
                     self._set_import_cutoff(cutoff)
-                    self._trigger_event("emergencyImportTriggered")
+                    # 5.117.0: only the power-cut reserve is an emergency. This
+                    # fired for every charge, so a trigger on it ran for every
+                    # cheap-window and peak top-up buy as well.
+                    if _is_reserve_import(getattr(decision, "import_purpose", None)):
+                        self._trigger_event("emergencyImportTriggered")
 
         # There is deliberately NO ACTION_STOP_IMPORT branch. battery_manager has not
         # returned that action since the v4.0 sufficiency model, and the import
@@ -7177,6 +7226,9 @@ class Plugin(indigo.PluginBase):
                 # Store the scheduled time - checked in _check_scheduled_import
                 self.store["import_scheduled_time"] = decision.scheduled_time
                 self.store["import_target_soc"]     = decision.target_soc_pct
+                # Read back when the schedule fires, for the event only.
+                self.store["import_scheduled_purpose"] = str(
+                    getattr(decision, "import_purpose", "") or "")
                 if self.store.get("import_scheduled_logged") != str(decision.scheduled_time):
                     log(f"[Manager] Import scheduled: {decision.reason}")
                     self.store["import_scheduled_logged"] = str(decision.scheduled_time)
@@ -7953,7 +8005,8 @@ class Plugin(indigo.PluginBase):
                 self.store["had_import_today"]   = True   # daily history flag
                 self._note_day_rate_import()
                 self._set_import_cutoff(cutoff)
-                self._trigger_event("emergencyImportTriggered")
+                if _is_reserve_import(self.store.pop("import_scheduled_purpose", None)):
+                    self._trigger_event("emergencyImportTriggered")
 
     # ================================================================
     # Solar Forecast Refresh

@@ -7,6 +7,14 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.117.0 — 27 September 2026
+
+- **A position left at 0.0 in `IndigoSecrets.py` no longer puts your roof in the sea off West Africa.** The example file came with `LATITUDE` and `LONGITUDE` set to 0.0, and the file wins over the settings, so anyone who left them had a solar forecast for the wrong side of the world. Both at 0.0 now counts as not set, and the plugin uses the position in its settings. The example file now leaves them empty.
+- **The Emergency Import Triggered event now means what it says.** It used to fire for every grid charge. Now it fires only when the battery charges to hold its overnight power-cut reserve. A trigger that sends you a message will go quiet on ordinary cheap-rate charges.
+- The example `IndigoSecrets.py` now names the Axle token `AXLE_API_KEY`, which is the name the plugin reads. It used to say `AXLE_API_TOKEN`, which nothing read.
+- **With no position set, the plugin no longer watches storm warnings for somebody else's area.** It used to fall back to a position built into the plugin, which was my house. Now it skips the storm check and says once in the Event Log that it needs your latitude and longitude in Configure.
+- In the settings, the storm note now says the storm reserve is 50% at every warning level, which is what the plugin has done since June, and the Flux heading no longer calls the strategy a draft.
+
 ## 5.116.0 — 26 September 2026
 
 - **The plugin now follows up the credit Octopus owes for a free hour.** A booked Weekend Happy Hour is free up to 16 kWh and Octopus pay it back as a credit. Four times a day the plugin works out what each Sunday's free hours are owed and keeps the amount on show until the credit arrives.

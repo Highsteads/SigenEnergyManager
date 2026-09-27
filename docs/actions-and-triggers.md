@@ -38,7 +38,7 @@ Create a new trigger, set its type to **Sigenergy Manager**, and choose one of t
 
 | Trigger | Runs when |
 |---|---|
-| **Emergency Import Triggered** | The plugin starts charging the battery from the grid. Despite its name, it runs for every charge the plugin starts, not only in an emergency. |
+| **Emergency Import Triggered** | The plugin starts charging the battery from the grid to hold its overnight power-cut reserve, because the battery is below it or, on Agile, would be below it by dawn. Ordinary charges, such as buying tomorrow's electricity in the cheap window, do not run it. |
 | **Grid Export Started** | The battery starts selling to the grid — to make room overnight before a sunny day, or at the start of an Axle event. |
 | **Grid Export Stopped** | That selling stops. |
 | **Flood Prevention Pre-Drain Started** | The plugin starts making room in the battery overnight before a very sunny day. |

@@ -4,13 +4,13 @@
     <Event id="emergencyImportTriggered">
         <Name>Emergency Import Triggered</Name>
         <TriggerLabel>Battery manager triggered emergency grid import</TriggerLabel>
-        <Description>Fires when the battery manager determines the battery will not reach dawn at the minimum SOC and initiates a grid import.</Description>
+        <Description>Fires when the battery manager starts a grid charge to hold the overnight power-cut reserve: the battery is below the reserve, or on Agile would be below it by dawn. It does not fire for a charge that buys tomorrow's shortfall or tops up ahead of the Flux peak, for a VPP pre-charge, a Happy Hour, the Flux controller's own overnight charge, or a Force Grid Import.</Description>
     </Event>
 
     <Event id="exportStarted">
         <Name>Grid Export Started</Name>
         <TriggerLabel>Battery export to grid started</TriggerLabel>
-        <Description>Fires when the battery manager begins exporting battery energy to the grid to prevent 100% SOC cap during solar generation.</Description>
+        <Description>Fires when the battery starts selling to the grid: an overnight export that makes room for tomorrow's solar, or the start of an Axle VPP export.</Description>
     </Event>
 
     <Event id="exportStopped">

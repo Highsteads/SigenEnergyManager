@@ -451,7 +451,7 @@ Guards, all automatic: it only ever runs for a session you are actually opted in
         <Label>Storm export release SOC (%):</Label>
     </Field>
     <Field id="stormExportReleasePctInfo" type="label">
-        <Label>During an active storm warning, export is held off so the battery banks charge ahead of a possible power cut — but only while it is below this percentage. At or above it the reserve is already banked, so export resumes (Solar Overflow throttles the charge and pushes surplus to grid) rather than ramming the battery to 100% and clipping every watt of PV above your export cap. Never drops below the storm reserve target (50% yellow / 80% amber-red). Default 85.</Label>
+        <Label>During an active storm warning, export is held off so the battery banks charge ahead of a possible power cut — but only while it is below this percentage. At or above it the reserve is already banked, so export resumes (Solar Overflow throttles the charge and pushes surplus to grid) rather than ramming the battery to 100% and clipping every watt of PV above your export cap. Never drops below the storm reserve target, which is 50% at every warning level. Default 85.</Label>
     </Field>
 
     <Field id="separator_tariff" type="separator"/>
@@ -477,7 +477,7 @@ Guards, all automatic: it only ever runs for a session you are actually opted in
 
     <Field id="separator_flux" type="separator"/>
     <Field id="fluxHeading" type="label" fontColor="darkgray">
-        <Label>OCTOPUS FLUX STRATEGY (draft — leave switched off unless you are on Flux)</Label>
+        <Label>OCTOPUS FLUX STRATEGY (leave switched off unless you are on Flux)</Label>
     </Field>
     <Field id="fluxEnabledInfo" type="label">
         <Label>Flux pays three prices for what you import and three for what you export, on the same clock: cheap overnight, dear between 4pm and 7pm, standard the rest of the day. This strategy fills the battery overnight for what the house is forecast to need, and sells what is genuinely spare during the dear hours. It takes the inverter over only inside those windows. Outside them, and any time a storm, a power cut, a paid Axle window, a Saving Session, a Happy Hour or anything you do by hand is in play, it hands the inverter straight back to the ordinary manager. Both boxes below must be ticked before it does anything at all, and it does nothing whatever unless Octopus tell the plugin your account really is on Flux — forcing the tariff above is a rehearsal and is never taken as proof.</Label>

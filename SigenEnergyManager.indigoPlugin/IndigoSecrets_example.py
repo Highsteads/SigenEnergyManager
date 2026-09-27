@@ -116,11 +116,12 @@ MQTT_PASSWORD = ""
 # ============================
 # Location
 # Required by: SigenEnergyManager (solar forecast), other weather integrations
-# Leave at 0.0 to fall back to PluginConfig values; the SigenEnergyManager
-# plugin's built-in fallback is Big Ben, London (51.5007, -0.1246).
+# Leave as None to use the figures in each plugin's Configure dialog.
+# SigenEnergyManager has no built-in position: with neither set it logs an
+# error and runs without a solar forecast. It also reads 0.0, 0.0 as not set.
 # ============================
-LATITUDE  = 0.0
-LONGITUDE = 0.0
+LATITUDE  = None    # e.g. 51.5007 (degrees north)
+LONGITUDE = None    # e.g. -0.1246 (degrees east, negative west of Greenwich)
 
 # ============================
 # Dashboards plugin (optional)
@@ -186,7 +187,7 @@ EXPORT_RATE_P = 15.0    # p/kWh flat export rate
 # Axle VPP (optional)
 # Required by: SigenEnergyManager plugin (Axle VPP feature)
 # ============================
-AXLE_API_TOKEN = ""
+AXLE_API_KEY = ""
 
 # ============================
 # Sigenergy Energy Manager — extras (optional)

@@ -136,6 +136,8 @@ class TestNetworkRunsUnlocked(unittest.TestCase):
 
         plugin.check_storm_level = _check
         try:
+            p.pluginPrefs["siteLatitude"]  = "52.5"   # generic test site; with
+            p.pluginPrefs["siteLongitude"] = "-1.5"   # no position the poll is skipped
             p.store["last_storm_watch"] = 0
             p.store["storm_level"] = "none"
             p.store["storm_alerted_level"] = "none"

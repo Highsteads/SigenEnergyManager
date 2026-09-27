@@ -27,7 +27,7 @@ While this runs, the **Battery Manager** shows **Power Cut Lockout Active** and 
 
 ## Storm warnings
 
-Every two hours the plugin checks the official weather warnings — the Met Office's own warnings for the UK, which it reads from the MeteoAlarm service. It only acts on a warning whose area covers your house, from the latitude and longitude in the settings, and only once the warning is due within the next 24 hours. It looks at warnings for wind, gales, storms, thunderstorms, snow, ice, rain and flooding.
+Every two hours the plugin checks the official weather warnings — the Met Office's own warnings for the UK, which it reads from the MeteoAlarm service. It only acts on a warning whose area covers your house, from the latitude and longitude in the settings, and only once the warning is due within the next 24 hours. Without a position it does not check at all, and says so once in the Event Log. It looks at warnings for wind, gales, storms, thunderstorms, snow, ice, rain and flooding.
 
 While a yellow, amber or red warning is in force:
 

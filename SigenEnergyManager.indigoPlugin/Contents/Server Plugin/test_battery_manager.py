@@ -1341,6 +1341,12 @@ class TestResilienceBuffer(unittest.TestCase):
         self.assertAlmostEqual(d.target_soc_pct, 52.0)
         self.assertEqual(d.power_watts, 10000)
 
+    def test_resilience_import_is_tagged_as_the_reserve(self):
+        # v5.117.0: plugin.py fires Emergency Import Triggered only for a
+        # "reserve" import, so this branch must say that is what it is buying.
+        d = self._run(soc_pct=30.0, dawn_target_pct=50.0, now_hour=20)
+        self.assertEqual(d.import_purpose, "reserve")
+
     def test_at_or_above_floor_no_import(self):
         # >= boundary: exactly at the floor means no import (and none above it).
         self.assertIsNone(self._run(soc_pct=50.0, dawn_target_pct=50.0,

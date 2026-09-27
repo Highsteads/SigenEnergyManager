@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.116.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.117.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,16 +54,17 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.117.0** — Fixes found while writing the guide. A position left at 0.0 in `IndigoSecrets.py` now counts as not set, so the one in the settings is used. **Emergency Import Triggered** now fires only when the battery charges to hold its power-cut reserve. The example secrets file names the Axle token `AXLE_API_KEY`, as the plugin reads it. With no position set anywhere, the storm check now waits for one instead of watching a built-in area.
+
 **v5.116.0** — The plugin checks that Octopus pay back each Weekend Happy Hour.
 - Four times a day it works out what each free hour is owed and looks for the credit on your Octopus account, with one Pushover when it is paid, one if it is more than 5p short, and one if nothing has come after two weeks.
 - It reads Octopus's own result for every Power Down you joined, and your OctoPoints balance, for the Dashboards Energy page.
 
 **v5.115.0** — On Octopus Flux, the Flux strategy does the 2am charge on its own, and the ordinary plan steps in only if it cannot make a plan. A dull afternoon, when the house uses more than the panels make, now counts when the plugin works out what will be left at dawn.
 
-**v5.114.0** — On Octopus Flux, a dull day no longer buys tomorrow's electricity at the day rate. The plugin buys at the day rate only what the battery needs to get through the 4pm to 7pm peak, and sells nothing in the peak on a day it has done so.
-
 | Version | Released | In short |
 |---|---|---|
+| 5.117.0 | 27 September 2026 | Fixes found while writing the guide |
 | 5.116.0 | 26 September 2026 | Free-hour payments checked, Power Down results read |
 | 5.115.0 | 26 September 2026 | The Flux strategy owns the 2am charge |
 | 5.114.0 | 26 September 2026 | The day rate buys only what the peak needs |

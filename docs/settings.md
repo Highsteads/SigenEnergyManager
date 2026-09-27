@@ -23,7 +23,7 @@ How the plugin reaches the inverter over your network.
 
 | Setting | What it does |
 |---|---|
-| **Site latitude** and **Site longitude** | Your roof's position, in degrees. Longitude is negative west of Greenwich. There is no starting value — without these the plugin writes an error to the Event Log and runs without a solar forecast. |
+| **Site latitude** and **Site longitude** | Your roof's position, in degrees. Longitude is negative west of Greenwich. There is no starting value — without these the plugin writes an error to the Event Log and runs without a solar forecast or storm check. |
 | **Location name** | Your town, used in storm warning messages. Blank shows "your area". |
 | **PV array specs** | A description of each of your solar arrays, as one line of text. Blank uses the arrays on my roof, which will not match yours, so it is worth filling in. The format is below. |
 | **Battery module size** | The size of one battery module, 8.76 kWh to start with, which is a SigenStor module. The plugin uses it to work out how many packs you have. |
@@ -214,9 +214,6 @@ This plugin reads these lines from the file:
 | `SIGEN_DASHBOARD_TOKEN` | **Access token** |
 | `DASHBOARD_HOST` | **Dashboard host** |
 
-Two things to watch:
-
-- **The example file sets `LATITUDE` and `LONGITUDE` to `0.0`.** Because the file wins, leaving them at `0.0` gives the solar forecast a position in the sea off West Africa. Put in your own position, or delete those two lines so the dialog's figures are used.
-- **The Axle line in the example file is called `AXLE_API_TOKEN`, but this plugin reads `AXLE_API_KEY`.** Add a line `AXLE_API_KEY = "..."` with your token, or put the token in the dialog.
+The example file leaves `LATITUDE` and `LONGITUDE` empty. Left empty, or both at `0.0`, they count as not set and the plugin uses **Site latitude** and **Site longitude** from the dialog.
 
 The **Run Self-Test** menu item lists which of these the plugin found in the file.

@@ -857,7 +857,9 @@ class Decision:
     import_held_why: str   = ""
     # v5.101.0 — what an Agile import (or hold) is FOR: "tomorrow" buys the deficit
     # and is gated on the round-trip comparison; "reserve" buys the power-cut floor
-    # and is not. plugin.py words the hold notice from it.
+    # and is not. plugin.py words the hold notice from it. v5.117.0: the flat/TOU
+    # resilience buffer is tagged "reserve" too, and only a "reserve" import fires
+    # the Emergency Import Triggered event. Nothing decides on this field.
     import_purpose:  str   = "tomorrow"
     # v3.11 — set when the bank-first gate is what refused the overflow branch.
     # Carried as a FLAG, not as text: the overflow reason string is already close
@@ -1348,6 +1350,7 @@ class BatteryManager:
             target_soc_pct  = buffer_target,
             dawn_viable     = True,
             soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            import_purpose  = "reserve",
         )
 
     @staticmethod

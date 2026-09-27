@@ -20,8 +20,9 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import storm_watch   # noqa: E402
 
-# A polygon (CAP "lat,lon lat,lon …") that encloses 54.882, -1.818 (Medomsley)
-_COVERS   = "54,-2 55,-2 55,-1 54,-1 54,-2"
+# A generic test site, and a polygon (CAP "lat,lon lat,lon …") that encloses it
+_LAT, _LON = 52.5, -1.5
+_COVERS   = "52,-2 53,-2 53,-1 52,-1 52,-2"
 # A polygon far to the south — does NOT enclose the test point
 _ELSEWHERE = "50,-1 51,-1 51,0 50,0 50,-1"
 
@@ -58,6 +59,8 @@ def _run(xml_bytes, **kwargs):
     orig = storm_watch.urllib.request.urlopen
     storm_watch.urllib.request.urlopen = lambda req, timeout=None: cm
     try:
+        kwargs.setdefault("lat", _LAT)
+        kwargs.setdefault("lon", _LON)
         return storm_watch.check_storm_level(**kwargs)
     finally:
         storm_watch.urllib.request.urlopen = orig
@@ -84,7 +87,7 @@ class TestStormWatchCurrentSchema(unittest.TestCase):
 
     def test_polygon_elsewhere_is_ignored(self):
         level, _ = _run(_feed(_entry_current(polygon=_ELSEWHERE)),
-                        lat=54.882, lon=-1.818)
+                        lat=_LAT, lon=_LON)
         self.assertEqual(level, "none")
 
     def test_non_power_cut_hazard_skipped(self):
@@ -112,9 +115,17 @@ class TestStormWatchLegacyAndGuards(unittest.TestCase):
         self.assertIsNone(level)
         self.assertIn("unrecognised", reason)
 
+    def test_there_is_no_built_in_site(self):
+        # v1.6: a baked-in default gave a user with no position configured the
+        # storm warnings for somebody else's area. lat and lon are required.
+        self.assertFalse(hasattr(storm_watch, "LATITUDE"))
+        self.assertFalse(hasattr(storm_watch, "LONGITUDE"))
+        with self.assertRaises(TypeError):
+            storm_watch.check_storm_level(location_name="York")
+
     def test_location_name_used_in_reason(self):
-        _, reason = _run(_feed(""), location_name="Medomsley")
-        self.assertIn("Medomsley", reason)
+        _, reason = _run(_feed(""), location_name="York")
+        self.assertIn("York", reason)
 
     def test_network_error_returns_failure_sentinel(self):
         # v1.5: a fetch failure returns None (unknown), NEVER "none" (all-clear) —
@@ -124,7 +135,7 @@ class TestStormWatchLegacyAndGuards(unittest.TestCase):
         orig = storm_watch.urllib.request.urlopen
         storm_watch.urllib.request.urlopen = _boom
         try:
-            level, reason = storm_watch.check_storm_level()
+            level, reason = storm_watch.check_storm_level(_LAT, _LON)
         finally:
             storm_watch.urllib.request.urlopen = orig
         self.assertIsNone(level)

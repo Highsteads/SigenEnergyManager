@@ -21,6 +21,33 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.117.0 — 27-09-2026
+
+**Faults found while writing the plain-English guide.** No control decision changes.
+
+- **Secrets position 0.0, 0.0 is unset.** `_usable_secrets_coords()` runs once at import on
+  `SITE_LATITUDE` / `SITE_LONGITUDE`: both zero, or blank, becomes `None`, so all three readers
+  (site_config publish, storm watch, forecast init) fall through to `siteLatitude` /
+  `siteLongitude`. The bundled `IndigoSecrets_example.py` now ships `None`, not 0.0. One zero on
+  its own is still a real position.
+- **`emergencyImportTriggered` fires only for `import_purpose == "reserve"`.** It fired on every
+  START_IMPORT and every scheduled import. `_check_resilience_buffer` now tags its Decision
+  `"reserve"` (the Agile reserve block already did). SCHEDULE_IMPORT stores the purpose in
+  `import_scheduled_purpose` and the firing path pops it. The import itself is unchanged.
+- **No storm check without a position.** `storm_watch.py` 1.6 has no `LATITUDE`/`LONGITUDE`
+  and `check_storm_level(lat, lon, ...)` requires both. `_check_storm_watch` used to fall back to
+  that built-in site (the author's house) when none was configured. It now returns before the
+  poll, leaves the stored level alone, and logs one INFO line per run
+  (`storm_no_position_logged`). `scripts/agile_replay.py` takes `--lat`/`--lng` or reads
+  IndigoSecrets.py. Test fixtures use a generic 52.5, -1.5.
+- `IndigoSecrets_example.py`: `AXLE_API_TOKEN` renamed `AXLE_API_KEY`, the name `plugin.py` reads.
+- PluginConfig: the storm release label said 50% yellow / 80% amber-red, the code is a flat 50%
+  (`STORM_SOC_YELLOW` = `STORM_SOC_AMBER` = 50 since 26-Jun-2026). The Flux heading lost "draft".
+- Events.xml: both import and export descriptions now say what fires them.
+- Tests: `TestSecretsCoordsLeftAtZeroAreUnset`, `TestEmergencyImportEventOnlyForTheReserve`,
+  `TestStormCheckNeedsAPosition`, `test_storm_watch.test_there_is_no_built_in_site`,
+  `TestResilienceBuffer.test_resilience_import_is_tagged_as_the_reserve`.
+
 ## v5.116.0 — 26-09-2026
 
 **Every session's result published; free-hour credits chased until paid.** (free_hour_credits 1.0)

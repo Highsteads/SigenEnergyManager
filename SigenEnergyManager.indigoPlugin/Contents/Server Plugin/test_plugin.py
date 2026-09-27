@@ -2371,16 +2371,16 @@ class TestApplyStormResultLocName(unittest.TestCase):
 
     def test_yellow_escalation_sends(self):
         stub = self._Stub({"storm_level": "none", "storm_alerted_level": "none"},
-                          {"siteLocationName": "Medomsley"})
+                          {"siteLocationName": "York"})
         self._apply(stub, "yellow")
         self.assertEqual(len(stub.sent), 1)
         self.assertIn("Yellow", stub.sent[0][0])
-        self.assertIn("Medomsley", stub.sent[0][1])
+        self.assertIn("York", stub.sent[0][1])
         self.assertEqual(stub.store["storm_alerted_level"], "yellow")
 
     def test_all_clear_sends_and_resets_the_latch(self):
         stub = self._Stub({"storm_level": "amber", "storm_alerted_level": "amber"},
-                          {"siteLocationName": "Medomsley"})
+                          {"siteLocationName": "York"})
         self._apply(stub, "none")
         self.assertEqual(len(stub.sent), 1)
         self.assertIn("Cleared", stub.sent[0][0])
@@ -8072,5 +8072,148 @@ class TestSavingSessionFlagEndsWhenAVppWindowOwnsTheExport(unittest.TestCase):
         self.assertTrue(p.store["saving_session_export_active"])
 
 
+class TestSecretsCoordsLeftAtZeroAreUnset(unittest.TestCase):
+    """v5.117.0 — the example IndigoSecrets.py shipped LATITUDE/LONGITUDE 0.0,
+    and the file wins over the Configure dialog, so the roof went to 0,0."""
+
+    def test_both_zero_is_unset(self):
+        self.assertEqual(plugin._usable_secrets_coords(0.0, 0.0), (None, None))
+        self.assertEqual(plugin._usable_secrets_coords("0", "0.0"), (None, None))
+
+    def test_blank_is_unset(self):
+        self.assertEqual(plugin._usable_secrets_coords("", " "), (None, None))
+
+    def test_a_real_position_passes_through(self):
+        self.assertEqual(plugin._usable_secrets_coords(51.5007, -0.1246),
+                         (51.5007, -0.1246))
+
+    def test_one_zero_is_a_real_position(self):
+        # On the equator or the Greenwich meridian is somewhere; only both is not.
+        self.assertEqual(plugin._usable_secrets_coords(51.4779, 0.0), (51.4779, 0.0))
+
+    def test_unset_stays_unset(self):
+        self.assertEqual(plugin._usable_secrets_coords(None, None), (None, None))
+
+
+class TestEmergencyImportEventOnlyForTheReserve(unittest.TestCase):
+    """v5.117.0 — Emergency Import Triggered fired on every grid charge. It is
+    for the power-cut reserve only (import_purpose "reserve")."""
+
+    def _p(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p.modbus      = MagicMock()
+        p.modbus.force_charge.return_value = True
+        p.pluginPrefs = {"inverterMaxKw": "10.0"}
+        p.latest_inverter_data = {}
+        p._set_import_cutoff     = MagicMock()
+        p._note_day_rate_import  = MagicMock()
+        p._flux_owns_cheap_window = MagicMock(return_value=False)
+        p._flux_preempt          = MagicMock()
+        p.store = {
+            "import_active":         False,
+            "export_active":         False,
+            "manager_paused":        False,
+            "import_scheduled_time": None,
+            "import_target_soc":     12.0,
+            "had_import_today":      False,
+            "vpp_state":             plugin.VPP_IDLE,
+        }
+        fired = []
+        p._trigger_event = lambda name: fired.append(name)
+        return p, fired
+
+    def _start(self, purpose):
+        p, fired = self._p()
+        dec = MagicMock()
+        dec.action         = plugin.ACTION_START_IMPORT
+        dec.reason         = "test"
+        dec.power_watts    = 10000
+        dec.target_soc_pct = 52.0
+        dec.import_purpose = purpose
+        p._act_on_decision(dec)
+        self.assertTrue(p.modbus.force_charge.called, "the charge itself still starts")
+        return fired
+
+    def test_reserve_import_fires_the_event(self):
+        self.assertIn("emergencyImportTriggered", self._start("reserve"))
+
+    def test_tomorrows_shortfall_does_not_fire_it(self):
+        self.assertNotIn("emergencyImportTriggered", self._start("tomorrow"))
+
+    def _scheduled(self, purpose):
+        p, fired = self._p()
+        dec = MagicMock()
+        dec.action         = plugin.ACTION_SCHEDULE_IMPORT
+        dec.reason         = "test"
+        dec.scheduled_time = datetime.now(timezone.utc) - timedelta(minutes=1)
+        dec.target_soc_pct = 40.0
+        dec.import_purpose = purpose
+        p._act_on_decision(dec)
+        p._check_scheduled_import_impl()
+        self.assertTrue(p.modbus.force_charge.called, "the schedule still fires")
+        return fired, p
+
+    def test_scheduled_reserve_import_fires_the_event(self):
+        fired, p = self._scheduled("reserve")
+        self.assertIn("emergencyImportTriggered", fired)
+        self.assertNotIn("import_scheduled_purpose", p.store)
+
+    def test_scheduled_tomorrow_import_does_not_fire_it(self):
+        fired, _ = self._scheduled("tomorrow")
+        self.assertNotIn("emergencyImportTriggered", fired)
+
+
+class TestStormCheckNeedsAPosition(unittest.TestCase):
+    """v5.117.0 — with no position anywhere the storm check fell back to
+    coordinates baked into storm_watch.py, so a user with none set got storm
+    warnings for somebody else's area. It now skips, with one INFO line."""
+
+    def _p(self, prefs):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.debug       = False
+        p._state_lock = threading.RLock()
+        p.pluginPrefs = prefs
+        p.store       = {"storm_level": "amber", "storm_alerted_level": "amber"}
+        p._apply_storm_result = MagicMock()
+        return p
+
+    def _check(self, p, lat=None, lon=None):
+        calls = []
+        with patch.object(plugin, "SITE_LATITUDE", lat), \
+             patch.object(plugin, "SITE_LONGITUDE", lon), \
+             patch.object(plugin, "check_storm_level",
+                          lambda *a, **k: calls.append((a, k)) or ("none", "ok")), \
+             patch.object(plugin, "log") as log:
+            p._check_storm_watch()
+        return calls, log
+
+    def test_no_position_skips_the_check(self):
+        p = self._p({"siteLatitude": "", "siteLongitude": ""})
+        calls, log = self._check(p)
+        self.assertEqual(calls, [], "no position must never poll a baked-in site")
+        p._apply_storm_result.assert_not_called()
+        self.assertEqual(p.store["storm_level"], "amber", "the stored level is left alone")
+        self.assertEqual(log.call_count, 1)
+        self.assertIn("Configure", log.call_args.args[0])
+        self.assertNotIn("level", log.call_args.kwargs, "INFO, not a warning")
+
+    def test_the_skip_is_logged_once(self):
+        p = self._p({})
+        self._check(p)
+        _, log = self._check(p)
+        log.assert_not_called()
+
+    def test_a_dialog_position_is_polled(self):
+        p = self._p({"siteLatitude": "52.5", "siteLongitude": "-1.5"})
+        calls, _ = self._check(p)
+        self.assertEqual(calls[0][0][:2], (52.5, -1.5))
+        p._apply_storm_result.assert_called_once()
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

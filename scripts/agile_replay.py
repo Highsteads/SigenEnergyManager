@@ -29,7 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 LONDON = ZoneInfo("Europe/London")
-LAT, LNG = 54.882, -1.818            # the site; dawn is derived from sunrise here
+LAT, LNG = None, None                # the site, set in main(); dawn is derived from sunrise here
 EFFICIENCY = 0.94
 CACHE_DIR = os.path.expanduser("~/.cache/sigen-agile-replay")
 
@@ -87,7 +87,25 @@ def main():
     ap.add_argument("--to", dest="date_to", default="2026-03-01")
     ap.add_argument("--product", default="AGILE-24-10-01")
     ap.add_argument("--region", default="F")
+    ap.add_argument("--lat", type=float, help="site latitude (default: LATITUDE in IndigoSecrets.py)")
+    ap.add_argument("--lng", type=float, help="site longitude (default: LONGITUDE in IndigoSecrets.py)")
     a = ap.parse_args()
+
+    global LAT, LNG
+    LAT, LNG = a.lat, a.lng
+    if LAT is None or LNG is None:
+        import importlib.util
+        path = "/Library/Application Support/Perceptive Automation/IndigoSecrets.py"
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location("replay_secrets", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            LAT = LAT if LAT is not None else getattr(mod, "LATITUDE", None)
+            LNG = LNG if LNG is not None else getattr(mod, "LONGITUDE", None)
+    if LAT is None or LNG is None or (float(LAT) == 0.0 and float(LNG) == 0.0):
+        ap.error("no site position: pass --lat and --lng, or set LATITUDE and "
+                 "LONGITUDE in IndigoSecrets.py")
+    LAT, LNG = float(LAT), float(LNG)
 
     rows  = fetch_rates(a.product, a.region, a.date_from, a.date_to)
     slots = sorted(((datetime.fromisoformat(r["valid_from"].replace("Z", "+00:00")),

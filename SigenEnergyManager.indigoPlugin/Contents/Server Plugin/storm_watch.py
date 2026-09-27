@@ -15,19 +15,18 @@
 #              risk, avoiding false positives from ordinary windy days.
 #              Returns a severity string: "none", "yellow", "amber", or "red".
 # Author:      CliveS & Claude Fable 5
-# Date:        02-07-2026
-# Version:     1.5 (failure paths return None — caller holds previous level, no false all-clear)
+# Date:        27-09-2026
+# Version:     1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
+#              1.5 (failure paths return None — caller holds previous level, no false all-clear)
 
 import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
-# ============================================================
-# Location: Medomsley, County Durham
-# ============================================================
-LATITUDE  = 54.882
-LONGITUDE = -1.818
+# There is deliberately NO default site (v1.6). A baked-in position meant a
+# user with none configured got storm warnings for somebody else's area. The
+# caller passes the configured coordinates, or skips the check.
 
 # ============================================================
 # How far ahead (hours) to activate the storm battery override.
@@ -176,14 +175,14 @@ _COLOUR_RE = re.compile(r"\b(red|amber|yellow)\b")
 # Public API
 # ============================================================
 
-def check_storm_level(lat=LATITUDE, lon=LONGITUDE, location_name="your location"):
+def check_storm_level(lat, lon, location_name="your location"):
     """
     Check the MeteoAlarm CAP feed for active wind/storm warnings covering the
     site at (lat, lon).
 
     Args:
-        lat, lon       site coordinates (default the module's Medomsley constants;
-                       the plugin passes its own configured site coordinates).
+        lat, lon       site coordinates, required. The plugin passes its own
+                       configured site and skips the check when it has none.
         location_name  label used in the human-readable reason string.
 
     Filters for:
