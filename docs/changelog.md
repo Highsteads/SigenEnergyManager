@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.118.0 — 27 September 2026
+
+- **Sundays now have their own pattern of use through the day.** The plugin used one pattern for every day of the week, so a Sunday roast, the microwaves and the week's wash were spread across the whole day rather than planned for in the afternoon. Over the last 18 Sundays here, 2pm to 5pm used about half as much again as the everyday pattern said, and the late morning less. The plugin now measures a Sunday's pattern from the inverter's own half-hourly records for the last 18 weeks, and uses it for the overnight charge, the Flux plan, the free Happy Hour bookings and the battery's own forecasts.
+- The total for a Sunday does not change: it is still the measured Sunday figure. Only the timing moves.
+- It needs six whole Sundays before it is used, leaves out the Sundays the clocks change, and is not used while the house is marked as empty. The Event Log says once when Sundays start or stop using their own pattern.
+
 ## 5.117.0 — 27 September 2026
 
 - **A position left at 0.0 in `IndigoSecrets.py` no longer puts your roof in the sea off West Africa.** The example file came with `LATITUDE` and `LONGITUDE` set to 0.0, and the file wins over the settings, so anyone who left them had a solar forecast for the wrong side of the world. Both at 0.0 now counts as not set, and the plugin uses the position in its settings. The example file now leaves them empty.

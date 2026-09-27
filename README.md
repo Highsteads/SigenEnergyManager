@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.117.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.118.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.118.0** — Sundays now have their own pattern of use through the day. The plugin measures it from the last 18 Sundays, so a roast and a wash in the afternoon are planned for in the afternoon, not spread across the day. The total for a Sunday is unchanged. Until six whole Sundays are recorded, Sundays use the everyday pattern as before.
+
 **v5.117.0** — Fixes found while writing the guide. A position left at 0.0 in `IndigoSecrets.py` now counts as not set, so the one in the settings is used. **Emergency Import Triggered** now fires only when the battery charges to hold its power-cut reserve. The example secrets file names the Axle token `AXLE_API_KEY`, as the plugin reads it. With no position set anywhere, the storm check now waits for one instead of watching a built-in area.
 
 **v5.116.0** — The plugin checks that Octopus pay back each Weekend Happy Hour.
@@ -64,6 +66,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.118.0 | 27 September 2026 | Sundays get their own pattern of use |
 | 5.117.0 | 27 September 2026 | Fixes found while writing the guide |
 | 5.116.0 | 26 September 2026 | Free-hour payments checked, Power Down results read |
 | 5.115.0 | 26 September 2026 | The Flux strategy owns the 2am charge |

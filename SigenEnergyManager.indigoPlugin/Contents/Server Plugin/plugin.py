@@ -41,8 +41,9 @@
 #              Claude Opus 5.5 (5.116.0 — every session's result published; free-hour credits chased until paid)
 #              Claude Opus 5.5 (5.117.0 — guide faults: 0,0 secrets position unset, emergency event only for the reserve, labels,
 #              no storm check without a position)
+#              Claude Opus 5.5 (5.118.0 — Sundays get their own half-hourly pattern: the roast and the wash)
 # Date:        27-09-2026
-# Version:     5.117.0
+# Version:     5.118.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -225,6 +226,7 @@ from sigenergy_modbus import SigenergyModbus, ENERGY_BLOCK_KEYS
 # v5.89.0: the daily figures derive from lifetime counters anchored at local
 # midnight. See docs/daily-energy-revamp.md for why the accumulate-and-reset
 # model went (it froze homeDailyKwh on yesterday's total for two days).
+import sunday_shape as _sunday_shape
 from daily_energy import (DailyEnergy, readings_from_data, recovery_from_data,
                           local_midnight_epoch, KEYS as ENERGY_KEYS)
 from openmeteo_forecast import OpenMeteoForecast
@@ -553,6 +555,10 @@ SUNDAY_UPLIFT_DEFAULT           = 1.05
 DAY_UPLIFT_WINDOW_DAYS          = 126   # 18 whole weeks
 DAY_UPLIFT_MIN_BASE_DAYS        = 20    # Tue-Fri days needed for a reference at all
 DAY_UPLIFT_MIN_DAYS             = 6     # of that particular day, before its own uplift is used
+# 5.118.0: a Sunday's own half-hourly SHAPE, from the inverter's half-hourly
+# records over the same 18 weeks as the uplift. The level stays with the uplift;
+# the Sundays only say when in the day the energy goes.
+SUNDAY_SHAPE_MIN_DAYS           = 6     # whole, covered Sundays before the shape is used
 STORM_WATCH_INTERVAL = 7200  # 2 hours
 # Octopus announces a new Saving Session at most a few times a day (usually the evening
 # before), so hourly is ample — no reason to poll it on the 30-min Octopus-rates cadence.
@@ -1842,6 +1848,10 @@ class Plugin(indigo.PluginBase):
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
+        # 5.118.0: a Sunday's own half-hourly shape (48 fractions), [] until
+        # enough Sundays are measured — see _refresh_sunday_shape.
+        self.store["sunday_shape"]      = []
+        self.store["sunday_shape_days"] = 0
 
         # Long-lived home-load profile accumulators (persist across days; never reset at midnight)
         # Built from real homePowerWatts inverter readings, one reading per Modbus poll.
@@ -2133,6 +2143,12 @@ class Plugin(indigo.PluginBase):
             hourly_mon = _hourly(_mon_scale)
             hourly_sat = _hourly(_sat_scale)
             hourly_sun = _hourly(_sun_scale)
+            # 5.118.0: a Sunday's own pattern once enough Sundays are measured,
+            # carrying the same Sunday total as before.
+            _sun_48 = self._sunday_profile() if hasattr(self, "store") else []
+            if len(_sun_48) == 48:
+                hourly_sun = {str(h): round(_sun_48[2 * h] + _sun_48[2 * h + 1], 4)
+                              for h in range(24)}
             hourly_wd  = _blend(hourly_mon, hourly_tf, 1.0, 4.0)   # Mon-Fri, legacy
             hourly_we  = _blend(hourly_sat, hourly_sun)            # Sat-Sun, legacy
             consumption_block = {
@@ -5055,6 +5071,7 @@ class Plugin(indigo.PluginBase):
             forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
             dawn_times              = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile     = self.store.get("consumption_profile", []),
+            sunday_consumption_profile = self._sunday_profile(sunday_pref),
             now                     = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             # v5.65.0: the control path's own factor. Falls back to biasFactor and
@@ -6235,7 +6252,8 @@ class Plugin(indigo.PluginBase):
         house = None
         try:
             house = _flux_strategy.HalfHourProfile(
-                self.store.get("consumption_profile", []), tz)
+                self.store.get("consumption_profile", []), tz,
+                sunday_slots=self._sunday_profile() or None)
         except (ValueError, TypeError):
             house = None
         soc = (self.latest_inverter_data or {}).get("batterySoc")
@@ -8366,8 +8384,95 @@ class Plugin(indigo.PluginBase):
     def _refresh_consumption_profile(self, force=False):
         # v5.45.0: reads the profile accumulators + writes the store — locked
         # (no network; the accumulators are fed by the locked modbus merge).
+        # 5.118.0: the Sunday shape is measured first and OUTSIDE the lock — it
+        # reads two files and touches nothing the modbus merge writes.
+        self._refresh_sunday_shape()
         with self._state_lock:
             return self._refresh_consumption_profile_impl(force=force)
+
+    def _refresh_sunday_shape(self):
+        """Measure when in the day a Sunday's load falls, and keep it in the store.
+
+        store["sunday_shape"] is 48 fractions summing to 1, or [] while fewer than
+        SUNDAY_SHAPE_MIN_DAYS usable Sundays exist. Only Sundays daily_history.json
+        accepts as whole days are used (the rule the day uplift already applies),
+        and only inside DAY_UPLIFT_WINDOW_DAYS. See sunday_shape.py for why the
+        half-hourly records and not the rolling window.
+        """
+        shape, used = None, 0
+        try:
+            today  = datetime.now().date()
+            cutoff = today - timedelta(days=DAY_UPLIFT_WINDOW_DAYS)
+            with open(os.path.join(self.data_dir, "daily_history.json"),
+                      "r", encoding="utf-8") as fh:
+                records = json.load(fh) or []
+            dates = set()
+            for r in records:
+                try:
+                    d = date.fromisoformat(str(r.get("date") or ""))
+                    h = float(r.get("home_kwh") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if cutoff <= d < today and d.weekday() == 6 \
+                        and not r.get("energy_partial") and h >= 2.0:
+                    dates.add(d)
+            db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+            rows = []
+            if dates and os.path.exists(db_path):
+                con = sqlite3.connect(db_path, timeout=5.0)
+                try:
+                    rows = con.execute(
+                        "SELECT slot_start, slot_end, home_kwh FROM halfhourly "
+                        "WHERE slot_start >= ? AND slot_start < ?",
+                        (cutoff.isoformat(), today.isoformat())).fetchall()
+                finally:
+                    con.close()
+            shape, used = _sunday_shape.sunday_shape(
+                rows, dates, _london_tz(), SUNDAY_SHAPE_MIN_DAYS)
+        except Exception as exc:                                    # noqa: BLE001
+            self.logger.warning(f"[Profile] Could not measure the Sunday shape: {exc}")
+            return
+        shape = [round(f, 6) for f in shape] if shape else []
+        changed = bool(shape) != bool(self.store.get("sunday_shape"))
+        self.store["sunday_shape"]      = shape
+        self.store["sunday_shape_days"] = used
+        if changed:
+            if shape:
+                afternoon = sum(shape[26:34])            # 1pm to 5pm
+                log(f"[Profile] Sundays now have their own daily pattern, measured "
+                    f"from {used} Sundays: {afternoon * 100:.0f}% of a Sunday's "
+                    f"electricity goes between 1pm and 5pm, against "
+                    f"{8 / 48 * 100:.0f}% if it were spread evenly")
+            else:
+                log(f"[Profile] Sundays use the everyday pattern — only {used} "
+                    f"whole Sundays recorded, {SUNDAY_SHAPE_MIN_DAYS} needed")
+
+    def _sunday_profile(self, level_kwh=None):
+        """48 kWh figures for a Sunday, or [] when the blended curve should serve.
+
+        The shape comes from _refresh_sunday_shape; the level is the Sunday figure
+        the manager already plans with (profile total x the measured Sunday scale),
+        unless the caller passes one. [] while the house is empty — an uplift and
+        a shape both model people at home — and while the base profile is too
+        thin to trust, the same 5 kWh floor _build_manager_snapshot applies.
+        """
+        shape   = self.store.get("sunday_shape") or []
+        profile = self.store.get("consumption_profile", []) or []
+        if len(shape) != 48 or len(profile) != 48 or self.store.get("away_active"):
+            return []
+        live_daily = sum(profile)
+        if live_daily < 5.0:
+            return []
+        if level_kwh is None:
+            mon_u, sat_u, sun_u = self._measured_day_uplifts()
+            level_kwh = live_daily * _need_scales(mon_u, sat_u, sun_u)[3]
+        try:
+            level_kwh = float(level_kwh)
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(level_kwh) or level_kwh <= 0.0:
+            return []
+        return _sunday_shape.scaled(shape, level_kwh)
 
     def _refresh_consumption_profile_impl(self, force=False):
         """Rebuild 48-slot consumption profile from accumulated inverter readings.
@@ -13652,7 +13757,8 @@ class Plugin(indigo.PluginBase):
         house = None
         try:
             house = _flux_strategy.HalfHourProfile(
-                self.store.get("consumption_profile", []), tz)
+                self.store.get("consumption_profile", []), tz,
+                sunday_slots=self._sunday_profile() or None)
         except (ValueError, TypeError) as exc:
             self.logger.debug(f"[Flux] no usable consumption profile: {exc}")
 

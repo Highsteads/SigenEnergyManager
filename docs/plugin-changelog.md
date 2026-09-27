@@ -21,6 +21,37 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.118.0 — 27-09-2026
+
+**A Sunday's own half-hourly shape.** CliveS: the roast, both microwaves and the wash put a
+Sunday's load in the afternoon. The planning profile is ONE 48-slot curve blended over every day;
+the four day types (5.104.0/5.105.0) only ever set the daily TOTAL. Measured over 18 Sundays to
+20-Sep-2026: 2pm-5pm about 1.3-1.4 kWh an hour against 0.9 on the blend, the late morning lighter.
+
+- **New pure module `sunday_shape.py`.** `sunday_shape(rows, dates, tz, min_days)` returns 48
+  fractions summing to 1 (or None) from `energy_timeseries.db` `halfhourly` rows. Rows carry no
+  fixed phase, so each is shared across the local half-hours it overlaps. A Sunday is used only if
+  `daily_history.json` accepts it (not `energy_partial`, >= 2 kWh), the rows cover 90% of it, and
+  it is not a clock-change day. Each Sunday is weighted equally as a shape; 1-2-1 smoothing.
+- **Why these records, not the rolling window.** `home_profile_days` began 13-Sep-2026 and holds
+  two Sundays; `halfhourly` goes back to May and is the counter the 13-Sep audit trusted.
+- **Shape only, level unchanged.** `_sunday_profile(level)` scales the shape to the profile total x
+  the measured Sunday scale (`_need_scales()[3]`), the figure `needTodayKwh` already used; the
+  snapshot passes `sunday_pref`, so a user's Sunday override still wins. [] while away, with no
+  shape, or on a base profile under 5 kWh.
+- **Readers.** `HalfHourProfile(..., sunday_slots=)` picks the Sunday curve per instant by LOCAL
+  weekday, so a walk from Saturday night changes curve at midnight; an unusable Sunday curve is
+  dropped, never fatal. Both call sites pass it (Flux planner, Happy Hour booking).
+  `ManagerSnapshot.sunday_consumption_profile`; `profile_for_weekday()` owns the curve-for-a-day
+  mapping beside `need_for_weekday()`; `_estimate_consumption_until(..., sunday_profile)` at all
+  six call sites; the three "today" slices go through `profile_for_weekday`. `sigen_site_config.json`
+  `hourly_kwh.sunday` uses it too.
+- `_refresh_sunday_shape()` runs at the start of every `_refresh_consumption_profile`, outside the
+  state lock. `SUNDAY_SHAPE_MIN_DAYS = 6` over `DAY_UPLIFT_WINDOW_DAYS` (126).
+- Tests: `test_sunday_shape.py` (33), including AST guards that every estimate call passes the
+  Sunday curve, no reader slices `consumption_profile` directly, both `HalfHourProfile` sites pass
+  `sunday_slots`, and the snapshot is given it. Mutation-swept: six mutations, all caught.
+
 ## v5.117.0 — 27-09-2026
 
 **Faults found while writing the plain-English guide.** No control decision changes.

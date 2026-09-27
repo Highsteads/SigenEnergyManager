@@ -364,30 +364,51 @@ def next_boundary(now, tz):
 # Energy series — walk UTC, index local
 # ================================================================
 
-class HalfHourProfile:
-    """48 half-hourly kWh figures, indexed by LOCAL half-hour."""
+def _profile_slots(slots, scale, what):
+    raw = list(slots or [])
+    if len(raw) != 48:
+        raise ValueError(f"{what} must have 48 slots, got {len(raw)}")
+    out = []
+    for i, s in enumerate(raw):
+        if isinstance(s, bool) or not isinstance(s, (int, float)) \
+                or not math.isfinite(float(s)) or float(s) < 0:
+            raise ValueError(f"{what} slot {i} is not a usable kWh value")
+        out.append(float(s) * float(scale))
+    if sum(out) <= 0.0:
+        raise ValueError(f"{what} is empty")
+    return tuple(out)
 
-    def __init__(self, slots, tz, scale=1.0):
+
+class HalfHourProfile:
+    """48 half-hourly kWh figures, indexed by LOCAL half-hour.
+
+    `sunday_slots` (5.118.0) is a second 48 used for any instant that falls on a
+    local Sunday: the roast, the microwaves and the wash put a Sunday's load in
+    the afternoon, where the blended curve spreads it through the day. It is
+    chosen per instant, so a walk from Saturday night into Sunday changes curve
+    at midnight. Left out, every day uses `slots`, exactly as before.
+    """
+
+    def __init__(self, slots, tz, scale=1.0, sunday_slots=None):
         if tz is None:
             raise ValueError("a local timezone is required")
-        raw = list(slots or [])
-        if len(raw) != 48:
-            raise ValueError(f"consumption profile must have 48 slots, got {len(raw)}")
-        out = []
-        for i, s in enumerate(raw):
-            if isinstance(s, bool) or not isinstance(s, (int, float)) \
-                    or not math.isfinite(float(s)) or float(s) < 0:
-                raise ValueError(f"consumption profile slot {i} is not a usable kWh value")
-            out.append(float(s) * float(scale))
-        if sum(out) <= 0.0:
-            raise ValueError("consumption profile is empty")
-        self.slots = tuple(out)
-        self.tz    = tz
+        self.slots = _profile_slots(slots, scale, "consumption profile")
+        # A Sunday curve that is unusable is dropped rather than refused: the
+        # blended curve is a complete answer on its own, and a bad Sunday figure
+        # must not take the whole planner down with it.
+        try:
+            self.sunday_slots = (_profile_slots(sunday_slots, scale, "Sunday profile")
+                                 if sunday_slots else None)
+        except ValueError:
+            self.sunday_slots = None
+        self.tz = tz
 
     def _rate_kwh_per_hour(self, instant):
         local = instant.astimezone(self.tz)
         idx   = (local.hour * 2) + (1 if local.minute >= 30 else 0)
-        return self.slots[idx] * 2.0      # a half-hour figure is kWh per half hour
+        slots = (self.sunday_slots if self.sunday_slots is not None
+                 and local.weekday() == 6 else self.slots)
+        return slots[idx] * 2.0           # a half-hour figure is kWh per half hour
 
     def _next_edge(self, instant):
         """Next real half-hour; UK local boundaries align with UTC half-hours."""

@@ -31,7 +31,9 @@ The pages that follow explain each one.
 
 ## What your house uses
 
-The plugin learns what your house uses in each half hour of the day, from the inverter's own readings, and keeps four patterns: Monday, Tuesday to Friday, Saturday and Sunday, because those days are rarely alike. It plans from the last nine weeks, so the patterns follow the seasons and a change in the way you live works through in a few weeks.
+The plugin learns what your house uses in each half hour of the day, from the inverter's own readings over the last nine weeks, so the pattern follows the seasons and a change in the way you live works through in a few weeks. It also works out a separate daily total for Monday, Tuesday to Friday, Saturday and Sunday, because those days are rarely alike.
+
+Sunday gets a pattern of its own as well, because a roast and the week's wash put its use in the afternoon. The plugin measures it from the last 18 Sundays, keeps the Sunday total as it was, and only moves the use to the time of day it really happens. Until six whole Sundays have been recorded, Sundays use the everyday pattern.
 
 Until it has learnt enough, it uses the four daily figures in its settings — **Weekday**, **Monday**, **Saturday** and **Sunday daily consumption**. If you change one of them by more than 1 kWh from its starting value, the plugin takes that as you meaning it, and uses your figure for that day instead of its own.
 
