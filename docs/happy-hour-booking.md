@@ -1,3 +1,9 @@
+---
+title: Weekend Happy Hour booking
+parent: Technical notes
+nav_order: 2
+---
+
 # Weekend Happy Hour booking (v5.112.0)
 
 Status: **built 22-Sep-2026**, on CliveS's go-ahead the same evening. Extends the Happy Hour

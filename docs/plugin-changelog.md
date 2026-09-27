@@ -1,3 +1,9 @@
+---
+title: Developer changelog
+parent: Technical notes
+nav_order: 3
+---
+
 # SigenEnergyManager — developer changelog
 
 The technical history, moved out of `plugin.py` on 25-Aug-2026. It had reached **2,002
@@ -8,8 +14,8 @@ Nothing was lost in the move: the parsed AST of `plugin.py` is byte-identical ei
 of it, because only comments were taken out.
 
 This is the *developer* record — what changed inside, why, and what it broke. The
-user-facing version history is the table in [README.md](../README.md), and that stays the
-one users read.
+user-facing version history, in plain words, is [Version history](changelog.md), with the
+newest few also under What's new in the README.
 
 New entries go at the top, as they were kept in the file.
 

@@ -1,3 +1,9 @@
+---
+title: Flux controller
+parent: Technical notes
+nav_order: 1
+---
+
 # Flux controller — native Octopus Flux support
 
 Status: released in v5.110.0, **disabled by default** — two switches and a verified site import
@@ -138,7 +144,7 @@ python3 -m pytest tests/test_version_consistency.py -q
 
 At v5.109.0: 1784 tests, no failures, errors or skips; Ruff clean; every XML and the
 Info.plist parse. The deployment route and its blockers are in
-[flux-changeover-handover.md](flux-changeover-handover.md).
+`docs/flux-changeover-handover.md` in the plugin's own files (it is not published on this site).
 
 
 ## Commissioning record — 17 September 2026 (Claude, after Codex paused)
