@@ -45,8 +45,9 @@
 #              Claude Opus 5.5 (5.119.0 — Saturdays too; the half-hourly record is honest at midnight)
 #              Claude Opus 5.5 (5.119.1 — the day-pattern note is logged once, not on every restart)
 #              Claude Opus 5.5 (5.120.0 — Mondays get their own half-hourly pattern too)
+#              Claude Opus 5.5 (5.121.0 — Tuesday to Friday share one measured pattern; every day now has one)
 # Date:        27-09-2026
-# Version:     5.120.0
+# Version:     5.121.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -558,14 +559,20 @@ SUNDAY_UPLIFT_DEFAULT           = 1.05
 DAY_UPLIFT_WINDOW_DAYS          = 126   # 18 whole weeks
 DAY_UPLIFT_MIN_BASE_DAYS        = 20    # Tue-Fri days needed for a reference at all
 DAY_UPLIFT_MIN_DAYS             = 6     # of that particular day, before its own uplift is used
-# 5.118.0 (Sunday) / 5.119.0 (Saturday) / 5.120.0 (Monday): a weekday's own half-hourly SHAPE, from
-# the inverter's half-hourly records over the same 18 weeks as the uplift. The
-# level stays with the uplift; the shape only says when in the day it goes.
-SHAPED_WEEKDAYS                 = (0, 5, 6)  # Monday, Saturday, Sunday — Python weekday numbers
+# 5.118.0 (Sunday) / 5.119.0 (Saturday) / 5.120.0 (Monday) / 5.121.0 (Tue-Fri): each
+# day's own half-hourly SHAPE, from the inverter's half-hourly records over the
+# same 18 weeks as the uplift. The level stays with the uplift; the shape only
+# says when in the day it goes.
+# Days are shaped in GROUPS, and a group shares one shape measured from all its
+# days. Tuesday to Friday are one group because they are not distinguishable:
+# measured 27-Sep-2026, each sat 0.02 kWh an hour from the other three on
+# average, less than the 0.03 between two halves of its OWN history, so four
+# separate shapes would each learn a quarter of the data's noise.
+DAY_SHAPE_GROUPS                = ((0,), (1, 2, 3, 4), (5,), (6,))  # Python weekday numbers
+SHAPED_WEEKDAYS                 = tuple(sorted(wd for g in DAY_SHAPE_GROUPS for wd in g))
 # Each shaped day's level comes from its own _need_scales() entry, which returns
-# (tuefri, monday, saturday, sunday). Tue-Fri is the reference the blended curve
-# already serves, so it has no shape of its own.
-_NEED_SCALE_INDEX               = {0: 1, 5: 2, 6: 3}
+# (tuefri, monday, saturday, sunday).
+_NEED_SCALE_INDEX               = {0: 1, 1: 0, 2: 0, 3: 0, 4: 0, 5: 2, 6: 3}
 DAY_SHAPE_MIN_DAYS              = 6       # whole, covered days of that weekday before its shape is used
 _WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday")
@@ -1421,6 +1428,14 @@ def _snapshot_in_window(rec, event, slack_mins=15):
     return -slack <= elapsed <= duration_hrs * 3600.0 + slack
 
 
+def _day_group_words(group):
+    """("Tuesdays to Fridays", "of those days") / ("Mondays", "Mondays") for a log line."""
+    names = [_WEEKDAY_NAMES[wd] + "s" for wd in group]
+    if len(names) == 1:
+        return names[0], names[0]
+    return f"{names[0]} to {names[-1]}", "of those days"
+
+
 def _clock_words(dt):
     """6pm, 6:30pm, midday, midnight: a time as a person says it."""
     if dt.hour == 12 and dt.minute == 0:
@@ -1861,7 +1876,7 @@ class Plugin(indigo.PluginBase):
 
         # Consumption profile (48 slots)
         self.store["consumption_profile"] = []
-        # 5.118.0/5.119.0: {weekday: 48 fractions} for each SHAPED_WEEKDAYS day
+        # 5.118.0-5.121.0: {weekday: 48 fractions} for each SHAPED_WEEKDAYS day
         # that has enough measured days, and {weekday: days used} — see
         # _refresh_day_shapes.
         self.store["day_shapes"]     = {}
@@ -2163,6 +2178,9 @@ class Plugin(indigo.PluginBase):
             # 5.118.0/5.119.0: a weekday's own pattern once enough of that day
             # are measured, carrying the same day total as before.
             _days_48 = self._day_profiles() if hasattr(self, "store") else {}
+            if len(_days_48.get(1) or []) == 48:
+                hourly_tf = {str(h): round(_days_48[1][2 * h] + _days_48[1][2 * h + 1], 4)
+                             for h in range(24)}
             if len(_days_48.get(0) or []) == 48:
                 hourly_mon = {str(h): round(_days_48[0][2 * h] + _days_48[0][2 * h + 1], 4)
                               for h in range(24)}
@@ -5095,7 +5113,8 @@ class Plugin(indigo.PluginBase):
             dawn_times              = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile     = self.store.get("consumption_profile", []),
             day_profiles            = self._day_profiles(
-                {0: monday_pref, 5: saturday_pref, 6: sunday_pref}),
+                {0: monday_pref, 1: weekday_pref, 2: weekday_pref, 3: weekday_pref,
+                 4: weekday_pref, 5: saturday_pref, 6: sunday_pref}),
             now                     = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             # v5.65.0: the control path's own factor. Falls back to biasFactor and
@@ -8456,35 +8475,40 @@ class Plugin(indigo.PluginBase):
                 finally:
                     con.close()
             shapes, used = {}, {}
-            for wd in SHAPED_WEEKDAYS:
-                shape, n = _day_shape.day_shape(rows, dates, wd, _london_tz(),
+            for group in DAY_SHAPE_GROUPS:
+                shape, n = _day_shape.day_shape(rows, dates, group, _london_tz(),
                                                 DAY_SHAPE_MIN_DAYS)
-                used[wd] = n
-                if shape:
-                    shapes[wd] = [round(f, 6) for f in shape]
+                for wd in group:
+                    used[wd] = n
+                    if shape:
+                        shapes[wd] = [round(f, 6) for f in shape]
         except Exception as exc:                                    # noqa: BLE001
-            self.logger.warning(f"[Profile] Could not measure the weekend day patterns: {exc}")
+            self.logger.warning(f"[Profile] Could not measure the day patterns: {exc}")
             return
         self.store["day_shapes"]     = shapes
         self.store["day_shape_days"] = used
         announced = set(self.store.get("day_shapes_announced") or [])
         changed   = False
-        for wd in SHAPED_WEEKDAYS:
-            if (wd in shapes) == (wd in announced):
+        for group in DAY_SHAPE_GROUPS:
+            wd = group[0]
+            if all((d in shapes) == (d in announced) for d in group):
                 continue
             changed = True
-            announced.symmetric_difference_update({wd})
-            name = _WEEKDAY_NAMES[wd]
+            if wd in shapes:
+                announced.update(group)
+            else:
+                announced.difference_update(group)
+            name, noun = _day_group_words(group)
             if wd in shapes:
                 peak = max(range(24), key=lambda h: shapes[wd][2 * h] + shapes[wd][2 * h + 1])
                 share = shapes[wd][2 * peak] + shapes[wd][2 * peak + 1]
-                log(f"[Profile] {name}s now have their own daily pattern, measured from "
-                    f"{used[wd]} {name}s. The busiest hour starts at "
+                log(f"[Profile] {name} now have their own daily pattern, measured from "
+                    f"{used[wd]} {noun}. The busiest hour starts at "
                     f"{_clock_words(datetime(2000, 1, 1, peak))}, with {share * 100:.0f}% of the day's "
                     f"electricity, against {100 / 24:.0f}% if it were spread evenly")
             else:
-                log(f"[Profile] {name}s use the everyday pattern again: only "
-                    f"{used[wd]} whole {name}s recorded, {DAY_SHAPE_MIN_DAYS} needed")
+                log(f"[Profile] {name} use the everyday pattern again: only "
+                    f"{used[wd]} whole {noun} recorded, {DAY_SHAPE_MIN_DAYS} needed")
         if changed:
             self.store["day_shapes_announced"] = sorted(announced)
             try:

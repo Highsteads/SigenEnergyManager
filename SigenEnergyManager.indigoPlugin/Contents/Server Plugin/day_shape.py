@@ -7,10 +7,12 @@
 #              the day that weekday's energy goes.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        27-09-2026 11:40 BST
-# Version:     2.1 (SigenEnergyManager 5.120.0)
+# Version:     3.0 (SigenEnergyManager 5.121.0)
 #
 # History
 #   1.0 (5.118.0) sunday_shape.py — Sundays only.
+#   3.0 (5.121.0) `weekday` may be a group of weekdays measured as one shape
+#       (Tuesday to Friday, which do not differ from each other beyond noise).
 #   2.1 (5.120.0) Monday shaped too (plugin.SHAPED_WEEKDAYS); no change here.
 #   2.0 (5.119.0) any weekday (Saturday added); the midnight row of the old
 #       recorder read at its true start; a zero row read as missing, not as
@@ -142,7 +144,8 @@ def _smooth(values):
 
 
 def day_shape(rows, dates, weekday, tz=None, min_days=6):
-    """(fractions[48] or None, days_used) for one Python weekday (Mon=0 .. Sun=6).
+    """(fractions[48] or None, days_used) for one Python weekday (Mon=0 .. Sun=6),
+    or for a group of them given as a collection, measured together as one shape.
 
     `dates` is the set of days the caller accepts — whole days, the house
     occupied, inside its window. Of those, a day is used only if it falls on
@@ -161,13 +164,14 @@ def day_shape(rows, dates, weekday, tz=None, min_days=6):
     day was never recorded on any of them: the caller keeps the blended curve,
     which is what it had before.
     """
+    weekdays = {weekday} if isinstance(weekday, int) else {int(w) for w in weekday}
     by_day = split_into_days(rows)
     wanted = set(dates or ())
     weighted = [0.0] * SLOTS
     weights  = [0.0] * SLOTS
     used     = 0
     for day, (energy, covered) in by_day.items():
-        if day not in wanted or day.weekday() != weekday:
+        if day not in wanted or day.weekday() not in weekdays:
             continue
         if not _is_24_hour_day(day, tz):
             continue

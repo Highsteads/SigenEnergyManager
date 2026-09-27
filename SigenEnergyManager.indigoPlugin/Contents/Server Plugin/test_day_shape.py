@@ -285,6 +285,18 @@ class TestManagerSundays(unittest.TestCase):
 
 class TestOtherWeekdaysAndOldRows(unittest.TestCase):
 
+    def test_a_group_is_measured_as_one_shape(self):
+        weds = [d - timedelta(days=4) for d in _sundays(3)]
+        thus = [d - timedelta(days=3) for d in _sundays(3)]
+        rows = []
+        for d in weds + thus:
+            rows += _day_rows(d, _roast_day())
+        alone, n_alone = ss.day_shape(rows, set(weds + thus), 2, LONDON)
+        group, n_group = ss.day_shape(rows, set(weds + thus), (1, 2, 3, 4), LONDON)
+        self.assertIsNone(alone)
+        self.assertEqual((n_alone, n_group), (3, 6))
+        self.assertAlmostEqual(sum(group), 1.0)
+
     def test_saturday_gets_its_own_shape_from_saturdays_only(self):
         sats  = [d - timedelta(days=1) for d in _sundays(8)]
         suns  = _sundays(8)
@@ -412,7 +424,8 @@ class TestPluginWiring(unittest.TestCase):
         self.p._refresh_day_shapes()
         shapes = self.p.store["day_shapes"]
         self.assertEqual(sorted(shapes), [5, 6])
-        self.assertEqual(self.p.store["day_shape_days"], {0: 0, 5: 7, 6: 8})
+        self.assertEqual(self.p.store["day_shape_days"],
+                         {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 7, 6: 8})
         self.assertGreater(sum(shapes[6][28:32]), 0.2)
         self.assertGreater(sum(shapes[5][20:26]), 0.25)
 
@@ -473,10 +486,22 @@ class TestPluginWiring(unittest.TestCase):
         self.assertEqual(sorted(self.p.store["day_shapes"]), [6])
         self.assertEqual(self.p.store["day_shape_days"][5], 3)
 
-    def test_weekdays_are_never_shaped(self):
-        self._write_history([(d, _roast_day()) for d in self._recent(2, 10)])
-        self.p._refresh_day_shapes()
-        self.assertEqual(self.p.store["day_shapes"], {})
+    def test_tuesday_to_friday_share_one_shape_from_all_four(self):
+        evening = [0.4 + (0.6 if 34 <= i < 40 else 0.0) for i in range(48)]
+        # Three Wednesdays and three Thursdays: neither day has six on its own,
+        # but the group does.
+        self._write_history([(d, evening) for d in self._recent(2, 3)]
+                            + [(d, evening) for d in self._recent(3, 3)])
+        with unittest.mock.patch.object(plugin, "log") as log:
+            self.p._refresh_day_shapes()
+        shapes = self.p.store["day_shapes"]
+        self.assertEqual(sorted(shapes), [1, 2, 3, 4])
+        self.assertTrue(shapes[1] == shapes[2] == shapes[3] == shapes[4])
+        self.assertEqual(self.p.store["day_shape_days"][4], 6)
+        self.assertEqual(log.call_count, 1)
+        self.assertIn("Tuesdays to Fridays now have their own daily pattern, measured "
+                      "from 6 of those days", log.call_args[0][0])
+        self.assertEqual(self.p.store["day_shapes_announced"], [1, 2, 3, 4])
 
     def test_refresh_without_files_warns_and_keeps_what_it_had(self):
         self.p.store["day_shapes"] = {6: [1 / 48.0] * 48}
@@ -527,11 +552,24 @@ class TestPluginWiring(unittest.TestCase):
         levels = found[0].value.args[0]
         self.assertIsInstance(levels, ast.Dict)
         names = {k.value: v.id for k, v in zip(levels.keys, levels.values)}
-        self.assertEqual(names, {0: "monday_pref", 5: "saturday_pref", 6: "sunday_pref"})
+        self.assertEqual(names, {0: "monday_pref", 1: "weekday_pref", 2: "weekday_pref",
+                                 3: "weekday_pref", 4: "weekday_pref",
+                                 5: "saturday_pref", 6: "sunday_pref"})
         self.assertEqual(set(names), set(plugin.SHAPED_WEEKDAYS))
 
     def test_every_shaped_day_has_its_own_level(self):
         self.assertEqual(set(plugin._NEED_SCALE_INDEX), set(plugin.SHAPED_WEEKDAYS))
+
+    def test_each_weekday_is_in_exactly_one_group(self):
+        seen = [wd for g in plugin.DAY_SHAPE_GROUPS for wd in g]
+        self.assertEqual(sorted(seen), list(range(7)))
+
+    def test_the_weekday_levels_come_from_the_tue_fri_scale(self):
+        self.p.store["day_shapes"] = {wd: [1 / 48.0] * 48 for wd in range(7)}
+        scales = plugin._need_scales(1.06, 1.2, 1.1)
+        got = self.p._day_profiles()
+        for wd in (1, 2, 3, 4):
+            self.assertAlmostEqual(sum(got[wd]), sum(FLAT) * scales[0], places=2)
 
     def test_the_refresh_measures_the_day_shapes_first(self):
         fn = next(n for n in ast.walk(_source_tree()) if isinstance(n, ast.FunctionDef)

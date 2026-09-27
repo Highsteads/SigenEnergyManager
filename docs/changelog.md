@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.121.0 — 27 September 2026
+
+- **Tuesday to Friday now have a pattern of use measured from those days alone.** Until now they used the everyday pattern, which is an average over the whole week and so carried some of the weekend's busy mornings and afternoons. Here a Tuesday to Friday uses about 0.8 kWh an hour from 10am to 1pm where the everyday pattern said 0.9 to 1.0, and about 1.0 kWh an hour at 5pm, 8pm and 10pm where it said 0.8 to 0.9. The total for those days does not change.
+- **The four days share one pattern.** They were measured separately first, and they differ from each other by less than each day differs from itself from one week to the next, so four patterns would each learn mostly noise. Measured together they draw on about 63 days.
+- Every day of the week now plans with its own measured pattern. The everyday pattern is still used for any day that has not had six whole examples recorded.
+
 ## 5.120.0 — 27 September 2026
 
 - **Mondays now have their own pattern of use too**, measured from the last 18 Mondays in the same way as Saturday and Sunday. The difference is smaller than at the weekend: here a Monday uses about 1.1 kWh an hour between 5pm and 8pm where the everyday pattern says 0.9, which matters because 4pm to 7pm is the Flux peak. The total for a Monday does not change.

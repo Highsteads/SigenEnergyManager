@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.120.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.121.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.121.0** — Tuesday to Friday now share a pattern of use measured from those days alone, so every day of the week is planned from how it really runs. The four days are too alike to tell apart, so they are measured together.
+
 **v5.120.0** — Mondays now have their own pattern of use too, alongside Saturday and Sunday. Here a Monday uses a little more between 5pm and 8pm than the everyday pattern says, which falls in the Flux peak.
 
 **v5.119.1** — The Event Log line saying a day has its own pattern of use now appears once, not after every restart.
@@ -72,6 +74,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.121.0 | 27 September 2026 | Tuesday to Friday get a measured pattern |
 | 5.120.0 | 27 September 2026 | Mondays get their own pattern too |
 | 5.119.1 | 27 September 2026 | Day-pattern note logged once |
 | 5.119.0 | 27 September 2026 | Saturdays get their own pattern too; honest midnight record |

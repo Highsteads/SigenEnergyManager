@@ -21,6 +21,24 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.121.0 — 27-09-2026
+
+- **Tuesday to Friday shaped, as ONE group.** `DAY_SHAPE_GROUPS = ((0,), (1, 2, 3, 4), (5,), (6,))`;
+  `SHAPED_WEEKDAYS` is derived from it; `_NEED_SCALE_INDEX` gives 1-4 the Tue-Fri scale [0];
+  `day_shape()` (3.0) accepts a collection of weekdays and measures them as one shape. Each
+  member of a group is stored under its own weekday with the same shape; announcements are per
+  group ("Tuesdays to Fridays ... measured from 63 of those days").
+- **Why a group.** Measured 27-Sep-2026, each of Tue/Wed/Thu/Fri sat 0.019-0.021 kWh an hour
+  (mean absolute, per hour) from the four-day mean, against 0.026-0.034 between the two halves
+  of its own history. Separate shapes would be fitting noise.
+- Live: 63 days; 10am-1pm 0.81 / 0.82 / 0.81 kWh an hour against 0.92 / 1.02 / 0.99 on the blend
+  at the same total; 5pm 0.96 vs 0.84, 8pm 1.06 vs 0.93, 10pm 1.00 vs 0.88. The blend over-stated
+  weekday mornings because it carried the weekend's.
+- site_config `hourly_kwh.tuefri` (and the legacy `weekday` blend) uses it. **New test** that
+  every shaped day's published hours follow its shape: the four per-day overrides in
+  `_write_site_config` had no test since 5.118.0 (a mutation disabling any of them survived).
+  Six mutations this release, all caught.
+
 ## v5.120.0 — 27-09-2026
 
 - **Monday shaped.** `SHAPED_WEEKDAYS = (0, 5, 6)`. Each shaped day's level now comes from

@@ -706,10 +706,10 @@ class ManagerSnapshot:
 
     # Consumption profile: 48 half-hourly floats (kWh per slot)
     consumption_profile: List[float] = field(default_factory=list)
-    # 5.118.0-5.120.0: a weekday's own 48, keyed by Python weekday (Mon=0,
-    # Sat=5, Sun=6), for the days that have been measured — a Saturday's load
-    # falls in the late morning, a Sunday's in the afternoon, a Monday's a little
-    # more in the early evening. A day absent here uses
+    # 5.118.0-5.121.0: a weekday's own 48, keyed by Python weekday (Mon=0 ..
+    # Sun=6), for the days that have been measured — a Saturday's load falls in
+    # the late morning, a Sunday's in the afternoon, a Monday's a little more in
+    # the early evening; Tuesday to Friday share one curve. A day absent here uses
     # consumption_profile. Read through profile_for_weekday() / the day_profiles
     # argument, never by indexing it directly.
     day_profiles: Dict[int, List[float]] = field(default_factory=dict)

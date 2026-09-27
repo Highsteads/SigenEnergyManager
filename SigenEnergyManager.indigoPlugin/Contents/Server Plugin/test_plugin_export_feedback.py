@@ -371,6 +371,25 @@ class TestSiteConfigPublishesTheManagersFigures(_Tmp):
         p.store["day_uplift_date"] = D1
         return p
 
+    def test_each_shaped_day_publishes_its_own_pattern(self):
+        """5.118.0-5.121.0: a day with its own shape publishes that shape, at the
+        same total as before — the optimiser script plans from these hours."""
+        def at(slot):
+            shape = [0.0] * 48
+            shape[slot] = 1.0
+            return shape
+        p = self._plugin()
+        p.store["away_active"] = False
+        p.store["day_shapes"] = {0: at(34), 1: at(20), 2: at(20), 3: at(20), 4: at(20),
+                                 5: at(22), 6: at(30)}
+        cons = self._write(p)
+        wd, mon, sat, sun = plugin._need_scales(1.06, 1.18, 1.05)
+        for key, slot, scale in (("monday", 34, mon), ("tuefri", 20, wd),
+                                 ("saturday", 22, sat), ("sunday", 30, sun)):
+            hours = cons["hourly_kwh"][key]
+            self.assertAlmostEqual(hours[str(slot // 2)], 24.0 * scale, places=1, msg=key)
+            self.assertAlmostEqual(sum(hours.values()), 24.0 * scale, places=1, msg=key)
+
     def test_profile_is_split_with_the_same_scales_the_manager_uses(self):
         cons = self._write(self._plugin())
         wd, mon, sat, sun = plugin._need_scales(1.06, 1.18, 1.05)
