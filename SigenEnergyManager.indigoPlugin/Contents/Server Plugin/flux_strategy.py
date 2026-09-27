@@ -382,32 +382,35 @@ def _profile_slots(slots, scale, what):
 class HalfHourProfile:
     """48 half-hourly kWh figures, indexed by LOCAL half-hour.
 
-    `sunday_slots` (5.118.0) is a second 48 used for any instant that falls on a
-    local Sunday: the roast, the microwaves and the wash put a Sunday's load in
-    the afternoon, where the blended curve spreads it through the day. It is
-    chosen per instant, so a walk from Saturday night into Sunday changes curve
-    at midnight. Left out, every day uses `slots`, exactly as before.
+    `day_slots` (5.118.0 Sunday, 5.119.0 any weekday) maps a Python weekday
+    (Mon=0 .. Sun=6) to its own 48, used for any instant that falls on that
+    local weekday: a Saturday's wash and cooking land in the late morning, a
+    Sunday's roast in the afternoon, where the blended curve spreads both through
+    the day. Chosen per instant, so a walk from Friday night into Saturday changes
+    curve at midnight. Left out, every day uses `slots`, exactly as before.
     """
 
-    def __init__(self, slots, tz, scale=1.0, sunday_slots=None):
+    def __init__(self, slots, tz, scale=1.0, day_slots=None):
         if tz is None:
             raise ValueError("a local timezone is required")
         self.slots = _profile_slots(slots, scale, "consumption profile")
-        # A Sunday curve that is unusable is dropped rather than refused: the
-        # blended curve is a complete answer on its own, and a bad Sunday figure
+        # A day curve that is unusable is dropped rather than refused: the
+        # blended curve is a complete answer on its own, and one bad day figure
         # must not take the whole planner down with it.
-        try:
-            self.sunday_slots = (_profile_slots(sunday_slots, scale, "Sunday profile")
-                                 if sunday_slots else None)
-        except ValueError:
-            self.sunday_slots = None
+        self.day_slots = {}
+        for weekday, day in (day_slots or {}).items():
+            try:
+                wd = int(weekday)
+                if 0 <= wd <= 6:
+                    self.day_slots[wd] = _profile_slots(day, scale, f"weekday {wd} profile")
+            except (TypeError, ValueError):
+                continue
         self.tz = tz
 
     def _rate_kwh_per_hour(self, instant):
         local = instant.astimezone(self.tz)
         idx   = (local.hour * 2) + (1 if local.minute >= 30 else 0)
-        slots = (self.sunday_slots if self.sunday_slots is not None
-                 and local.weekday() == 6 else self.slots)
+        slots = self.day_slots.get(local.weekday(), self.slots)
         return slots[idx] * 2.0           # a half-hour figure is kWh per half hour
 
     def _next_edge(self, instant):

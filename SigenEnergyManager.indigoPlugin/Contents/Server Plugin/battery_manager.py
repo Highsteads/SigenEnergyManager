@@ -216,14 +216,22 @@ def profile_for_weekday(snapshot, weekday_index):
     """The 48-slot profile for a Python weekday index (Mon=0 .. Sun=6).
 
     The single owner of "which curve belongs to which day" (5.118.0), beside
-    need_for_weekday() which owns "which total". A Sunday gets its own curve
-    when one has been measured; every other day, and a Sunday without one,
-    gets the blended curve.
+    need_for_weekday() which owns "which total". A day with a measured curve of
+    its own gets it; every other day gets the blended curve.
     """
-    sunday = getattr(snapshot, "sunday_consumption_profile", None) or []
-    if weekday_index == 6 and len(sunday) == 48:
-        return sunday
-    return snapshot.consumption_profile
+    day = _day_curve(getattr(snapshot, "day_profiles", None), weekday_index)
+    return day if day is not None else snapshot.consumption_profile
+
+
+def _day_curve(day_profiles, weekday_index):
+    """A usable 48-slot curve for this weekday from `day_profiles`, or None."""
+    try:
+        day = (day_profiles or {}).get(weekday_index)
+    except AttributeError:
+        return None
+    if day is not None and len(day) == 48:
+        return day
+    return None
 
 
 def need_for_weekday(snapshot, weekday_index):
@@ -698,12 +706,12 @@ class ManagerSnapshot:
 
     # Consumption profile: 48 half-hourly floats (kWh per slot)
     consumption_profile: List[float] = field(default_factory=list)
-    # 5.118.0: the same 48 for a Sunday, when enough Sundays have been measured —
-    # the roast and the wash put a Sunday's load in the afternoon. Empty means
-    # "not known", and every reader then uses consumption_profile for Sundays too.
-    # Read through sunday_aware_profile() / the sunday_profile argument, never by
-    # indexing it directly.
-    sunday_consumption_profile: List[float] = field(default_factory=list)
+    # 5.118.0 / 5.119.0: a weekday's own 48, keyed by Python weekday (Sat=5,
+    # Sun=6), for the days that have been measured — a Saturday's load falls in
+    # the late morning, a Sunday's in the afternoon. A day absent here uses
+    # consumption_profile. Read through profile_for_weekday() / the day_profiles
+    # argument, never by indexing it directly.
+    day_profiles: Dict[int, List[float]] = field(default_factory=dict)
 
     # Current time
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -1497,7 +1505,7 @@ class BatteryManager:
         hours_to_dawn  = max(0.0, (dawn_dt - now).total_seconds() / 3600.0)
         overnight_kwh  = self._estimate_consumption_until(
             now, dawn_dt, snapshot.consumption_profile,
-            snapshot.sunday_consumption_profile
+            snapshot.day_profiles
         )
 
         # ── Daytime / dusk detection ────────────────────────────────────────
@@ -1603,7 +1611,7 @@ class BatteryManager:
             if dusk_dt is not None:
                 drain_dusk_to_dawn = self._estimate_consumption_until(
                     dusk_dt, dawn_dt, snapshot.consumption_profile,
-                    snapshot.sunday_consumption_profile
+                    snapshot.day_profiles
                 )
             else:
                 drain_dusk_to_dawn = overnight_kwh
@@ -1705,7 +1713,7 @@ class BatteryManager:
         now: datetime,
         target: datetime,
         profile: List[float],
-        sunday_profile: Optional[List[float]] = None,
+        day_profiles: Optional[Dict[int, List[float]]] = None,
     ) -> float:
         """Sum expected consumption from now until target using 48-slot profile.
 
@@ -1713,9 +1721,10 @@ class BatteryManager:
             now:            Current datetime
             target:         Target datetime (dawn / dusk)
             profile:        48-slot half-hourly profile (kWh per slot)
-            sunday_profile: 5.118.0 — the 48 slots for any half-hour that falls on
-                            a local Sunday. None or not 48 long: `profile` serves
-                            Sundays too, as it always did.
+            day_profiles:   5.118.0/5.119.0 — {weekday: 48 slots} for the days
+                            with a measured curve of their own, used for any
+                            half-hour that falls on that local weekday. A day
+                            absent or not 48 long uses `profile`, as it always did.
 
         Returns:
             Expected consumption in kWh
@@ -1747,9 +1756,7 @@ class BatteryManager:
                 local_cursor = self._to_local(cursor)
                 slot_idx   = local_cursor.hour * 2 + (1 if local_cursor.minute >= 30 else 0)
                 slot_idx   = max(0, min(47, slot_idx))
-                day_prof   = (sunday_profile if local_cursor.weekday() == 6
-                              and sunday_profile and len(sunday_profile) == 48
-                              else profile)
+                day_prof   = _day_curve(day_profiles, local_cursor.weekday()) or profile
                 total_kwh += day_prof[slot_idx] * fraction
 
             cursor = slot_end
@@ -1892,7 +1899,7 @@ class BatteryManager:
         floor_kwh = floor_pct / 100.0 * cap_kwh
         drain     = self._estimate_consumption_until(
             now, next_window_dt, snapshot.consumption_profile,
-            snapshot.sunday_consumption_profile)
+            snapshot.day_profiles)
         lasts     = (snapshot.current_soc_pct / 100.0 * cap_kwh) - drain >= floor_kwh
         window_words = _spoken_hm(cheap_start)
         reason = (f"Tomorrow is short by about {short_kwh:.0f} kWh, buying it in the "
@@ -1969,10 +1976,10 @@ class BatteryManager:
         floor_pct   = max(snapshot.health_cutoff_pct, snapshot.reserve_floor_pct)
         floor_kwh   = floor_pct / 100.0 * cap_kwh
         profile     = snapshot.consumption_profile
-        sunday      = snapshot.sunday_consumption_profile
+        days        = snapshot.day_profiles
         peak_need   = self._estimate_consumption_until(peak_start_dt, peak_end_dt,
-                                                       profile, sunday)
-        home_before = self._estimate_consumption_until(now, peak_start_dt, profile, sunday)
+                                                       profile, days)
+        home_before = self._estimate_consumption_until(now, peak_start_dt, profile, days)
         solar_before = self._forecast_solar_kwh(
             snapshot, self._to_local(now),
             self._to_local(peak_start_dt).replace(tzinfo=None))
@@ -2048,7 +2055,7 @@ class BatteryManager:
 
             drain_to_midnight   = self._estimate_consumption_until(
                 now, midnight_dt, snapshot.consumption_profile,
-                snapshot.sunday_consumption_profile
+                snapshot.day_profiles
             )
             soc_at_midnight_kwh = (snapshot.current_soc_pct / 100.0 * cap_kwh) - drain_to_midnight
 

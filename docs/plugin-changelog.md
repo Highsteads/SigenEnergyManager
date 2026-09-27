@@ -21,6 +21,39 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.119.0 — 27-09-2026
+
+**Saturday gets its own half-hourly shape; the half-hourly recorder is honest at midnight.**
+
+- **Generalised, not copied.** `sunday_shape.py` -> `day_shape.py` 2.0: `day_shape(rows, dates,
+  weekday, tz, min_days)`. `SHAPED_WEEKDAYS = (5, 6)`; `store["day_shapes"]` /
+  `["day_shape_days"]` keyed by Python weekday; `_refresh_day_shapes()`, `_day_profiles(levels)`
+  (level per day from `_need_scales`: Saturday [2], Sunday [3]; the snapshot passes
+  `{5: saturday_pref, 6: sunday_pref}`). `HalfHourProfile(day_slots={wd: 48})`,
+  `ManagerSnapshot.day_profiles`, `profile_for_weekday()` via `_day_curve()`,
+  `_estimate_consumption_until(..., day_profiles)`. site_config `hourly_kwh.saturday` too.
+  Live 27-Sep: 17 of 18 Saturdays, 10am-1pm 1.73 / 2.18 / 1.84 kWh an hour against 1.10 / 1.22 /
+  1.19 on the blend at the same total.
+- **Recorder fault, found measuring the shapes.** `_log_halfhourly_to_db_impl` labelled every
+  row `now - ENERGY_VAR_INTERVAL` while its energy is the delta since the anchor, and
+  `_check_midnight_impl` reset `last_energy_var` without writing — so each day's first row held
+  ~55 min (23:35-00:30) under a 00:00-00:30 label, and the old day's last half-hour was always
+  recorded in the new day. Now: `store["hh_anchor_at"]` records when the anchor was taken (seed
+  and every write) and becomes the row's `slot_start` (trusted when 0 < age <= 3 h, else the old
+  label); `_check_midnight_impl` calls `_log_halfhourly_to_db()` before the timer reset. Readers
+  keyed on the `slot_start` date (Evening_Report, band weighting, winter forecast) now see each
+  day's energy in that day.
+- **Reading the old rows.** `day_shape._true_spans`: a row labelled within 5 min after midnight
+  whose predecessor ended < 60 min before really began at that end. A 0.0 kWh row is dropped
+  after placing its end — before 5.89.0 the midnight row was always written as zero (daily
+  counter delta, clamped), so it was lost energy, not none. Each half-hour is read as a rate over
+  the time recorded, relative to that day's mean rate, weighted by recorded time: a restart gap
+  is not a quiet spell, and each day still counts once. None if any half-hour was never recorded.
+- Tests: `test_day_shape.py` (46, was `test_sunday_shape.py` 33) incl. recorder tests and an AST
+  check that midnight writes before it resets. Mutation-swept: nine mutations, eight caught; the
+  ninth (the weekday pre-filter in `_refresh_day_shapes`) is equivalent — `day_shape` filters by
+  weekday itself.
+
 ## v5.118.0 — 27-09-2026
 
 **A Sunday's own half-hourly shape.** CliveS: the roast, both microwaves and the wash put a

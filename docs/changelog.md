@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.119.0 — 27 September 2026
+
+- **Saturdays now have their own pattern of use too.** Over the last 18 Saturdays here, 10am to 1pm used between 1.7 and 2.2 kWh an hour where the everyday pattern said 1.1 to 1.2, and the afternoon less. The plugin plans Saturdays with that pattern now, as it has done for Sundays since 5.118.0. The total for a Saturday does not change.
+- **The half-hourly energy record is honest at midnight.** The plugin skipped a row at midnight, so the last half-hour of each day was written into the first row of the next, under a label that said it began at midnight. It now writes a row at midnight, and every row says when its energy really started. Before 5.89.0 that first row was written as nothing at all, and the patterns now ignore those rows rather than learning a quiet midnight that never happened.
+- A half-hour with some of its record missing, after a restart for instance, now counts at the rate it ran rather than as a quiet spell.
+
 ## 5.118.0 — 27 September 2026
 
 - **Sundays now have their own pattern of use through the day.** The plugin used one pattern for every day of the week, so a Sunday roast, the microwaves and the week's wash were spread across the whole day rather than planned for in the afternoon. Over the last 18 Sundays here, 2pm to 4pm used about 1.4 kWh an hour where the everyday pattern said 0.9, and the late morning less. The plugin now measures a Sunday's pattern from the inverter's own half-hourly records for the last 18 weeks, and uses it for the overnight charge, the Flux plan, the free Happy Hour bookings and the battery's own forecasts.
