@@ -21,6 +21,34 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.125.0 — 27-09-2026
+
+Measured on the first Happy Hour (27-Sep-2026 13:00-15:00): in Remote EMS 0x03 (Command
+Charging, grid first) at a 10 kW charge limit the inverter drew ~12.8 kW (house ~2.8 +
+battery ~10) and held PV at **0 W** for the whole window, the string voltages rising from
+~195/295 V to ~228/340 V (MPPT backed off to near open circuit), while PV read 1717 W at 13:00
+and 1784 W at 15:00. Grid First lets PV fill only what the site import cap (16 kW) cannot.
+
+- **sigenergy_modbus 1.17:** `force_charge(..., pv_first=False)`; True writes 0x04 (Command
+  Charging, PV first). Default unchanged, so SigenVPP (shared copy) is unaffected.
+- **plugin:** `EMS_CHARGE_GRID_FIRST` / `EMS_CHARGE_PV_FIRST`; every manager import (START_IMPORT,
+  HAPPY_HOUR_IMPORT, scheduled import, Force Grid Import action) goes through `_force_charge`,
+  which asks for PV first and records `import_ems_mode` + `import_power_w`. AST test: no other
+  caller of `modbus.force_charge`. `_verify_ems_registers` expects `_import_ems_mode()` during an
+  import (was hard 0x03). Stuck-mode recovery also recognises "Charge PV First". Flux's own
+  02:00-05:00 charge stays 0x03 (dark window).
+- **`_check_pv_first_charge`** (each manager pass, before verify): PV First has not been seen live
+  topping up from the grid, so if battery < 0.8 x limit AND battery - PV < 500 W for
+  `PV_FIRST_SHORTFALL_PASSES` (2) passes, below min(cutoff-3, 92)% SOC, set 0x03 for the rest of
+  that import and WARN. One-way per import; a missing reading judges nothing.
+- **Happy Hour restart:** `_load_accumulators` restored `happy_hour_import_active` but not
+  `import_active`, so verify expected 0x02 and switched the free charge off, and the HH branch
+  (own flag set) never re-drove it. Now restores `import_active`, `import_target_soc` (persisted as
+  `happy_hour_target_soc`, default 100) and `import_power_w`.
+- **`_check_happy_hour_overrun`:** within 90 s of the latest used span's end it ends the import at
+  INFO ("the free hour ended"); WARNING only beyond that. The 10 s tick is normally first to see the
+  window close (27-Sep 15:00:01 logged a WARNING for a 1.6 s overrun).
+
 ## v5.124.0 — 27-09-2026
 
 CliveS, 27-Sep-2026: "at no point during the day should the battery be stopped ... the only

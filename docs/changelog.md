@@ -7,6 +7,13 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.125.0 — 27 September 2026
+
+- **The solar panels keep working while the battery charges from the grid.** Every grid charge the plugin runs used to tell the inverter to take the grid first, and the inverter then held the panels back to nothing. In the first Weekend Happy Hour, on 27 September, the panels made 1.7 kW just before 1pm and just after 3pm, and nothing at all in between. The charge now takes the sun first and the grid for the rest, so the battery fills at the same rate. In a free hour nothing is thrown away once the battery is full, because the sun runs the house and anything spare is sold. In a charge the house pays for, every unit the sun gives is one less bought.
+- **A safety check stands behind it.** If the battery takes no more than the sun can give while the plugin is asking for much more, two minutes running, the grid is not coming in, and that charge goes back to taking the grid first.
+- **A restart during a free hour no longer stops the charge** for the rest of the hour.
+- **The end of a free hour no longer logs a warning** when the plugin simply noticed the window close a few seconds before its usual check.
+
 ## 5.124.0 — 27 September 2026
 
 - **The battery is never stopped during the day.** From 5am until 2am it always runs the house. The two hours before the 4pm peak no longer hold it back. The peak sells only what is spare above what the house needs until 2am, and sells nothing when nothing is.

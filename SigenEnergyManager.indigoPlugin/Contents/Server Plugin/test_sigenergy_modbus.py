@@ -911,6 +911,19 @@ class TestForceChargeCutoffBackstop(unittest.TestCase):
                   for c in mock_client.write_register.call_args_list]
         self.assertIn((HOLD_ESS_CHARGE_CUTOFF, 520), writes)   # gain 10
 
+    def test_force_charge_defaults_to_grid_first(self):
+        """SigenVPP shares this file and relies on the old default."""
+        modbus, mock_client = _make_modbus()
+        self.assertTrue(modbus.force_charge(10000))
+        self.assertEqual(_decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_MODE),
+                         [0x03])
+
+    def test_force_charge_pv_first_selects_0x04(self):
+        modbus, mock_client = _make_modbus()
+        self.assertTrue(modbus.force_charge(10000, pv_first=True))
+        self.assertEqual(_decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_MODE),
+                         [0x04])
+
     def test_force_charge_without_cutoff_leaves_register_alone(self):
         modbus, mock_client = _make_modbus()
         self.assertTrue(modbus.force_charge(10000))

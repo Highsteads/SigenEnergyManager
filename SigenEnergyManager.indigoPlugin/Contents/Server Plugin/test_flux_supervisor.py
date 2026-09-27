@@ -185,7 +185,7 @@ class _FakeModbus:
         self.writes.append(("daytime_export", watts))
         return True
 
-    def force_charge(self, watts, cutoff_soc=None):
+    def force_charge(self, watts, cutoff_soc=None, pv_first=False):
         self.writes.append(("force_charge", watts, cutoff_soc))
         return True
 
@@ -711,7 +711,7 @@ class TestPolicyFloorOwnership(unittest.TestCase):
         p.flux_executor = _Watching(owns=True)
 
         class _WatchingModbus(_FakeModbus):
-            def force_charge(self_inner, watts, cutoff_soc=None):
+            def force_charge(self_inner, watts, cutoff_soc=None, pv_first=False):
                 order.append("force_charge")
                 return True
 

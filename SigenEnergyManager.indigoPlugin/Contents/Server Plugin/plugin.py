@@ -49,8 +49,9 @@
 #              Claude Opus 5.5 (5.122.0 — /api/day-patterns: the day patterns, for the Dashboards Energy page)
 #              Claude Opus 5.5 (5.123.0 — the run-up to the peak holds only what the peak can sell)
 #              Claude Opus 5.5 (5.124.0 — the day never stops the battery; it buys only free hours and Axle cover)
+#              Claude Opus 5.5 (5.125.0 — grid charges take the sun first; the panels are no longer switched off)
 # Date:        27-09-2026
-# Version:     5.124.0
+# Version:     5.125.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -466,6 +467,22 @@ FLUX_OWNER_PRE_PEAK_OVERFLOW = "solar overflow is running"
 # The Remote EMS modes that discharge to the grid: 0x05 PV-first, 0x06 ESS-first.
 # Either means the battery is not charging.
 _VPP_EXPORT_MODES = (0x05, 0x06)
+# The two Command Charging modes. Every grid import the plugin drives uses PV
+# FIRST (5.125.0). Grid First draws the whole charge from the grid and holds the
+# panels back to whatever the site import cap cannot cover -- measured live in
+# the first Happy Hour, 27-Sep-2026: 10 kW from the grid, PV at 0 W for two
+# hours with the string voltages up near open circuit, while the same sun made
+# 1.7 kW either side of it. PV First charges from the panels and tops up from
+# the grid, so the charge rate is the same and no sun is thrown away. Flux's own
+# 02:00-05:00 charge keeps Grid First: its window is dark.
+EMS_CHARGE_GRID_FIRST = 0x03
+EMS_CHARGE_PV_FIRST   = 0x04
+_IMPORT_EMS_MODES = (EMS_CHARGE_GRID_FIRST, EMS_CHARGE_PV_FIRST)
+# PV First has not yet been seen topping up from the grid on this inverter, so
+# every import watches for it: if the battery takes no more than the sun can
+# give, well short of the commanded rate, for this many manager passes in a
+# row, the import falls back to Grid First for the rest of its run.
+PV_FIRST_SHORTFALL_PASSES = 2
 # There is deliberately no give-up timeout for an unconfirmed claim. An earlier
 # draft had one; it worked by telling the executor an external supervisor had
 # taken over, which is a lie when nothing has. See _flux_note_pending.
@@ -1874,8 +1891,10 @@ class Plugin(indigo.PluginBase):
 
         # Import charge-cutoff backstop (hardware ceiling while a grid import is
         # active — see _set_import_cutoff). Deliberately NOT rehydrated at startup:
-        # import_active does not survive a restart (the stuck-mode recovery returns
+        # a paid import does not survive a restart (the stuck-mode recovery returns
         # the inverter to self-consumption) and _init_modules parks 40047 at 100%.
+        # A free Happy Hour import DOES survive one (5.125.0, _load_accumulators),
+        # and runs on to the end of its window against the 100% cutoff.
         self.store["import_charge_cutoff_pct"] = None
 
         # Consumption profile (48 slots)
@@ -4163,6 +4182,7 @@ class Plugin(indigo.PluginBase):
                 self._publish_flood_preview(snapshot, decision)
                 return
         self.store["manager_hands_off_reason"] = ""
+        self._check_pv_first_charge()
         self._verify_ems_registers()
         # 8a. NO TARIFF YET. Straight after a restart the first manager tick runs
         #    before the first Octopus refresh, and _build_tariff_data then fell
@@ -7075,11 +7095,39 @@ class Plugin(indigo.PluginBase):
             # No live window but the flag is set: either it ended and the primary
             # path missed it, or the pref was switched off mid-window. Either way,
             # stop importing.
-            log("[Manager] Happy Hour import still running with no live window — "
-                "force-ending it", level="WARNING")
-            self._end_happy_hour_import("overrun backstop: no live window")
+            #
+            # 5.125.0: this tick runs every 10 s and the manager every 60 s, so in
+            # the first minute after the window closes this check is normally
+            # FIRST to see it -- that is the backstop doing its ordinary job, not
+            # a missed end (27-Sep-2026 15:00:01: a WARNING for a 1.6 s overrun).
+            # It only warns once the primary path has had its full minute.
+            since = self._seconds_since_happy_hour_end()
+            if since is not None and 0 <= since <= 90:
+                log("[Manager] The free Happy Hour window has closed — ending the import")
+                self._end_happy_hour_import("the free hour ended")
+            else:
+                log("[Manager] Happy Hour import still running with no live window — "
+                    "force-ending it", level="WARNING")
+                self._end_happy_hour_import("overrun backstop: no live window")
         except Exception as exc:                                # noqa: BLE001
             log(f"[Manager] Happy Hour overrun check failed: {exc}", level="WARNING")
+
+    def _seconds_since_happy_hour_end(self, now_utc=None):
+        """Seconds since the latest free window the import ran in closed, or None."""
+        spans = (self.store.get("happy_hour_used") or {}).get("spans") or []
+        ends = []
+        for span in spans:
+            try:
+                end = datetime.fromisoformat(str(span[1]))
+            except (IndexError, TypeError, ValueError):
+                continue
+            if end.tzinfo is None:
+                continue
+            ends.append(end)
+        if not ends:
+            return None
+        now_utc = now_utc or datetime.now(timezone.utc)
+        return (now_utc - max(ends)).total_seconds()
 
     def _window_of_direction(self, direction, pref, now_utc=None):
         """The live cached window of one direction, or None. Pure cache read.
@@ -7274,7 +7322,7 @@ class Plugin(indigo.PluginBase):
                 # symmetric set_discharge_cutoff floor). +3% headroom keeps the
                 # software SOC compare as the primary stop.
                 cutoff = min((decision.target_soc_pct or 100.0) + 3.0, 100.0)
-                if self.modbus.force_charge(power_w, cutoff_soc=cutoff):
+                if self._force_charge(power_w, cutoff):
                     self.store["import_active"]     = True
                     self.store["import_target_soc"] = decision.target_soc_pct
                     self.store["export_active"]     = False
@@ -7410,7 +7458,7 @@ class Plugin(indigo.PluginBase):
                 power_w = min(int(decision.power_watts or 10000),
                               int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
                 if self.modbus and self.modbus.connected and \
-                        self.modbus.force_charge(power_w, cutoff_soc=cutoff):
+                        self._force_charge(power_w, cutoff):
                     # Anchor the free-kWh measurement on the cumulative import
                     # counter, captured ONCE at entry. A delta from one anchor is
                     # the only way a restart mid-window cannot double-count.
@@ -7532,7 +7580,8 @@ class Plugin(indigo.PluginBase):
             # Check store flags first; fall back to actual emsWorkMode from inverter data
             # so a restart (which resets all flags to False) can still recover a stuck mode.
             ems_mode_str   = self.latest_inverter_data.get("emsWorkMode", "")
-            inverter_stuck = ems_mode_str in ("Discharge ESS First", "Charge Grid First")
+            inverter_stuck = ems_mode_str in ("Discharge ESS First", "Charge Grid First",
+                                              "Charge PV First")
 
             if prev_import:
                 # Only cancel an active import if the target SOC has been reached.
@@ -7674,6 +7723,74 @@ class Plugin(indigo.PluginBase):
             return True
         return bool(self.store.get("saving_session_export_active"))
 
+    def _force_charge(self, power_w, cutoff):
+        """Start a grid import in Charge PV First and remember how it was started.
+
+        The one door every manager import goes through, so the mode the verify
+        pass expects and the mode the import wrote cannot disagree. See
+        EMS_CHARGE_PV_FIRST for why PV First.
+        """
+        ok = self.modbus.force_charge(power_w, cutoff_soc=cutoff, pv_first=True)
+        if ok:
+            self.store["import_ems_mode"]       = EMS_CHARGE_PV_FIRST
+            self.store["import_power_w"]        = int(power_w)
+            self.store["pv_first_short_passes"] = 0
+        return ok
+
+    def _import_ems_mode(self):
+        """The Command Charging mode the running import should hold.
+
+        PV First unless this import has fallen back. An import restored after a
+        restart has no record, and gets PV First too: the fallback check re-proves
+        it within two passes if it is wrong.
+        """
+        mode = self.store.get("import_ems_mode")
+        return mode if mode in _IMPORT_EMS_MODES else EMS_CHARGE_PV_FIRST
+
+    def _check_pv_first_charge(self):
+        """Fall back to Grid First if PV First is not topping up from the grid.
+
+        The failure this catches is PV First behaving as "PV only": the battery
+        then takes what the sun gives and nothing more, which in a free hour
+        wastes the free electricity and at night charges nothing at all. It is
+        judged from the battery, not the grid: in PV First the battery should
+        take the commanded rate, sun first and grid for the rest. A battery
+        taking no more than the sun, well short of that rate, is the grid not
+        coming in. Skipped near the charge cutoff, where the battery slows by
+        design, and after one fallback per import, so it cannot flap.
+        """
+        if not self.store.get("import_active") or self._import_ems_mode() != EMS_CHARGE_PV_FIRST:
+            return
+        inv = self.latest_inverter_data or {}
+        try:
+            batt_w = float(inv.get("batteryPowerWatts"))
+            pv_w   = max(0.0, float(inv.get("pvPowerWatts")))
+            soc    = float(inv.get("batterySoc"))
+        except (TypeError, ValueError):
+            return                          # no reading: judge nothing
+        limit_w = float(self.store.get("import_power_w") or 0.0)
+        cutoff  = float(self.store.get("import_charge_cutoff_pct") or 100.0)
+        if limit_w <= 0 or soc >= min(cutoff - 3.0, 92.0):
+            self.store["pv_first_short_passes"] = 0
+            return
+        short = batt_w < 0.8 * limit_w and batt_w - pv_w < 500.0
+        if not short:
+            self.store["pv_first_short_passes"] = 0
+            return
+        passes = int(self.store.get("pv_first_short_passes") or 0) + 1
+        self.store["pv_first_short_passes"] = passes
+        if passes < PV_FIRST_SHORTFALL_PASSES:
+            return
+        log(f"[Manager] The grid import is not reaching the battery in Charge PV "
+            f"First: the battery is taking {batt_w:.0f} W against the {limit_w:.0f} W "
+            f"asked for, with the sun giving {pv_w:.0f} W. Switching this import to "
+            f"Charge Grid First, which holds the panels back but does charge.",
+            level="WARNING")
+        if self.modbus and self.modbus.connected and \
+                self.modbus.set_remote_ems_mode(EMS_CHARGE_GRID_FIRST):
+            self.store["import_ems_mode"] = EMS_CHARGE_GRID_FIRST
+        self.store["pv_first_short_passes"] = 0
+
     def _verify_ems_registers(self):
         """Read back HOLD_ESS_MAX_DISCHARGE and HOLD_ESS_MAX_CHARGE and correct if wrong.
 
@@ -7693,7 +7810,8 @@ class Plugin(indigo.PluginBase):
           - export_active: discharge limit = inverter max (night_export uses export limit register,
                            not discharge register, to cap grid flow; battery must be free to supply
                            house load + grid simultaneously)
-          - import_active: charge limit = inverter max (full import power), discharge = inverter max
+          - import_active: mode = Charge PV First (Grid First if the import fell
+                           back), charge limit = inverter max, discharge = inverter max
           - a Happy Hour import: discharge = 0 (v5.112.0 — the house runs on the free grid)
           - otherwise:     both limits = inverter max (unrestricted self-consumption)
         """
@@ -7725,6 +7843,7 @@ class Plugin(indigo.PluginBase):
         # moment the window ends. See _driven_export_owns_registers for why the old
         # vpp_state-only test was not enough.
         mode_names = {0x02: "Self Consumption", 0x03: "Charge Grid First",
+                      0x04: "Charge PV First",
                       0x05: "Discharge PV First", 0x06: "Discharge ESS First"}
         _export_driven = self._driven_export_owns_registers()
         if not _export_driven:
@@ -7735,7 +7854,7 @@ class Plugin(indigo.PluginBase):
             if self.store.get("export_active"):
                 expected_mode = 0x06  # Discharge ESS First
             elif self.store.get("import_active"):
-                expected_mode = 0x03  # Charge Grid First
+                expected_mode = self._import_ems_mode()   # PV First unless it fell back
             else:
                 expected_mode = 0x02  # Max Self Consumption
 
@@ -8106,7 +8225,7 @@ class Plugin(indigo.PluginBase):
             # Power follows the configured inverter rating, as the START_IMPORT
             # branch already does — 10000 was right only on a 10 kW machine.
             power_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-            if self.modbus and self.modbus.force_charge(power_w, cutoff_soc=cutoff):
+            if self.modbus and self._force_charge(power_w, cutoff):
                 self.store["import_active"]      = True
                 self.store["import_target_soc"]  = target_soc
                 self.store["import_scheduled_time"] = None
@@ -14465,8 +14584,7 @@ class Plugin(indigo.PluginBase):
             target_soc = min(max(10.0, _as_float(props.get("targetSocPct"), 80.0)), 100.0)
             log(f"[Action] Force grid import: {power_kw:.1f}kW to {target_soc:.0f}% SOC")
             cutoff = min(target_soc + 3.0, 100.0)
-            if self.modbus and self.modbus.force_charge(int(power_kw * 1000),
-                                                        cutoff_soc=cutoff):
+            if self.modbus and self._force_charge(int(power_kw * 1000), cutoff):
                 self.store["import_active"]     = True
                 self.store["import_target_soc"] = target_soc
                 self.store["export_active"]     = False
@@ -15986,6 +16104,9 @@ class Plugin(indigo.PluginBase):
             # restart mid-window without double-counting, so it is persisted on entry.
             "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
             "happy_hour_anchor_kwh":     self.store.get("happy_hour_anchor_kwh"),
+            "happy_hour_target_soc":     (self.store.get("import_target_soc")
+                                          if self.store.get("happy_hour_import_active")
+                                          else None),
             "happy_hour_free_kwh":       self.store.get("happy_hour_free_kwh", 0.0),
             # v5.112.0 booking: which notes have gone out (so a restart cannot
             # resend a booking or a reminder), which slots Octopus refused (so a
@@ -16092,6 +16213,15 @@ class Plugin(indigo.PluginBase):
             if data.get("happy_hour_import_active"):
                 self.store["happy_hour_import_active"] = True
                 self.store["happy_hour_anchor_kwh"] = data.get("happy_hour_anchor_kwh")
+                # 5.125.0: the import flag as well. With only the Happy Hour flag
+                # back, the verify pass expected Self Consumption and switched the
+                # charge off for the rest of the free window, and the Happy Hour
+                # branch, seeing its own flag set, never started it again.
+                self.store["import_active"] = True
+                self.store["import_target_soc"] = float(
+                    data.get("happy_hour_target_soc") or 100.0)
+                self.store["import_power_w"] = int(
+                    _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
             if data.get("happy_hour_free_kwh") is not None:
                 self.store["happy_hour_free_kwh"] = data.get("happy_hour_free_kwh", 0.0)
             # Restart-critical control state, restored regardless of day.

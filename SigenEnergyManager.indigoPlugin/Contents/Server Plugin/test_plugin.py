@@ -8346,6 +8346,240 @@ class TestStormCheckNeedsAPosition(unittest.TestCase):
 
 
 
+
+class TestImportsChargePvFirst(unittest.TestCase):
+    """5.125.0. Every grid import runs in Charge PV First (0x04). In Grid First
+    (0x03) the inverter held the panels at 0 W through the whole of the first
+    Happy Hour (27-Sep-2026), because Grid First only lets the sun fill what the
+    grid import cap cannot."""
+
+    def _p(self, soc=50.0, batt_w=9900.0, pv_w=1700.0, active=True,
+           mode=None, limit=10000, cutoff=100.0):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger      = MagicMock()
+        p.pluginPrefs = {"inverterMaxKw": "10.0", "batteryHealthCutoff": "1.0"}
+        m = p.modbus  = MagicMock()
+        m.connected   = True
+        m.set_remote_ems_mode.return_value = True
+        m.force_charge.return_value        = True
+        p.latest_inverter_data = {"batterySoc": soc, "batteryPowerWatts": batt_w,
+                                  "pvPowerWatts": pv_w}
+        p.store = {"import_active": active, "export_active": False,
+                   "import_power_w": limit, "import_charge_cutoff_pct": cutoff}
+        if mode is not None:
+            p.store["import_ems_mode"] = mode
+        return p
+
+    # --- the one door ---------------------------------------------------
+    def test_force_charge_is_asked_for_pv_first(self):
+        p = self._p(active=False)
+        self.assertTrue(p._force_charge(10000, 95.0))
+        self.assertTrue(p.modbus.force_charge.call_args.kwargs["pv_first"])
+        self.assertEqual(p.store["import_ems_mode"], plugin.EMS_CHARGE_PV_FIRST)
+        self.assertEqual(p.store["import_power_w"], 10000)
+
+    def test_a_refused_charge_records_nothing(self):
+        p = self._p(active=False)
+        p.modbus.force_charge.return_value = False
+        self.assertFalse(p._force_charge(10000, 95.0))
+        self.assertNotIn("import_ems_mode", p.store)
+
+    def test_every_import_goes_through_the_one_door(self):
+        """No caller may reach modbus.force_charge except _force_charge itself,
+        or it would start an import in a mode the verify pass does not expect."""
+        import ast
+        src  = open(plugin.__file__, encoding="utf-8").read()
+        tree = ast.parse(src)
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) or fn.name == "_force_charge":
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "force_charge"
+                        and isinstance(node.func.value, ast.Attribute)
+                        and node.func.value.attr == "modbus"):
+                    offenders.append(f"{fn.name}:{node.lineno}")
+        self.assertEqual(offenders, [])
+        callers = [fn.name for fn in ast.walk(tree)
+                   if isinstance(fn, ast.FunctionDef)
+                   and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                           and n.func.attr == "_force_charge" for n in ast.walk(fn))]
+        self.assertGreaterEqual(len(callers), 3, callers)
+
+    def test_the_happy_hour_starts_in_pv_first(self):
+        from battery_manager import Decision
+        p = self._p(active=False)
+        p.store.update({"happy_hour_import_active": False, "grid_import_daily_kwh": 3.0,
+                        "import_target_soc": 0.0, "import_scheduled_time": None})
+        p._set_import_cutoff = MagicMock()
+        p._save_accumulators = MagicMock()
+        p._trigger_event     = MagicMock()
+        p._act_on_decision(Decision(action=plugin.ACTION_HAPPY_HOUR_IMPORT,
+                                    reason="free", target_soc_pct=100.0,
+                                    power_watts=10000))
+        self.assertTrue(p.modbus.force_charge.call_args.kwargs["pv_first"])
+        self.assertTrue(p.store["happy_hour_import_active"])
+
+    # --- the verify pass ------------------------------------------------
+    def _verify(self, p, actual_mode):
+        p.modbus.read_ems_mode.return_value         = actual_mode
+        p.modbus.read_charge_limit.return_value     = 10000
+        p.modbus.read_discharge_limit.return_value  = 10000
+        p.modbus.read_discharge_cutoff.return_value = 1.0
+        p.modbus.read_charge_cutoff.return_value    = 100.0
+        p._verify_ems_registers()
+
+    def test_verify_holds_pv_first_during_an_import(self):
+        p = self._p(mode=plugin.EMS_CHARGE_PV_FIRST)
+        self._verify(p, plugin.EMS_CHARGE_PV_FIRST)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_verify_moves_grid_first_to_pv_first(self):
+        p = self._p(mode=plugin.EMS_CHARGE_PV_FIRST)
+        self._verify(p, plugin.EMS_CHARGE_GRID_FIRST)
+        p.modbus.set_remote_ems_mode.assert_called_once_with(plugin.EMS_CHARGE_PV_FIRST)
+
+    def test_verify_leaves_a_fallen_back_import_in_grid_first(self):
+        p = self._p(mode=plugin.EMS_CHARGE_GRID_FIRST)
+        self._verify(p, plugin.EMS_CHARGE_GRID_FIRST)
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_an_import_with_no_record_expects_pv_first(self):
+        p = self._p()
+        self.assertEqual(p._import_ems_mode(), plugin.EMS_CHARGE_PV_FIRST)
+
+    # --- the fallback ---------------------------------------------------
+    def test_a_healthy_pv_first_charge_is_left_alone(self):
+        p = self._p(batt_w=9900.0, pv_w=1700.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        for _ in range(3):
+            p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_a_battery_taking_only_the_sun_falls_back_after_two_passes(self):
+        p = self._p(batt_w=1650.0, pv_w=1700.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+        p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_called_once_with(plugin.EMS_CHARGE_GRID_FIRST)
+        self.assertEqual(p.store["import_ems_mode"], plugin.EMS_CHARGE_GRID_FIRST)
+
+    def test_a_dark_import_that_charges_nothing_falls_back(self):
+        p = self._p(batt_w=0.0, pv_w=0.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_called_once_with(plugin.EMS_CHARGE_GRID_FIRST)
+
+    def test_a_slowed_battery_that_still_takes_grid_is_not_a_fault(self):
+        """Cold or derated: 6 kW in with 2 kW of sun is the grid topping up."""
+        p = self._p(batt_w=6000.0, pv_w=2000.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_near_the_cutoff_the_slowdown_is_by_design(self):
+        p = self._p(soc=97.5, batt_w=300.0, pv_w=1700.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_one_healthy_pass_resets_the_count(self):
+        p = self._p(batt_w=1650.0, pv_w=1700.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge()
+        p.latest_inverter_data["batteryPowerWatts"] = 9900.0
+        p._check_pv_first_charge()
+        p.latest_inverter_data["batteryPowerWatts"] = 1650.0
+        p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_no_import_no_judgment(self):
+        p = self._p(active=False, batt_w=0.0, pv_w=0.0, mode=plugin.EMS_CHARGE_PV_FIRST)
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_a_missing_reading_judges_nothing(self):
+        p = self._p(mode=plugin.EMS_CHARGE_PV_FIRST)
+        p.latest_inverter_data = {"batterySoc": 50.0}
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+    def test_a_grid_first_import_is_never_rechecked(self):
+        p = self._p(batt_w=0.0, pv_w=0.0, mode=plugin.EMS_CHARGE_GRID_FIRST)
+        p._check_pv_first_charge(); p._check_pv_first_charge()
+        p.modbus.set_remote_ems_mode.assert_not_called()
+
+
+class TestHappyHourEndAtTheEdgeIsNotAWarning(unittest.TestCase):
+    """5.125.0. The 10 s backstop is normally first to see the window close; that
+    is not an overrun and must not log a WARNING (27-Sep-2026 15:00:01)."""
+
+    def _p(self, ended_s_ago):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        end = datetime.now(timezone.utc) - timedelta(seconds=ended_s_ago)
+        p.store = {"happy_hour_import_active": True,
+                   "happy_hour_used": {"day": "x", "spans": [
+                       [(end - timedelta(hours=2)).isoformat(), end.isoformat()]]}}
+        p._happy_hour_window     = lambda: None
+        p._end_happy_hour_import = MagicMock()
+        return p
+
+    def _levels(self, ended_s_ago):
+        p = self._p(ended_s_ago)
+        with patch.object(plugin, "log") as lg:
+            p._check_happy_hour_overrun()
+        p._end_happy_hour_import.assert_called_once()
+        return [c.kwargs.get("level") for c in lg.call_args_list], p
+
+    def test_just_after_the_edge_is_info(self):
+        levels, p = self._levels(2)
+        self.assertNotIn("WARNING", levels)
+        self.assertEqual(p._end_happy_hour_import.call_args.args[0], "the free hour ended")
+
+    def test_a_real_overrun_still_warns(self):
+        levels, p = self._levels(300)
+        self.assertIn("WARNING", levels)
+
+    def test_no_record_of_the_window_warns(self):
+        p = self._p(2)
+        p.store["happy_hour_used"] = {}
+        with patch.object(plugin, "log") as lg:
+            p._check_happy_hour_overrun()
+        self.assertIn("WARNING", [c.kwargs.get("level") for c in lg.call_args_list])
+
+
+class TestHappyHourSurvivesARestart(unittest.TestCase):
+    """5.125.0. Only the Happy Hour flag came back after a restart, so the verify
+    pass expected Self Consumption and switched the free charge off, and the Happy
+    Hour branch, seeing its own flag already set, never started it again."""
+
+    def _load(self, data):
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "accumulators.json"), "w", encoding="utf-8") as fh:
+            _json.dump(data, fh)
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger        = MagicMock()
+        p.pluginPrefs   = {"inverterMaxKw": "10.0"}
+        p.store         = {}
+        p._get_data_dir = lambda: tmp
+        p._load_accumulators()
+        return p
+
+    def test_the_import_itself_comes_back(self):
+        p = self._load({"happy_hour_import_active": True, "happy_hour_anchor_kwh": 4.0,
+                        "happy_hour_target_soc": 95.0})
+        self.assertTrue(p.store["import_active"])
+        self.assertEqual(p.store["import_target_soc"], 95.0)
+        self.assertEqual(p.store["import_power_w"], 10000)
+        self.assertEqual(p._import_ems_mode(), plugin.EMS_CHARGE_PV_FIRST)
+
+    def test_an_older_file_without_the_target_charges_to_full(self):
+        p = self._load({"happy_hour_import_active": True, "happy_hour_anchor_kwh": 4.0})
+        self.assertEqual(p.store["import_target_soc"], 100.0)
+
+    def test_no_happy_hour_no_import(self):
+        p = self._load({"happy_hour_import_active": False})
+        self.assertNotIn("import_active", p.store)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

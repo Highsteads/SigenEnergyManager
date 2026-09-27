@@ -36,6 +36,8 @@ Tick **Export the battery during a Saving Session** and, during a session you ha
 
 Tick **Charge the battery during a Weekend Happy Hour** and, during an hour you have booked, the plugin charges the battery from the grid at full power, so the free electricity is banked rather than wasted. It fills to your **Daytime charge target**, or to 100% on Flux once nothing left of the day's sun could be lost. Once the battery reaches that level, the house carries on running on the free grid power until the hour ends, instead of on the battery.
 
+The solar panels keep working through a free hour. The battery takes the sun first and the grid makes up the rest, so it fills just as fast. Once it is full the sun runs the house and anything spare is sold. (Until 5.125.0 the inverter was told to charge from the grid first, and it switched the panels off for the whole hour to do it.)
+
 On Flux, the 2am to 5am charge leaves room for a booked hour, so the free energy replaces energy that would otherwise have been bought.
 
 **Happy Hour Import** shows on the **Battery Manager** while it runs, and **Happy Hour free kWh** says afterwards how much went in.
