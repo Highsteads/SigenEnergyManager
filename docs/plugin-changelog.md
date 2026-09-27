@@ -21,6 +21,18 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.120.0 — 27-09-2026
+
+- **Monday shaped.** `SHAPED_WEEKDAYS = (0, 5, 6)`. Each shaped day's level now comes from
+  `_NEED_SCALE_INDEX = {0: 1, 5: 2, 6: 3}` into `_need_scales()` (was an inline {5, 6} map); the
+  snapshot passes `{0: monday_pref, 5: saturday_pref, 6: sunday_pref}`; site_config
+  `hourly_kwh.monday` (and so the legacy Mon-Fri `weekday` blend) uses it. Live 27-Sep: 16 of
+  18 Mondays; 5pm-8pm 1.07 / 0.91 / 0.97 kWh an hour against 0.89 / 0.82 / 0.90 on the blend,
+  4pm and 9pm a little lighter. Tue-Fri stays on the blend: it is the reference bucket and most
+  of the blend's data.
+- Tests: Monday measured, Monday's level from `scales[1]`, and `_NEED_SCALE_INDEX` /
+  the snapshot levels must cover exactly `SHAPED_WEEKDAYS`. Two mutations, both caught.
+
 ## v5.119.1 — 27-09-2026
 
 - `_refresh_day_shapes` announced a day's pattern whenever the in-memory `day_shapes` changed,

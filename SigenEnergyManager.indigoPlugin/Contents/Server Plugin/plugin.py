@@ -44,8 +44,9 @@
 #              Claude Opus 5.5 (5.118.0 — Sundays get their own half-hourly pattern: the roast and the wash)
 #              Claude Opus 5.5 (5.119.0 — Saturdays too; the half-hourly record is honest at midnight)
 #              Claude Opus 5.5 (5.119.1 — the day-pattern note is logged once, not on every restart)
+#              Claude Opus 5.5 (5.120.0 — Mondays get their own half-hourly pattern too)
 # Date:        27-09-2026
-# Version:     5.119.1
+# Version:     5.120.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -557,10 +558,14 @@ SUNDAY_UPLIFT_DEFAULT           = 1.05
 DAY_UPLIFT_WINDOW_DAYS          = 126   # 18 whole weeks
 DAY_UPLIFT_MIN_BASE_DAYS        = 20    # Tue-Fri days needed for a reference at all
 DAY_UPLIFT_MIN_DAYS             = 6     # of that particular day, before its own uplift is used
-# 5.118.0 (Sunday) / 5.119.0 (Saturday): a weekday's own half-hourly SHAPE, from
+# 5.118.0 (Sunday) / 5.119.0 (Saturday) / 5.120.0 (Monday): a weekday's own half-hourly SHAPE, from
 # the inverter's half-hourly records over the same 18 weeks as the uplift. The
 # level stays with the uplift; the shape only says when in the day it goes.
-SHAPED_WEEKDAYS                 = (5, 6)  # Saturday, Sunday — Python weekday numbers
+SHAPED_WEEKDAYS                 = (0, 5, 6)  # Monday, Saturday, Sunday — Python weekday numbers
+# Each shaped day's level comes from its own _need_scales() entry, which returns
+# (tuefri, monday, saturday, sunday). Tue-Fri is the reference the blended curve
+# already serves, so it has no shape of its own.
+_NEED_SCALE_INDEX               = {0: 1, 5: 2, 6: 3}
 DAY_SHAPE_MIN_DAYS              = 6       # whole, covered days of that weekday before its shape is used
 _WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday")
@@ -2158,6 +2163,9 @@ class Plugin(indigo.PluginBase):
             # 5.118.0/5.119.0: a weekday's own pattern once enough of that day
             # are measured, carrying the same day total as before.
             _days_48 = self._day_profiles() if hasattr(self, "store") else {}
+            if len(_days_48.get(0) or []) == 48:
+                hourly_mon = {str(h): round(_days_48[0][2 * h] + _days_48[0][2 * h + 1], 4)
+                              for h in range(24)}
             if len(_days_48.get(5) or []) == 48:
                 hourly_sat = {str(h): round(_days_48[5][2 * h] + _days_48[5][2 * h + 1], 4)
                               for h in range(24)}
@@ -5086,7 +5094,8 @@ class Plugin(indigo.PluginBase):
             forecast_p50            = self.latest_forecast_data.get("_hourly_p50_today", {}),
             dawn_times              = self.latest_forecast_data.get("_dawn_times", {}),
             consumption_profile     = self.store.get("consumption_profile", []),
-            day_profiles            = self._day_profiles({5: saturday_pref, 6: sunday_pref}),
+            day_profiles            = self._day_profiles(
+                {0: monday_pref, 5: saturday_pref, 6: sunday_pref}),
             now                     = datetime.now(timezone.utc),
             bias_factor                 = float(self.latest_forecast_data.get("biasFactor", 1.0)),
             # v5.65.0: the control path's own factor. Falls back to biasFactor and
@@ -8510,8 +8519,7 @@ class Plugin(indigo.PluginBase):
             if level is None:
                 if scales is None:
                     scales = _need_scales(*self._measured_day_uplifts())
-                # _need_scales: (tuefri, monday, saturday, sunday)
-                level = live_daily * {5: scales[2], 6: scales[3]}.get(wd, scales[0])
+                level = live_daily * scales[_NEED_SCALE_INDEX.get(wd, 0)]
             try:
                 level = float(level)
             except (TypeError, ValueError):

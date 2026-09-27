@@ -7,10 +7,11 @@
 #              the day that weekday's energy goes.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        27-09-2026 11:40 BST
-# Version:     2.0 (SigenEnergyManager 5.119.0)
+# Version:     2.1 (SigenEnergyManager 5.120.0)
 #
 # History
 #   1.0 (5.118.0) sunday_shape.py — Sundays only.
+#   2.1 (5.120.0) Monday shaped too (plugin.SHAPED_WEEKDAYS); no change here.
 #   2.0 (5.119.0) any weekday (Saturday added); the midnight row of the old
 #       recorder read at its true start; a zero row read as missing, not as
 #       nothing used; each half-hour averaged over the time actually recorded.

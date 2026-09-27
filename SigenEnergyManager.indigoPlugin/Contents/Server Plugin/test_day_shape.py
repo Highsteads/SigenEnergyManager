@@ -381,7 +381,7 @@ class TestPluginWiring(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp  = self._tmp.name
         self.p    = _mk(self.tmp)
-        self.p._measured_day_uplifts = lambda: (1.0, 1.2, 1.1)
+        self.p._measured_day_uplifts = lambda: (1.06, 1.2, 1.1)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -412,7 +412,7 @@ class TestPluginWiring(unittest.TestCase):
         self.p._refresh_day_shapes()
         shapes = self.p.store["day_shapes"]
         self.assertEqual(sorted(shapes), [5, 6])
-        self.assertEqual(self.p.store["day_shape_days"], {5: 7, 6: 8})
+        self.assertEqual(self.p.store["day_shape_days"], {0: 0, 5: 7, 6: 8})
         self.assertGreater(sum(shapes[6][28:32]), 0.2)
         self.assertGreater(sum(shapes[5][20:26]), 0.25)
 
@@ -458,6 +458,14 @@ class TestPluginWiring(unittest.TestCase):
         q._load_accumulators()
         self.assertEqual(q.store["day_shapes_announced"], [5, 6])
 
+    def test_refresh_measures_monday(self):
+        evening = [0.4 + (0.6 if 34 <= i < 40 else 0.0) for i in range(48)]   # 5pm-8pm
+        self._write_history([(d, evening) for d in self._recent(0, 7)])
+        self.p._refresh_day_shapes()
+        shapes = self.p.store["day_shapes"]
+        self.assertEqual(sorted(shapes), [0])
+        self.assertGreater(sum(shapes[0][34:40]), sum(shapes[0][20:26]))
+
     def test_a_day_with_too_few_examples_is_left_out(self):
         self._write_history([(d, _roast_day()) for d in self._recent(6, 8)]
                             + [(d, _roast_day()) for d in self._recent(5, 3)])
@@ -477,9 +485,11 @@ class TestPluginWiring(unittest.TestCase):
         self.p.logger.warning.assert_called()
 
     def test_day_profiles_carry_each_days_total(self):
-        self.p.store["day_shapes"] = {5: [1 / 48.0] * 48, 6: [1 / 48.0] * 48}
-        scales = plugin._need_scales(1.0, 1.2, 1.1)
+        self.p.store["day_shapes"] = {0: [1 / 48.0] * 48, 5: [1 / 48.0] * 48,
+                                      6: [1 / 48.0] * 48}
+        scales = plugin._need_scales(1.06, 1.2, 1.1)
         got = self.p._day_profiles()
+        self.assertAlmostEqual(sum(got[0]), sum(FLAT) * scales[1], places=2)
         self.assertAlmostEqual(sum(got[5]), sum(FLAT) * scales[2], places=2)
         self.assertAlmostEqual(sum(got[6]), sum(FLAT) * scales[3], places=2)
         got = self.p._day_profiles({5: 30.0, 6: 25.0})
@@ -509,7 +519,7 @@ class TestPluginWiring(unittest.TestCase):
             kw = {k.arg for k in c.keywords}
             self.assertIn("day_slots", kw, f"line {c.lineno} builds without the day curves")
 
-    def test_the_snapshot_is_given_both_weekend_levels(self):
+    def test_the_snapshot_is_given_every_shaped_days_level(self):
         found = [k for n in ast.walk(_source_tree()) if isinstance(n, ast.Call)
                  and getattr(n.func, "id", None) == "ManagerSnapshot"
                  for k in n.keywords if k.arg == "day_profiles"]
@@ -517,7 +527,11 @@ class TestPluginWiring(unittest.TestCase):
         levels = found[0].value.args[0]
         self.assertIsInstance(levels, ast.Dict)
         names = {k.value: v.id for k, v in zip(levels.keys, levels.values)}
-        self.assertEqual(names, {5: "saturday_pref", 6: "sunday_pref"})
+        self.assertEqual(names, {0: "monday_pref", 5: "saturday_pref", 6: "sunday_pref"})
+        self.assertEqual(set(names), set(plugin.SHAPED_WEEKDAYS))
+
+    def test_every_shaped_day_has_its_own_level(self):
+        self.assertEqual(set(plugin._NEED_SCALE_INDEX), set(plugin.SHAPED_WEEKDAYS))
 
     def test_the_refresh_measures_the_day_shapes_first(self):
         fn = next(n for n in ast.walk(_source_tree()) if isinstance(n, ast.FunctionDef)

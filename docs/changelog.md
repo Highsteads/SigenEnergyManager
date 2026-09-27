@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.120.0 — 27 September 2026
+
+- **Mondays now have their own pattern of use too**, measured from the last 18 Mondays in the same way as Saturday and Sunday. The difference is smaller than at the weekend: here a Monday uses about 1.1 kWh an hour between 5pm and 8pm where the everyday pattern says 0.9, which matters because 4pm to 7pm is the Flux peak. The total for a Monday does not change.
+- Tuesday to Friday keep the everyday pattern, which is built mostly from those days anyway.
+
 ## 5.119.1 — 27 September 2026
 
 - The Event Log line saying Saturdays or Sundays have their own pattern of use now appears once, when that changes, instead of again after every restart.
