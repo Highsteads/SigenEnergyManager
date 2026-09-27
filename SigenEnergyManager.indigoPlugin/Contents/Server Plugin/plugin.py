@@ -47,8 +47,9 @@
 #              Claude Opus 5.5 (5.120.0 — Mondays get their own half-hourly pattern too)
 #              Claude Opus 5.5 (5.121.0 — Tuesday to Friday share one measured pattern; every day now has one)
 #              Claude Opus 5.5 (5.122.0 — /api/day-patterns: the day patterns, for the Dashboards Energy page)
+#              Claude Opus 5.5 (5.123.0 — the run-up to the peak holds only what the peak can sell)
 # Date:        27-09-2026
-# Version:     5.122.0
+# Version:     5.123.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

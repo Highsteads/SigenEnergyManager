@@ -21,6 +21,29 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.123.0 — 27-09-2026
+
+- **flux_strategy 2.4 — the run-up hold is sized to the peak sale.** New
+  `_peak_shortfall_kwh(inputs, peak_start, until)` -> (shortfall, needed, arriving):
+  `arriving` walks now -> 16:00 from the live SOC with the house served; `needed` is
+  `required_start_kwh(peak_start, next_cheap, reserve, no_charge_until=peak_end)` (the export
+  floor at 16:00) plus the battery side of the sale, `(min(discharge, export cap) x 3 h -
+  export commitments in the peak - roof export in the peak) / eff`, and zero sale when
+  `day_rate_import_today` (v2.3 sells nothing then). The run-up returns MODE_SOLAR (hand back,
+  "no need to hold") when the shortfall is under `MIN_TRADE_KWH`, else the existing hold with
+  `planned_kwh` = shortfall. Stateless and re-planned every tick: while held, the house's draw
+  still to come before 16:00 shrinks and the shortfall closes, so the hold lets go once it has
+  kept what the sale needs.
+- Why: `_hold_is_profitable` compared 27.7p against 24.4p + 2p wear and nothing else. On
+  27-Sep-2026 it held a 93.5% battery 15:00-16:00 (discharge limit 0) while the house imported
+  ~2.2 kW, although the planner's own `_resale_room_kwh` already knew the peak sells ~12 kWh.
+  Needed 78%, arriving 93%.
+- Tests (test_flux_strategy.py `TestTheRunUpHoldsOnlyWhatThePeakCanSell`, 7): the 27-Sep case
+  on the real region F rates with the Axle 18-19 event, a short battery held, the shortfall
+  closing while held, a boundary charge letting go before 16:00, an Axle hour in the peak not
+  counted twice, no hold for a sale that will not happen. `test_a_hold_fires_where_it_genuinely_pays`
+  now uses a 50% battery. Six of the seven fail on 5.122.0; three mutations each caught.
+
 ## v5.122.0 — 27-09-2026
 
 - **`/api/day-patterns`** (web_dashboard.py) -> `get_dashboard_day_patterns()`: one entry per

@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.122.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.123.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.123.0** — Before the 4pm peak the battery is held back only when it would otherwise be short of what the peak can sell and what the house needs until 2am. A battery that already has plenty keeps running the house, instead of the house buying at the standard price for energy the peak could never sell.
+
 **v5.122.0** — The daily patterns are published for the Dashboards Energy page (3.51.0), which charts each kind of day against the everyday pattern.
 
 **v5.121.0** — Tuesday to Friday now share a pattern of use measured from those days alone, so every day of the week is planned from how it really runs. The four days are too alike to tell apart, so they are measured together.
@@ -76,6 +78,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.123.0 | 27 September 2026 | No hold before the peak when the battery has plenty |
 | 5.122.0 | 27 September 2026 | Day patterns published for the Energy page |
 | 5.121.0 | 27 September 2026 | Tuesday to Friday get a measured pattern |
 | 5.120.0 | 27 September 2026 | Mondays get their own pattern too |

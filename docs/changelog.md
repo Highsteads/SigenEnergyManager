@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.123.0 — 27 September 2026
+
+- **The battery is no longer held before the 4pm peak when it already has plenty.** In the two hours before the peak the plugin can stop the battery running the house, so its charge is kept to sell at the peak price. It used to do this whenever the peak price beat the standard price, however full the battery was. At a 4 kW export limit the peak sells about 12 kWh, so on a full day that energy was never sold: it was bought at the standard price and then waited for the night. On 27 September it held a 93% battery from 3pm to 4pm and the house bought about 2 kWh an hour meanwhile.
+- **Now it holds only while the battery would reach 4pm short** of what the peak can sell and what the house needs until 2am, and only for as long as it is short. An Axle hour inside the peak counts once, because it uses the same export limit as the sale. On a day that has bought at the standard price, when the peak does not sell, it holds only for the house.
+
 ## 5.122.0 — 27 September 2026
 
 - **The daily patterns are published for the Dashboards Energy page.** Dashboards 3.51.0 adds a "Through the day" card that charts each kind of day's use hour by hour against the everyday pattern, and says in words where they differ. Nothing about how the battery is run has changed.

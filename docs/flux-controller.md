@@ -28,6 +28,13 @@ not additional contingency buffers. Preparation is for standard paired Flux.
   the battery by 16:00 on its own, and a day 35% sunnier than forecast would not
   push back out before 16:00 (5.113.0). The household's own charge is still sized
   on the forecast itself.
+- 14:00–16:00: hold the battery (discharge 0, solar still charges) only while,
+  running the house as forecast, it would reach 16:00 short of the evening's
+  need (house and commitments to the next cheap window, above the reserve) plus
+  what the peak can sell (export cap over three hours, less any commitment in
+  the peak and the roof's own export). Re-judged every tick, so a shortfall is
+  held and then released, not the whole run-up (5.123.0). Before that the hold
+  compared prices only and held a 93% battery for an hour on 27-Sep-2026.
 - 16:00–19:00: export only spare energy above the reserve, remaining household
   demand to the next cheap window and committed events. Account for the fact
   that mode 5 prevents battery charging from the PV the forecast predicts.

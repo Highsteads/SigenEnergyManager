@@ -887,7 +887,9 @@ class TestWindowsAndLeases(unittest.TestCase):
         day = datetime(2026, 9, 16, tzinfo=LONDON).date()
         now = fs._wall(LONDON, day, fs.time(15, 0))
         rich = _bands(day, now, exp={**EXPORT_P, "peak": 40.0})
-        d = fs.plan(_inputs((15, 0), soc_pct=80.0, bands=rich))
+        # v2.4: a battery short of what the peak can sell. At 80% it is not, and
+        # holding it would only buy energy to wait for the night.
+        d = fs.plan(_inputs((15, 0), soc_pct=50.0, bands=rich))
         self.assertEqual(d.mode, fs.MODE_HOLD)
         self.assertEqual(d.discharge_limit_w, 0)
         self.assertGreater(d.charge_limit_w, 0)
@@ -1326,6 +1328,96 @@ class TestNoPeakExportAfterADayRateBuy(unittest.TestCase):
         plain = fs.plan(_inputs((2, 30), soc_pct=25.0))
         flag  = fs.plan(_inputs((2, 30), soc_pct=25.0, day_rate_import_today=True))
         self.assertEqual(plain.control_key(), flag.control_key())
+
+class TestTheRunUpHoldsOnlyWhatThePeakCanSell(unittest.TestCase):
+    """v2.4. On 27-Sep-2026 the run-up held a 93% battery from 3pm to 4pm and the
+    house imported at 24.4p. A 4 kW cap sells about 12 kWh in three hours, and the
+    battery held nearly three times that plus the evening, so nothing held was
+    ever sold. CliveS: "I see no reason to import when we have more than enough
+    for the 3 hour export and to take us around to 2am." """
+
+    # The real region F Flux rates and the configured wear on that day.
+    IMP = {"cheap": 14.62, "day": 24.35, "peak": 34.10}
+    EXP = {"cheap": 4.21,  "day": 9.71,  "peak": 27.69}
+    DAY = datetime(2026, 9, 27, tzinfo=LONDON).date()
+
+    def _real(self, hhmm, soc, **over):
+        now = fs._wall(LONDON, self.DAY, fs.time(*hhmm))
+        kw = dict(bands=_bands(self.DAY, now, imp=self.IMP, exp=self.EXP),
+                  site=_site(wear_p_per_kwh=2.0),
+                  house=_profile(22.0), pv=_pv(self.DAY, 7.0, first_hour=8,
+                                               last_hour=18),
+                  flows=_flows(pv_w=1000.0, house_w=3200.0, grid_w=2200.0),
+                  commitments=(_axle(self.DAY, 18, 19),))
+        kw.update(over)
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 9, 27), **kw)
+
+    def test_the_hold_is_still_priced_as_worth_it_on_that_day(self):
+        worth, margin = fs._hold_is_profitable(self._real((15, 0), 93.5).bands,
+                                               _site(wear_p_per_kwh=2.0))
+        self.assertTrue(worth, "otherwise the rest of these tests prove nothing")
+        self.assertGreater(margin, fs.MIN_ARBITRAGE_MARGIN_P)
+
+    def test_the_27_september_battery_is_not_held(self):
+        d = fs.plan(self._real((15, 0), 93.5))
+        self.assertEqual(d.mode, fs.MODE_SOLAR)
+        self.assertFalse(d.owns)
+        self.assertIn("no need to hold", d.reason)
+
+    def test_a_battery_short_of_the_sale_is_held(self):
+        d = fs.plan(self._real((15, 0), 55.0))
+        self.assertEqual(d.mode, fs.MODE_HOLD)
+        self.assertEqual(d.discharge_limit_w, 0)
+        self.assertGreater(d.planned_kwh, fs.MIN_TRADE_KWH)
+        self.assertIn("short", d.reason)
+
+    def test_a_held_battery_lets_go_once_the_shortfall_is_covered(self):
+        # Held, the charge stays put while the house's draw before 4pm shrinks,
+        # so the shortfall closes and the battery goes back to running the house.
+        # That is how a small shortfall holds for a few minutes, not two hours.
+        inputs = self._real((15, 0), 55.0)
+        start  = fs.next_local(inputs.now, LONDON, fs.FLUX_PEAK_START)
+        cheap  = fs.next_cheap_start(inputs.now, LONDON)
+        early, _n, _a = fs._peak_shortfall_kwh(inputs, start, cheap)
+        late,  _n, _a = fs._peak_shortfall_kwh(self._real((15, 50), 55.0), start, cheap)
+        self.assertLess(late, early)
+
+    def test_a_small_shortfall_does_not_hold_for_the_whole_run_up(self):
+        # Find a charge that is short at 3pm but covered by the time the house's
+        # own draw has been held back, and check the hold lets go before 4pm.
+        for soc in range(40, 95):
+            if fs.plan(self._real((15, 0), float(soc))).mode == fs.MODE_HOLD:
+                continue
+            short = float(soc - 1)
+            if fs.plan(self._real((15, 0), short)).mode != fs.MODE_HOLD:
+                continue
+            self.assertNotEqual(fs.plan(self._real((15, 55), short)).mode,
+                                fs.MODE_HOLD)
+            return
+        self.fail("no boundary charge found between 40% and 95%")
+
+    def test_an_axle_hour_in_the_peak_is_not_counted_twice(self):
+        # The event and the sale share one 4 kW cap, so the hour the event fills
+        # is not also an hour the sale needs energy for.
+        inputs = self._real((15, 0), 60.0)
+        start  = fs.next_local(inputs.now, LONDON, fs.FLUX_PEAK_START)
+        cheap  = fs.next_cheap_start(inputs.now, LONDON)
+        _s, with_event, _a = fs._peak_shortfall_kwh(inputs, start, cheap)
+        _s, without, _a = fs._peak_shortfall_kwh(self._real((15, 0), 60.0,
+                                                            commitments=()),
+                                                 start, cheap)
+        # The event adds its 4 kWh to what the battery must keep and takes the
+        # same hour off the sale, so what the evening needs does not move.
+        self.assertAlmostEqual(with_event, without, places=3)
+
+    def test_nothing_is_held_for_a_sale_that_will_not_happen(self):
+        # After a day-rate buy the peak does not export (v2.3), so a battery that
+        # covers the house but not a sale has nothing to hold for.
+        inputs = self._real((15, 0), 60.0)
+        self.assertEqual(fs.plan(inputs).mode, fs.MODE_HOLD)
+        d = fs.plan(self._real((15, 0), 60.0, day_rate_import_today=True))
+        self.assertNotEqual(d.mode, fs.MODE_HOLD)
+
 
 if __name__ == "__main__":
     unittest.main()

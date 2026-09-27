@@ -4,9 +4,20 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.3 Claude Opus 5.5
-# Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026
-# Version:     2.3
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.4 Claude Opus 5.5
+# Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
+#              v2.4 27-09-2026
+# Version:     2.4
+#
+# v2.4 (SigenEnergyManager 5.123.0) holds the battery before the peak only for the
+# energy the peak could actually sell. The hold compared prices and nothing else,
+# so on 27-Sep-2026 it stopped a 93% battery from 3pm to 4pm and the house imported
+# at 24.4p, although a 4 kW export cap sells about 12 kWh in three hours and the
+# battery held nearly three times that plus the evening. Every kWh held there was
+# never sold; it waited for the night. The run-up now works out what the battery
+# will reach 4pm with if it keeps running the house, against what the peak sale
+# and the house until 2am need, and holds only while it would fall short. Judged
+# again every tick, so a small shortfall holds briefly and then lets go.
 #
 # v2.3 (SigenEnergyManager 5.114.0) does not export in the peak on a day the manager has
 # bought at the day rate (inputs.day_rate_import_today). CliveS, 26-Sep-2026: 24.4p in
@@ -1273,6 +1284,44 @@ def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
     return lo
 
 
+def _peak_shortfall_kwh(inputs, peak_start, until):
+    """(shortfall, needed, arriving) in battery kWh at `peak_start` (v2.4).
+
+    ARRIVING is what the battery reaches the peak with if it keeps running the
+    house from now, the sun charging it as forecast. NEEDED is what the evening
+    asks of it: the house and every commitment until the cheap window, above the
+    reserve (the export floor the peak will itself use), plus the battery side of
+    what the peak can sell. The sale is the export cap over three hours, less any
+    of it a commitment already fills (an Axle hour inside the peak shares the
+    same cap) and less the sunshine the roof sends out through it. Nothing is
+    sold on a day that bought at the day rate (v2.3), so then only the house
+    counts.
+
+    A hold only earns anything for the SHORTFALL. Beyond it, a kWh held is a kWh
+    the peak cannot sell, bought at the day rate to wait for the night.
+    """
+    site     = inputs.site
+    eff      = site.one_way_efficiency
+    tz       = inputs.local_tz
+    peak_end = next_local(peak_start, tz, FLUX_PEAK_END)
+    floor_kwh = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
+    keep, _inf = required_start_kwh(inputs, peak_start, until, floor_kwh,
+                                    no_charge_until=peak_end)
+    sale_kwh = 0.0
+    if not inputs.day_rate_import_today:
+        peak_hours = (peak_end - peak_start).total_seconds() / 3600.0
+        cap_kwh    = (min(site.discharge_power_w, site.export_limit_w) / 1000.0
+                      * peak_hours)
+        committed  = _commitment_kwh(inputs.commitments, peak_start, peak_end, "export")
+        roof_out   = max(0.0, inputs.pv.kwh_between(peak_start, peak_end)
+                         - inputs.house.kwh_between(peak_start, peak_end))
+        sale_kwh   = max(0.0, cap_kwh - committed - roof_out) / eff
+    needed = min(site.capacity_kwh, keep + sale_kwh)
+    now_kwh = float(inputs.soc_pct) / 100.0 * site.capacity_kwh
+    arriving, _low, _unmet, _high = simulate(inputs, now_kwh, inputs.now, peak_start)
+    return max(0.0, needed - arriving), needed, arriving
+
+
 def _export_plan(inputs):
     """(floor_pct, power_w, surplus_kwh, committed_kwh).
 
@@ -1468,6 +1517,20 @@ def plan(inputs):
                                    "the peak, so holding the battery cannot be "
                                    "judged")
             if worth_holding:
+                short_kwh, needed_kwh, arriving_kwh = _peak_shortfall_kwh(
+                    inputs, peak_start, next_cheap)
+                if short_kwh < MIN_TRADE_KWH:
+                    return FluxDecision(
+                        mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
+                        protect_soc_pct=house_floor, household_floor_pct=house_floor,
+                        margin_p=hold_margin_p, committed_kwh=committed,
+                        reason=(f"no need to hold the battery for the peak in "
+                                f"{minutes_to_peak:.0f} minutes — running the house "
+                                f"until then it still reaches 4pm with about "
+                                f"{_pct(arriving_kwh, site.capacity_kwh):.0f}%, and "
+                                f"the peak sale and the house until 2am need about "
+                                f"{_pct(needed_kwh, site.capacity_kwh):.0f}%, so the "
+                                f"battery keeps running the house"))
                 hold_floor = max(house_floor, export_floor_pct(inputs, peak_start))
                 if float(inputs.soc_pct) > hold_floor:
                     return FluxDecision(
@@ -1479,8 +1542,12 @@ def plan(inputs):
                         decision_until=_decision_until(inputs, peak_start),
                         protect_soc_pct=hold_floor, household_floor_pct=house_floor,
                         margin_p=hold_margin_p, committed_kwh=committed,
+                        planned_kwh=round(short_kwh, 2),
                         reason=(f"holding the battery for the peak in "
-                                f"{minutes_to_peak:.0f} minutes — it sells at "
+                                f"{minutes_to_peak:.0f} minutes — without it the "
+                                f"battery would reach 4pm about {short_kwh:.1f} kWh "
+                                f"short of what the peak can sell and the house "
+                                f"needs until 2am, and that energy sells at "
                                 f"{bands.export_peak_p:.1f}p there against the "
                                 f"{bands.import_day_p:.1f}p the house pays now. Solar "
                                 f"still charges"))
