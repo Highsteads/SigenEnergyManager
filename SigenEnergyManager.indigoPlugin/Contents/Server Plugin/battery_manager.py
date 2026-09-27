@@ -4,9 +4,21 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 5; 3.12-3.13 Claude Opus 5.5
-# Date:        05-08-2026; 3.12-3.13 26-09-2026
-# Version:     3.13
+# Author:      CliveS & Claude Opus 5; 3.12-3.14 Claude Opus 5.5
+# Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026
+# Version:     3.14
+# 3.14 — THE DAY BUYS NOTHING BUT FREE HOURS AND AXLE COVER. CliveS, 27-Sep-2026:
+#       "the only time during the day that we import is when we have free hours or
+#       the battery gets near the lower battery limit", plus an Axle event the
+#       battery cannot cover. (1) The day-rate peak top-up (3.12) is gone: it bought
+#       at 24.4p to spare the house the 34.1p peak. (2) A TOU tariff whose cheap
+#       window is not known, or opens after sunrise, now HOLDS (warning + one
+#       Pushover a day) instead of buying at once at 10 kW, which a single failed
+#       Octopus slot fetch could trigger at any hour. (3) New EVENT-COVER branch:
+#       the plugin works out (flux_strategy.event_cover) whether the battery,
+#       running the house, reaches an announced Axle event holding the event and
+#       the house to 02:00; when it would not, and it is time, this buys the gap.
+#       (4) The tariff defaults to UNKNOWN, never Tracker, until Octopus answers.
 # 3.13 — (1) THE DAWN PROJECTION COUNTS A DULL AFTERNOON. battery_at_dusk used
 #       max(0, solar - home), so a house that outran the panels before dusk drained
 #       nothing and the projection kept energy already spent. Now signed, floored at
@@ -183,7 +195,7 @@ try:
     from octopus_api import (
         TARIFF_TRACKER, TARIFF_GO, TARIFF_FLUX,
         TARIFF_IGO, TARIFF_IFLUX, TARIFF_AGILE,
-        TARIFF_FLEXIBLE,
+        TARIFF_FLEXIBLE, TARIFF_UNKNOWN,
         TARIFF_WINDOWS,
         OCTOPOINTS_PER_PENNY,
     )
@@ -196,6 +208,7 @@ except ImportError:
     TARIFF_IFLUX    = "iflux"
     TARIFF_AGILE    = "agile"
     TARIFF_FLEXIBLE = "flexible"
+    TARIFF_UNKNOWN  = "unknown"
     # Imported, not re-derived, for the same reason london_time is: a second copy
     # of a conversion rate is how two places end up disagreeing about money. The
     # fallback exists only so this module still imports without Indigo present.
@@ -387,21 +400,6 @@ TRACKER_DEFER_THRESHOLD = 0.90   # tomorrow must be < 90% of today (10%+ cheaper
 # Minimum import quantity — below this don't bother charging
 MIN_IMPORT_KWH = 0.5
 
-# v3.12 — the day-rate peak top-up. On a time-of-use tariff with a peak band, a
-# battery that will run out before the cheap window buys at the DAY rate only what
-# the peak would otherwise cost at the PEAK rate. Everything after the peak costs
-# the day rate either way, and passing it through the battery first only loses the
-# round trip, so it waits for the cheap window like the rest of tomorrow's need.
-#
-# The two figures are a deadband, which is what stops the stop/start seen on
-# 26-Sep-2026 (four starts in 25 minutes, targets 34% -> 40% -> 37% -> 54%): a
-# top-up starts only once the peak is short by PEAK_TOPUP_MIN_KWH, and buys the
-# shortfall plus PEAK_TOPUP_BUFFER_KWH. After it finishes the battery sits the
-# buffer ABOVE the requirement, so a new one needs the requirement to grow by
-# min + buffer — 1.5 kWh — before anything restarts.
-PEAK_TOPUP_MIN_KWH      = 1.0
-PEAK_TOPUP_BUFFER_KWH   = 0.5
-PEAK_TOPUP_MIN_MARGIN_P = 1.0    # pence per kWh the peak must beat stored day-rate energy by
 
 # Minimum 24h surplus before daytime export is allowed.
 # Below this the battery has barely enough for 24h — every kWh is worth more
@@ -625,7 +623,9 @@ FLUX_CLIP_GUST_FACTOR = 1.25
 @dataclass
 class TariffData:
     """Tariff-related information passed to the decision engine."""
-    tariff_key:       str   = TARIFF_TRACKER
+    # UNKNOWN, never Tracker (5.124.0): a guessed tariff plans for prices the
+    # house is not paying. Unknown runs self consumption and buys nothing.
+    tariff_key:       str   = TARIFF_UNKNOWN
     today_rate_p:     Optional[float] = None   # pence/kWh
     tomorrow_rate_p:  Optional[float] = None   # pence/kWh (may be None until ~16:00)
     cheap_start:      Optional[str]   = None   # "HH:MM" local time (Go/Flux cheap window)
@@ -806,12 +806,17 @@ class ManagerSnapshot:
     home_today_kwh:      Optional[float] = None  # house use so far today (kWh); None = unknown
     home_today_partial:  bool = False            # True when the plugin missed part of today
 
-    # v3.12 — the day-rate peak top-up (see _plan_peak_topup).
+    # v3.12 — added for the day-rate peak top-up (removed in 3.14).
     # reserve_floor_pct: the lowest SOC the house may draw the battery to while the
     # grid is up — plugin.py's _policy_discharge_floor_pct, i.e. the Flux backup
     # reserve when Flux is armed. 0.0 means "use health_cutoff_pct", which is what
     # every older harness gets.
     reserve_floor_pct:   float = 0.0
+    # 3.14: an announced Axle event the battery cannot cover alone, worked out by
+    # flux_strategy.event_cover. Active only once it is time to buy.
+    event_cover_active:     bool  = False
+    event_cover_target_pct: float = 0.0
+    event_cover_reason:     str   = ""
     wear_p_per_kwh:      float = 2.0             # battery wear, pence per kWh cycled
     # True while an import is running or queued. Holds import_needed on until the
     # shortfall is genuinely gone, so a forecast wobble across MIN_IMPORT_KWH cannot
@@ -970,6 +975,7 @@ class BatteryManager:
 
         Decision flow (first match wins):
           1. Overrides     — VPP / active flood-prevention export
+          1b. Event cover  — an Axle event the battery cannot cover (3.14)
           2. Resilience    — flat-rate tariff overnight power-cut floor
           3. Flood prep    — overnight pre-drain before very sunny day
           4. Import        — tomorrow won't reach sufficiency without grid
@@ -1011,6 +1017,17 @@ class BatteryManager:
             f"tomorrow need {balance.tomorrow_need_kwh:.1f} kWh"
             + _balance_extras(balance)
         ))
+
+        # 1b. Event cover (3.14): the one daytime import that is not a free hour.
+        cover = self._check_event_cover(snapshot, balance)
+        if cover is not None:
+            audit.append(("EVENT-COVER", f"matched -> {cover.reason}"))
+            cover.audit_trail = audit
+            return cover
+        audit.append(("EVENT-COVER", (
+            "skipped — no Axle event needs covering"
+            if not snapshot.event_cover_reason else
+            f"skipped — planned, not yet time: {snapshot.event_cover_reason}")))
 
         # 2. Resilience buffer (flat-rate any-time; TOU only in the cheap window
         #    when tomorrow is already covered; Agile in the cheapest block, v5.101.0
@@ -1817,6 +1834,30 @@ class BatteryManager:
         return self._hold_import(
             balance, f"the tariff '{tariff.tariff_key}' is not recognised")
 
+    @staticmethod
+    def _check_event_cover(snapshot: ManagerSnapshot,
+                           balance: SufficiencyBalance) -> Optional[Decision]:
+        """Buy what an announced Axle event needs, when it is time (3.14).
+
+        The sums are flux_strategy.event_cover's, done by the plugin with the
+        half-hourly walk; this only acts on them. Nothing is bought once the
+        battery is at the target, so a finished top-up cannot restart itself.
+        """
+        if not snapshot.event_cover_active:
+            return None
+        target = float(snapshot.event_cover_target_pct)
+        if target <= snapshot.current_soc_pct:
+            return None
+        return Decision(
+            action          = ACTION_START_IMPORT,
+            reason          = (f"Covering an Axle event: {snapshot.event_cover_reason}, "
+                               f"charging to {target:.0f}%"),
+            power_watts     = 10000,
+            target_soc_pct  = target,
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+        )
+
     def _plan_tou_import(
         self,
         snapshot:   ManagerSnapshot,
@@ -1829,9 +1870,9 @@ class BatteryManager:
         buy tomorrow's whole shortfall NOW at the day rate". A battery that runs out
         before the cheap window does not black the house out — the house draws from
         the grid at the day rate, which is the same price as buying now, minus the
-        round-trip loss. So the day rate is only worth paying for energy that would
-        otherwise be bought at a HIGHER rate: the Flux peak. That part is sized by
-        _plan_peak_topup; tomorrow's shortfall always waits for the cheap window.
+        round-trip loss. So tomorrow's shortfall always waits for the cheap window.
+        3.14: the day-rate top-up for the Flux peak (3.12) is gone too — the day
+        buys nothing but free hours and Axle cover (see evaluate).
         Live 26-Sep-2026: a dull day ran the old rule four times before midday,
         ratcheting the target from 34% to 54% at 24.4p with 2am 14.6p twelve hours
         away.
@@ -1844,15 +1885,11 @@ class BatteryManager:
         short_kwh   = balance.import_kwh_grid
 
         if not cheap_start or not cheap_end:
-            return Decision(
-                action         = ACTION_START_IMPORT,
-                reason         = (
-                    f"Tomorrow is short by about {short_kwh:.0f} kWh and the cheap "
-                    f"window times are not known, so buying it now"
-                ),
-                power_watts    = 10000,
-                target_soc_pct = target_soc,
-            )
+            # 3.14: HOLD, never "buy it now". The window goes missing when one
+            # Octopus slot fetch fails, and buying at once then meant 10 kW at the
+            # day or peak rate at any hour.
+            return self._hold_import(
+                balance, "the cheap window times are not known")
 
         # Are we currently in the cheap window? cheap_start/cheap_end are LOCAL
         # (Europe/London) HH:MM but snapshot.now is UTC — convert before comparing
@@ -1876,19 +1913,11 @@ class BatteryManager:
         next_window_dt = self._next_window_start(now, cheap_start)
         if next_window_dt is None or (dawn_dt is not None and next_window_dt >= dawn_dt):
             # Not reachable with any Go/Flux window today; kept for a malformed one.
-            return Decision(
-                action         = ACTION_START_IMPORT,
-                reason         = (
-                    f"Tomorrow is short by about {short_kwh:.0f} kWh and the cheap "
-                    f"window opens after sunrise, so buying it now"
-                ),
-                power_watts    = 10000,
-                target_soc_pct = target_soc,
-            )
+            # 3.14: held rather than bought at once, for the same reason as above.
+            return self._hold_import(
+                balance, "the cheap window opens after sunrise, which no real tariff "
+                         "does")
 
-        topup = self._plan_peak_topup(snapshot, next_window_dt)
-        if topup is not None:
-            return topup
         if snapshot.flux_owns_cheap_window:
             return self._leave_cheap_window_to_flux(balance, cheap_start, cheap_end,
                                                     now_open=False)
@@ -1937,73 +1966,6 @@ class BatteryManager:
             action = ACTION_SELF_CONSUMPTION,
             reason = (f"Tomorrow is short by about {balance.import_kwh_grid:.0f} kWh. "
                       f"The Flux controller buys it {when}"),
-        )
-
-    def _plan_peak_topup(
-        self,
-        snapshot:       ManagerSnapshot,
-        next_window_dt: datetime,
-    ) -> Optional[Decision]:
-        """A day-rate import sized to carry the house through the peak, or None.
-
-        Worth it only when the peak import rate beats a stored day-rate kWh (the
-        day rate over the round trip, plus wear) by PEAK_TOPUP_MIN_MARGIN_P, and
-        only for a peak that opens before the next cheap window. The battery must
-        hold, at the start of the peak, the peak's own demand above the reserve
-        floor; the purchase is whatever the projection falls short of that by.
-        Solar before the peak counts; solar DURING it is ignored, which errs towards
-        buying a little more for a window where a kWh short costs the peak rate.
-        """
-        tariff = snapshot.tariff
-        if not (tariff.peak_start and tariff.peak_end
-                and tariff.peak_rate_p and tariff.day_rate_p):
-            return None
-        now = snapshot.now
-        peak_start_dt = self._next_window_start(now, tariff.peak_start)
-        if peak_start_dt is None or peak_start_dt >= next_window_dt:
-            return None                          # no peak before the cheap window
-        peak_end_dt = self._next_window_start(peak_start_dt, tariff.peak_end)
-        if peak_end_dt is None or peak_end_dt <= peak_start_dt:
-            return None
-
-        eff       = max(0.01, snapshot.efficiency)
-        stored_p  = tariff.day_rate_p / eff + snapshot.wear_p_per_kwh
-        margin_p  = tariff.peak_rate_p - stored_p
-        if margin_p < PEAK_TOPUP_MIN_MARGIN_P:
-            return None
-
-        cap_kwh     = snapshot.capacity_kwh
-        battery_kwh = snapshot.current_soc_pct / 100.0 * cap_kwh
-        floor_pct   = max(snapshot.health_cutoff_pct, snapshot.reserve_floor_pct)
-        floor_kwh   = floor_pct / 100.0 * cap_kwh
-        profile     = snapshot.consumption_profile
-        days        = snapshot.day_profiles
-        peak_need   = self._estimate_consumption_until(peak_start_dt, peak_end_dt,
-                                                       profile, days)
-        home_before = self._estimate_consumption_until(now, peak_start_dt, profile, days)
-        solar_before = self._forecast_solar_kwh(
-            snapshot, self._to_local(now),
-            self._to_local(peak_start_dt).replace(tzinfo=None))
-        projected   = battery_kwh + solar_before - home_before
-        shortfall   = floor_kwh + peak_need - projected
-        if shortfall < PEAK_TOPUP_MIN_KWH:
-            return None
-
-        buy_kwh    = shortfall + PEAK_TOPUP_BUFFER_KWH
-        target_soc = min(98.0, (battery_kwh + buy_kwh) / max(1.0, cap_kwh) * 100.0)
-        if target_soc <= snapshot.current_soc_pct:
-            return None
-        return Decision(
-            action         = ACTION_START_IMPORT,
-            reason         = (
-                f"Buying about {buy_kwh:.0f} kWh now at {tariff.day_rate_p:.1f}p so the "
-                f"battery lasts through the {_spoken_hm(tariff.peak_start)} to "
-                f"{_spoken_hm(tariff.peak_end)} peak, when the grid costs "
-                f"{tariff.peak_rate_p:.1f}p. The rest of tomorrow's need waits for "
-                f"the cheap window"
-            ),
-            power_watts    = 10000,
-            target_soc_pct = target_soc,
         )
 
     def _plan_tracker_import(

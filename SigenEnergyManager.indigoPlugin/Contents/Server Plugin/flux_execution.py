@@ -222,6 +222,14 @@ class FluxExecutor:
         # the inverter chooses the physical direction from the current net load.
         if (target.ems_mode == 3 and discharge) or (target.ems_mode == 5 and charge):
             raise ValueError('Conflicting battery directions')
+        # A HOLD — mode 2 with the battery barred from running the house — only in
+        # the cheap window (SigenEnergyManager 5.124.0). CliveS, 27-Sep-2026: "at no
+        # point during the day should the battery be stopped". The planner no
+        # longer asks for one in the day; this makes sure no later change can.
+        if target.ems_mode == 2 and discharge == 0:
+            boundary = local.replace(hour=5, minute=0, second=0, microsecond=0)
+            if not 2 <= local.hour < 5 or expiry > boundary.astimezone(timezone.utc):
+                raise ValueError('Battery hold outside Flux cheap window')
         top, bottom = map(_number, (target.charge_cutoff_pct, target.discharge_cutoff_pct))
         if not 0 <= bottom <= top <= 100:
             raise ValueError('Invalid target energy band')

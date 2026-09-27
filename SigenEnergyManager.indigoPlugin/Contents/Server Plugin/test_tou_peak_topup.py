@@ -1,13 +1,15 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 # Filename:    test_tou_peak_topup.py
-# Description: The day-rate import on a time-of-use tariff (battery_manager 3.12).
-#              Pins the 26-Sep-2026 fault: a dull Flux day bought tomorrow's whole
-#              shortfall at the 24.4p day rate before midday, four times, with the
-#              target ratcheting 34% -> 54%, while 2am's 14.6p was twelve hours off.
+# Description: The day-rate import on a time-of-use tariff (battery_manager 3.12,
+#              3.14). Pins the 26-Sep-2026 fault: a dull Flux day bought tomorrow's
+#              whole shortfall at the 24.4p day rate before midday, four times, with
+#              the target ratcheting 34% -> 54%, while 2am's 14.6p was twelve hours
+#              off. From 3.14 the day buys nothing at all for the peak either, and
+#              only an Axle event the battery cannot cover buys in the day.
 # Author:      CliveS & Claude Opus 5.5
-# Date:        26-09-2026
-# Version:     1.0
+# Date:        26-09-2026; 2.0 27-09-2026
+# Version:     2.0
 
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -19,7 +21,6 @@ from battery_manager import (
     ACTION_START_IMPORT,
     ACTION_SCHEDULE_IMPORT,
     ACTION_SELF_CONSUMPTION,
-    PEAK_TOPUP_BUFFER_KWH,
     MIN_IMPORT_KWH,
     TARIFF_GO,
 )
@@ -70,82 +71,41 @@ def _snap(soc, local_hh, local_mm=0, tariff=None, reserve=20.0, p50=None,
     )
 
 
-def _peak_target(soc, hours_to_peak, reserve=20.0, solar_before=0.0):
-    """What the battery must reach now: reserve + the peak + the run-up to it."""
-    battery = soc / 100.0 * CAP
-    need    = reserve / 100.0 * CAP + 3 * 2 * SLOT
-    projected = battery + solar_before - hours_to_peak * 2 * SLOT
-    buy = need - projected + PEAK_TOPUP_BUFFER_KWH
-    return (battery + buy) / CAP * 100.0
-
-
-class TestDayRateBuysOnlyThePeak(unittest.TestCase):
+class TestTheDayBuysNothingForThePeak(unittest.TestCase):
+    """3.14. CliveS, 27-Sep-2026: "the only time during the day that we import is
+    when we have free hours or the battery gets near the lower battery limit".
+    The 3.12 day-rate top-up for the peak is gone; tomorrow waits for 2am."""
 
     def setUp(self):
         self.bm = BatteryManager()
 
-    def test_a_dull_morning_buys_only_what_the_peak_needs(self):
-        """25% at 11:30: 8.8 kWh, the run-up eats 2.7 and the peak needs 1.8 above a
-        7.0 kWh reserve. Buy the 2.7 kWh gap plus the buffer, not tomorrow."""
+    def _day_times(self):
+        for hh in range(5, 24):
+            for mm in (0, 30):
+                yield hh, mm
+        yield 0, 30
+        yield 1, 30
+
+    def test_a_dull_morning_buys_nothing(self):
+        """25% at 11:30 used to buy for the peak at 24.4p."""
         d = self.bm.evaluate(_snap(25.0, 11, 30))
-        self.assertEqual(d.action, ACTION_START_IMPORT)
-        self.assertAlmostEqual(d.target_soc_pct, _peak_target(25.0, 4.5), places=1)
-        self.assertLess(d.target_soc_pct, 40.0)
-        self.assertIn("peak", d.reason)
-        self.assertIn("4pm to 7pm", d.reason)
-        self.assertNotIn("Tomorrow at risk", d.reason)
-
-    def test_the_target_does_not_ratchet_as_the_battery_fills(self):
-        """The 26-Sep fault: each restart set target = SOC now + tomorrow's gap, so
-        it climbed with the battery. The peak target is an absolute level."""
-        first  = self.bm.evaluate(_snap(22.0, 11, 30))
-        second = self.bm.evaluate(_snap(24.0, 11, 30))
-        self.assertEqual(first.action, ACTION_START_IMPORT)
-        self.assertEqual(second.action, ACTION_START_IMPORT)
-        self.assertAlmostEqual(first.target_soc_pct, second.target_soc_pct, places=6)
-
-    def test_reaching_the_target_does_not_start_another(self):
-        """After a top-up the battery sits the buffer above need; nothing restarts."""
-        d1 = self.bm.evaluate(_snap(25.0, 11, 30))
-        d2 = self.bm.evaluate(_snap(d1.target_soc_pct, 11, 30, import_pending=True))
-        self.assertEqual(d2.action, ACTION_SCHEDULE_IMPORT)
-
-    def test_a_small_drift_after_a_top_up_does_not_restart_it(self):
-        """The deadband: need grows by 1 kWh (under min + buffer) -> still no start."""
-        d1 = self.bm.evaluate(_snap(25.0, 11, 30))
-        drifted = d1.target_soc_pct - 1.0 / CAP * 100.0
-        d2 = self.bm.evaluate(_snap(drifted, 11, 30, import_pending=True))
-        self.assertEqual(d2.action, ACTION_SCHEDULE_IMPORT)
-
-    def test_solar_before_the_peak_shrinks_the_purchase(self):
-        p50 = {f"2026-09-26 {h:02d}:00:00": 500 for h in range(7, 19)}
-        dull  = self.bm.evaluate(_snap(22.0, 11, 30))
-        sunny = self.bm.evaluate(_snap(22.0, 11, 30, p50=p50))
-        self.assertEqual(sunny.action, ACTION_START_IMPORT)
-        # 11:30-16:00 is half of 11:00 plus 12:00-15:00: 0.25 + 2.0 kWh of sun.
-        self.assertAlmostEqual(sunny.target_soc_pct,
-                               _peak_target(22.0, 4.5, solar_before=2.25), places=1)
-        self.assertLess(sunny.target_soc_pct, dull.target_soc_pct)
-
-    def test_enough_for_the_peak_waits_for_the_cheap_window(self):
-        d = self.bm.evaluate(_snap(35.0, 11, 30))
+        self.assertNotEqual(d.action, ACTION_START_IMPORT)
         self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
         self.assertIn("cheap window from 2am", d.reason)
 
-    def test_a_thin_peak_margin_is_not_worth_the_round_trip(self):
-        """24.35 / 0.94 + 2p wear = 27.9p; a 28p peak beats it by under 1p."""
-        d = self.bm.evaluate(_snap(15.0, 11, 30, tariff=_flux(peak_p=28.0)))
-        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
+    def test_nothing_starts_an_import_anywhere_in_the_day(self):
+        for soc in (3.0, 12.0, 25.0, 40.0):
+            for hh, mm in self._day_times():
+                for owns in (False, True):
+                    d = self.bm.evaluate(_snap(soc, hh, mm, flux_owns=owns))
+                    self.assertNotEqual(d.action, ACTION_START_IMPORT,
+                                        (soc, hh, mm, owns, d.reason))
 
     def test_nothing_is_bought_at_the_day_rate_after_the_peak(self):
         """20:00, battery low: every kWh until 2am costs the day rate either way."""
         d = self.bm.evaluate(_snap(12.0, 20, 0))
         self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
         self.assertIn("normal rate", d.reason)
-
-    def test_nothing_is_bought_during_the_peak(self):
-        d = self.bm.evaluate(_snap(12.0, 17, 0))
-        self.assertEqual(d.action, ACTION_SCHEDULE_IMPORT)
 
     def test_go_has_no_peak_so_it_always_waits(self):
         go = TariffData(tariff_key=TARIFF_GO, today_rate_p=25.0,
@@ -159,13 +119,47 @@ class TestDayRateBuysOnlyThePeak(unittest.TestCase):
         self.assertEqual(d.action, ACTION_START_IMPORT)
         self.assertIn("cheap window (2am to 5am)", d.reason)
 
-    def test_the_reserve_floor_counts_not_the_health_floor(self):
-        """With Flux armed the house stops at the 20% backup reserve, so a battery
-        that is fine against a 1% floor can still be short for the peak."""
-        armed   = self.bm.evaluate(_snap(28.0, 11, 30, reserve=20.0))
-        unarmed = self.bm.evaluate(_snap(28.0, 11, 30, reserve=0.0))
-        self.assertEqual(armed.action, ACTION_START_IMPORT)
-        self.assertEqual(unarmed.action, ACTION_SCHEDULE_IMPORT)
+    def test_an_unknown_cheap_window_holds_rather_than_buying_now(self):
+        """One failed Octopus slot fetch used to mean 10 kW at once, at any hour."""
+        blind = TariffData(tariff_key="flux", today_rate_p=24.35, day_rate_p=24.35,
+                           peak_start="16:00", peak_end="19:00", peak_rate_p=34.10)
+        for hh in (11, 17, 21):
+            d = self.bm.evaluate(_snap(12.0, hh, 0, tariff=blind))
+            self.assertEqual(d.action, ACTION_SELF_CONSUMPTION, hh)
+            self.assertTrue(d.import_held, hh)
+            self.assertIn("cheap window times are not known", d.reason)
+
+
+class TestAxleEventCover(unittest.TestCase):
+    """3.14. The one daytime purchase: an Axle event the battery cannot cover.
+    The sums are flux_strategy.event_cover's; the manager only acts on them."""
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def _cover(self, soc, active, target, hh=14):
+        snap = _snap(soc, hh, 0)
+        snap.event_cover_active     = active
+        snap.event_cover_target_pct = target
+        snap.event_cover_reason     = "the test event needs 60% by 4pm"
+        return self.bm.evaluate(snap)
+
+    def test_an_active_cover_buys_to_its_target(self):
+        d = self._cover(30.0, True, 60.0)
+        self.assertEqual(d.action, ACTION_START_IMPORT)
+        self.assertAlmostEqual(d.target_soc_pct, 60.0)
+        self.assertIn("Axle", d.reason)
+        self.assertEqual(d.audit_trail[-1][0], "EVENT-COVER")
+
+    def test_a_planned_cover_buys_nothing_yet(self):
+        d = self._cover(30.0, False, 60.0)
+        self.assertNotEqual(d.action, ACTION_START_IMPORT)
+        self.assertTrue(any(tag == "EVENT-COVER" and "planned" in msg
+                            for tag, msg in d.audit_trail))
+
+    def test_a_battery_already_at_the_target_buys_nothing(self):
+        d = self._cover(61.0, True, 60.0)
+        self.assertNotEqual(d.action, ACTION_START_IMPORT)
 
 
 class TestImportNeededHysteresis(unittest.TestCase):
@@ -257,10 +251,10 @@ class TestFluxOwnsTheCheapWindow(unittest.TestCase):
         self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
         self.assertIn("buys it now", d.reason)
 
-    def test_the_day_rate_peak_top_up_is_still_the_managers(self):
+    def test_the_day_buys_nothing_for_the_peak_under_flux_either(self):
         d = self.bm.evaluate(_snap(25.0, 11, 30, flux_owns=True))
-        self.assertEqual(d.action, ACTION_START_IMPORT)
-        self.assertIn("peak", d.reason)
+        self.assertEqual(d.action, ACTION_SELF_CONSUMPTION)
+        self.assertIn("Flux controller buys it", d.reason)
 
     def test_without_flux_the_manager_still_buys_in_the_window(self):
         d = self.bm.evaluate(_snap(12.0, 3, 0, flux_owns=False))

@@ -48,8 +48,9 @@
 #              Claude Opus 5.5 (5.121.0 — Tuesday to Friday share one measured pattern; every day now has one)
 #              Claude Opus 5.5 (5.122.0 — /api/day-patterns: the day patterns, for the Dashboards Energy page)
 #              Claude Opus 5.5 (5.123.0 — the run-up to the peak holds only what the peak can sell)
+#              Claude Opus 5.5 (5.124.0 — the day never stops the battery; it buys only free hours and Axle cover)
 # Date:        27-09-2026
-# Version:     5.123.0
+# Version:     5.124.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -238,7 +239,7 @@ from daily_energy import (DailyEnergy, readings_from_data, recovery_from_data,
 from openmeteo_forecast import OpenMeteoForecast
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               TARIFF_FLUX, TARIFF_GO, TARIFF_IGO, TARIFF_IFLUX,
-                              GAS_KWH_PER_M3)
+                              TARIFF_UNKNOWN, GAS_KWH_PER_M3)
 from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
 from octopus_api      import octopoints_to_pence as _points_to_pence
 
@@ -1478,8 +1479,9 @@ def _ascii_plain(text):
     return text.encode("ascii", "ignore").decode("ascii")
 
 
-# How long the manager waits after startup for the first tariff before planning
-# with the Tracker fallback (v5.109.1).
+# How long the manager waits after startup for the first tariff before acting on
+# a plan made with the tariff UNKNOWN (v5.109.1; the fallback was Tracker until
+# 5.124.0). An unknown tariff runs self consumption and buys nothing.
 TARIFF_WAIT_S = 300
 
 
@@ -2446,7 +2448,7 @@ class Plugin(indigo.PluginBase):
 
             tariff_info = rates.get("tariff_info", {})
             active_today_p, active_tomorrow_p = self._rates_for_tariff(
-                tariff_info.get("tariff_key", TARIFF_TRACKER), rates)
+                tariff_info.get("tariff_key", TARIFF_UNKNOWN), rates)
 
             pv_w   = int(inv.get("pvPowerWatts",     0))
             bat_w  = int(inv.get("batteryPowerWatts", 0))
@@ -4163,9 +4165,9 @@ class Plugin(indigo.PluginBase):
         self.store["manager_hands_off_reason"] = ""
         self._verify_ems_registers()
         # 8a. NO TARIFF YET. Straight after a restart the first manager tick runs
-        #    before the first Octopus refresh, and _build_tariff_data then falls
-        #    back to Tracker — so on Flux (or Go, or Agile) the first plan of every
-        #    restart was a flat-rate plan (seen live 17-Sep-2026: "tariff=tracker"
+        #    before the first Octopus refresh, and _build_tariff_data then fell
+        #    back to Tracker (UNKNOWN since 5.124.0) — so on Flux (or Go, or Agile)
+        #    the first plan of every restart was a flat-rate plan (seen live 17-Sep-2026: "tariff=tracker"
         #    at 11:23, 11:25 and 12:50, each a restart). Everything above still runs (Flux pre-emption,
         #    the device state); only the hardware ACTION waits for the tariff, up to
         #    TARIFF_WAIT_S; after that, carry on as before rather than never
@@ -5021,6 +5023,7 @@ class Plugin(indigo.PluginBase):
         return mon_u, sat_u, sun_u
 
     def _build_manager_snapshot(self, soc_pct, export_enabled, vpp_reserved_kwh):
+        _cover = self._event_cover(soc_pct)
         """Construct the immutable snapshot passed to manager.evaluate()."""
         prefs = self.pluginPrefs
 
@@ -5097,6 +5100,10 @@ class Plugin(indigo.PluginBase):
             import_pending     = bool(self.store.get("import_active")
                                       or self.store.get("import_scheduled_time") is not None),
             flux_owns_cheap_window = self._flux_owns_cheap_window(),
+            # 5.124.0: an Axle event the battery cannot cover alone.
+            event_cover_active     = bool(_cover is not None and _cover.active),
+            event_cover_target_pct = float(_cover.target_pct) if _cover else 0.0,
+            event_cover_reason     = _cover.reason if _cover else "",
             export_enabled     = export_enabled,
             max_export_kw      = _as_float(prefs.get("maxExportKw"), 4.0),
             inverter_max_kw    = _as_float(prefs.get("inverterMaxKw"), 10.0),
@@ -7160,6 +7167,9 @@ class Plugin(indigo.PluginBase):
             # already makes. No tomorrow figure: the bands repeat daily and a
             # second number would only invite the question of which band it is.
             return _tou_rate_now_p(rates.get(tariff_key, {})), None
+        if tariff_key != TARIFF_TRACKER:
+            # Unknown, or not yet fetched: no price, rather than Tracker's.
+            return None, None
         tracker = rates.get(TARIFF_TRACKER, {})
         return tracker.get("today_p"), tracker.get("tomorrow_p")
 
@@ -7183,7 +7193,13 @@ class Plugin(indigo.PluginBase):
         """Build a TariffData object from the latest Octopus rates."""
         rates       = self.latest_rates_data
         tariff_info = rates.get("tariff_info", {})
-        tariff_key  = tariff_info.get("tariff_key", TARIFF_TRACKER)
+        # UNKNOWN until Octopus has said, never Tracker (5.124.0). Straight after a
+        # restart the first plan runs before the first rate refresh, and a Tracker
+        # guess made that plan a flat-rate one on a Flux house ("tariff=tracker" in
+        # the audit on 17 and 27-Sep-2026). An unknown tariff plans self
+        # consumption and buys nothing (_plan_import holds), which is the right
+        # thing to do with no prices.
+        tariff_key  = tariff_info.get("tariff_key", TARIFF_UNKNOWN)
 
         tou = rates.get(tariff_key, {})          # cheap window data for Go/Flux/iGo/iFlux
         today_rate_p, tomorrow_rate_p = self._rates_for_tariff(tariff_key, rates)
@@ -7975,6 +7991,26 @@ class Plugin(indigo.PluginBase):
         with self._state_lock:
             return self._check_scheduled_import_impl()
 
+    def _scheduled_import_missed_its_window(self, now_utc):
+        """True when a time-of-use tariff's cheap window has closed (5.124.0).
+
+        Only the time-of-use tariffs, whose schedule is always their cheap window.
+        Tracker, Agile and Flexible schedule at other times on purpose.
+        """
+        try:
+            tariff = self._build_tariff_data()
+            if tariff.tariff_key not in (TARIFF_GO, TARIFF_FLUX, TARIFF_IGO, TARIFF_IFLUX):
+                return False
+            if not (tariff.cheap_start and tariff.cheap_end):
+                return False
+            hm = now_utc.astimezone(_london_tz()).strftime("%H:%M")
+            start, end = tariff.cheap_start, tariff.cheap_end
+            inside = (start <= hm < end) if start < end else (hm >= start or hm < end)
+            return not inside
+        except Exception as exc:                            # noqa: BLE001
+            self.logger.debug(f"[Manager] cheap-window check failed: {exc!r}")
+            return False
+
     def _check_scheduled_import_impl(self):
         """Check if a scheduled import time has arrived."""
         scheduled = self.store.get("import_scheduled_time")
@@ -8043,6 +8079,15 @@ class Plugin(indigo.PluginBase):
             if self._flux_owns_cheap_window():
                 log("[Manager] Scheduled import dropped — the Flux controller is "
                     "doing the cheap-window charge")
+                self.store["import_scheduled_time"]   = None
+                self.store["import_scheduled_logged"] = False
+                return
+            # 5.124.0: a cheap-window charge that a VPP hold pushed past the end of
+            # the window no longer fires in the day. CliveS, 27-Sep-2026: the day
+            # buys nothing but free hours and Axle cover.
+            if self._scheduled_import_missed_its_window(now_utc):
+                log("[Manager] Scheduled import dropped — its cheap window has closed, "
+                    "and the house does not buy at the day rate")
                 self.store["import_scheduled_time"]   = None
                 self.store["import_scheduled_logged"] = False
                 return
@@ -12266,7 +12311,7 @@ class Plugin(indigo.PluginBase):
         if not dev:
             return
 
-        active_key = tariff_info.get("tariff_key", TARIFF_TRACKER)
+        active_key = tariff_info.get("tariff_key", TARIFF_UNKNOWN)
         tracker    = monitored.get("tracker",  {})
         go         = monitored.get("go",       {})
         flux       = monitored.get("flux",     {})
@@ -13093,6 +13138,10 @@ class Plugin(indigo.PluginBase):
         # manager has managed to act on it yet.
         if self.store.get("happy_hour_import_active") or self._happy_hour_window():
             return "a Happy Hour free import"
+        if self.store.get("event_cover_active"):
+            # 5.124.0: an Axle event the battery cannot cover alone. The manager
+            # buys the gap, so Flux must let go even in the peak.
+            return "an Axle event needs a grid top-up"
         if self.store.get("import_active"):
             return "the manager has a grid import in flight"
         if self.store.get("export_active"):
@@ -13889,6 +13938,56 @@ class Plugin(indigo.PluginBase):
             policy_floor_pct      = self._flux_planner_floor_pct(),
             max_charge_soc_pct    = _as_float(prefs.get("fluxMaxChargeSocPct"), 100.0),
         )
+
+    def _event_cover(self, soc_pct):
+        """The import an announced Axle event needs, or None (5.124.0).
+
+        CliveS, 27-Sep-2026: the day buys nothing but free hours, and an Axle event
+        the battery cannot cover — "an import to cover it so that the VPP runs
+        fully and we have enough to get to 2am". flux_strategy.event_cover does
+        the sums on the same half-hourly walk the Flux planner uses.
+
+        Not inside 02:00-05:00 on Flux: the Flux charge already sizes itself for
+        every event announced by then, and a manager import there would pre-empt
+        it. Never raises; anything missing means no cover, and the house runs
+        from the battery. The flag in the store is what makes Flux stand aside.
+        """
+        cover = None
+        try:
+            if (_flux_strategy is not None
+                    and _as_bool(self.pluginPrefs.get("axleEnabled"), False)):
+                tz  = _london_tz()
+                now = datetime.now(timezone.utc)
+                on_flux = str(((self.latest_rates_data or {}).get("tariff_info") or {})
+                              .get("tariff_key") or "") == TARIFF_FLUX
+                if not (on_flux and _flux_strategy.in_window(
+                        now, tz, _flux_strategy.FLUX_CHEAP_START,
+                        _flux_strategy.FLUX_CHEAP_END)):
+                    inv = self.latest_inverter_data or {}
+                    observed = {
+                        "batterySoc":     float(soc_pct),
+                        "pvPowerWatts":   float(inv.get("pvPowerWatts", 0) or 0),
+                        "homePowerWatts": float(inv.get("homePowerWatts", 0) or 0),
+                        "gridPowerWatts": float(inv.get("gridPowerWatts", 0) or 0),
+                    }
+                    cover = _flux_strategy.event_cover(
+                        self._flux_inputs(observed, time.time()), avoid_peak=on_flux)
+        except Exception as exc:                            # noqa: BLE001
+            self.logger.debug(f"[Cover] event cover not worked out: {exc!r}")
+            cover = None
+        active = bool(cover is not None and cover.active)
+        key = ((cover.event_start.isoformat(), active) if cover is not None else None)
+        if key != self.store.get("event_cover_key"):
+            self.store["event_cover_key"] = key
+            if cover is not None:
+                log(f"[Cover] {'Buying now' if active else 'Planned'}: {cover.reason}"
+                    + ("" if active else
+                       f". It starts by {cover.start_by.astimezone(_london_tz()):%H:%M} "
+                       f"if the battery is still short then"))
+            elif self.store.get("event_cover_active"):
+                log("[Cover] The Axle event no longer needs a grid top-up.")
+        self.store["event_cover_active"] = active
+        return cover
 
     def _flux_inputs(self, observed, observed_at):
         """Everything plan() is allowed to see."""

@@ -4,10 +4,25 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.4 Claude Opus 5.5
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.5 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
-#              v2.4 27-09-2026
-# Version:     2.4
+#              v2.4 and v2.5 27-09-2026
+# Version:     2.5
+#
+# v2.5 (SigenEnergyManager 5.124.0) removes the run-up hold altogether. CliveS,
+# 27-Sep-2026: "at no point during the day should the battery be stopped, there is
+# no reason to do so, if we cant export for the 3 hours due to lack of battery then
+# dont export." Outside 02:00-05:00 the planner never stops the battery running the
+# house; the peak sells only what is spare above the house's need to 02:00, and
+# sells nothing when nothing is.
+#
+# The one daytime import besides free hours (CliveS, same day): an Axle event
+# the battery cannot cover. `event_cover` works out whether the battery, running
+# the house as forecast, reaches the event (or the 4pm peak, if the event falls
+# in it, so the energy is bought at the day rate) holding the event plus the
+# house until 02:00 above the reserve. If not, it names how much to buy and the
+# latest time to start, so the purchase is as small and as late as it can be.
+# The 02:00-05:00 charge already counts an event announced by then.
 #
 # v2.4 (SigenEnergyManager 5.123.0) holds the battery before the peak only for the
 # energy the peak could actually sell. The hold compared prices and nothing else,
@@ -95,7 +110,6 @@ MAX_TELEMETRY_AGE_S = 120
 MAX_PROFILE_AGE_S   = 7 * 86400      # rebuilt daily; a week old is a fault
 MAX_FLOW_AGE_S      = 120            # power flows, for site headroom
 
-HOLD_BEFORE_PEAK_MINUTES = 120
 # How much sunnier than forecast a day is assumed to be when deciding what to BUY
 # for resale (v2.2). Measured 24-Sep-2026 over the last 90 forecast/actual pairs
 # in openmeteo_accuracy_records.json: actual/forecast median 0.95, 75th
@@ -105,6 +119,7 @@ HOLD_BEFORE_PEAK_MINUTES = 120
 RESALE_PV_OPTIMISM       = 1.35
 RESALE_SPILL_TOLERANCE   = 0.2          # kWh of displaced energy ignored
 MIN_TRADE_KWH            = 0.5
+COVER_LEAD_MINUTES       = 60        # finish an event-cover charge this long before its deadline (the VPP pre-charge starts 30 min before an event)
 SIM_STEP_MINUTES         = 30
 SEARCH_TOLERANCE_KWH     = 1e-6      # the binary search's own convergence error
 MAX_HORIZON_HOURS        = 36        # bounds every simulation
@@ -1021,12 +1036,6 @@ def _export_is_profitable(bands, site):
     return margin_p >= MIN_ARBITRAGE_MARGIN_P, round(margin_p, 3)
 
 
-def _hold_is_profitable(bands, site):
-    """Holding means buying at the day rate now to sell at peak later."""
-    margin_p = bands.export_peak_p - bands.import_day_p - site.wear_p_per_kwh
-    return margin_p >= MIN_ARBITRAGE_MARGIN_P, round(margin_p, 3)
-
-
 # ================================================================
 # Physical headroom
 # ================================================================
@@ -1284,42 +1293,87 @@ def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
     return lo
 
 
-def _peak_shortfall_kwh(inputs, peak_start, until):
-    """(shortfall, needed, arriving) in battery kWh at `peak_start` (v2.4).
+@dataclass(frozen=True)
+class EventCover:
+    """An Axle event the battery cannot cover on its own (v2.5).
 
-    ARRIVING is what the battery reaches the peak with if it keeps running the
-    house from now, the sun charging it as forecast. NEEDED is what the evening
-    asks of it: the house and every commitment until the cheap window, above the
-    reserve (the export floor the peak will itself use), plus the battery side of
-    what the peak can sell. The sale is the export cap over three hours, less any
-    of it a commitment already fills (an Axle hour inside the peak shares the
-    same cap) and less the sunshine the roof sends out through it. Nothing is
-    sold on a day that bought at the day rate (v2.3), so then only the house
-    counts.
-
-    A hold only earns anything for the SHORTFALL. Beyond it, a kWh held is a kWh
-    the peak cannot sell, bought at the day rate to wait for the night.
+    `active` is True once it is time to buy; before that the cover is only
+    planned, so the forecast has every chance to make it unnecessary.
     """
-    site     = inputs.site
-    eff      = site.one_way_efficiency
-    tz       = inputs.local_tz
-    peak_end = next_local(peak_start, tz, FLUX_PEAK_END)
-    floor_kwh = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
-    keep, _inf = required_start_kwh(inputs, peak_start, until, floor_kwh,
-                                    no_charge_until=peak_end)
-    sale_kwh = 0.0
-    if not inputs.day_rate_import_today:
-        peak_hours = (peak_end - peak_start).total_seconds() / 3600.0
-        cap_kwh    = (min(site.discharge_power_w, site.export_limit_w) / 1000.0
-                      * peak_hours)
-        committed  = _commitment_kwh(inputs.commitments, peak_start, peak_end, "export")
-        roof_out   = max(0.0, inputs.pv.kwh_between(peak_start, peak_end)
-                         - inputs.house.kwh_between(peak_start, peak_end))
-        sale_kwh   = max(0.0, cap_kwh - committed - roof_out) / eff
-    needed = min(site.capacity_kwh, keep + sale_kwh)
-    now_kwh = float(inputs.soc_pct) / 100.0 * site.capacity_kwh
-    arriving, _low, _unmet, _high = simulate(inputs, now_kwh, inputs.now, peak_start)
-    return max(0.0, needed - arriving), needed, arriving
+    active:       bool
+    buy_kwh:      float           # grid-side
+    target_pct:   float           # SOC to charge to, now
+    start_by:     datetime        # latest start that still finishes in time
+    deadline:     datetime        # event start, or 4pm when the event is in the peak
+    event_start:  datetime
+    needed_kwh:   float           # battery kWh wanted at the deadline
+    arriving_kwh: float           # battery kWh the deadline would see without it
+    reason:       str
+
+
+def event_cover(inputs, source="axle", avoid_peak=True):
+    """The import an upcoming `source` export event needs, or None (v2.5).
+
+    The battery must reach the deadline holding every commitment still to come
+    and the house's need until the next 02:00, above the reserve: the same walk
+    the peak export floor uses. The deadline is the first upcoming event's start,
+    or the 4pm peak when the event falls inside it and `avoid_peak` (so the
+    energy is bought at the day rate, not the peak rate). An event already
+    running is the VPP driver's business, not this function's.
+
+    Pure, and it never raises for missing inputs: no forecast, no profile or no
+    reading means no cover, and the house simply runs from the battery.
+    """
+    site = inputs.site
+    tz   = inputs.local_tz
+    now  = inputs.now
+    if inputs.house is None or inputs.pv is None or inputs.soc_pct is None:
+        return None
+    try:
+        until = next_cheap_start(now, tz)
+    except FluxDeferred:
+        return None
+    upcoming = sorted((c for c in inputs.commitments
+                       if c.kind == "export" and c.source == source
+                       and now < c.start < until),
+                      key=lambda c: c.start)
+    if not upcoming:
+        return None
+    event_start = upcoming[0].start
+    deadline    = event_start
+    if avoid_peak:
+        peak_start = next_local(now, tz, FLUX_PEAK_START)
+        peak_end   = next_local(peak_start, tz, FLUX_PEAK_END)
+        if peak_start < event_start < peak_end:
+            deadline = peak_start
+    try:
+        floor_kwh = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
+        needed, _infeasible = required_start_kwh(inputs, deadline, until, floor_kwh)
+        now_kwh = float(inputs.soc_pct) / 100.0 * site.capacity_kwh
+        arriving, _low, _unmet, _high = simulate(inputs, now_kwh, now, deadline)
+    except (FluxDeferred, TypeError, ValueError, ArithmeticError):
+        return None
+    short = needed - arriving
+    if short < MIN_TRADE_KWH:
+        return None
+    eff        = site.one_way_efficiency
+    buy_kwh    = short / eff
+    charge_kw  = max(0.1, min(site.charge_power_w, site.import_limit_w) / 1000.0)
+    start_by   = deadline - timedelta(hours=buy_kwh / charge_kw,
+                                      minutes=COVER_LEAD_MINUTES)
+    target_pct = min(float(site.max_charge_soc_pct),
+                     float(math.ceil(_pct(now_kwh + short, site.capacity_kwh))))
+    active     = now >= start_by
+    when       = deadline.astimezone(tz).strftime("%H:%M")
+    reason     = (f"the Axle event at {event_start.astimezone(tz):%H:%M} and the house "
+                  f"until 2am need about {_pct(needed, site.capacity_kwh):.0f}% by "
+                  f"{when}, and running the house the battery would have about "
+                  f"{_pct(arriving, site.capacity_kwh):.0f}%, so about "
+                  f"{buy_kwh:.1f} kWh is bought from the grid")
+    return EventCover(active=active, buy_kwh=round(buy_kwh, 2),
+                      target_pct=target_pct, start_by=start_by, deadline=deadline,
+                      event_start=event_start, needed_kwh=round(needed, 2),
+                      arriving_kwh=round(arriving, 2), reason=reason)
 
 
 def _export_plan(inputs):
@@ -1507,59 +1561,14 @@ def plan(inputs):
                 planned_kwh=round(surplus_kwh, 2), margin_p=margin_p,
                 committed_kwh=committed, reason=reason)
 
-        # ── the run-up to the peak ──────────────────────────────────────────
-        peak_start = next_local(inputs.now, tz, FLUX_PEAK_START)
-        minutes_to_peak = (peak_start - inputs.now).total_seconds() / 60.0
-        if minutes_to_peak <= HOLD_BEFORE_PEAK_MINUTES:
-            worth_holding, hold_margin_p = _hold_is_profitable(bands, site)
-            if worth_holding and not inputs.pv.covers(inputs.now, peak_start):
-                raise FluxDeferred("the solar forecast does not cover the run-up to "
-                                   "the peak, so holding the battery cannot be "
-                                   "judged")
-            if worth_holding:
-                short_kwh, needed_kwh, arriving_kwh = _peak_shortfall_kwh(
-                    inputs, peak_start, next_cheap)
-                if short_kwh < MIN_TRADE_KWH:
-                    return FluxDecision(
-                        mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
-                        protect_soc_pct=house_floor, household_floor_pct=house_floor,
-                        margin_p=hold_margin_p, committed_kwh=committed,
-                        reason=(f"no need to hold the battery for the peak in "
-                                f"{minutes_to_peak:.0f} minutes — running the house "
-                                f"until then it still reaches 4pm with about "
-                                f"{_pct(arriving_kwh, site.capacity_kwh):.0f}%, and "
-                                f"the peak sale and the house until 2am need about "
-                                f"{_pct(needed_kwh, site.capacity_kwh):.0f}%, so the "
-                                f"battery keeps running the house"))
-                hold_floor = max(house_floor, export_floor_pct(inputs, peak_start))
-                if float(inputs.soc_pct) > hold_floor:
-                    return FluxDecision(
-                        mode=MODE_HOLD, owns=True, decision_at=inputs.now,
-                        ems_mode=EMS_SELF_CONSUMPTION,
-                        charge_limit_w=int(site.charge_power_w), discharge_limit_w=0,
-                        charge_cutoff_pct=float(site.max_charge_soc_pct),
-                        discharge_cutoff_pct=hold_floor,
-                        decision_until=_decision_until(inputs, peak_start),
-                        protect_soc_pct=hold_floor, household_floor_pct=house_floor,
-                        margin_p=hold_margin_p, committed_kwh=committed,
-                        planned_kwh=round(short_kwh, 2),
-                        reason=(f"holding the battery for the peak in "
-                                f"{minutes_to_peak:.0f} minutes — without it the "
-                                f"battery would reach 4pm about {short_kwh:.1f} kWh "
-                                f"short of what the peak can sell and the house "
-                                f"needs until 2am, and that energy sells at "
-                                f"{bands.export_peak_p:.1f}p there against the "
-                                f"{bands.import_day_p:.1f}p the house pays now. Solar "
-                                f"still charges"))
-
         # ── everything else ─────────────────────────────────────────────────
         return FluxDecision(
             mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
             protect_soc_pct=house_floor, household_floor_pct=house_floor,
             committed_kwh=committed,
-            reason=("outside the Flux windows — self consumption and solar overflow "
-                    "are the existing manager's job, so Flux is not holding the "
-                    "inverter"))
+            reason=("outside the Flux windows — the battery runs the house, and self "
+                    "consumption and solar overflow are the existing manager's job, "
+                    "so Flux is not holding the inverter"))
 
     except FluxDeferred as exc:
         return FluxDecision(mode=MODE_DEFER, owns=False, decision_at=inputs.now,

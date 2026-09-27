@@ -16,7 +16,8 @@ The plugin checks Axle for new events every ten minutes, and every minute when o
 
 - **When an event is announced,** usually a day ahead, the plugin sets its energy aside, so the overnight plan does not use it, and an event in the morning always has what it needs. The **VPP Event Announced** trigger runs.
 - **Half an hour before,** it sets the lowest level the battery may go to during the event — the reserve the house needs afterwards — so the event only sells what the battery can spare. For an event in the day that is the battery's safety floor, because the sun will refill it. For an event at night it is the overnight reserve.
-- **It never buys from the grid to sell in an event.** If the battery looks short for the event, you get a Pushover message saying so.
+- **If the battery cannot cover the event,** the plugin buys just enough from the grid to run the whole event and still carry the house to 2am. It works this out from the forecast and the house's usual pattern, and buys as late as it can, so a sunny afternoon has every chance to make it unnecessary. For an event between 4pm and 7pm it buys before 4pm, at the standard price rather than the peak price. An event announced before 2am is covered by the overnight charge instead. The Event Log says when a top-up is planned and when it starts.
+- If the battery still looks short for the event, you get a Pushover message saying so.
 
 ## During an event
 

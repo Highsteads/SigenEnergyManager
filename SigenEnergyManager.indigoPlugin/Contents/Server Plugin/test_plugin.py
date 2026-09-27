@@ -6454,6 +6454,138 @@ _TRACKER_RATES = {
 }
 
 
+class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
+    """5.124.0. CliveS, 27-Sep-2026: the battery is never stopped in the day, and
+    the house buys only in free hours or to cover an Axle event."""
+
+    def _owner_fake(self, **store):
+        return types.SimpleNamespace(
+            store=dict(store), _grid_outage_active=lambda: False,
+            _happy_hour_window=lambda: None, _flux_peak_now=lambda: True,
+            _power_cut_window_active=lambda: False)
+
+    def test_an_active_cover_makes_flux_stand_aside_even_in_the_peak(self):
+        fake = self._owner_fake(event_cover_active=True)
+        self.assertIn("Axle", plugin.Plugin._flux_other_owner(fake))
+        self.assertEqual(plugin.Plugin._flux_other_owner(self._owner_fake()), "")
+
+    def _window_fake(self, key, start="02:00", end="05:00"):
+        tariff = types.SimpleNamespace(tariff_key=key, cheap_start=start, cheap_end=end)
+        return types.SimpleNamespace(_build_tariff_data=lambda: tariff,
+                                     logger=logging.getLogger("t"))
+
+    def _at(self, hh, mm=0):
+        return datetime(2026, 9, 28, hh, mm, tzinfo=timezone.utc) - timedelta(hours=1)
+
+    def test_a_late_scheduled_charge_is_dropped_on_flux(self):
+        fake = self._window_fake("flux")
+        missed = plugin.Plugin._scheduled_import_missed_its_window
+        self.assertFalse(missed(fake, self._at(2, 0)))
+        self.assertFalse(missed(fake, self._at(4, 59)))
+        self.assertTrue(missed(fake, self._at(5, 0)))
+        self.assertTrue(missed(fake, self._at(11, 0)))
+
+    def test_tracker_and_agile_schedules_are_left_alone(self):
+        for key in ("tracker", "agile", "flexible", "unknown"):
+            self.assertFalse(plugin.Plugin._scheduled_import_missed_its_window(
+                self._window_fake(key), self._at(11, 0)), key)
+
+    def _cover_fake(self, axle=True, key="flux"):
+        return types.SimpleNamespace(
+            pluginPrefs={"axleEnabled": axle},
+            latest_rates_data={"tariff_info": {"tariff_key": key}},
+            latest_inverter_data={"pvPowerWatts": 0, "homePowerWatts": 500,
+                                  "gridPowerWatts": 500},
+            _flux_inputs=lambda observed, at: observed,
+            store={}, logger=logging.getLogger("t"))
+
+    def _cover(self, active):
+        now = datetime.now(timezone.utc)
+        return plugin._flux_strategy.EventCover(
+            active=active, buy_kwh=5.0, target_pct=60.0, start_by=now,
+            deadline=now + timedelta(hours=1), event_start=now + timedelta(hours=2),
+            needed_kwh=20.0, arriving_kwh=15.0, reason="the test event needs it")
+
+    def test_an_active_cover_sets_the_flag_and_logs_once(self):
+        fake = self._cover_fake()
+        with patch.object(plugin._flux_strategy, "event_cover",
+                          return_value=self._cover(True)), \
+             patch.object(plugin._flux_strategy, "in_window", return_value=False), \
+             patch.object(plugin, "log") as logged:
+            got = plugin.Plugin._event_cover(fake, 30.0)
+            plugin.Plugin._event_cover(fake, 30.0)
+        self.assertTrue(got.active)
+        self.assertTrue(fake.store["event_cover_active"])
+        self.assertEqual(logged.call_count, 1)
+        self.assertIn("Buying now", logged.call_args[0][0])
+
+    def test_no_axle_means_no_cover(self):
+        fake = self._cover_fake(axle=False)
+        with patch.object(plugin._flux_strategy, "event_cover",
+                          return_value=self._cover(True)):
+            self.assertIsNone(plugin.Plugin._event_cover(fake, 30.0))
+        self.assertFalse(fake.store["event_cover_active"])
+
+    def test_the_cheap_window_is_left_to_the_flux_charge(self):
+        fake = self._cover_fake()
+        with patch.object(plugin._flux_strategy, "event_cover",
+                          return_value=self._cover(True)) as cover, \
+             patch.object(plugin._flux_strategy, "in_window", return_value=True):
+            self.assertIsNone(plugin.Plugin._event_cover(fake, 30.0))
+        cover.assert_not_called()
+
+    def test_a_failure_means_no_cover_never_an_exception(self):
+        fake = self._cover_fake()
+        with patch.object(plugin._flux_strategy, "event_cover",
+                          side_effect=RuntimeError("boom")), \
+             patch.object(plugin._flux_strategy, "in_window", return_value=False):
+            self.assertIsNone(plugin.Plugin._event_cover(fake, 30.0))
+        self.assertFalse(fake.store["event_cover_active"])
+
+
+class TestNoTrackerGuessBeforeTheFirstRefresh(unittest.TestCase):
+    """5.124.0. Straight after a restart the first plan ran before the first rate
+    refresh, and the tariff fell back to Tracker, so a Flux house got a flat-rate
+    plan ("tariff=tracker" in the audit, 17 and 27-Sep-2026). CliveS: "we will
+    never be using Tracker again so it should not be the default tariff". With
+    nothing fetched the tariff is UNKNOWN, which plans self consumption only."""
+
+    def _build(self, rates):
+        fake = types.SimpleNamespace(latest_rates_data=rates,
+                                     _rates_for_tariff=plugin.Plugin._rates_for_tariff)
+        return plugin.Plugin._build_tariff_data(fake)
+
+    def test_nothing_fetched_is_unknown_not_tracker(self):
+        self.assertEqual(self._build({}).tariff_key, "unknown")
+
+    def test_a_fetched_tariff_is_still_used(self):
+        t = self._build({"tariff_info": {"tariff_key": "flux"},
+                         "flux": {"cheap_start": "02:00", "cheap_end": "05:00"}})
+        self.assertEqual(t.tariff_key, "flux")
+        self.assertEqual(t.cheap_start, "02:00")
+
+    def test_unknown_never_shows_a_tracker_price(self):
+        self.assertEqual(plugin.Plugin._rates_for_tariff("unknown", _TRACKER_RATES),
+                         (None, None))
+
+    def test_the_decision_engine_default_is_unknown(self):
+        import battery_manager
+        self.assertEqual(battery_manager.TariffData().tariff_key, "unknown")
+
+    def test_no_tariff_lookup_in_plugin_defaults_to_tracker(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(plugin.__file__)),
+                                "plugin.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and len(node.args) == 2
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "tariff_key"
+                    and isinstance(node.args[1], ast.Name)):
+                self.assertNotEqual(node.args[1].id, "TARIFF_TRACKER",
+                                    f"line {node.lineno} guesses Tracker")
+
+
 class TestRatesFollowActiveTariff(unittest.TestCase):
 
     def test_agile_shows_the_current_half_hour_not_tracker(self):

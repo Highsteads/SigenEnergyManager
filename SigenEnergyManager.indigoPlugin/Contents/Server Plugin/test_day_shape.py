@@ -266,7 +266,8 @@ class TestManagerSundays(unittest.TestCase):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "_estimate_consumption_until"]
-        self.assertGreaterEqual(len(calls), 6)
+        # 4 since battery_manager 3.14 removed the peak top-up's two calls.
+        self.assertGreaterEqual(len(calls), 4)
         for c in calls:
             self.assertEqual(len(c.args) + len(c.keywords), 4,
                              f"line {c.lineno} does not pass the Sunday curve")

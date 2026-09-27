@@ -21,6 +21,41 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.124.0 — 27-09-2026
+
+CliveS, 27-Sep-2026: "at no point during the day should the battery be stopped ... the only
+time during the day that we import is when we have free hours or the battery gets near the
+lower battery limit", plus Axle cover to the event and 2am.
+
+- **flux_strategy 2.5:** the 14:00-16:00 run-up hold is removed (`_hold_is_profitable`,
+  `_peak_shortfall_kwh`, `HOLD_BEFORE_PEAK_MINUTES` gone). New `event_cover(inputs,
+  source="axle", avoid_peak=True)` -> `EventCover` or None: first upcoming Axle export
+  commitment before the next 02:00; deadline = its start, or 16:00 when it falls in the
+  peak; needed = `required_start_kwh(deadline, next 02:00, reserve)`; arriving =
+  `simulate(now -> deadline)` with the house served; buy = (needed - arriving) / eff when
+  over `MIN_TRADE_KWH`; `start_by` = deadline - buy/charge rate - `COVER_LEAD_MINUTES` (60,
+  clear of the VPP pre-charge); `active` once past it. Never raises for missing inputs.
+- **flux_execution:** `_valid_target` refuses mode 2 with discharge 0 outside 02:00-05:00.
+- **battery_manager 3.14:** `_plan_peak_topup` and `PEAK_TOPUP_*` removed; unknown cheap
+  window or one opening after sunrise -> `_hold_import` (was START_IMPORT at 10 kW); new
+  EVENT-COVER branch (1b, after BALANCE) -> START_IMPORT to `event_cover_target_pct` while
+  `event_cover_active` and SOC is below it; `TariffData.tariff_key` defaults to
+  `TARIFF_UNKNOWN`.
+- **plugin.py:** `_event_cover(soc)` computed in `_build_manager_snapshot` (not inside
+  02:00-05:00 on Flux, where the Flux charge already counts announced events); logs
+  `[Cover]` on change; `store["event_cover_active"]` makes `_flux_other_owner` stand Flux
+  aside. `_scheduled_import_missed_its_window` drops a TOU cheap-window charge that fires
+  after its window (a VPP hold can push it past 05:00). Tariff fallbacks are
+  `TARIFF_UNKNOWN`, never Tracker, and `_rates_for_tariff` gives (None, None) for anything
+  but a real tariff.
+- Tests (+19): planner never holds 05:00-02:00 on the real rates; event cover (no event,
+  full battery, peak event before 16:00, activation, the walk meets event + reserve to
+  02:00, non-peak event, Saving Session ignored, running event ignored, missing inputs,
+  2am charge grows for an announced event); manager buys nothing in the day, holds on an
+  unknown window, acts on cover; executor refuses a daytime hold; plugin stands Flux aside,
+  drops a late schedule, sets and logs the cover flag once. `test_tou_peak_topup.py`
+  rewritten for 3.14. Seven mutations of the new guards, each caught.
+
 ## v5.123.0 — 27-09-2026
 
 - **flux_strategy 2.4 — the run-up hold is sized to the peak sale.** New

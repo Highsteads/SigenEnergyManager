@@ -100,9 +100,23 @@ class FluxExecutionTests(unittest.TestCase):
     def test_export_hold_solar_and_house_supply(self):
         self.now=self.now.replace(hour=16)
         self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
-        for c,d in [(0,0),(2000,0),(0,500),(10000,10000)]:
+        for c,d in [(0,500),(2000,500),(10000,10000)]:
             self.assertEqual(self.e.step(self.target(ems_mode=2,charge_limit_w=c,discharge_limit_w=d),self.now),'applied')
             self.assertEqual((self.d.values['mode'],self.d.values['charge'],self.d.values['discharge']),(2,c,d))
+    def test_a_battery_hold_is_refused_outside_the_cheap_window(self):
+        # 5.124.0: "at no point during the day should the battery be stopped".
+        for hour in (5, 11, 15, 16, 20, 23, 0, 1):
+            self.now = self.now.replace(hour=hour)
+            self.e.step(None, self.now)
+            for c in (0, 2000):
+                self.assertEqual(self.e.step(self.target(ems_mode=2, charge_limit_w=c,
+                                                         discharge_limit_w=0), self.now),
+                                 'released', hour)
+                self.assertIn('hold outside', self.e.last_error)
+    def test_a_battery_hold_is_allowed_in_the_cheap_window(self):
+        self.now = self.now.replace(hour=3)
+        self.arm(self.target(ems_mode=2, charge_limit_w=10000, discharge_limit_w=0))
+        self.assertEqual((self.d.values['mode'], self.d.values['discharge']), (2, 0))
     def test_confirmed_supervisor_exclusive_then_release_reconcile(self):
         self.arm(); self.d.writes.clear()
         self.assertEqual(self.e.step(self.target(),self.now,supervisor_owns=True),'supervisor')

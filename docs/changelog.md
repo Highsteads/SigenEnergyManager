@@ -7,6 +7,13 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.124.0 — 27 September 2026
+
+- **The battery is never stopped during the day.** From 5am until 2am it always runs the house. The two hours before the 4pm peak no longer hold it back. The peak sells only what is spare above what the house needs until 2am, and sells nothing when nothing is.
+- **The day buys only in three cases:** free-electricity hours, the battery reaching its lowest allowed charge, and an Axle event the battery cannot cover. The top-up bought at the standard price before the peak is gone. So is the rule that bought at once whenever Octopus's cheap-window times failed to load: the plugin now waits and tells you. A 2am charge that an Axle event pushed past 5am is dropped instead of running in the morning.
+- **Axle events are covered.** If the battery would reach an Axle event without enough to run all of it and carry the house to 2am, the plugin buys the difference, as late as it can, and before 4pm for an event in the peak. An event announced before 2am is covered by the overnight charge.
+- **After a restart the plugin no longer assumes the Tracker tariff** while it waits for Octopus. Until the tariff arrives it simply runs the house from the battery.
+
 ## 5.123.0 — 27 September 2026
 
 - **The battery is no longer held before the 4pm peak when it already has plenty.** In the two hours before the peak the plugin can stop the battery running the house, so its charge is kept to sell at the peak price. It used to do this whenever the peak price beat the standard price, however full the battery was. At a 4 kW export limit the peak sells about 12 kWh, so on a full day that energy was never sold: it was bought at the standard price and then waited for the night. On 27 September it held a 93% battery from 3pm to 4pm and the house bought about 2 kWh an hour meanwhile.
