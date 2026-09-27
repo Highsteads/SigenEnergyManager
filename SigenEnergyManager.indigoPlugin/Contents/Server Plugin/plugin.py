@@ -43,8 +43,9 @@
 #              no storm check without a position)
 #              Claude Opus 5.5 (5.118.0 — Sundays get their own half-hourly pattern: the roast and the wash)
 #              Claude Opus 5.5 (5.119.0 — Saturdays too; the half-hourly record is honest at midnight)
+#              Claude Opus 5.5 (5.119.1 — the day-pattern note is logged once, not on every restart)
 # Date:        27-09-2026
-# Version:     5.119.0
+# Version:     5.119.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1860,6 +1861,9 @@ class Plugin(indigo.PluginBase):
         # _refresh_day_shapes.
         self.store["day_shapes"]     = {}
         self.store["day_shape_days"] = {}
+        # Weekdays last announced in the log as having their own pattern.
+        # Persisted, so a restart does not announce it again.
+        self.store["day_shapes_announced"] = []
 
         # Long-lived home-load profile accumulators (persist across days; never reset at midnight)
         # Built from real homePowerWatts inverter readings, one reading per Modbus poll.
@@ -8452,12 +8456,15 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:                                    # noqa: BLE001
             self.logger.warning(f"[Profile] Could not measure the weekend day patterns: {exc}")
             return
-        before = self.store.get("day_shapes") or {}
         self.store["day_shapes"]     = shapes
         self.store["day_shape_days"] = used
+        announced = set(self.store.get("day_shapes_announced") or [])
+        changed   = False
         for wd in SHAPED_WEEKDAYS:
-            if (wd in shapes) == (wd in before):
+            if (wd in shapes) == (wd in announced):
                 continue
+            changed = True
+            announced.symmetric_difference_update({wd})
             name = _WEEKDAY_NAMES[wd]
             if wd in shapes:
                 peak = max(range(24), key=lambda h: shapes[wd][2 * h] + shapes[wd][2 * h + 1])
@@ -8469,6 +8476,13 @@ class Plugin(indigo.PluginBase):
             else:
                 log(f"[Profile] {name}s use the everyday pattern again: only "
                     f"{used[wd]} whole {name}s recorded, {DAY_SHAPE_MIN_DAYS} needed")
+        if changed:
+            self.store["day_shapes_announced"] = sorted(announced)
+            try:
+                self._save_accumulators()
+            except Exception as exc:                                # noqa: BLE001
+                # The five-minute save carries it; at worst a restart repeats the line.
+                self.logger.debug(f"[Profile] day-pattern note not saved yet: {exc}")
 
     def _day_profiles(self, levels=None):
         """{weekday: 48 kWh figures} for the days with their own pattern, or {}.
@@ -15800,6 +15814,8 @@ class Plugin(indigo.PluginBase):
                 list(self.store.get("happy_hour_book_refused") or [])[-200:],
             "happy_hour_booked_codes":
                 list(self.store.get("happy_hour_booked_codes") or [])[-200:],
+            "day_shapes_announced":
+                [int(x) for x in (self.store.get("day_shapes_announced") or [])],
             "happy_hour_used":           self.store.get("happy_hour_used") or {},
             # Restart-critical control state. These also live in pluginPrefs,
             # but runtime pref writes only reach .indiPref on a GRACEFUL
@@ -15876,6 +15892,10 @@ class Plugin(indigo.PluginBase):
                     self.store[_k] = [str(x) for x in list(data[_k])[-200:]]
             if isinstance(data.get("happy_hour_used"), dict):
                 self.store["happy_hour_used"] = data["happy_hour_used"]
+            if isinstance(data.get("day_shapes_announced"), list):
+                self.store["day_shapes_announced"] = [
+                    int(x) for x in data["day_shapes_announced"]
+                    if isinstance(x, int) and 0 <= x <= 6]
             # The warn-once latches come back as SETS, because that is what the
             # three checks that read them expect; JSON can only carry a list, so
             # the conversion has to happen on the way in. Restored WITHOUT

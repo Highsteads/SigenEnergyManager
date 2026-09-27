@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.119.1 — 27 September 2026
+
+- The Event Log line saying Saturdays or Sundays have their own pattern of use now appears once, when that changes, instead of again after every restart.
+
 ## 5.119.0 — 27 September 2026
 
 - **Saturdays now have their own pattern of use too.** Over the last 18 Saturdays here, 10am to 1pm used between 1.7 and 2.2 kWh an hour where the everyday pattern said 1.1 to 1.2, and the afternoon less. The plugin plans Saturdays with that pattern now, as it has done for Sundays since 5.118.0. The total for a Saturday does not change.

@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.119.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.119.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.119.1** — The Event Log line saying a day has its own pattern of use now appears once, not after every restart.
+
 **v5.119.0** — Saturdays now have their own pattern of use as well, measured from the last 18 Saturdays: most of a Saturday's extra use comes between 10am and 1pm. The half-hourly energy record now writes a row at midnight, so the last half-hour of each day is no longer recorded as the first of the next.
 
 **v5.118.0** — Sundays now have their own pattern of use through the day. The plugin measures it from the last 18 Sundays, so a roast and a wash in the afternoon are planned for in the afternoon, not spread across the day. The total for a Sunday is unchanged. Until six whole Sundays are recorded, Sundays use the everyday pattern as before.
@@ -68,6 +70,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.119.1 | 27 September 2026 | Day-pattern note logged once |
 | 5.119.0 | 27 September 2026 | Saturdays get their own pattern too; honest midnight record |
 | 5.118.0 | 27 September 2026 | Sundays get their own pattern of use |
 | 5.117.0 | 27 September 2026 | Fixes found while writing the guide |

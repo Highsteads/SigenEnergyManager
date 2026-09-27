@@ -22,6 +22,7 @@ import threading
 import types
 import unittest
 from datetime import date, datetime, timedelta, timezone
+import unittest.mock
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -414,6 +415,48 @@ class TestPluginWiring(unittest.TestCase):
         self.assertEqual(self.p.store["day_shape_days"], {5: 7, 6: 8})
         self.assertGreater(sum(shapes[6][28:32]), 0.2)
         self.assertGreater(sum(shapes[5][20:26]), 0.25)
+
+    def test_the_announcement_is_made_once_and_survives_a_restart(self):
+        self._write_history([(d, _roast_day()) for d in self._recent(6, 8)])
+        self.p._save_accumulators = MagicMock()
+        with unittest.mock.patch.object(plugin, "log") as log:
+            self.p._refresh_day_shapes()
+            self.assertEqual(log.call_count, 1)
+            self.assertEqual(self.p.store["day_shapes_announced"], [6])
+            self.p._save_accumulators.assert_called_once()
+            restarted = _mk(self.tmp)
+            restarted._measured_day_uplifts = self.p._measured_day_uplifts
+            restarted._save_accumulators = MagicMock()
+            restarted.store["day_shapes_announced"] = [6]     # as _load_accumulators restores it
+            restarted._refresh_day_shapes()
+            self.assertEqual(log.call_count, 1)
+            restarted._save_accumulators.assert_not_called()
+
+    def test_the_announcement_list_is_saved_and_restored(self):
+        p = plugin.Plugin.__new__(plugin.Plugin)
+        p.logger = MagicMock()
+        p.store  = {"pv_daily_kwh": 1.0, "grid_import_daily_kwh": 0.0,
+                    "grid_export_daily_kwh": 2.0, "home_daily_kwh": 3.0,
+                    "peak_soc": 90.0, "min_soc": 40.0, "today_date": "2026-09-27",
+                    "pv_lifetime_start_kwh": 100.0, "import_lifetime_start_kwh": 10.0,
+                    "export_lifetime_start_kwh": 20.0, "day_shapes_announced": [5, 6]}
+        p.pluginPrefs = {}
+        p._state_lock = threading.RLock()
+        p._save_home_profile = MagicMock()
+        path = os.path.join(self.tmp, "accumulators.json")
+        p._save_accumulators_locked(path)
+        with open(path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["day_shapes_announced"], [5, 6])
+        saved["day_shapes_announced"] = [5, 6, 9, "x"]           # junk is dropped
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(saved, fh)
+        q = plugin.Plugin.__new__(plugin.Plugin)
+        q.logger = MagicMock()
+        q.store  = {"day_shapes_announced": []}
+        q._get_data_dir = lambda: self.tmp
+        q._load_accumulators()
+        self.assertEqual(q.store["day_shapes_announced"], [5, 6])
 
     def test_a_day_with_too_few_examples_is_left_out(self):
         self._write_history([(d, _roast_day()) for d in self._recent(6, 8)]

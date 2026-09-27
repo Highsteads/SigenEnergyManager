@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.119.1 — 27-09-2026
+
+- `_refresh_day_shapes` announced a day's pattern whenever the in-memory `day_shapes` changed,
+  and the store starts empty, so every restart re-announced both days. It now compares against
+  `store["day_shapes_announced"]`, persisted in accumulators.json (saved at once when it
+  changes; restored with anything outside 0-6 dropped). Tests: a restart does not re-announce,
+  and a real `_save_accumulators_locked` / `_load_accumulators` round trip; three mutations, all
+  caught.
+
 ## v5.119.0 — 27-09-2026
 
 **Saturday gets its own half-hourly shape; the half-hourly recorder is honest at midnight.**
