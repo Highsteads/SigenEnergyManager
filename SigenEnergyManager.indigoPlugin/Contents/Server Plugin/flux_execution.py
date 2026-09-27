@@ -167,12 +167,22 @@ class FluxExecutor:
         return setter(expected) is True and _near(reader(), expected, tolerance)
 
     def _neutralise(self):
+        """Put the inverter in mode 2 before any cutoff or limit is changed.
+
+        Mode 2 (self consumption) can neither charge from the grid nor export from
+        the battery, so with it confirmed first, no later write can start an
+        import or a sale: the worst a half-finished sequence leaves is the house
+        drawing on the battery a little more or less for a few seconds. And a
+        mode write that is refused or not read back stops everything here, so no
+        cutoff is ever lifted while mode 3 or 5 may still be running.
+
+        Until SigenEnergyManager 5.125.1 this also set BOTH limits to zero first,
+        which stopped the battery running the house for 15-30 s on every claim,
+        mode change, release and restart, and the house imported for that time.
+        CliveS, 27-Sep-2026: "at no point during the day should the battery be
+        stopped".
+        """
         d = self.raw
-        # Zero both directions before selecting a mode or releasing SOC limits.
-        if not self._set_read(d.set_charge_limit, d.read_charge_limit, 0, 1):
-            return False
-        if not self._set_read(d.set_discharge_limit, d.read_discharge_limit, 0, 1):
-            return False
         if d.set_remote_ems_mode(2) is not True:
             return False
         mode = d.read_ems_mode()
@@ -312,7 +322,8 @@ class FluxExecutor:
                     self.last_error = ''
                     return 'applied'
             # SAME MODE AND ENERGY BAND, NEW POWER ONLY: adjust the limits in place.
-            # A full _apply neutralises first (both limits to 0, mode 2), which is
+            # A full _apply neutralises first (mode 2; until 5.125.1 both limits to 0
+            # as well), which is
             # right for a change of mode or cutoffs but, measured live 17-Sep-2026,
             # dropped a 4 kW peak export to zero for ~20-30 s on every tick the
             # planned power moved. Staying in the verified mode and moving only the

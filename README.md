@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.125.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.125.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.125.1** — The battery no longer stops for half a minute when the Flux controller changes what it is doing (taking over at 4pm, switching between selling and running the house, handing back at 7pm, or checking the inverter after a restart). The house used to draw from the grid for those 15 to 30 seconds.
+
 **v5.125.0** — The solar panels keep working while the battery charges from the grid. The inverter used to be told to charge from the grid first, and it switched the panels off to do it: in the first Weekend Happy Hour they made nothing for two hours. The battery now takes the sun first and the grid for the rest, so it fills just as fast and no sun is wasted.
 
 **v5.124.0** — The battery always runs the house during the day. The plugin buys from the grid in the day only in free-electricity hours, when the battery reaches its lowest allowed charge, or to cover an Axle event the battery could not manage alone, and then only enough for the event and the house until 2am. After a restart it no longer assumes the Tracker tariff while it waits for Octopus.
@@ -82,6 +84,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.125.1 | 27 September 2026 | No half-minute battery stop when Flux changes mode |
 | 5.125.0 | 27 September 2026 | Solar keeps working during a grid charge |
 | 5.124.0 | 27 September 2026 | Battery never stopped in the day; Axle events covered |
 | 5.123.0 | 27 September 2026 | No hold before the peak when the battery has plenty |

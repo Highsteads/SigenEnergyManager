@@ -21,6 +21,20 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.125.1 — 27-09-2026
+
+- **flux_execution `_neutralise` is mode-2-first, with no zeroed limits.** It used to write
+  charge 0, discharge 0, then mode 2 before every full apply and every `_restore`, so each
+  claim, mode or band change, release and post-restart reconcile stopped the battery for
+  15-30 s (live: 15:45:41-15:45:56 on 27-Sep-2026, discharge 0 W while the house imported).
+  Mode 2 alone gives the same protection: it cannot grid-charge or battery-export, so every
+  later cutoff/limit write is benign, and a refused or unread mode write still stops the
+  sequence before any cutoff moves (`test_failed_stop_never_lifts_cutoffs_while_exporting`
+  unchanged and green).
+- Tests (+4): a restart reconcile writes no zero discharge; claim -> export -> supply ->
+  release writes none; mode 2 is the first write from mode 3 or 5; a refused mode write moves
+  nothing else. Six executor tests fail on 5.125.0.
+
 ## v5.125.0 — 27-09-2026
 
 Measured on the first Happy Hour (27-Sep-2026 13:00-15:00): in Remote EMS 0x03 (Command

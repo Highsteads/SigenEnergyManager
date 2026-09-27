@@ -50,8 +50,9 @@
 #              Claude Opus 5.5 (5.123.0 — the run-up to the peak holds only what the peak can sell)
 #              Claude Opus 5.5 (5.124.0 — the day never stops the battery; it buys only free hours and Axle cover)
 #              Claude Opus 5.5 (5.125.0 — grid charges take the sun first; the panels are no longer switched off)
+#              Claude Opus 5.5 (5.125.1 — a Flux change of mode no longer stops the battery for 15-30 s)
 # Date:        27-09-2026
-# Version:     5.125.0
+# Version:     5.125.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

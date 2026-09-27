@@ -103,6 +103,48 @@ class FluxExecutionTests(unittest.TestCase):
         for c,d in [(0,500),(2000,500),(10000,10000)]:
             self.assertEqual(self.e.step(self.target(ems_mode=2,charge_limit_w=c,discharge_limit_w=d),self.now),'applied')
             self.assertEqual((self.d.values['mode'],self.d.values['charge'],self.d.values['discharge']),(2,c,d))
+    def _no_daytime_zero(self, writes):
+        return ('discharge', 0) not in writes
+
+    def test_a_restart_reconcile_never_stops_the_battery(self):
+        # 15:45:41 on 27-Sep-2026: the first tick after a restart wrote discharge
+        # 0 W and put it back 15 s later. The house imported meanwhile.
+        self.now = self.now.replace(hour=15, minute=45)
+        self.d.values.update(mode=2, charge=10000, discharge=10000, top=100., bottom=20.)
+        e = self.executor(); self.d.writes.clear()
+        self.assertEqual(e.step(None, self.now), 'released')
+        self.assertTrue(self._no_daytime_zero(self.d.writes), self.d.writes)
+        self.assertEqual(self.d.values['discharge'], 10000)
+
+    def test_claiming_and_leaving_the_peak_never_stops_the_battery(self):
+        self.now = self.now.replace(hour=16, minute=0)
+        self.d.values.update(mode=2, charge=10000, discharge=10000, top=100., bottom=20.)
+        self.arm(self.target(ems_mode=5, charge_limit_w=0, discharge_limit_w=10000))
+        # export -> supply the house: a mode AND band change, so a full apply
+        self.now += timedelta(seconds=5)
+        self.assertEqual(self.e.step(self.target(ems_mode=2, charge_limit_w=0,
+                                                 discharge_limit_w=10000,
+                                                 discharge_cutoff_pct=30.), self.now),
+                         'applied')
+        self.now = self.now.replace(hour=19, minute=0, second=1)
+        self.assertEqual(self.e.step(None, self.now), 'released')
+        self.assertTrue(self._no_daytime_zero(self.d.writes), self.d.writes)
+
+    def test_mode_two_is_confirmed_before_any_cutoff_or_limit_moves(self):
+        for start_mode in (3, 5):
+            self.d.values['mode'] = start_mode
+            e = self.executor(); self.d.writes.clear()
+            e.step(None, self.now)
+            keys = [k for k, _v in self.d.writes]
+            self.assertEqual(keys[0], 'mode', start_mode)
+            self.assertEqual(self.d.writes[0], ('mode', 2))
+
+    def test_a_refused_mode_write_moves_nothing_else(self):
+        self.d.values['mode'] = 5
+        e = self.executor(); self.d.lie = 'mode'; self.d.writes.clear()
+        self.assertEqual(e.step(None, self.now), 'pending')
+        self.assertEqual([k for k, _v in self.d.writes if k != 'mode'], [])
+
     def test_a_battery_hold_is_refused_outside_the_cheap_window(self):
         # 5.124.0: "at no point during the day should the battery be stopped".
         for hour in (5, 11, 15, 16, 20, 23, 0, 1):
@@ -170,16 +212,18 @@ class FluxExecutionTests(unittest.TestCase):
         self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
         self.d.writes.clear(); self.now+=timedelta(seconds=5)
         self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000,discharge_cutoff_pct=40.),self.now)
-        self.assertEqual(self.d.writes[:3],[('charge',0),('discharge',0),('mode',2)])
+        # 5.125.1: mode 2 first, and the limits are never zeroed on the way.
+        self.assertEqual(self.d.writes[0],('mode',2))
+        self.assertNotIn(('discharge',0),self.d.writes)
 
     def test_failed_in_place_write_falls_back_to_full_apply(self):
         self.now=self.now.replace(hour=16)
         self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
         self.d.writes.clear(); self.now+=timedelta(seconds=5); self.d.lie='discharge'
         self.assertEqual(self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3900),self.now),'pending')
-        # The in-place write is tried, then the full apply's neutralise (limits to 0).
+        # The in-place write is tried, then the full apply's neutralise (mode 2).
         self.assertEqual(self.d.writes[:2],[('charge',0),('discharge',3900)])
-        self.assertIn(('discharge',0),self.d.writes[2:])
+        self.assertIn(('mode',2),self.d.writes[2:])
 
     def test_realistic_slow_staging_within_observation_budget(self):
         self.e.step(None,self.now)

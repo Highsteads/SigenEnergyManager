@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.125.1 — 27 September 2026
+
+- **The battery no longer stops for half a minute when the Flux controller changes what it is doing.** Each time it took control at 4pm, switched between selling and running the house, handed back at 7pm, or checked the inverter after a restart, it first set both battery limits to zero, and the house drew from the grid for 15 to 30 seconds. It now puts the inverter into its ordinary run-the-house mode first, which can neither sell from the battery nor charge from the grid, and changes the settings from there, so the battery keeps running the house throughout.
+
 ## 5.125.0 — 27 September 2026
 
 - **The solar panels keep working while the battery charges from the grid.** Every grid charge the plugin runs used to tell the inverter to take the grid first, and the inverter then held the panels back to nothing. In the first Weekend Happy Hour, on 27 September, the panels made 1.7 kW just before 1pm and just after 3pm, and nothing at all in between. The charge now takes the sun first and the grid for the rest, so the battery fills at the same rate. In a free hour nothing is thrown away once the battery is full, because the sun runs the house and anything spare is sold. In a charge the house pays for, every unit the sun gives is one less bought.
