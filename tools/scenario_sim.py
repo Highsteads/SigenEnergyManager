@@ -16,7 +16,7 @@
 #              the registers were written.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        28-09-2026
-# Version:     1.1 (28-09-2026: the cover reads the day's sun with no 0.6 floor, as 5.125.4)
+# Version:     1.2 (28-09-2026: winter scenarios (--season), battery use per day)
 
 import argparse
 import csv
@@ -123,6 +123,9 @@ class Scenario:
     free: list = field(default_factory=list)       # [Window] Happy Hours
     note: str = ""
     track: bool = True              # model the plugin's intraday PV tracking
+    sun_up: float = 7.0             # local hours the PV bell spans
+    sun_down: float = 19.0
+    house: tuple = None             # kW by local hour (default HOUSE_KW)
 
 
 def W(day, h0, h1, announced=None):
@@ -153,9 +156,10 @@ class Sim:
         self.day = sc.day
         self.start = _wall(sc.day, 2)
         self.end = _wall(sc.day + timedelta(days=1), 2)
-        self.pv_true = pv_curve(sc.pv_kwh)
+        self.house_kw = list(sc.house or HOUSE_KW)
+        self.pv_true = pv_curve(sc.pv_kwh, sc.sun_up, sc.sun_down)
         fc = sc.forecast_kwh if sc.forecast_kwh is not None else sc.pv_kwh
-        self.pv_fc = pv_curve(fc)
+        self.pv_fc = pv_curve(fc, sc.sun_up, sc.sun_down)
         self.fc_kwh = fc
         self.kwh = sc.start_soc / 100.0 * CAP_KWH
         self.site = fs.FluxSite(capacity_kwh=CAP_KWH, charge_power_w=int(INV_KW * 1000),
@@ -166,7 +170,7 @@ class Sim:
                                 wear_p_per_kwh=WEAR_P, reserve_pct=RESERVE_PCT)
         slots = []
         for i in range(48):
-            slots.append(HOUSE_KW[i // 2] * 0.5)
+            slots.append(self.house_kw[i // 2] * 0.5)
         self.slots = slots
         self.house_profile = fs.HalfHourProfile(slots, LONDON)
         self.manager = bm.BatteryManager()
@@ -245,8 +249,8 @@ class Sim:
         dawn = {}
         for off in range(-1, 3):
             d = self.day + timedelta(days=off)
-            dawn[f"{d:%Y-%m-%d}"] = _wall(d, 7)
-        daily = sum(HOUSE_KW)
+            dawn[f"{d:%Y-%m-%d}"] = _wall(d, int(self.sc.sun_up))
+        daily = sum(self.house_kw)
         today_local = now.astimezone(LONDON).date()
         vpp_today = sum(EXPORT_KW * (w.end - w.start).total_seconds() / 3600.0
                         for w in self.sc.axle
@@ -343,7 +347,7 @@ class Sim:
         while now < self.end:
             hour = _hour(now)
             pv = self.pv_true(hour + 0.125) * dt_h
-            house = house_kw(hour) * dt_h
+            house = self.house_kw[int(hour) % 24] * dt_h
             local_day = now.astimezone(LONDON).date()
             if local_day != self.track_day:
                 self.track_day, self.track_actual, self.track_fc, self.track = \
@@ -476,7 +480,12 @@ class Sim:
                    and not fs.in_window(st.t, LONDON, fs.FLUX_CHEAP_START, fs.FLUX_CHEAP_END)
                    and st.mode != "hh" and not (st.mode == "grid_charge"
                                                and st.imp_cause == "Axle cover")]
+        after_charge = next((st.soc for st in s if st.t.astimezone(LONDON).hour == 5), None)
+        from_5am = [st.soc for st in s if st.t >= _wall(self.day, 5)]
+        throughput = sum(max(0.0, a.soc - b.soc) for a, b in zip(s, s[1:])) / 100.0 * CAP_KWH
         return dict(imp_by=imp_by, exp_by=exp_by, cost_p=cost_p, earn_p=earn_p,
+                    soc_5am=after_charge, soc_max=max(st.soc for st in s),
+                    soc_min_day=min(from_5am), used_kwh=throughput,
                     axle=axle, saving=saving, unexpected=unexpected, stopped=stopped,
                     soc_min=min(st.soc for st in s), soc_end=s[-1].soc,
                     soc_1600=next((st.soc for st in s
@@ -522,6 +531,42 @@ def scenarios():
     ]
 
 
+# A December weekday here: more lighting and cooking in the evening, the house
+# about 24 kWh a day (the September measure is 21). kW by local hour.
+WINTER_HOUSE = (0.40, 0.38, 0.37, 0.37, 0.38, 0.45, 0.80, 1.20, 1.15, 0.95, 0.85, 0.85,
+                0.90, 0.85, 0.85, 1.05, 1.45, 1.70, 1.75, 1.65, 1.45, 1.15, 0.85, 0.55)
+COLD_HOUSE = tuple(round(k * 1.25, 3) for k in WINTER_HOUSE)     # about 30 kWh
+
+
+def winter_scenarios():
+    mon = date(2026, 12, 14)     # a Monday, GMT
+    sun = date(2026, 12, 13)     # a Sunday
+    def ws(name, day, pv, **kw):
+        kw.setdefault("start_soc", 22.0)
+        kw.setdefault("house", WINTER_HOUSE)
+        return Scenario(name, day, pv, sun_up=8.25, sun_down=15.75, **kw)
+    return [
+        ws("W1 winter, dull (2 kWh sun), nothing booked", mon, 2.0),
+        ws("W2 winter, bright (6 kWh sun), nothing booked", mon, 6.0),
+        ws("W3 winter dull + Axle 5-6pm (known before 2am)", mon, 2.0,
+           axle=[W(mon, 17, 18)]),
+        ws("W4 winter dull + Axle 5-6pm announced noon", mon, 2.0,
+           axle=[W(mon, 17, 18, announced=_wall(mon, 12))]),
+        ws("W5 winter dull + Axle 4-6pm (two hours)", mon, 2.0,
+           axle=[W(mon, 16, 18)]),
+        ws("W6 winter dull + Saving Session 5:30-6:30pm", mon, 2.0,
+           saving=[Window(_wall(mon, 17, 30), _wall(mon, 18, 30), _wall(mon - timedelta(days=1), 20))]),
+        ws("W7 winter Sunday dull + free hours 1-3pm", sun, 2.0, free=[W(sun, 13, 15)]),
+        ws("W8 winter Sunday dull + free hours 1-3pm + Axle 5-6pm", sun, 2.0,
+           free=[W(sun, 13, 15)], axle=[W(sun, 17, 18)]),
+        ws("W9 winter forecast 6, day 2 + Axle 5-6pm announced noon", mon, 2.0,
+           forecast_kwh=6.0, axle=[W(mon, 17, 18, announced=_wall(mon, 12))]),
+        ws("W10 cold winter day (30 kWh house), dull + Axle 5-6pm", mon, 2.0,
+           house=COLD_HOUSE, axle=[W(mon, 17, 18)]),
+        ws("W11 winter dull, battery 60% at 2am", mon, 2.0, start_soc=60.0),
+    ]
+
+
 def fmt_kwh(v):
     return f"{v:.1f}"
 
@@ -530,10 +575,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv-dir", default="", help="write a per-step trace per scenario here")
     ap.add_argument("--only", default="", help="run scenarios whose name contains this")
+    ap.add_argument("--season", choices=("autumn", "winter", "all"), default="autumn",
+                    help="which scenario set to run (default autumn, the original 17)")
     args = ap.parse_args()
     failures = 0
     rows = []
-    for sc in scenarios():
+    chosen = {"autumn": scenarios(), "winter": winter_scenarios(),
+              "all": scenarios() + winter_scenarios()}[args.season]
+    for sc in chosen:
         if args.only and args.only not in sc.name:
             continue
         sim = Sim(sc).run()
@@ -581,6 +630,10 @@ def main():
             print(f"   Axle {w.start.astimezone(LONDON):%H:%M}: {got:.1f} of {want:.1f} kWh")
         for w, got in r["saving"]:
             print(f"   Saving Session {w.start.astimezone(LONDON):%H:%M}: {got:.1f} kWh sold")
+        print(f"   battery: after the 2am charge {r['soc_5am'] or 0:.0f}%, highest "
+              f"{r['soc_max']:.0f}%, lowest after 5am {r['soc_min_day']:.0f}%, "
+              f"discharged {r['used_kwh']:.1f} kWh ({r['used_kwh'] / CAP_KWH * 100:.0f}% of "
+              f"the pack)")
         print(f"   battery: lowest {r['soc_min']:.0f}%, 4pm {r['soc_1600'] or 0:.0f}%, "
               f"2am {r['soc_end']:.0f}%   money: pay {r['cost_p'] / 100:.2f}, "
               f"earn {r['earn_p'] / 100:.2f} (Axle and points not included)")
