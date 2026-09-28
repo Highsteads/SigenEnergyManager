@@ -16,7 +16,7 @@
 #              the registers were written.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        28-09-2026
-# Version:     1.4 (28-09-2026: the peak sale is lined up with a joined session, as 5.127.0)
+# Version:     1.5 (28-09-2026: scenario 7d is the largest forecast miss on record, 1.89x)
 
 import argparse
 import csv
@@ -508,8 +508,13 @@ def scenarios():
                  start_soc=35, axle=[W(mon, 18, 19)]),
         Scenario("7c forecast 20, day 12 + Axle 6-7pm", mon, 12.0, forecast_kwh=20.0,
                  start_soc=35, axle=[W(mon, 18, 19)]),
-        Scenario("7d dull forecast, sunny day + Axle 6-7pm", mon, hi, forecast_kwh=lo,
-                 start_soc=35, axle=[W(mon, 18, 19)]),
+        # The largest miss on record (21-Sep-2026: 16.7 forecast after correction,
+        # 31.5 actual, 1.89x). It used to be 6 against 34 (5.7x), which no day here
+        # has come near. CliveS, 28-Sep-2026: "i would rather overcharge in the low
+        # morning window than undercharge and pay later", so the overnight charge
+        # is sized on the forecast and the cost of a bright surprise is accepted.
+        Scenario("7d dull forecast, sunny day (21-Sep: 17 forecast, 32 actual) + Axle 6-7pm",
+                 mon, 32.0, forecast_kwh=17.0, start_soc=35, axle=[W(mon, 18, 19)]),
         Scenario("8 high sun + Saving Session 5-6pm", mon, hi, start_soc=35,
                  saving=[W(mon, 17, 18)]),
         Scenario("9 low sun + Saving Session 5-6pm", mon, lo, start_soc=35,
