@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.126.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.127.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.127.0** — The 4pm to 7pm sale is timed to fit a Saving Session. When there is not enough spare to sell for the whole three hours, the session gets its share of the sale instead of the sale running out before it starts.
+
 **v5.126.0** — On Octopus Flux, Saving Sessions no longer have battery energy of their own. Inside 4pm to 7pm the normal peak sale runs through them; outside it the plugin still joins them but exports nothing, and the battery runs the house.
 
 **v5.125.4** — An Axle event now always leaves enough to reach 2am. The top-up before an event goes by the sun the day is really giving and keeps 1 kWh spare, since Axle pays about £1 a kWh against about 30p to buy.
@@ -92,6 +94,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.127.0 | 28 September 2026 | The peak sale is timed to fit a Saving Session |
 | 5.126.0 | 28 September 2026 | Saving Sessions on Flux: no kWh of their own, no export outside the peak |
 | 5.125.4 | 28 September 2026 | Axle cover always reaches 2am |
 | 5.125.3 | 28 September 2026 | Axle cover follows the day's real sun |

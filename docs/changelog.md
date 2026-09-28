@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.127.0 — 28 September 2026
+
+- **The 4pm to 7pm sale is timed to fit a Saving Session.** On a winter day the battery only has enough spare to sell for about an hour and a half at the export limit, and the sale used to start at 4pm, so a 5:30pm session got only a little of it. Now, before a session starts, the plugin sells only what the session will not need, and the battery runs the house meanwhile. During the session it sells at the full limit, and afterwards it carries on as before. The total sold is the same, but more of it falls inside the session, where it earns the session's points as well. When there is spare for the whole three hours, nothing changes.
+
 ## 5.126.0 — 28 September 2026
 
 - **On Octopus Flux, Saving Sessions no longer have battery energy of their own.** A session between 4pm and 7pm falls in the peak, when the battery is already selling what it can spare, so the session gets that sale and nothing is set aside for it. A session outside 4pm to 7pm is still joined, but nothing is exported: the battery runs the house through it, which is the lower use the session asks for, and selling then would earn less than the energy is worth later. Every Power Down is now joined on Flux, since joining costs nothing. Other tariffs work as before.

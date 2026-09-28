@@ -16,7 +16,7 @@
 #              the registers were written.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        28-09-2026
-# Version:     1.3 (28-09-2026: Saving Sessions as 5.126.0 - nothing reserved or driven on Flux)
+# Version:     1.4 (28-09-2026: the peak sale is lined up with a joined session, as 5.127.0)
 
 import argparse
 import csv
@@ -234,7 +234,9 @@ class Sim:
             commitments=self._commitments(now), tariff_verified=True, commissioned=True,
             enabled=True, rates_age_s=600.0, forecast_age_s=600.0, telemetry_age_s=2.0,
             flows_age_s=2.0, profile_age_s=3600.0,
-            day_rate_import_today=self.day_rate_bought)
+            day_rate_import_today=self.day_rate_bought,
+            sale_priority=tuple((w.start, w.end) for w in self.sc.saving
+                                if w.announced <= now and w.end > now))
 
     def _snapshot(self, now, pv_w, house_w, cover, vpp_live, ss_live, hh_live):
         tariff = bm.TariffData(tariff_key="flux", today_rate_p=IMP["day"],

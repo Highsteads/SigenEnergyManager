@@ -26,7 +26,7 @@ Joining the scheme does not enter you into each session — every one is a separ
 
 ## Selling during a Power Down
 
-**On Octopus Flux the plugin never exports for a session, and sets no energy aside for one.** A session between 4pm and 7pm falls in the peak, when the battery is already selling whatever it can spare, so the session gets that sale. A session outside 4pm to 7pm is still joined, but the battery just runs the house through it: selling then would earn less than the energy is worth later, and running the house from the battery is itself the lower use the session asks for. The setting below does nothing on Flux.
+**On Octopus Flux the plugin never exports for a session, and sets no energy aside for one.** A session between 4pm and 7pm falls in the peak, when the battery is already selling whatever it can spare, so the session gets that sale. When there is not enough spare to sell for the whole three hours, as on a winter day, the plugin times the sale so the session gets its share: before the session it sells only what the session will not need, and the battery runs the house meanwhile. A session outside 4pm to 7pm is still joined, but the battery just runs the house through it: selling then would earn less than the energy is worth later, and running the house from the battery is itself the lower use the session asks for. The setting below does nothing on Flux.
 
 On other tariffs, tick **Export the battery during a Saving Session** and, during a session you have joined, the plugin sells from the battery to beat your usual use. **Saving Session Export** shows on the **Battery Manager** while it runs.
 

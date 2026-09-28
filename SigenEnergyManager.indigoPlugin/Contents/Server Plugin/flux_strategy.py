@@ -4,10 +4,20 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.5 Claude Opus 5.5
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.6 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
-#              v2.4 and v2.5 27-09-2026
-# Version:     2.5
+#              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026
+# Version:     2.6
+#
+# v2.6 (SigenEnergyManager 5.127.0) lines the peak sale up with a joined Saving
+# Session (inputs.sale_priority). A session has no energy of its own on Flux
+# (5.126.0); it rides the 4pm-7pm sale. But on a winter day the spare runs out
+# after about 90 minutes at the 4 kW limit, so a 5:30pm session got 1.4 kWh of a
+# 7 kWh sale. Before a session starts the sale now sells only what is spare
+# beyond what the session can take at the limit, and the battery runs the house
+# meanwhile; in the session it sells at the limit; afterwards as before. With
+# enough spare for the whole peak nothing changes. CliveS, 28-Sep-2026: "yes line
+# the peak sale up with the session".
 #
 # v2.5 (SigenEnergyManager 5.124.0) removes the run-up hold altogether. CliveS,
 # 27-Sep-2026: "at no point during the day should the battery be stopped, there is
@@ -294,6 +304,9 @@ class FluxInputs:
     # v2.3: True once the manager has bought from the grid at the DAY rate today.
     # That energy is never sold in the peak — see the peak window in plan().
     day_rate_import_today: bool = False
+    # v2.6: (start, end) windows the peak sale serves FIRST (joined Saving Sessions).
+    # Not a reservation: they only decide WHEN inside the peak the spare is sold.
+    sale_priority:    Tuple[Tuple[datetime, datetime], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -1382,6 +1395,32 @@ def event_cover(inputs, source="axle", avoid_peak=True):
                       arriving_kwh=round(arriving, 2), reason=reason)
 
 
+def _sale_priority_holdback(inputs, window_end):
+    """(grid kWh to keep for later priority windows, first such start) (v2.6).
+
+    Only windows that start after now and inside this peak count; a window that
+    is running is being served. Each takes what the export limit sells in its
+    part of the peak, less what the roof sends out through the same limit then.
+    """
+    site = inputs.site
+    cap_kw = min(site.discharge_power_w, site.export_limit_w) / 1000.0
+    hold, first = 0.0, None
+    for start, end in sorted(inputs.sale_priority or ()):
+        try:
+            start = _aware(start, "a sale priority start").astimezone(timezone.utc)
+            end = _aware(end, "a sale priority end").astimezone(timezone.utc)
+        except FluxDeferred:
+            continue
+        a, b = max(start, inputs.now), min(end, window_end)
+        if start <= inputs.now or b <= a:
+            continue
+        hours = (b - a).total_seconds() / 3600.0
+        roof = max(0.0, inputs.pv.kwh_between(a, b) - inputs.house.kwh_between(a, b))
+        hold += max(0.0, cap_kw * hours - roof)
+        first = start if first is None else min(first, start)
+    return hold, first
+
+
 def _export_plan(inputs):
     """(floor_pct, power_w, surplus_kwh, committed_kwh).
 
@@ -1514,7 +1553,12 @@ def plan(inputs):
             # round trip and wear. The battery runs the house through the peak
             # instead, which is what the day-rate purchase was for.
             day_rate_bought = bool(inputs.day_rate_import_today)
-            if (day_rate_bought or (not profitable) or surplus_kwh < MIN_TRADE_KWH
+            # v2.6: keep what a later Saving Session in this peak can sell for it.
+            hold_kwh, hold_from = _sale_priority_holdback(inputs, window_end)
+            hold_kwh = min(hold_kwh, surplus_kwh)
+            sell_now = surplus_kwh - hold_kwh
+            holding = hold_kwh >= MIN_TRADE_KWH
+            if (day_rate_bought or (not profitable) or sell_now < MIN_TRADE_KWH
                     or power_w <= 0):
                 # NOT exporting means mode 2 with the charge limit at zero, and
                 # that would throw away any PV the roof is still making. If the
@@ -1528,6 +1572,9 @@ def plan(inputs):
                        "losses and wear" if day_rate_bought else
                        "selling does not cover what it cost to store, after losses "
                        "and wear" if not profitable else
+                       (f"the {hold_kwh:.1f} kWh spare is kept for the Saving Session "
+                        f"at {hold_from.astimezone(tz):%H:%M}, so it sells then")
+                       if holding and surplus_kwh >= MIN_TRADE_KWH else
                        "there is nothing spare above what the house and its "
                        "commitments need before the cheap rate comes back")
                 if (pv_left - house_left) >= MIN_TRADE_KWH:
@@ -1544,14 +1591,23 @@ def plan(inputs):
                     charge_limit_w=0, discharge_limit_w=int(site.discharge_power_w),
                     charge_cutoff_pct=float(site.max_charge_soc_pct),
                     discharge_cutoff_pct=house_floor,
-                    decision_until=_decision_until(inputs, window_end),
+                    decision_until=_decision_until(
+                        inputs, min(window_end, hold_from) if holding else window_end),
                     protect_soc_pct=sell_floor, household_floor_pct=house_floor,
                     margin_p=margin_p, committed_kwh=committed,
                     reason=f"peak window, but {why}, so the battery runs the house")
-            reason = (f"peak window — about {surplus_kwh:.1f} kWh is spare above what "
+            if holding:
+                # Sell only what the session will not want; the floor keeps the rest.
+                sell_floor = min(100.0, float(math.ceil(
+                    sell_floor + _pct(hold_kwh / site.one_way_efficiency,
+                                      site.capacity_kwh))))
+            reason = (f"peak window — about {sell_now:.1f} kWh is spare above what "
                       f"the house needs before 2am, selling at "
                       f"{bands.export_peak_p:.1f}p for a {margin_p:.1f}p margin after "
                       f"losses and wear, holding {sell_floor:.0f}% back")
+            if holding:
+                reason += (f", and {hold_kwh:.1f} kWh more for the Saving Session at "
+                           f"{hold_from.astimezone(tz):%H:%M}")
             if committed > 0:
                 reason += (f" (including {committed:.1f} kWh already promised to a "
                            f"grid event, which is paid separately and is not part of "
@@ -1562,9 +1618,10 @@ def plan(inputs):
                 charge_limit_w=0, discharge_limit_w=int(power_w),
                 charge_cutoff_pct=float(site.max_charge_soc_pct),
                 discharge_cutoff_pct=sell_floor,
-                decision_until=_decision_until(inputs, window_end),
+                decision_until=_decision_until(
+                    inputs, min(window_end, hold_from) if holding else window_end),
                 protect_soc_pct=sell_floor, household_floor_pct=house_floor,
-                planned_kwh=round(surplus_kwh, 2), margin_p=margin_p,
+                planned_kwh=round(sell_now, 2), margin_p=margin_p,
                 committed_kwh=committed, reason=reason)
 
         # ── everything else ─────────────────────────────────────────────────

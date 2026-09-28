@@ -1490,5 +1490,68 @@ class TestAxleEventCover(unittest.TestCase):
         self.assertGreater(event.charge_cutoff_pct, plain.charge_cutoff_pct)
 
 
+class TestThePeakSaleServesTheSession(unittest.TestCase):
+    """v2.6. CliveS, 28-Sep-2026: "yes line the peak sale up with the session".
+    On a winter day the spare runs out about 90 minutes into the 4pm sale, so a
+    5:30pm session got 1.4 kWh of it. The sale now keeps the session's share."""
+
+    IMP = {"cheap": 14.62, "day": 24.35, "peak": 34.10}
+    EXP = {"cheap": 4.21,  "day": 9.71,  "peak": 27.69}
+    DAY = datetime(2026, 12, 14, tzinfo=LONDON).date()
+
+    def _in(self, hhmm, soc, sessions=()):
+        now = fs._wall(LONDON, self.DAY, fs.time(*hhmm))
+        prio = tuple((fs._wall(LONDON, self.DAY, fs.time(*a)),
+                      fs._wall(LONDON, self.DAY, fs.time(*b))) for a, b in sessions)
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 12, 14),
+                       bands=_bands(self.DAY, now, imp=self.IMP, exp=self.EXP),
+                       site=_site(wear_p_per_kwh=2.0), house=_profile(24.0),
+                       pv=_pv(self.DAY, 2.0, first_hour=9, last_hour=15),
+                       sale_priority=prio)
+
+    SESSION = (((17, 30), (18, 30)),)
+
+    def test_without_a_session_the_sale_is_unchanged(self):
+        plain = fs.plan(self._in((16, 0), 70.0))
+        self.assertEqual(plain.mode, fs.MODE_EXPORT)
+
+    def test_before_the_session_only_the_rest_is_sold(self):
+        plain = fs.plan(self._in((16, 0), 70.0))
+        held = fs.plan(self._in((16, 0), 70.0, self.SESSION))
+        self.assertAlmostEqual(held.planned_kwh, plain.planned_kwh - 4.0, places=1)
+        self.assertGreater(held.discharge_cutoff_pct, plain.discharge_cutoff_pct)
+        self.assertIn("Saving Session", held.reason)
+        self.assertLessEqual(held.decision_until,
+                             fs._wall(LONDON, self.DAY, fs.time(17, 30)))
+
+    def test_a_small_spare_is_all_kept_and_the_battery_runs_the_house(self):
+        d = fs.plan(self._in((16, 0), 58.0, self.SESSION))
+        self.assertEqual(d.mode, fs.MODE_SUPPLY_HOUSE)
+        self.assertGreater(d.discharge_limit_w, 0, "the battery keeps running the house")
+        self.assertIn("kept for the Saving Session at 17:30", d.reason)
+
+    def test_in_the_session_it_sells_at_the_limit(self):
+        d = fs.plan(self._in((17, 30), 58.0, self.SESSION))
+        self.assertEqual(d.mode, fs.MODE_EXPORT)
+        self.assertEqual(d.discharge_limit_w, _site().discharge_power_w)
+        plain = fs.plan(self._in((17, 30), 58.0))
+        self.assertEqual(d.planned_kwh, plain.planned_kwh)
+
+    def test_plenty_of_spare_still_sells_from_4pm(self):
+        d = fs.plan(self._in((16, 0), 99.0, self.SESSION))
+        self.assertEqual(d.mode, fs.MODE_EXPORT)
+        self.assertEqual(d.discharge_limit_w, _site().discharge_power_w)
+
+    def test_a_session_outside_the_peak_changes_nothing(self):
+        plain = fs.plan(self._in((16, 0), 70.0))
+        late = fs.plan(self._in((16, 0), 70.0, (((20, 0), (21, 0)),)))
+        self.assertEqual(plain.control_key(), late.control_key())
+
+    def test_a_malformed_window_is_ignored(self):
+        bad = self._in((16, 0), 70.0)
+        bad = fs.FluxInputs(**{**bad.__dict__, "sale_priority": (("x", "y"),)})
+        self.assertEqual(fs.plan(bad).mode, fs.MODE_EXPORT)
+
+
 if __name__ == "__main__":
     unittest.main()

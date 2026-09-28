@@ -55,8 +55,9 @@
 #              Claude Opus 5.5 (5.125.3 — the Flux planner and Axle cover follow the day's measured sun)
 #              Claude Opus 5.5 (5.125.4 — the Axle cover never counts on sun the day is not giving, and keeps a margin)
 #              Claude Opus 5.5 (5.126.0 — on Flux a Saving Session has no kWh of its own and never drives an export)
+#              Claude Opus 5.5 (5.127.0 — the 4pm-7pm sale is lined up with a joined Saving Session)
 # Date:        27-09-2026
-# Version:     5.126.0
+# Version:     5.127.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -14254,7 +14255,33 @@ class Plugin(indigo.PluginBase):
             telemetry_age_s = max(0.0, time.time() - observed_at),
             flows_age_s     = max(0.0, time.time() - observed_at),
             day_rate_import_today = self._day_rate_import_today(),
+            sale_priority   = self._flux_sale_priority(),
         )
+
+    def _flux_sale_priority(self):
+        """The joined Saving Sessions, as (start, end), for the peak sale (5.127.0).
+
+        CliveS, 28-Sep-2026: "yes line the peak sale up with the session". The
+        planner sells a session's share of the spare during the session rather
+        than before it. It only decides WHEN in the 4pm-7pm sale energy goes; a
+        session still has no energy of its own on Flux (5.126.0).
+        """
+        out = []
+        for window in (self.store.get("saving_sessions_windows") or []):
+            if window.get("direction") != SAVING_SESSION_TURN_DOWN:
+                continue
+            try:
+                start = datetime.fromisoformat(str(window["start"]))
+                end   = datetime.fromisoformat(str(window["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            if end > start:
+                out.append((start, end))
+        return tuple(sorted(out))
 
     def _flux_target(self, decision, observed_at):
         """A leased FluxTarget, or None.

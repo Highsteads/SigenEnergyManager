@@ -21,6 +21,24 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.127.0 — 28-09-2026
+
+- **flux_strategy 2.6 — `FluxInputs.sale_priority`**, (start, end) windows the peak sale serves
+  first; the plugin passes joined TURN_DOWN sessions (`_flux_sale_priority`). In the peak branch
+  `_sale_priority_holdback` sums, for each window starting after now inside this peak, the export
+  cap times its hours less the roof's export then; `hold = min(that, surplus)` and only
+  `surplus - hold` is sold now (sell floor raised by `hold / eff`, decision lease ends at the
+  window start). Under `MIN_TRADE_KWH` to sell -> SUPPLY_HOUSE ("kept for the Saving Session at
+  17:30"). A running window is served at the limit; windows outside the peak are ignored. It is
+  timing only: a session still has no energy of its own (5.126.0).
+- Simulator 1.4 mirrors it. Winter W6 (spare 7.4 kWh, session 17:30-18:30): the session gets
+  4.0 kWh (was 1.4), the sale total unchanged. 29 scenarios, every rule kept.
+- Tests (+8): unchanged without a session; before it only the rest is sold, floor raised, lease
+  ends at the start; a small spare is all kept and the battery runs the house; in the session it
+  sells at the limit; plenty of spare still sells from 4pm; a session outside the peak and a
+  malformed window change nothing; the plugin passes only joined turn-downs. The two holdback
+  tests fail with the holdback removed.
+
 ## v5.126.0 — 28-09-2026
 
 CliveS, 28-Sep-2026: "The winter saving sessions normally run inside the 4-7pm export window so

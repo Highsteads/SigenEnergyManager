@@ -1025,6 +1025,22 @@ class TestCommitmentsFromState(unittest.TestCase):
             "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
         self.assertEqual(p._flux_commitments(), ())
 
+    def test_joined_turn_downs_are_the_peak_sales_priority(self):
+        """5.127.0: sessions decide WHEN in the peak the spare is sold."""
+        p = _mk_plugin()
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [
+            {"id": "ss", "start": (now + timedelta(hours=1)).isoformat(),
+             "end": (now + timedelta(hours=2)).isoformat(),
+             "direction": plugin.SAVING_SESSION_TURN_DOWN},
+            {"id": "hh", "start": (now + timedelta(hours=3)).isoformat(),
+             "end": (now + timedelta(hours=4)).isoformat(),
+             "direction": plugin.SAVING_SESSION_HAPPY_HOUR},
+            {"id": "bad", "start": "nonsense", "direction": plugin.SAVING_SESSION_TURN_DOWN}]
+        prio = p._flux_sale_priority()
+        self.assertEqual(len(prio), 1)
+        self.assertEqual(prio[0][1] - prio[0][0], timedelta(hours=1))
+
     def test_on_flux_a_live_session_never_drives_the_battery(self):
         """5.126.0: inside 4-7pm the Flux sale exports through it; outside, the
         battery just runs the house. Either way the manager has no session to drive."""
