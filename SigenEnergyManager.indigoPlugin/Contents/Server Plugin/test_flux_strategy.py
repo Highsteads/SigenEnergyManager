@@ -1411,6 +1411,16 @@ class TestAxleEventCover(unittest.TestCase):
         kw.update(over)
         return _inputs(hhmm, soc_pct=soc, day=(2026, 9, 27), **kw)
 
+    def test_the_cover_keeps_a_margin_above_the_reserve(self):
+        # 5.125.4: charged to its target, the walk to 2am stays COVER_MARGIN_KWH
+        # above the reserve, not merely at it.
+        inputs = self._in((14, 30), 25.0)
+        c = fs.event_cover(inputs)
+        until = fs.next_cheap_start(inputs.now, LONDON)
+        start = c.target_pct / 100.0 * _site().capacity_kwh
+        _end, low, _unmet, _high = fs.simulate(inputs, start, inputs.now, until)
+        self.assertGreaterEqual(low, _site().capacity_kwh * 0.20 + fs.COVER_MARGIN_KWH - 0.05)
+
     def test_no_event_no_cover(self):
         self.assertIsNone(fs.event_cover(self._in((11, 0), 25.0, commitments=())))
 

@@ -53,8 +53,9 @@
 #              Claude Opus 5.5 (5.125.1 — a Flux change of mode no longer stops the battery for 15-30 s)
 #              Claude Opus 5.5 (5.125.2 — an announced Axle event no longer raises the daytime floor)
 #              Claude Opus 5.5 (5.125.3 — the Flux planner and Axle cover follow the day's measured sun)
+#              Claude Opus 5.5 (5.125.4 — the Axle cover never counts on sun the day is not giving, and keeps a margin)
 # Date:        27-09-2026
-# Version:     5.125.3
+# Version:     5.125.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -13944,7 +13945,7 @@ class Plugin(indigo.PluginBase):
                  "gridPowerWatts": float(fresh["gridPowerWatts"])},
                 time.time())
 
-    def _flux_pv_forecast(self, include_ahead=False):
+    def _flux_pv_forecast(self, include_ahead=False, cover=False):
         """The solar forecast as the planner reads it, or None. One owner.
 
         Lifted out of _flux_inputs in v5.112.0 so the Weekend Happy Hour booking
@@ -13976,8 +13977,9 @@ class Plugin(indigo.PluginBase):
             # is 1.0 until enough of the day has been measured, and resets at
             # midnight, so the 02:00-05:00 charge is untouched.
             try:
-                track = float(self.store.get("pv_track_factor", 1.0) or 1.0)
-                if not math.isfinite(track) or track <= 0:
+                track = (self._cover_track_factor() if cover
+                         else float(self.store.get("pv_track_factor", 1.0) or 1.0))
+                if not math.isfinite(track) or track < 0 or (track == 0 and not cover):
                     track = 1.0
             except (TypeError, ValueError):
                 track = 1.0
@@ -13994,6 +13996,25 @@ class Plugin(indigo.PluginBase):
         except (ValueError, TypeError) as exc:
             self.logger.debug(f"[Flux] no usable solar forecast: {exc}")
             return None
+
+    def _cover_track_factor(self):
+        """Today's PV tracking with no lower limit, for the Axle cover (5.125.4).
+
+        The manager's factor stops at 0.6 so a dark morning cannot write off the
+        afternoon. For the cover that limit is the wrong way round: on a day
+        forecast at 34 kWh that brought 6, it still counted on about 20, bought
+        too little and left the house on the grid after the event. The same
+        accumulators and weighting, and the same "1.0 until there is enough to
+        judge" and partial-day rules as the manager's factor.
+        """
+        if self.store.get("pv_track_date") != _local_today_str():
+            return 1.0
+        if self.store.get("pv_track_ratio") is None:
+            return 1.0
+        factor, _ratio = _pv_tracking_factor(self.store.get("pv_track_actual_kwh", 0.0),
+                                             self.store.get("pv_track_forecast_kwh", 0.0),
+                                             min_factor=0.0)
+        return factor
 
     def _wear_p_per_kwh(self):
         """Battery wear in pence per kWh cycled. One owner: the Flux planner and the
@@ -14119,8 +14140,12 @@ class Plugin(indigo.PluginBase):
                         "homePowerWatts": float(inv.get("homePowerWatts", 0) or 0),
                         "gridPowerWatts": float(inv.get("gridPowerWatts", 0) or 0),
                     }
-                    cover = _flux_strategy.event_cover(
-                        self._flux_inputs(observed, time.time()), avoid_peak=on_flux)
+                    inputs = self._flux_inputs(observed, time.time())
+                    # 5.125.4: the cover reads today's sun with no lower limit.
+                    cover_pv = self._flux_pv_forecast(cover=True)
+                    if cover_pv is not None:
+                        inputs = _replace(inputs, pv=cover_pv)
+                    cover = _flux_strategy.event_cover(inputs, avoid_peak=on_flux)
         except Exception as exc:                            # noqa: BLE001
             self.logger.debug(f"[Cover] event cover not worked out: {exc!r}")
             cover = None

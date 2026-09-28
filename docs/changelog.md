@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.125.4 — 28 September 2026
+
+- **An Axle event now always leaves enough to reach 2am.** On a day forecast sunny that turns out dull, the top-up before an Axle event could still count on sun that never came, because the correction for a dull day stops at 60% of the forecast. The top-up now goes by the sun the day is really giving, with no such limit, and keeps 1 kWh above the reserve for the rest of the evening. Axle pays about £1 a kWh and the dearest import is about 30p, so buying a little too much for an event is the right side to err on. The rest of the plugin keeps the 60% limit.
+
 ## 5.125.3 — 28 September 2026
 
 - **The Axle cover and the 4pm-7pm plan now allow for how the day's sun is actually going.** They used the morning's forecast all day, so on a day forecast sunny that turned out dull, the plugin bought too little before an Axle event, and the battery ran out after it. They now use the same correction the rest of the plugin already applies: once enough of the day has been measured, the forecast for the rest of today is scaled by how the sun has done so far. The overnight charge is not affected.

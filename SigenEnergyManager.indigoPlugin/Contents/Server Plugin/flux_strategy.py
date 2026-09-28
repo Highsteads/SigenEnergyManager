@@ -119,6 +119,10 @@ MAX_FLOW_AGE_S      = 120            # power flows, for site headroom
 RESALE_PV_OPTIMISM       = 1.35
 RESALE_SPILL_TOLERANCE   = 0.2          # kWh of displaced energy ignored
 MIN_TRADE_KWH            = 0.5
+# Kept above the reserve at 2am by an Axle cover (5.125.4). CliveS, 28-Sep-2026:
+# Axle pays about £1/kWh and the dearest import is about 30p, so buying a little
+# too much to support an event is fine; running out before 2am should not happen.
+COVER_MARGIN_KWH         = 1.0
 COVER_LEAD_MINUTES       = 60        # finish an event-cover charge this long before its deadline (the VPP pre-charge starts 30 min before an event)
 SIM_STEP_MINUTES         = 30
 SEARCH_TOLERANCE_KWH     = 1e-6      # the binary search's own convergence error
@@ -1348,7 +1352,9 @@ def event_cover(inputs, source="axle", avoid_peak=True):
             deadline = peak_start
     try:
         floor_kwh = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
-        needed, _infeasible = required_start_kwh(inputs, deadline, until, floor_kwh)
+        needed, _infeasible = required_start_kwh(
+            inputs, deadline, until,
+            min(site.capacity_kwh, floor_kwh + COVER_MARGIN_KWH))
         now_kwh = float(inputs.soc_pct) / 100.0 * site.capacity_kwh
         arriving, _low, _unmet, _high = simulate(inputs, now_kwh, now, deadline)
     except (FluxDeferred, TypeError, ValueError, ArithmeticError):

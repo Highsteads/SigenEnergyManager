@@ -477,7 +477,7 @@ PV_TRACKING_MIN_FACTOR       = 0.6    # a dark morning cannot write off the afte
 PV_TRACKING_MAX_FACTOR       = 1.3    # nor can a bright one promise more than the model + 30%
 
 
-def pv_tracking_factor(actual_kwh, forecast_kwh):
+def pv_tracking_factor(actual_kwh, forecast_kwh, min_factor=None):
     """(factor, ratio) from today's measured PV against the forecast for the SAME
     elapsed hours, counted only while the inverter could take all the PV.
 
@@ -490,7 +490,13 @@ def pv_tracking_factor(actual_kwh, forecast_kwh):
     single day may move the forecast. Returns (1.0, None) when the elapsed
     forecast is too small to judge or either input is unusable: no factor is
     a factor of exactly one, never a guess.
+
+    `min_factor` replaces the lower clamp. The Axle cover passes 0.0 (5.125.4):
+    a dark day must not be read as 60% of a bright forecast when the question is
+    whether a £1/kWh event and the house until 2am are covered, and erring
+    towards buying costs at most the day rate.
     """
+    floor = PV_TRACKING_MIN_FACTOR if min_factor is None else float(min_factor)
     try:
         actual   = float(actual_kwh)
         forecast = float(forecast_kwh)
@@ -501,7 +507,7 @@ def pv_tracking_factor(actual_kwh, forecast_kwh):
     ratio  = actual / forecast
     weight = min(1.0, forecast / PV_TRACKING_FULL_WEIGHT_KWH)
     factor = 1.0 + weight * (ratio - 1.0)
-    factor = max(PV_TRACKING_MIN_FACTOR, min(PV_TRACKING_MAX_FACTOR, factor))
+    factor = max(floor, min(PV_TRACKING_MAX_FACTOR, factor))
     return round(factor, 3), round(ratio, 3)
 
 

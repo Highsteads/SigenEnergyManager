@@ -16,7 +16,7 @@
 #              the registers were written.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        28-09-2026
-# Version:     1.0
+# Version:     1.1 (28-09-2026: the cover reads the day's sun with no 0.6 floor, as 5.125.4)
 
 import argparse
 import csv
@@ -181,6 +181,7 @@ class Sim:
         self.track_actual = 0.0
         self.track_fc = 0.0
         self.track = 1.0
+        self.cover_track = 1.0           # 5.125.4: the same, with no 0.6 floor
 
     # -- forecasts in the two shapes the code reads
     def _pv_buckets(self):
@@ -221,14 +222,15 @@ class Sim:
                 return w
         return None
 
-    def _flux_inputs(self, now, pv_w, house_w):
+    def _flux_inputs(self, now, pv_w, house_w, track=None):
+        track = self.track if track is None else track
         return fs.FluxInputs(
             now=now, local_tz=LONDON,
             bands=fs.derive_bands(_spans(self.day, IMP), _spans(self.day, EXP), LONDON, now),
             site=self.site, soc_pct=self.kwh / CAP_KWH * 100.0,
             house=self.house_profile,
             pv=fs.HourlyPvForecast(self._pv_buckets(), LONDON,
-                                   bias_by_date={now.astimezone(LONDON).date(): self.track}),
+                                   bias_by_date={now.astimezone(LONDON).date(): track}),
             flows=fs.FluxFlows(pv_w=pv_w, house_w=house_w, grid_w=0.0),
             commitments=self._commitments(now), tariff_verified=True, commissioned=True,
             enabled=True, rates_age_s=600.0, forecast_age_s=600.0, telemetry_age_s=2.0,
@@ -346,11 +348,13 @@ class Sim:
             if local_day != self.track_day:
                 self.track_day, self.track_actual, self.track_fc, self.track = \
                     local_day, 0.0, 0.0, 1.0
+                self.cover_track = 1.0
             pv_w, house_w = pv / dt_h * 1000.0, house / dt_h * 1000.0
 
             inputs = self._flux_inputs(now, pv_w, house_w)
             in_cheap = fs.in_window(now, LONDON, fs.FLUX_CHEAP_START, fs.FLUX_CHEAP_END)
-            cover = None if in_cheap else fs.event_cover(inputs)
+            cover = None if in_cheap else fs.event_cover(
+                self._flux_inputs(now, pv_w, house_w, track=self.cover_track))
             vpp_live = self._live(self.sc.axle, now)
             vpp_pre = self._live(self.sc.axle, now, lead=timedelta(minutes=30))
             ss_live = self._live(self.sc.saving, now)
@@ -432,8 +436,10 @@ class Sim:
                 self.track_actual += pv
                 self.track_fc += self.pv_fc(hour + 0.125) * dt_h
                 if self.sc.track:
-                    self.track, _ratio = bm.pv_tracking_factor(self.track_actual,
-                                                               self.track_fc)
+                    self.track, ratio = bm.pv_tracking_factor(self.track_actual,
+                                                              self.track_fc)
+                    self.cover_track = (1.0 if ratio is None else bm.pv_tracking_factor(
+                        self.track_actual, self.track_fc, min_factor=0.0)[0])
             now += STEP
         return self
 
@@ -493,8 +499,6 @@ def scenarios():
                  axle=[W(mon, 13, 14, announced=_wall(mon, 9))]),
         Scenario("7 sunny forecast, dull day + Axle 6-7pm", mon, lo, forecast_kwh=hi,
                  start_soc=35, axle=[W(mon, 18, 19)]),
-        Scenario("7b the same, without the day's tracking (5.125.2)", mon, lo,
-                 forecast_kwh=hi, start_soc=35, axle=[W(mon, 18, 19)], track=False),
         Scenario("7c forecast 20, day 12 + Axle 6-7pm", mon, 12.0, forecast_kwh=20.0,
                  start_soc=35, axle=[W(mon, 18, 19)]),
         Scenario("7d dull forecast, sunny day + Axle 6-7pm", mon, hi, forecast_kwh=lo,

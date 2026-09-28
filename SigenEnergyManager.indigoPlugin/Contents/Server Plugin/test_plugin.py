@@ -6454,6 +6454,12 @@ _TRACKER_RATES = {
 }
 
 
+@__import__("dataclasses").dataclass(frozen=True)
+class _CoverInputs:
+    """The one field the cover swaps, in a real dataclass so `replace` works."""
+    pv: object
+
+
 class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
     """5.124.0. CliveS, 27-Sep-2026: the battery is never stopped in the day, and
     the house buys only in free hours or to cover an Axle event."""
@@ -6496,7 +6502,8 @@ class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
             latest_rates_data={"tariff_info": {"tariff_key": key}},
             latest_inverter_data={"pvPowerWatts": 0, "homePowerWatts": 500,
                                   "gridPowerWatts": 500},
-            _flux_inputs=lambda observed, at: observed,
+            _flux_inputs=lambda observed, at: _CoverInputs(pv="planner pv"),
+            _flux_pv_forecast=lambda cover=False: "cover pv" if cover else "planner pv",
             store={}, logger=logging.getLogger("t"))
 
     def _cover(self, active):
@@ -6518,6 +6525,35 @@ class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
         self.assertTrue(fake.store["event_cover_active"])
         self.assertEqual(logged.call_count, 1)
         self.assertIn("Buying now", logged.call_args[0][0])
+
+    def test_the_cover_reads_the_unfloored_forecast(self):
+        # 5.125.4: the cover must not count on 60% of a bright forecast on a dark day.
+        fake = self._cover_fake()
+        seen = {}
+        def capture(inputs, avoid_peak=True):
+            seen["pv"] = inputs.pv
+            return None
+        with patch.object(plugin._flux_strategy, "event_cover", side_effect=capture), \
+             patch.object(plugin._flux_strategy, "in_window", return_value=False):
+            plugin.Plugin._event_cover(fake, 30.0)
+        self.assertEqual(seen["pv"], "cover pv")
+
+    def _track_fake(self, ratio, actual, forecast, date_ok=True):
+        return types.SimpleNamespace(store={
+            "pv_track_date": plugin._local_today_str() if date_ok else "1999-01-01",
+            "pv_track_ratio": ratio, "pv_track_actual_kwh": actual,
+            "pv_track_forecast_kwh": forecast})
+
+    def test_the_cover_factor_has_no_sixty_percent_floor(self):
+        dark = self._track_fake(0.18, 1.8, 10.0)
+        self.assertAlmostEqual(plugin.Plugin._cover_track_factor(dark), 0.18, places=3)
+        f, _r = plugin._pv_tracking_factor(1.8, 10.0)
+        self.assertAlmostEqual(f, 0.6, places=3, msg="the manager keeps its floor")
+
+    def test_the_cover_factor_is_one_until_the_day_can_be_judged(self):
+        self.assertEqual(plugin.Plugin._cover_track_factor(self._track_fake(None, 0.1, 0.5)), 1.0)
+        self.assertEqual(plugin.Plugin._cover_track_factor(
+            self._track_fake(0.18, 1.8, 10.0, date_ok=False)), 1.0)
 
     def test_no_axle_means_no_cover(self):
         fake = self._cover_fake(axle=False)

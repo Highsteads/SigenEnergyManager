@@ -21,6 +21,23 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.125.4 — 28-09-2026
+
+CliveS, 28-Sep-2026: "axle gives £1 kwh and the most we are charged is around 30p then buying
+in to support axle is still ok if we cannot get to 2am but this shouldn't happen".
+- **`event_cover` reads today's PV through `_cover_track_factor()`**: the manager's tracking
+  (same accumulators, weighting, "1.0 until judged", partial-day and date rules) with
+  `min_factor=0.0` instead of the 0.6 clamp (`pv_tracking_factor(..., min_factor=)` new
+  optional arg). `_flux_pv_forecast(cover=True)` builds it; `_event_cover` swaps it into the
+  inputs with `_replace`. The planner and manager keep the clamped factor.
+- **`COVER_MARGIN_KWH = 1.0`**: the cover's walk to 02:00 must stay that far above the reserve.
+- Simulator 1.1 mirrors both. Scenario 7 (forecast 34, actual 6, Axle 18:00): cover 13.9 kWh
+  bought 13:45-15:00 at the day rate in one run (was 12.0 in four starts, one at the peak rate),
+  nothing at the reserve before 02:00. 7c (forecast 20, actual 12) now buys 1.4 kWh of cover.
+  17 scenarios, all rules kept. The 7b "without tracking" comparison is removed.
+- Tests (+4): cover reads the unfloored forecast; the cover factor has no 0.6 floor while the
+  manager's keeps it; 1.0 until judged or on a stale date; the walk keeps the margin.
+
 ## v5.125.3 — 28-09-2026
 
 - **`_flux_pv_forecast` multiplies today's factor by `store["pv_track_factor"]`** (the manager's

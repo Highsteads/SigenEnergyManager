@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.125.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.125.4 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.125.4** — An Axle event now always leaves enough to reach 2am. The top-up before an event goes by the sun the day is really giving and keeps 1 kWh spare, since Axle pays about £1 a kWh against about 30p to buy.
+
 **v5.125.3** — The Axle cover and the 4pm-7pm plan now allow for how the day's sun is actually going, so a dull day after a sunny forecast no longer leaves the battery short after an Axle event.
 
 **v5.125.2** — An announced Axle event no longer stops the battery running the house hours before it starts. The event is still covered by the overnight charge and, if needed, a small top-up before 4pm.
@@ -88,6 +90,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.125.4 | 28 September 2026 | Axle cover always reaches 2am |
 | 5.125.3 | 28 September 2026 | Axle cover follows the day's real sun |
 | 5.125.2 | 28 September 2026 | An Axle event no longer stops the battery early |
 | 5.125.1 | 27 September 2026 | No half-minute battery stop when Flux changes mode |
