@@ -51,8 +51,9 @@
 #              Claude Opus 5.5 (5.124.0 — the day never stops the battery; it buys only free hours and Axle cover)
 #              Claude Opus 5.5 (5.125.0 — grid charges take the sun first; the panels are no longer switched off)
 #              Claude Opus 5.5 (5.125.1 — a Flux change of mode no longer stops the battery for 15-30 s)
+#              Claude Opus 5.5 (5.125.2 — an announced Axle event no longer raises the daytime floor)
 # Date:        27-09-2026
-# Version:     5.125.1
+# Version:     5.125.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -12909,8 +12910,8 @@ class Plugin(indigo.PluginBase):
         agreed 20% reserve lasted less than a minute.
 
         Highest of: the health floor, a live flood-prevention target, and — only
-        while the Flux strategy is armed — the Flux reserve plus whatever energy
-        is already promised to a grid event. Storm is NOT here: it raises a
+        while the Flux strategy is armed — the Flux reserve, plus (5.125.2: only
+        while a dispatch is being served) the energy promised to OTHER events. Storm is NOT here: it raises a
         software dawn target, never this register, and a storm floor written to
         hardware is one nothing would ever lower.
         """
@@ -13026,11 +13027,21 @@ class Plugin(indigo.PluginBase):
         return (time.time() - read_at) <= (3 * poll_s + 60)
 
     def _flux_reserve_floor_pct(self, dispatch_event=None):
-        """Flux's own floor: the flat reserve plus committed event energy.
+        """Flux's own floor: the flat reserve, plus other events' energy DURING a dispatch.
 
-        Committed energy is included because a promised kWh is not spare — but
-        household demand is NOT, because the house must be able to eat its own
-        evening: see flux_strategy.household_floor_pct.
+        5.125.2: committed energy is added ONLY while a dispatch is being served
+        (an Axle pre-charge or window, or a Saving Session export), so that one
+        event cannot sell what a later one was promised. Until then this floor
+        rose the moment an event was announced and stayed up all day: on
+        28-Sep-2026 it went to 31.8% at 05:00 for a 6pm Axle event, and the house
+        imported from 07:00 with the battery idle at 32%, although the planner
+        expected the sun to refill it by the evening. CliveS, 27-Sep-2026: "at no
+        point during the day should the battery be stopped". An announced event
+        is now covered by flux_strategy.event_cover (a top-up bought only if the
+        battery would otherwise reach it short) and by the 02:00-05:00 charge,
+        and the peak export still keeps it out of what it sells.
+        Household demand is never in this floor: the house must be able to eat
+        its own evening (flux_strategy.household_floor_pct).
         """
         reserve = _as_float(self.pluginPrefs.get("fluxReservePct"),
                             _flux_strategy.DEFAULT_RESERVE_PCT)
@@ -13051,6 +13062,10 @@ class Plugin(indigo.PluginBase):
             # PRE_CHARGING. The caller explicitly identifies that dispatch.
             if dispatch_event is not None:
                 dispatched.add(str(dispatch_event.get("id") or "axle"))
+            if not dispatched:
+                # Nobody is exporting for an event, so nothing can sell a later
+                # event's energy: the house runs on the battery down to the reserve.
+                return round(min(100.0, max(0.0, reserve)), 1)
             commitments = tuple(c for c in self._flux_commitments() if c.kind == "export")
             serving = tuple(c for c in commitments if c.event_id in dispatched)
             # Union(all) minus union(serving) leaves only energy not supplied by

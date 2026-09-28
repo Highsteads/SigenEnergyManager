@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.125.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.125.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.125.2** — An announced Axle event no longer stops the battery running the house hours before it starts. The event is still covered by the overnight charge and, if needed, a small top-up before 4pm.
+
 **v5.125.1** — The battery no longer stops for half a minute when the Flux controller changes what it is doing (taking over at 4pm, switching between selling and running the house, handing back at 7pm, or checking the inverter after a restart). The house used to draw from the grid for those 15 to 30 seconds.
 
 **v5.125.0** — The solar panels keep working while the battery charges from the grid. The inverter used to be told to charge from the grid first, and it switched the panels off to do it: in the first Weekend Happy Hour they made nothing for two hours. The battery now takes the sun first and the grid for the rest, so it fills just as fast and no sun is wasted.
@@ -84,6 +86,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.125.2 | 28 September 2026 | An Axle event no longer stops the battery early |
 | 5.125.1 | 27 September 2026 | No half-minute battery stop when Flux changes mode |
 | 5.125.0 | 27 September 2026 | Solar keeps working during a grid charge |
 | 5.124.0 | 27 September 2026 | Battery never stopped in the day; Axle events covered |

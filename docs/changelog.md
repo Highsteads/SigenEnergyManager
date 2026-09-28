@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.125.2 — 28 September 2026
+
+- **An Axle event no longer stops the battery hours before it starts.** From the moment an event was announced, the plugin raised the lowest charge the battery may run down to by the event's energy, and kept it there all day. On 28 September, for a 6pm event, that was 32% from 5am, so from 7am the battery sat idle and the house bought from the grid, on a day forecast to bring 35 kWh of sun. The battery now runs the house down to its usual 20%. The event is still covered: the overnight charge allows for it, the evening sale never sells its energy, and if the battery would reach it short the plugin buys just the difference before 4pm. The raised floor now applies only while an event's export is running, so it cannot sell energy promised to a later one.
+
 ## 5.125.1 — 27 September 2026
 
 - **The battery no longer stops for half a minute when the Flux controller changes what it is doing.** Each time it took control at 4pm, switched between selling and running the house, handed back at 7pm, or checked the inverter after a restart, it first set both battery limits to zero, and the house drew from the grid for 15 to 30 seconds. It now puts the inverter into its ordinary run-the-house mode first, which can neither sell from the battery nor charge from the grid, and changes the settings from there, so the battery keeps running the house throughout.

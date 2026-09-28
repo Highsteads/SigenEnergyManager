@@ -580,14 +580,22 @@ class TestPolicyFloorOwnership(unittest.TestCase):
         self.assertIn(("backup_soc", 20.0), p.modbus.writes)
         self.assertIn(("discharge_cutoff", 1.0), p.modbus.writes)
 
-    def test_a_committed_event_raises_the_floor_for_everybody(self):
+    def test_an_announced_event_does_not_stop_the_battery_running_the_house(self):
+        """5.125.2. 28-Sep-2026: announced at night for 6pm, this floor went to
+        31.8% at 05:00 and the house imported from 07:00 with the battery idle.
+        The event is covered by event_cover and the 2am charge instead."""
         p = _mk_plugin()
         with _pinned_clock() as now:
             p.store["vpp_state"] = "announced"
-            p.store["vpp_event"] = {"start_time": now + timedelta(hours=1),
-                                    "end_time": now + timedelta(hours=2),
+            p.store["vpp_event"] = {"start_time": now + timedelta(hours=11),
+                                    "end_time": now + timedelta(hours=12),
                                     "import_export": "export", "duration_hrs": 1.0}
-            self.assertGreater(p._policy_discharge_floor_pct(), 20.0)
+            self.assertEqual(p._policy_discharge_floor_pct(), 20.0)
+            p.store["saving_sessions_windows"] = [{
+                "id": "ss", "start": (now + timedelta(hours=3)).isoformat(),
+                "end": (now + timedelta(hours=4)).isoformat(),
+                "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
+            self.assertEqual(p._policy_discharge_floor_pct(), 20.0)
 
     def test_a_driving_owner_takes_the_commitment_component_off_the_floor(self):
         """During pre-charge and the window itself, the VPP owns that energy.
@@ -602,8 +610,7 @@ class TestPolicyFloorOwnership(unittest.TestCase):
                                 "end_time": now + timedelta(hours=2),
                                 "import_export": "export", "duration_hrs": 1.0}
         p.store["vpp_state"] = "announced"
-        announced = p._policy_discharge_floor_pct()
-        self.assertGreater(announced, 20.0)
+        self.assertEqual(p._policy_discharge_floor_pct(), 20.0)
         for driving in ("pre_charging", "active"):
             p.store["vpp_state"] = driving
             self.assertEqual(p._policy_discharge_floor_pct(), 20.0, driving)
@@ -621,8 +628,6 @@ class TestPolicyFloorOwnership(unittest.TestCase):
                                     "end_time": now + timedelta(minutes=90),
                                     "import_export": "export", "duration_hrs": 1.0}
             p.store["vpp_state"] = "announced"
-            self.assertGreater(p._policy_discharge_floor_pct(), 20.0,
-                               "an announced event should still be reserved")
             for driving in ("pre_charging", "active"):
                 p.store["vpp_state"] = driving
                 self.assertEqual(p._policy_discharge_floor_pct(), 20.0, driving)
@@ -644,7 +649,8 @@ class TestPolicyFloorOwnership(unittest.TestCase):
                                "an unrelated later session was dropped with the dispatch")
 
     def test_the_floor_uses_the_union_budget_not_a_sum(self):
-        """Two schemes paying for one exported kWh must not reserve it twice."""
+        """Two schemes paying for one exported kWh must not reserve it twice.
+        5.125.2: reserved only while a dispatch runs, so one is set running."""
         p = _mk_plugin()
         with _pinned_clock() as now:
             start = (now + timedelta(hours=2)).isoformat()
@@ -652,13 +658,16 @@ class TestPolicyFloorOwnership(unittest.TestCase):
             p.store["saving_sessions_windows"] = [
                 {"id": "a", "start": start, "end": end, "points": 1800,
                  "direction": plugin.SAVING_SESSION_TURN_DOWN}]
-            one = p._policy_discharge_floor_pct()
+            running = {"id": "axle-0", "start_time": now + timedelta(minutes=20),
+                       "end_time": now + timedelta(minutes=80),
+                       "import_export": "export", "duration_hrs": 1.0}
+            one = p._policy_discharge_floor_pct(dispatch_event=running)
             p.store["vpp_event"] = {"id": "axle-1",
                                     "start_time": now + timedelta(hours=2),
                                     "end_time": now + timedelta(hours=3),
                                     "import_export": "export", "duration_hrs": 1.0}
             p.store["vpp_state"] = "announced"
-            both = p._policy_discharge_floor_pct()
+            both = p._policy_discharge_floor_pct(dispatch_event=running)
             self.assertGreater(one, 20.0)
             self.assertEqual(both, one, "overlapping events were summed, not unioned")
 
@@ -945,7 +954,8 @@ class TestReserveNeverOnTheAbsoluteCutoff(unittest.TestCase):
                                 "end_time": now + timedelta(hours=2),
                                 "import_export": "export", "duration_hrs": 1.0}
         self.assertEqual(p._absolute_cutoff_pct(), 1.0)
-        self.assertGreater(p._policy_discharge_floor_pct(), 20.0)
+        # 5.125.2: an announced event no longer raises the backup reserve either.
+        self.assertEqual(p._policy_discharge_floor_pct(), 20.0)
 
     def test_an_unarmed_install_never_touches_the_backup_reserve(self):
         p = _mk_plugin(_flux_prefs(fluxEnabled=False))

@@ -14,6 +14,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 from test_flux_supervisor import _mk_plugin      # the shared fake-plugin harness
 import plugin                                     # noqa: E402
@@ -22,8 +23,28 @@ UTC = timezone.utc
 
 
 def _events(ended_hours_ago=3, joined=True, direction="WEEKEND_HAPPY_HOUR"):
-    now = datetime.now(UTC)
-    s1 = now - timedelta(hours=ended_hours_ago + 2)
+    """Two free hours, 1pm-3pm LOCAL, ending at least `ended_hours_ago` hours ago
+    (or that far ahead, when negative).
+
+    Anchored to a local afternoon, not "N hours before now": claims are kept per
+    local day, and two hours placed by subtraction straddled midnight whenever
+    the suite ran between about 7am and 9am (30 hours back) or 3am and 5am (3
+    hours back), splitting one claim into two. Found 28-Sep-2026 at 07:40.
+    """
+    london = ZoneInfo("Europe/London")
+    now    = datetime.now(UTC)
+    target = now - timedelta(hours=ended_hours_ago)
+    day    = target.astimezone(london).date()
+    end    = datetime(day.year, day.month, day.day, 15, tzinfo=london)
+    if ended_hours_ago >= 0:
+        while end > target:
+            day -= timedelta(days=1)
+            end = datetime(day.year, day.month, day.day, 15, tzinfo=london)
+    else:
+        while end < target:
+            day += timedelta(days=1)
+            end = datetime(day.year, day.month, day.day, 15, tzinfo=london)
+    s1 = end.astimezone(UTC) - timedelta(hours=2)
     return [{"id": "6540", "start_at": s1, "end_at": s1 + timedelta(hours=1),
              "joined": joined, "direction": direction},
             {"id": "6541", "start_at": s1 + timedelta(hours=1),

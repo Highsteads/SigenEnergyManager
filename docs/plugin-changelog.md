@@ -21,6 +21,22 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.125.2 — 28-09-2026
+
+- **`_flux_reserve_floor_pct` adds committed event energy only while a dispatch is being
+  served** (VPP pre-charge/active, a Saving Session export, or an explicit `dispatch_event`).
+  Until now it rose from announcement: 28-Sep-2026 05:00 backup reserve 31.8% for an 18:00
+  Axle event, battery idle at 31.8% from ~07:00 and the house importing, on a 34.7 kWh forecast
+  (event_cover correctly found nothing to buy). Announced events are covered by the 02:00-05:00
+  charge, `event_cover`, and the peak export's own sell floor; the during-dispatch uplift still
+  stops one event selling a later one's energy.
+- Tests: the five floor tests in test_flux_supervisor.py reworked for the new rule (announced
+  -> 20%, union budget measured with a dispatch running).
+- **test_free_hour_plugin `_events` anchored to a local 1pm-3pm**: placed by "N hours before
+  now", the two hours straddled local midnight when the suite ran 07:00-09:00 (30 h back) or
+  03:00-05:00 (3 h back), so one claim became two and two TestDailyCheck tests failed. Found
+  at 07:40 on 28-Sep-2026, failing on 5.125.1 too.
+
 ## v5.125.1 — 27-09-2026
 
 - **flux_execution `_neutralise` is mode-2-first, with no zeroed limits.** It used to write
