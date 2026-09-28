@@ -1766,6 +1766,124 @@ class TestPreemption(unittest.TestCase):
         self.assertFalse(p._flux_may_claim())
 
 
+class TestPreChargeLeavesThePeakSaleRunning(_FluxCase):
+    """5.127.1. Live 28-Sep-2026 17:31: the Axle pre-charge for an 18:00 window
+    took the inverter off the 4pm-7pm sale with the battery at 88%, although the
+    sale was already keeping the event's 4 kWh back and pre-charge never imports.
+    Half an hour of the peak went unsold."""
+
+    @staticmethod
+    def _axle_at(when, minutes=29):
+        start = (when + timedelta(minutes=minutes)).astimezone(timezone.utc)
+        return {"id": "axle-1", "start_time": start,
+                "end_time": start + timedelta(hours=1),
+                "import_export": "export", "duration_hrs": 1.0}
+
+    def _selling(self, soc=88.0):
+        p, when = self._at((17, 31), soc=soc)
+        p.flux_executor = _FakeExecutor(owns=True)
+        p.store["flux_decision"] = types.SimpleNamespace(mode="export")
+        p._flux_peak_now = MagicMock(return_value=True)
+        p._event_is_daytime = MagicMock(return_value=True)
+        p._drive_vpp_export = MagicMock()
+        p.store["vpp_state"] = plugin.VPP_ANNOUNCED
+        p.store["vpp_event"] = self._axle_at(when)
+        return p, when
+
+    def test_pre_charge_does_not_take_the_inverter_off_a_running_sale(self):
+        p, _ = self._selling()
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        self.assertTrue(p.flux_executor.owns_control)
+        p._set_vpp_discharge_cutoff.assert_not_called()
+        self.assertEqual(p.store["vpp_state"], plugin.VPP_PRE_CHARGING)
+        self.assertTrue(p.store["vpp_floor_deferred"])
+
+    def test_a_shared_pre_charge_is_not_an_owner_and_dispatches_nothing(self):
+        p, _ = self._selling()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        self.assertEqual(p._flux_other_owner(), "")
+        self.assertEqual(p._flux_dispatch_event_ids(), set())
+        self.assertFalse(p._driven_export_owns_registers())
+
+    def test_the_sale_keeps_the_event_energy_back_through_the_pre_charge(self):
+        """The same 17:31 pass, with and without the event: the sale goes on in
+        both, and its floor is higher by the event's allocation when it stands."""
+        floors = {}
+        for with_event in (False, True):
+            p, when = self._at((17, 31), soc=88.0)
+            if with_event:
+                p.store.update({"vpp_state": plugin.VPP_PRE_CHARGING,
+                                "vpp_floor_deferred": True,
+                                "vpp_event": self._axle_at(when)})
+            self._run(p, when)
+            self.assertEqual(p.store["flux_owner_reason"], "", with_event)
+            targets = p.flux_executor.targets()
+            self.assertEqual(len(targets), 1, with_event)
+            floors[with_event] = targets[0].discharge_cutoff_pct
+        # 4 kWh of a 35 kWh pack is about 11 points, less round-trip losses.
+        self.assertGreater(floors[True] - floors[False], 8.0, floors)
+
+    def test_no_sale_running_keeps_the_old_pre_charge(self):
+        p, _ = self._selling()
+        p.flux_executor = _FakeExecutor(owns=False)
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        p._set_vpp_discharge_cutoff.assert_called_once()
+        self.assertFalse(p.store["vpp_floor_deferred"])
+        self.assertIn("Axle VPP window", p._flux_other_owner())
+
+    def test_outside_the_peak_the_old_pre_charge_stands(self):
+        p, _ = self._selling()
+        p._flux_peak_now = MagicMock(return_value=False)
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        p._set_vpp_discharge_cutoff.assert_called_once()
+
+    def test_a_hold_is_not_a_sale(self):
+        p, _ = self._selling()
+        p.store["flux_decision"] = types.SimpleNamespace(mode="hold")
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        p._set_vpp_discharge_cutoff.assert_called_once()
+
+    def test_the_window_releases_flux_first_then_writes_its_own_floors(self):
+        """Flux's release restores a baseline floor. Written the other way round,
+        that baseline would land on top of the VPP floor for the window."""
+        p, _ = self._selling()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        order = []
+        real_step = p.flux_executor.step
+
+        def _step(target, now, **kw):
+            order.append("flux_release")
+            return real_step(target, now, **kw)
+
+        p.flux_executor.step = _step
+        p._set_vpp_discharge_cutoff = MagicMock(
+            side_effect=lambda *a, **k: order.append("vpp_floor"))
+        p._vpp_transition(plugin.VPP_ACTIVE)
+        self.assertEqual(order[:2], ["flux_release", "vpp_floor"])
+        self.assertFalse(p.flux_executor.owns_control)
+        self.assertFalse(p.store["vpp_floor_deferred"])
+        self.assertEqual(p._flux_dispatch_event_ids(), {"axle-1"})
+
+    def test_a_window_whose_pre_charge_wrote_the_floors_does_not_write_them_twice(self):
+        p, _ = self._selling()
+        p.flux_executor = _FakeExecutor(owns=False)
+        p._start_vpp_precharge(p.store["vpp_event"])
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._vpp_transition(plugin.VPP_ACTIVE)
+        p._set_vpp_discharge_cutoff.assert_not_called()
+
+    def test_leaving_pre_charge_any_other_way_clears_the_deferral(self):
+        p, _ = self._selling()
+        p._start_vpp_precharge(p.store["vpp_event"])
+        p.store["export_active"] = False
+        p._vpp_transition(plugin.VPP_IDLE)
+        self.assertFalse(p.store["vpp_floor_deferred"])
+
+
 # ================================================================
 # Disable and restart recovery (review 4)
 # ================================================================

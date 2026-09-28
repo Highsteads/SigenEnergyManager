@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.127.1 — 28 September 2026
+
+- **The 4pm to 7pm sale no longer stops half an hour before an Axle event.** Half an hour before an event the plugin sets the lowest level the battery may reach, and to do that it used to take the battery off the peak sale. On 28 September that stopped the sale at 5:31pm for a 6pm event, with the battery at 88% and the event needing about 4 kWh, so half an hour of selling at 27.7p was lost. The sale was already keeping the event's energy back, so now it carries on, and the plugin sets the event's lowest level two minutes before the start, when the event takes over. Outside 4pm to 7pm, or when the battery is not selling, nothing changes.
+
 ## 5.127.0 — 28 September 2026
 
 - **The 4pm to 7pm sale is timed to fit a Saving Session.** On a winter day the battery only has enough spare to sell for about an hour and a half at the export limit, and the sale used to start at 4pm, so a 5:30pm session got only a little of it. Now, before a session starts, the plugin sells only what the session will not need, and the battery runs the house meanwhile. During the session it sells at the full limit, and afterwards it carries on as before. The total sold is the same, but more of it falls inside the session, where it earns the session's points as well. When there is spare for the whole three hours, nothing changes.

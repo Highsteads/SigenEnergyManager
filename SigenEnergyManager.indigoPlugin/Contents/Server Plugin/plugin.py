@@ -56,8 +56,9 @@
 #              Claude Opus 5.5 (5.125.4 — the Axle cover never counts on sun the day is not giving, and keeps a margin)
 #              Claude Opus 5.5 (5.126.0 — on Flux a Saving Session has no kWh of its own and never drives an export)
 #              Claude Opus 5.5 (5.127.0 — the 4pm-7pm sale is lined up with a joined Saving Session)
-# Date:        27-09-2026
-# Version:     5.127.0
+#              Claude Opus 5.5 (5.127.1 — an Axle pre-charge no longer stops a running 4pm-7pm sale)
+# Date:        28-09-2026
+# Version:     5.127.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -7748,11 +7749,13 @@ class Plugin(indigo.PluginBase):
         NEXT session would have picked 0x05 and been fought. Fixed here and in
         _export_is_daylight together — either alone still loses the window.
 
-        VPP_PRE_CHARGING stays in the list: pre-charge is a grid IMPORT that owns
-        the same registers. The export re-assert itself is additionally gated on
-        export_active, which pre-charge does not set.
+        VPP_PRE_CHARGING stays in the list: pre-charge writes the VPP floors and
+        may put the inverter in Self Consumption. The export re-assert itself is
+        additionally gated on export_active, which pre-charge does not set. A
+        pre-charge that left the floors to a running Flux sale owns nothing.
         """
-        if self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE):
+        if (self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE)
+                and not self._vpp_precharge_shares_flux()):
             return True
         return bool(self.store.get("saving_session_export_active"))
 
@@ -9805,7 +9808,7 @@ class Plugin(indigo.PluginBase):
             # wrote Self Consumption over a Saving Session export and the verify
             # pass put it back 37 s later. Either discharge mode already means
             # "not charging", so the intent is met and nothing is written.
-            if soc_ready and not charge_stopped:
+            if soc_ready and not charge_stopped and not self._vpp_precharge_shares_flux():
                 cur_mode = self.modbus.read_ems_mode() if self.modbus else None
                 exporting = (cur_mode in _VPP_EXPORT_MODES
                              or bool(self.store.get("export_active"))
@@ -10378,8 +10381,20 @@ class Plugin(indigo.PluginBase):
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        # Set discharge cutoff now (30 min before) — not at announcement time
-        self._set_vpp_discharge_cutoff(event, is_daytime)
+        # Set discharge cutoff now (30 min before) — not at announcement time.
+        # UNLESS the Flux 4pm-7pm sale is running (5.127.1). Pre-charge never
+        # imports, so all this step would do is take the inverter off a sale that
+        # already keeps this event's energy back. Live 28-Sep-2026 17:31: the sale
+        # stopped with the battery at 88% for a 4 kWh event, and half an hour of
+        # the peak went unsold. The sale carries on; the VPP floors are written
+        # when the window takes over at T-2min (_vpp_transition).
+        self.store["vpp_floor_deferred"] = self._flux_sale_running()
+        if self.store["vpp_floor_deferred"]:
+            log("[Flux] An Axle window starts at "
+                f"{_local_time(event.get('start_time'))}. The peak sale already keeps "
+                "its energy back, so the sale carries on until the window takes over.")
+        else:
+            self._set_vpp_discharge_cutoff(event, is_daytime)
 
         if current_kwh >= required_kwh:
             if self._flux_armed():
@@ -10732,6 +10747,7 @@ class Plugin(indigo.PluginBase):
     def _vpp_transition(self, new_state, preempted=False):
         """Transition VPP state machine to a new state."""
         old_state = self.store["vpp_state"]
+        floor_deferred = bool(self.store.get("vpp_floor_deferred"))
         # Flux lets go BEFORE the state machine's own writes, not after: a paid
         # window taking the inverter must not find a Flux claim still standing,
         # and a release discovered a tick later would restore the baseline over
@@ -10744,6 +10760,8 @@ class Plugin(indigo.PluginBase):
                 and old_state != new_state):
             self._flux_preempt(f"an Axle VPP window ({new_state})")
         self.store["vpp_state"] = new_state
+        if new_state != VPP_PRE_CHARGING:
+            self.store["vpp_floor_deferred"] = False
         if self.debug:
             vpp_log(f"[VPP] State: {old_state} -> {new_state}")
 
@@ -10758,7 +10776,9 @@ class Plugin(indigo.PluginBase):
         # acknowledged a SigEnergy-API fault that may not be fixed before the next
         # event). _drive_vpp_export() does the actual driving here for a prompt
         # start at T-2min, and the manager's ACTION_VPP_EXPORT override re-runs it
-        # each tick. The discharge floor (next-day reserve) was set at pre-charge.
+        # each tick. The discharge floor (next-day reserve) was set at pre-charge,
+        # or, when pre-charge left it to a running Flux sale, is set just below —
+        # after the pre-emption above, so the Flux release cannot overwrite it.
         if new_state == VPP_ACTIVE:
             if self.store.get("solar_overflow_active"):
                 self.store["solar_overflow_active"]       = False
@@ -10775,6 +10795,8 @@ class Plugin(indigo.PluginBase):
             self.store["vpp_is_daytime"]       = self._event_is_daytime(event.get("start_time"))
             self.store["vpp_export_submode"]   = None    # force a mode log on first drive
             self.store["vpp_bank_charge_cap_w"] = -1
+            if floor_deferred and old_state == VPP_PRE_CHARGING:
+                self._set_vpp_discharge_cutoff(event, self.store["vpp_is_daytime"])
             vpp_log("[VPP] >>> VPP WINDOW ACTIVE <<<  self-driving export "
                 f"({'daytime' if self.store['vpp_is_daytime'] else 'dark'} window, "
                 "DNO-capped; Axle dispatch ignored).")
@@ -13118,12 +13140,14 @@ class Plugin(indigo.PluginBase):
         the floor it sets for it. Reserving the same kWh again on top is how a
         reservation comes to block the dispatch it was made for.
 
-        Pre-charge counts: it is the VPP code filling the battery for exactly
-        this event, and it is also the only moment the VPP writes the discharge
-        cutoff.
+        Pre-charge counts: it is the moment the VPP writes the discharge
+        cutoff for this event. Not when it left that to a running Flux sale —
+        the sale is still holding this event's energy back, and must go on doing
+        so until the window takes over.
         """
         ids = set()
-        if self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE):
+        if (self.store.get("vpp_state", VPP_IDLE) in (VPP_PRE_CHARGING, VPP_ACTIVE)
+                and not self._vpp_precharge_shares_flux()):
             event = self.store.get("vpp_event") or {}
             ids.add(str(event.get("id") or "axle"))
         if self.store.get("saving_session_export_active"):
@@ -13266,6 +13290,24 @@ class Plugin(indigo.PluginBase):
                 self.logger.debug(f"[Flux] baseline refresh refused: {exc!r}")
         return self.flux_executor
 
+    def _flux_sale_running(self):
+        """True while the Flux executor holds the inverter for the 4pm-7pm sale."""
+        if _flux_strategy is None or not self._flux_owns_control() or not self._flux_peak_now():
+            return False
+        decision = self.store.get("flux_decision")
+        return getattr(decision, "mode", "") == _flux_strategy.MODE_EXPORT
+
+    def _vpp_precharge_shares_flux(self):
+        """True while an Axle pre-charge has left the inverter to the Flux sale.
+
+        Set once, when pre-charge starts, and cleared when the VPP leaves
+        pre-charge. Deliberately not re-derived each tick: if the sale sells out
+        and hands back, the pre-charge still has nothing to write, and the
+        floors still wait for the window.
+        """
+        return (self.store.get("vpp_state", VPP_IDLE) == VPP_PRE_CHARGING
+                and bool(self.store.get("vpp_floor_deferred")))
+
     def _flux_owns_control(self):
         """True while the executor holds the claim. Asked of the executor, never
         of a local flag — it is the thing that knows whether a write landed."""
@@ -13290,9 +13332,10 @@ class Plugin(indigo.PluginBase):
         # planner reserves its energy and the cheap window is where that energy
         # gets bought. Standing Flux down at announcement would block the very
         # charge that funds the dispatch. Ownership starts when the VPP code
-        # begins writing, which is pre-charge.
+        # begins writing, which is pre-charge — or, when pre-charge found the
+        # peak sale running and left it alone (5.127.1), the window itself.
         _vpp = self.store.get("vpp_state", VPP_IDLE)
-        if _vpp not in (VPP_IDLE, VPP_ANNOUNCED):
+        if _vpp not in (VPP_IDLE, VPP_ANNOUNCED) and not self._vpp_precharge_shares_flux():
             return f"an Axle VPP window ({_vpp})"
         if self.store.get("saving_session_export_active"):
             return "an Octopus Saving Session"
@@ -16262,6 +16305,7 @@ class Plugin(indigo.PluginBase):
             "vpp_export_start_kwh":      self.store.get("vpp_export_start_kwh", 0.0),
             "vpp_charge_stopped":        self.store.get("vpp_charge_stopped", False),
             "vpp_cutoff_raised":         self.store.get("vpp_cutoff_raised", False),
+            "vpp_floor_deferred":        self.store.get("vpp_floor_deferred", False),
             "vpp_is_daytime":            self.store.get("vpp_is_daytime", False),
             # The live export mode (0x02 bank / 0x05 / 0x06). Without it, the
             # first verify after a mid-window restart expects the 0x06 default
@@ -16380,6 +16424,7 @@ class Plugin(indigo.PluginBase):
                     self.store["vpp_export_start_kwh"] = data.get("vpp_export_start_kwh", 0.0)
                     self.store["vpp_charge_stopped"]   = bool(data.get("vpp_charge_stopped", False))
                     self.store["vpp_cutoff_raised"]    = bool(data.get("vpp_cutoff_raised", False))
+                    self.store["vpp_floor_deferred"]   = bool(data.get("vpp_floor_deferred", False))
                     self.store["vpp_is_daytime"]       = bool(data.get("vpp_is_daytime", False))
                     # Restore the live export mode so the first verify holds the
                     # window's REAL mode rather than the 0x06 default (see the

@@ -8003,6 +8003,13 @@ class TestPreChargeNeverStopsARunningExport(unittest.TestCase):
         p._apply_vpp_event(self.event)
         p.modbus.set_self_consumption.assert_not_called()
 
+    def test_a_pre_charge_sharing_with_the_flux_sale_writes_nothing(self):
+        """5.127.1: the sale may have sold out and handed back, so the mode reads
+        Self Consumption here, but the pre-charge still owns nothing."""
+        p = self._p(0x02, vpp_floor_deferred=True)
+        p._apply_vpp_event(self.event)
+        p.modbus.set_self_consumption.assert_not_called()
+
     def test_a_session_export_flag_protects_it_when_the_read_fails(self):
         p = self._p(None, saving_session_export_active=True)
         p._apply_vpp_event(self.event)

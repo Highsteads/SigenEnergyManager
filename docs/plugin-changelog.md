@@ -21,6 +21,24 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.127.1 — 28-09-2026
+
+- **An Axle pre-charge no longer pre-empts a running Flux peak sale.** Live 28-Sep 17:31: the
+  pre-charge for an 18:00-19:00 event called `_set_vpp_discharge_cutoff`, whose first act is
+  `_flux_preempt`, and `_flux_other_owner` then counted `pre_charging` as an owner, so the sale
+  stopped with SOC 88% for a 4 kWh event. Pre-charge never imports, and the sale's floor already
+  carried the event (its commitment stands in PRE_CHARGING), so nothing was gained.
+- `_start_vpp_precharge` sets `vpp_floor_deferred = _flux_sale_running()` (executor owns control,
+  peak open, `flux_decision.mode == export`). When set it skips `_set_vpp_discharge_cutoff` and
+  logs one `[Flux]` line. `_vpp_precharge_shares_flux()` (PRE_CHARGING + the flag) then keeps the
+  pre-charge out of `_flux_other_owner`, `_flux_dispatch_event_ids` (so the event stays reserved)
+  and `_driven_export_owns_registers`, and pre-charge Step 1 writes nothing.
+- `_vpp_transition(ACTIVE)` from a deferred pre-charge writes the VPP floors after the Flux
+  pre-emption, so the release baseline cannot land over them. The flag clears on leaving
+  PRE_CHARGING and is persisted with the VPP state.
+- Tests: `TestPreChargeLeavesThePeakSaleRunning` (9) and a Step 1 case; six fail on 5.127.0.
+  Suite 2,310; sim 18 clean (the sim models the event window, not the pre-charge half hour).
+
 ## v5.127.0 — 28-09-2026
 
 - **flux_strategy 2.6 — `FluxInputs.sale_priority`**, (start, end) windows the peak sale serves
