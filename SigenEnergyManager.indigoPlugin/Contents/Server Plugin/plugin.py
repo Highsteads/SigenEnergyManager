@@ -52,8 +52,9 @@
 #              Claude Opus 5.5 (5.125.0 — grid charges take the sun first; the panels are no longer switched off)
 #              Claude Opus 5.5 (5.125.1 — a Flux change of mode no longer stops the battery for 15-30 s)
 #              Claude Opus 5.5 (5.125.2 — an announced Axle event no longer raises the daytime floor)
+#              Claude Opus 5.5 (5.125.3 — the Flux planner and Axle cover follow the day's measured sun)
 # Date:        27-09-2026
-# Version:     5.125.2
+# Version:     5.125.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -13967,12 +13968,25 @@ class Plugin(indigo.PluginBase):
             # behind it, tomorrow has none — so a single factor biases the
             # overnight charge by whatever the two disagree by.
             today_local = _london_today()
+            # 5.125.3: TODAY also carries the day's measured tracking factor, the
+            # one the manager already plans with (damped, 0.6-1.3). Without it the
+            # Flux planner and the Axle cover believed the forecast all day: the
+            # scenario simulator's "sunny forecast, dull day, Axle at 6pm" bought
+            # too little cover and ran the battery out after the event. The factor
+            # is 1.0 until enough of the day has been measured, and resets at
+            # midnight, so the 02:00-05:00 charge is untouched.
+            try:
+                track = float(self.store.get("pv_track_factor", 1.0) or 1.0)
+                if not math.isfinite(track) or track <= 0:
+                    track = 1.0
+            except (TypeError, ValueError):
+                track = 1.0
             return _flux_strategy.HourlyPvForecast(
                 buckets, tz,
                 bias=float(fc.get("biasFactor", 1.0) or 1.0),
                 bias_by_date={
                     today_local: float(fc.get("biasFactorToday")
-                                       or fc.get("biasFactor", 1.0) or 1.0),
+                                       or fc.get("biasFactor", 1.0) or 1.0) * track,
                     today_local + timedelta(days=1):
                         float(fc.get("biasFactorTomorrow")
                               or fc.get("biasFactor", 1.0) or 1.0),

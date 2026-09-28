@@ -21,6 +21,23 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.125.3 — 28-09-2026
+
+- **`_flux_pv_forecast` multiplies today's factor by `store["pv_track_factor"]`** (the manager's
+  damped, 0.6-1.3 intraday tracking; 1.0 until enough is measured, reset at midnight), so
+  `flux_strategy.plan` and `event_cover` read the same corrected forecast the manager plans
+  with. A missing, zero, negative or non-finite factor is ignored. Found by the new simulator:
+  forecast 34 kWh, actual 6, Axle 18:00 -> cover under-bought and 1.3 kWh was imported at the
+  reserve after the event; with tracking 0.6 kWh (the 0.6 clamp is the remainder).
+- **`tools/scenario_sim.py` (new, outside the bundle)**: drives `flux_strategy.plan`,
+  `event_cover` and `BatteryManager.evaluate` through 02:00-02:00 in 15-minute steps with the
+  plugin's ownership order (VPP pre-charge/active, Saving Session, Happy Hour, cover, manager
+  import outrank Flux), PV-first grid charging, a 4 kW export cap and one-way efficiency
+  sqrt(0.94); classifies every import (cheap window / free hour / Axle cover / at reserve /
+  UNEXPECTED) and checks Axle delivery and the battery reaching 02:00. 18 scenarios; exit 10
+  when a rule breaks. `--csv-dir` writes per-step traces. It models decisions, not registers.
+- Tests (+3): today's forecast scales with the factor, tomorrow does not, bad factors ignored.
+
 ## v5.125.2 — 28-09-2026
 
 - **`_flux_reserve_floor_pct` adds committed event energy only while a dispatch is being

@@ -6543,6 +6543,41 @@ class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
         self.assertFalse(fake.store["event_cover_active"])
 
 
+class TestFluxForecastFollowsTheDay(unittest.TestCase):
+    """5.125.3: the Flux planner and the Axle cover read today's forecast with the
+    day's measured tracking factor, as the manager does."""
+
+    def _fake(self, track):
+        today = plugin._london_today()
+        buckets = {f"{today:%Y-%m-%d} {h:02d}:00:00": 2000.0 for h in range(8, 18)}
+        tomorrow = today + timedelta(days=1)
+        buckets.update({f"{tomorrow:%Y-%m-%d} {h:02d}:00:00": 2000.0 for h in range(8, 18)})
+        return types.SimpleNamespace(
+            latest_forecast_data={"_hourly_p50_today": buckets, "biasFactor": 1.0,
+                                  "biasFactorToday": 1.0, "biasFactorTomorrow": 1.0},
+            store={"pv_track_factor": track}, logger=logging.getLogger("t"))
+
+    def _kwh(self, fake, day_offset):
+        pv = plugin.Plugin._flux_pv_forecast(fake)
+        tz = plugin._london_tz()
+        d = plugin._london_today() + timedelta(days=day_offset)
+        a = datetime(d.year, d.month, d.day, 0, tzinfo=tz).astimezone(timezone.utc)
+        return pv.kwh_between(a, a + timedelta(days=1))
+
+    def test_a_dull_day_scales_todays_forecast(self):
+        self.assertAlmostEqual(self._kwh(self._fake(0.6), 0),
+                               0.6 * self._kwh(self._fake(1.0), 0), places=6)
+
+    def test_tomorrow_is_left_alone(self):
+        self.assertAlmostEqual(self._kwh(self._fake(0.6), 1),
+                               self._kwh(self._fake(1.0), 1), places=6)
+
+    def test_a_missing_or_nonsense_factor_is_ignored(self):
+        base = self._kwh(self._fake(1.0), 0)
+        for bad in (None, 0, -1, float("nan"), "x"):
+            self.assertAlmostEqual(self._kwh(self._fake(bad), 0), base, places=6, msg=bad)
+
+
 class TestNoTrackerGuessBeforeTheFirstRefresh(unittest.TestCase):
     """5.124.0. Straight after a restart the first plan ran before the first rate
     refresh, and the tariff fell back to Tracker, so a Flux house got a flat-rate

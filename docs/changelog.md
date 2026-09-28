@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.125.3 — 28 September 2026
+
+- **The Axle cover and the 4pm-7pm plan now allow for how the day's sun is actually going.** They used the morning's forecast all day, so on a day forecast sunny that turned out dull, the plugin bought too little before an Axle event, and the battery ran out after it. They now use the same correction the rest of the plugin already applies: once enough of the day has been measured, the forecast for the rest of today is scaled by how the sun has done so far. The overnight charge is not affected.
+- A scenario simulator (`tools/scenario_sim.py`) runs the plugin's own decisions through whole days: high and low sun, Axle events, Saving Sessions and free hours, with the forecast right or wrong. It checks each day against the rules: the battery is never stopped in the day, the day buys only in free hours, at the reserve or to cover Axle, and every Axle event runs in full.
+
 ## 5.125.2 — 28 September 2026
 
 - **An Axle event no longer stops the battery hours before it starts.** From the moment an event was announced, the plugin raised the lowest charge the battery may run down to by the event's energy, and kept it there all day. On 28 September, for a 6pm event, that was 32% from 5am, so from 7am the battery sat idle and the house bought from the grid, on a day forecast to bring 35 kWh of sun. The battery now runs the house down to its usual 20%. The event is still covered: the overnight charge allows for it, the evening sale never sells its energy, and if the battery would reach it short the plugin buys just the difference before 4pm. The raised floor now applies only while an event's export is running, so it cannot sell energy promised to a later one.
