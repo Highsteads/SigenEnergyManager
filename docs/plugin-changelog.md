@@ -21,6 +21,25 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.126.0 — 28-09-2026
+
+CliveS, 28-Sep-2026: "The winter saving sessions normally run inside the 4-7pm export window so
+do not need to have any kwh associated to them, if a saving session is outside that 4-7pm window
+then we should still join them but do not export as it is not cost effective."
+- **`_saving_session_window()` returns None when `_flux_armed()`**, so the manager never decides
+  ACTION_SAVING_SESSION, `saving_session_export_active` is never set, and `_flux_other_owner`
+  never stands Flux down for a session: inside the peak Flux's own sale runs through it.
+- **`_flux_commitments()` skips TURN_DOWN sessions on Flux**: no energy is reserved (planner
+  floors, export floor, the during-dispatch uplift). Happy Hour import commitments are kept.
+- **`_session_join_verdict()` returns True on Flux outside the peak too** (joining costs nothing
+  with no export); the token verdict still decides off Flux. The "opted in but not driven"
+  warning is off on Flux, and the join message says which case applies.
+- Tests: ten tests that pinned session reservations / declines on Flux rewritten to the new rule,
+  with non-Flux twins kept; new: a live session never drives the battery on Flux but still does
+  without it. Simulator 1.3: sessions reserve nothing and are never driven; any export inside
+  the session window counts. 29 scenarios (autumn + winter), every rule kept. Winter W6: the
+  peak sale puts 1.4 kWh inside a 5:30-6:30pm session; the battery runs the house for the rest.
+
 ## v5.125.4 — 28-09-2026
 
 CliveS, 28-Sep-2026: "axle gives £1 kwh and the most we are charged is around 30p then buying

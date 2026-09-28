@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.126.0 — 28 September 2026
+
+- **On Octopus Flux, Saving Sessions no longer have battery energy of their own.** A session between 4pm and 7pm falls in the peak, when the battery is already selling what it can spare, so the session gets that sale and nothing is set aside for it. A session outside 4pm to 7pm is still joined, but nothing is exported: the battery runs the house through it, which is the lower use the session asks for, and selling then would earn less than the energy is worth later. Every Power Down is now joined on Flux, since joining costs nothing. Other tariffs work as before.
+- The scenario simulator runs winter days as well (`--season winter`) and reports how much of the battery each day uses.
+
 ## 5.125.4 — 28 September 2026
 
 - **An Axle event now always leaves enough to reach 2am.** On a day forecast sunny that turns out dull, the top-up before an Axle event could still count on sun that never came, because the correction for a dull day stops at 60% of the forecast. The top-up now goes by the sun the day is really giving, with no such limit, and keeps 1 kWh above the reserve for the rest of the evening. Axle pays about £1 a kWh and the dearest import is about 30p, so buying a little too much for an event is the right side to err on. The rest of the plugin keeps the 60% limit.

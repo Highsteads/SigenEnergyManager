@@ -351,16 +351,19 @@ class TestTheJoinVerdictKnowsTheFluxPeak(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "")
 
-    def test_outside_the_peak_after_the_scheme_is_declined_as_before(self):
+    def test_outside_the_peak_on_flux_is_joined_but_not_exported(self):
+        # 5.126.0. CliveS: "we should still join them but do not export". Joining
+        # costs nothing on Flux: nothing is exported for a session.
         day = datetime(2026, 11, 10, tzinfo=LONDON).date()
-        ok, why = self._p()._session_join_verdict(self._event(day, 19, 20), day, day)
-        self.assertFalse(ok)
-        self.assertIn("ended", why)
+        for h0, h1 in ((19, 20), (18, 20), (10, 11)):
+            ok, why = self._p()._session_join_verdict(self._event(day, h0, h1), day, day)
+            self.assertTrue(ok, (h0, h1))
+            self.assertEqual(why, "")
 
     def test_a_session_that_runs_past_seven_is_not_inside_the_peak(self):
         day = datetime(2026, 11, 10, tzinfo=LONDON).date()
-        ok, _ = self._p()._session_join_verdict(self._event(day, 18, 20), day, day)
-        self.assertFalse(ok)
+        self.assertFalse(self._p()._session_inside_flux_peak(
+            self._event(day, 18, 20)["start_at"], self._event(day, 18, 20)["end_at"]))
 
     def test_without_flux_armed_the_token_check_decides(self):
         day = datetime(2026, 11, 10, tzinfo=LONDON).date()

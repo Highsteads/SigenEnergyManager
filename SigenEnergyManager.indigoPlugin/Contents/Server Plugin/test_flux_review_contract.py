@@ -295,9 +295,9 @@ class FluxEventIntegrationReviewTests(unittest.TestCase):
             p._set_vpp_discharge_cutoff(event,is_daytime=True)
         cutoffs=[v[1] for v in p.modbus.writes if isinstance(v,tuple)
                  and v[0]=='backup_soc']
-        # Release Axle's own 4 kWh, preserve the subsequent 4 kWh plus losses.
-        self.assertGreater(cutoffs[-1],31.)
-        self.assertLess(cutoffs[-1],33.)
+        # Axle's own 4 kWh is released; from 5.126.0 a following Saving Session
+        # reserves nothing on Flux, so the floor is the plain reserve.
+        self.assertEqual(cutoffs[-1],20.)
 
     def test_actual_announced_precharge_can_export_and_reports_real_shortfall(self):
         from test_flux_supervisor import _mk_plugin, _pinned_clock
@@ -317,11 +317,11 @@ class FluxEventIntegrationReviewTests(unittest.TestCase):
             p._alert_vpp_shortfall=MagicMock()
             p._start_vpp_precharge(event)
             floors=[x[1] for x in p.modbus.writes if isinstance(x,tuple) and x[0]=='backup_soc']
-            self.assertGreater(floors[0],31.)
-            self.assertLess(floors[0],33.)
+            # 5.126.0: the later Saving Session reserves nothing on Flux, so the
+            # floor is the reserve and 35% covers the 4 kWh event above it.
+            self.assertEqual(floors[0],20.)
             self.assertEqual(p.store['vpp_state'],plugin.VPP_PRE_CHARGING)
-            p._alert_vpp_shortfall.assert_called_once()
-            self.assertGreater(p._alert_vpp_shortfall.call_args.args[3],15.)
+            p._alert_vpp_shortfall.assert_not_called()
 
     def test_flux_release_precedes_axle_cutoff_and_does_not_overwrite_it(self):
         from test_flux_supervisor import _mk_plugin, _FakeExecutor, _pinned_clock
@@ -361,8 +361,7 @@ class FluxEventIntegrationReviewTests(unittest.TestCase):
                     'end':(now+timedelta(minutes=120)).isoformat(),
                     'direction':plugin.SAVING_SESSION_TURN_DOWN}])
             floor=p._policy_discharge_floor_pct(dispatch_event=event)
-            self.assertGreater(floor,25.)
-            self.assertLess(floor,27.)  # Only the 19:00-19:30 tail, 2 kWh.
+            self.assertEqual(floor,20.)  # 5.126.0: a session reserves nothing on Flux.
 
     def test_same_day_cached_forecast_keeps_its_generation_age(self):
         from test_flux_supervisor import TestForecastFreshnessStamp

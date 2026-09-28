@@ -114,7 +114,7 @@ Leave the four daily figures alone unless you want to override them. The plugin 
 | Setting | What it does |
 |---|---|
 | **Opt in to Power Down sessions automatically** | Ticked, the plugin joins each Power Down for you. Off to start with. |
-| **Export the battery during a Saving Session** | Ticked, the plugin sells from the battery during a session you have joined. Off to start with. |
+| **Export the battery during a Saving Session** | Ticked, the plugin sells from the battery during a session you have joined. Off to start with. Has no effect on Octopus Flux, where the plugin never exports for a session. |
 | **Charge the battery during a Weekend Happy Hour** | Ticked, the plugin charges the battery with the free electricity during an hour you have booked. Off to start with. |
 | **Book Weekend Happy Hours automatically** | Ticked, the plugin books your Happy Hours for you. Off to start with, and it needs the charging box ticked too. |
 | **Tokens needed to book a Happy Hour** | 2 to start with. 0 stops the messages mentioning tokens at all. |

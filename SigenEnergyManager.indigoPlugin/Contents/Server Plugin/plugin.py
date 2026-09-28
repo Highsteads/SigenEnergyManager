@@ -54,8 +54,9 @@
 #              Claude Opus 5.5 (5.125.2 — an announced Axle event no longer raises the daytime floor)
 #              Claude Opus 5.5 (5.125.3 — the Flux planner and Axle cover follow the day's measured sun)
 #              Claude Opus 5.5 (5.125.4 — the Axle cover never counts on sun the day is not giving, and keeps a margin)
+#              Claude Opus 5.5 (5.126.0 — on Flux a Saving Session has no kWh of its own and never drives an export)
 # Date:        27-09-2026
-# Version:     5.125.4
+# Version:     5.126.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6026,6 +6027,11 @@ class Plugin(indigo.PluginBase):
         """
         if self._session_inside_flux_peak(event.get("start_at"), event.get("end_at")):
             return True, ""
+        if self._flux_armed():
+            # 5.126.0: outside the peak nothing is exported for a session on Flux,
+            # so joining costs nothing: the battery runs the house either way.
+            # CliveS: "we should still join them".
+            return True, ""
         return self._happy_hour_token_verdict(session_start_local, now_local=now_local)
 
     def _happy_hour_token_verdict(self, session_start_local, now_local=None):
@@ -6245,7 +6251,8 @@ class Plugin(indigo.PluginBase):
         if refused != {str(x) for x in (self.store.get("saving_sessions_join_refused") or [])}:
             self.store["saving_sessions_join_refused"] = list(refused)[-200:]
             self._save_accumulators()
-        if joined_any and not _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
+        if (joined_any and not self._flux_armed()
+                and not _as_bool(self.pluginPrefs.get("savingSessionExport"), False)):
             # Worth one line: opted in is not the same as being driven, and the two
             # are separate checkboxes on purpose. Without this the owner can be
             # joined to a session nothing will act on and have no way to know.
@@ -6892,7 +6899,18 @@ class Plugin(indigo.PluginBase):
                                      "so the battery is not run for it.")
                     title = f"Saving Session {day}: not one for the battery"
                 elif joined:
-                    if _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
+                    if self._flux_armed():
+                        # 5.126.0: on Flux a session never has its own export.
+                        if self._session_inside_flux_peak(start_at, end_at):
+                            parts.append("You are in it. It falls in the 4pm to 7pm "
+                                         "peak, when the battery is selling anyway, so "
+                                         "nothing extra is needed.")
+                        else:
+                            parts.append("You are in it. It falls outside the 4pm to "
+                                         "7pm peak, so the battery just runs the house "
+                                         "through it and does not export: selling then "
+                                         "earns less than the energy is worth later.")
+                    elif _as_bool(self.pluginPrefs.get("savingSessionExport"), False):
                         parts.append("You are in it, and the battery will export for it.")
                     else:
                         parts.append("You are in it, but exporting for sessions is "
@@ -7176,7 +7194,17 @@ class Plugin(indigo.PluginBase):
         Returns {"id", "start", "end", "points", "hours"} or None. Gated on the
         `savingSessionExport` pref: this drives the battery, so it is OFF unless
         the owner turned it on.
+
+        5.126.0: NEVER on Flux. CliveS, 28-Sep-2026: "The winter saving sessions
+        normally run inside the 4-7pm export window so do not need to have any kwh
+        associated to them, if a saving session is outside that 4-7pm window then
+        we should still join them but do not export as it is not cost effective."
+        Inside the peak the Flux sale already exports through the session; outside
+        it the battery simply runs the house, which is the turn-down the session
+        asks for. So nothing drives an export for a session on Flux.
         """
+        if self._flux_armed():
+            return None
         return self._window_of_direction(
             SAVING_SESSION_TURN_DOWN, "savingSessionExport", now_utc)
 
@@ -13359,6 +13387,11 @@ class Plugin(indigo.PluginBase):
                 continue
             hours = max(0.0, (end - start).total_seconds() / 3600.0)
             direction = window.get("direction")
+            if direction == SAVING_SESSION_TURN_DOWN and self._flux_armed():
+                # 5.126.0: no energy is set aside for a session on Flux. Inside the
+                # peak the ordinary sale exports through it; outside, nothing is
+                # exported for it (see _saving_session_window).
+                continue
             if direction == SAVING_SESSION_TURN_DOWN:
                 out.append(_flux_strategy.EventCommitment(
                     source="octopus", kind="export", start=start, end=end,

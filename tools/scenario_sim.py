@@ -16,7 +16,7 @@
 #              the registers were written.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        28-09-2026
-# Version:     1.2 (28-09-2026: winter scenarios (--season), battery use per day)
+# Version:     1.3 (28-09-2026: Saving Sessions as 5.126.0 - nothing reserved or driven on Flux)
 
 import argparse
 import csv
@@ -205,12 +205,7 @@ class Sim:
                 out.append(fs.EventCommitment(source="axle", kind="export", start=w.start,
                                               end=w.end, energy_kwh=EXPORT_KW * hours,
                                               event_id=f"axle-{i}"))
-        for i, w in enumerate(self.sc.saving):
-            if w.announced <= now and w.end > now:
-                hours = (w.end - w.start).total_seconds() / 3600.0
-                out.append(fs.EventCommitment(source="octopus", kind="export", start=w.start,
-                                              end=w.end, energy_kwh=EXPORT_KW * hours,
-                                              event_id=f"ss-{i}"))
+        # Saving Sessions reserve nothing on Flux (5.126.0).
         for i, w in enumerate(self.sc.free):
             if w.announced <= now and w.end > now:
                 hours = (w.end - w.start).total_seconds() / 3600.0
@@ -267,7 +262,7 @@ class Sim:
             tariff=tariff, forecast_p50=self._pv_buckets(), dawn_times=dawn,
             consumption_profile=list(self.slots), now=now,
             vpp_active=vpp_live is not None, vpp_today_kwh=vpp_today,
-            saving_session_active=ss_live is not None,
+            saving_session_active=False,    # 5.126.0: never driven on Flux
             saving_session_hours=((ss_live.end - ss_live.start).total_seconds() / 3600.0
                                   if ss_live else 1.0),
             happy_hour_active=hh_live is not None,
@@ -367,7 +362,7 @@ class Sim:
             dec = self.manager.evaluate(snap)
 
             # The plugin's ownership rules (_flux_other_owner): these outrank Flux.
-            other = (vpp_pre is not None or ss_live is not None or hh_live is not None
+            other = (vpp_pre is not None or hh_live is not None
                      or (cover is not None and cover.active) or self.import_active)
             mode, why, floor, target, power, cap = "sc", "", RESERVE_PCT, 100.0, INV_KW, INV_KW
             imp_cause = None
@@ -472,7 +467,8 @@ class Sim:
             axle.append((w, got, want, reserve_after))
         saving = []
         for w in self.sc.saving:
-            got = sum(st.exp for st in s if w.start <= st.t < w.end and st.mode == "saving")
+            # Whatever leaves the house during the session counts towards it.
+            got = sum(st.exp for st in s if w.start <= st.t < w.end)
             saving.append((w, got))
         unexpected = [st for st in s if st.imp_cause.startswith("UNEXPECTED")]
         stopped = [st for st in s
@@ -518,6 +514,8 @@ def scenarios():
                  saving=[W(mon, 17, 18)]),
         Scenario("10 low sun + Axle 6-7pm + Saving Session 6-7pm", mon, lo, start_soc=35,
                  axle=[W(mon, 18, 19)], saving=[W(mon, 18, 19)]),
+        Scenario("10b low sun + Saving Session 8-9pm (outside the peak)", mon, lo,
+                 start_soc=35, saving=[W(mon, 20, 21)]),
         Scenario("11 Sunday high sun + free hours 1-3pm", sun, hi, start_soc=35,
                  free=[W(sun, 13, 15)]),
         Scenario("12 Sunday low sun + free hours 1-3pm", sun, lo, start_soc=35,

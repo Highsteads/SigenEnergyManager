@@ -21,12 +21,14 @@ Joining the scheme does not enter you into each session — every one is a separ
 - It only ever joins a Power Down, never a Power Up, which asks you to use more.
 - Joining cannot be undone — Octopus offer no way to withdraw. A session you then do not beat simply pays nothing, with no penalty.
 - It does not join a session whose token you could never spend. It counts how many Happy Hours are left before the offer ends, and you can lower that with **Happy Hours you expect to use**. It also turns down a session too late in October for Octopus to score it in time to book a weekend.
-- On Octopus Flux, a session wholly inside 4pm to 7pm is always joined, because the battery is selling at your export limit then anyway, so the points come free.
+- On Octopus Flux, every Power Down is joined. Joining costs nothing there, because the plugin never exports for a session on Flux (see below).
 - After the offer ends, every Power Down is joined for its points.
 
 ## Selling during a Power Down
 
-Tick **Export the battery during a Saving Session** and, during a session you have joined, the plugin sells from the battery to beat your usual use. **Saving Session Export** shows on the **Battery Manager** while it runs.
+**On Octopus Flux the plugin never exports for a session, and sets no energy aside for one.** A session between 4pm and 7pm falls in the peak, when the battery is already selling whatever it can spare, so the session gets that sale. A session outside 4pm to 7pm is still joined, but the battery just runs the house through it: selling then would earn less than the energy is worth later, and running the house from the battery is itself the lower use the session asks for. The setting below does nothing on Flux.
+
+On other tariffs, tick **Export the battery during a Saving Session** and, during a session you have joined, the plugin sells from the battery to beat your usual use. **Saving Session Export** shows on the **Battery Manager** while it runs.
 
 - An Axle event always comes first, and energy already promised to Axle is kept back for it.
 - It does not sell if that would leave the battery unable to reach the next morning without buying from the grid.

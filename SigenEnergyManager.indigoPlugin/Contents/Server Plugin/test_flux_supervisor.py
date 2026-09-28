@@ -645,31 +645,23 @@ class TestPolicyFloorOwnership(unittest.TestCase):
                 "id": "ss-later", "start": (now + timedelta(hours=3)).isoformat(),
                 "end": (now + timedelta(hours=4)).isoformat(),
                 "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
-            self.assertGreater(p._policy_discharge_floor_pct(), 20.0,
-                               "an unrelated later session was dropped with the dispatch")
+            # 5.126.0: on Flux a Saving Session is never reserved, so a dispatch
+            # has nothing else to protect and the floor stays at the reserve.
+            self.assertEqual(p._policy_discharge_floor_pct(), 20.0)
 
-    def test_the_floor_uses_the_union_budget_not_a_sum(self):
-        """Two schemes paying for one exported kWh must not reserve it twice.
-        5.125.2: reserved only while a dispatch runs, so one is set running."""
+    def test_a_session_under_a_running_dispatch_is_not_reserved_on_flux(self):
+        """5.126.0 (was the union-budget test, whose second event was a Saving
+        Session): on Flux a session never carries energy of its own."""
         p = _mk_plugin()
         with _pinned_clock() as now:
-            start = (now + timedelta(hours=2)).isoformat()
-            end   = (now + timedelta(hours=3)).isoformat()
             p.store["saving_sessions_windows"] = [
-                {"id": "a", "start": start, "end": end, "points": 1800,
+                {"id": "a", "start": (now + timedelta(hours=2)).isoformat(),
+                 "end": (now + timedelta(hours=3)).isoformat(), "points": 1800,
                  "direction": plugin.SAVING_SESSION_TURN_DOWN}]
             running = {"id": "axle-0", "start_time": now + timedelta(minutes=20),
                        "end_time": now + timedelta(minutes=80),
                        "import_export": "export", "duration_hrs": 1.0}
-            one = p._policy_discharge_floor_pct(dispatch_event=running)
-            p.store["vpp_event"] = {"id": "axle-1",
-                                    "start_time": now + timedelta(hours=2),
-                                    "end_time": now + timedelta(hours=3),
-                                    "import_export": "export", "duration_hrs": 1.0}
-            p.store["vpp_state"] = "announced"
-            both = p._policy_discharge_floor_pct(dispatch_event=running)
-            self.assertGreater(one, 20.0)
-            self.assertEqual(both, one, "overlapping events were summed, not unioned")
+            self.assertEqual(p._policy_discharge_floor_pct(dispatch_event=running), 20.0)
 
     def test_an_announced_window_does_not_pre_empt_on_the_state_change_either(self):
         """The _flux_other_owner fix is undone if the transition pre-empts."""
@@ -1023,8 +1015,34 @@ class TestCommitmentsFromState(unittest.TestCase):
                                 "import_export": "export", "duration_hrs": 1.0}
         self.assertEqual(p._flux_commitments(), ())
 
-    def test_a_joined_turn_down_session_becomes_a_reservation(self):
+    def test_a_joined_turn_down_session_is_not_a_reservation_on_flux(self):
+        """5.126.0. CliveS: sessions "do not need to have any kwh associated to them"."""
         p = _mk_plugin()
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [{
+            "id": "ss1", "start": (now + timedelta(hours=1)).isoformat(),
+            "end": (now + timedelta(hours=2)).isoformat(),
+            "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
+        self.assertEqual(p._flux_commitments(), ())
+
+    def test_on_flux_a_live_session_never_drives_the_battery(self):
+        """5.126.0: inside 4-7pm the Flux sale exports through it; outside, the
+        battery just runs the house. Either way the manager has no session to drive."""
+        p = _mk_plugin()
+        p.pluginPrefs["savingSessionExport"] = True
+        now = datetime.now(timezone.utc)
+        p.store["saving_sessions_windows"] = [{
+            "id": "ss1", "start": (now - timedelta(minutes=10)).isoformat(),
+            "end": (now + timedelta(minutes=50)).isoformat(), "joined": True,
+            "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
+        self.assertIsNone(p._saving_session_window())
+        p.pluginPrefs["fluxEnabled"] = False
+        self.assertIsNotNone(p._saving_session_window(),
+                             "without Flux the session is still driven as before")
+
+    def test_without_flux_a_joined_turn_down_session_is_still_a_reservation(self):
+        p = _mk_plugin()
+        p.pluginPrefs["fluxEnabled"] = False
         now = datetime.now(timezone.utc)
         p.store["saving_sessions_windows"] = [{
             "id": "ss1", "start": (now + timedelta(hours=1)).isoformat(),
@@ -1098,7 +1116,7 @@ class TestCommitmentsFromState(unittest.TestCase):
             "end": (now + timedelta(hours=6)).isoformat(),
             "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
         sources = {c.source for c in p._flux_commitments()}
-        self.assertEqual(sources, {"axle", "octopus"})
+        self.assertEqual(sources, {"axle"}, "5.126.0: a session reserves nothing on Flux")
 
     def test_a_malformed_session_window_is_skipped_not_fatal(self):
         p = _mk_plugin()
@@ -1118,12 +1136,12 @@ class TestCommitmentReplanning(_FluxCase):
         self.assertIsNotNone(first_key)
 
         day = when.date()
-        p.store["vpp_state"] = "idle"     # announced but not yet owning
-        p.store["saving_sessions_windows"] = [{
-            "id": "ss-late",
-            "start": fs._wall(LONDON, day, fs.time(18, 0)).isoformat(),
-            "end":   fs._wall(LONDON, day, fs.time(19, 0)).isoformat(),
-            "points": 1800, "direction": plugin.SAVING_SESSION_TURN_DOWN}]
+        # A late Axle announcement (a Saving Session reserved nothing from 5.126.0).
+        p.store["vpp_state"] = "announced"     # announced but not yet owning
+        p.store["vpp_event"] = {
+            "id": "axle-late", "import_export": "export", "duration_hrs": 1.0,
+            "start_time": fs._wall(LONDON, day, fs.time(18, 0)),
+            "end_time":   fs._wall(LONDON, day, fs.time(19, 0))}
         self._run(p, when)
         self.assertNotEqual(p.store["flux_applied_key"], first_key)
         applied = p.flux_executor.targets()
