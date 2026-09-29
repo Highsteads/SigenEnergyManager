@@ -57,8 +57,9 @@
 #              Claude Opus 5.5 (5.126.0 — on Flux a Saving Session has no kWh of its own and never drives an export)
 #              Claude Opus 5.5 (5.127.0 — the 4pm-7pm sale is lined up with a joined Saving Session)
 #              Claude Opus 5.5 (5.127.1 — an Axle pre-charge no longer stops a running 4pm-7pm sale)
+#              Claude Opus 5.5 (5.128.0 — the 2am charge plans on 80% of the solar forecast, all year)
 # Date:        28-09-2026
-# Version:     5.127.1
+# Version:     5.128.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

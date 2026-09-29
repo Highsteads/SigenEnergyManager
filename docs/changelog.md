@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.128.0 — 29 September 2026
+
+- **The 2am charge now plans on 80% of the solar forecast, all year.** When the forecast was too sunny, the charge bought too little and the 4pm to 7pm sale ran out early. On 29 September the forecast said about 15 kWh of sun, the day brought 11, the battery reached 4pm at 65%, and the sale stopped at 5:46pm having sold 7 kWh of a possible 12. Replayed over every day on record (161 days, April to September), planning on 80% left the sale short on 5 days instead of 15, needed nothing from the grid in the day, and earned slightly more: a kWh sold at the peak earns about 10p, while one whose sunshine then goes to the grid at 9.7p costs about 6p. In winter the charge already reaches a full battery, so nothing changes then.
+
 ## 5.127.1 — 28 September 2026
 
 - **The 4pm to 7pm sale no longer stops half an hour before an Axle event.** Half an hour before an event the plugin sets the lowest level the battery may reach, and to do that it used to take the battery off the peak sale. On 28 September that stopped the sale at 5:31pm for a 6pm event, with the battery at 88% and the event needing about 4 kWh, so half an hour of selling at 27.7p was lost. The sale was already keeping the event's energy back, so now it carries on, and the plugin sets the event's lowest level two minutes before the start, when the event takes over. Outside 4pm to 7pm, or when the battery is not selling, nothing changes.

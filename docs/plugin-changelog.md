@@ -21,6 +21,25 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.128.0 — 29-09-2026
+
+CliveS, 29-Sep-2026: "yes set it to 80% all year" (and: this plugin is for this house only).
+- **flux_strategy 2.7 `CHARGE_PV_FACTOR = 0.8`**: `plan()`'s cheap-window branch calls
+  `_charge_plan(replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR)))`, so the household
+  charge, the resale "by_peak" room and the brighter-day check (now 1.35 x the dimmed
+  forecast) all plan on 80%. Nothing outside 02:00-05:00 reads it: the peak sale, event_cover
+  and the manager see the forecast as it stands.
+- Why: 29-Sep forecast ~15 kWh (corrected), actual ~11; 4pm at 65%, the sale ran out at 17:46
+  with ~7 kWh sold. 161-day replay (Apr 19 - Sep 28, chained SOC, day length by date): old
+  £666.25 / 1887 kWh sold / 15 short days / 3.7 kWh day import; new £668.31 / 1919 / 5 / 0.
+  Checking the brighter-day guard against the real forecast x1.35 instead earned 38p more but
+  left 10 short days, so the guard follows the dimmed forecast. A learned per-forecast-band
+  factor (37th-40th percentile of past ratios) earned no more and was not built.
+- Tests (+5): the factor is 0.8; the charge equals the one a 0.8x forecast would make; the
+  29-Sep night charges higher; nothing outside the cheap window reads it; a bright day still
+  buys little. Two v2.2 tests updated (the 21-Sep night now buys ~6.3 kWh, bound < 8; the
+  brighter-day check is made on the dimmed forecast). Removing the scaling fails two tests.
+
 ## v5.127.1 — 28-09-2026
 
 - **An Axle pre-charge no longer pre-empts a running Flux peak sale.** Live 28-Sep 17:31: the

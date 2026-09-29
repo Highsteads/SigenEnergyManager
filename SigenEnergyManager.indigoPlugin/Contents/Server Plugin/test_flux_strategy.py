@@ -369,7 +369,9 @@ class TestResaleBuyingLeavesRoomForABrighterDay(unittest.TestCase):
         self.assertIn("is for the peak window", trade.reason)
         top  = self._target_kwh(trade)
         base = self._target_kwh(house) or 30.0 / 100.0 * _site().capacity_kwh
-        bright = pv.scaled(fs.RESALE_PV_OPTIMISM)
+        # v2.7: the charge plans on CHARGE_PV_FACTOR of the forecast, and the
+        # brighter-day check is made on that planning forecast.
+        bright = pv.scaled(fs.CHARGE_PV_FACTOR * fs.RESALE_PV_OPTIMISM)
         pushed_out = (self._displaced(bright, top, busy)
                       - self._displaced(bright, base, busy))
         # a whole percent of rounding on the target, on top of the tolerance
@@ -382,7 +384,10 @@ class TestResaleBuyingLeavesRoomForABrighterDay(unittest.TestCase):
         d = fs.plan(_inputs((2, 0), soc_pct=56.7, day=(2026, 9, 21),
                             pv=self._bell(15.6), house=_profile(21.5)))
         bought = d.planned_kwh if d.mode == fs.MODE_CHARGE else 0.0
-        self.assertLess(bought, 5.0)
+        # v2.2 bought under 5 kWh here. v2.7 plans on 80% of the forecast, which
+        # CliveS chose knowing a bright surprise like this one costs a little, so
+        # it buys more — but still well short of the old 11.6.
+        self.assertLess(bought, 8.0)
 
     def test_the_peak_only_buys_what_the_sun_does_not_already_leave_there(self):
         """With the brighter-day check out of the way, the purchase is still no
@@ -1551,6 +1556,65 @@ class TestThePeakSaleServesTheSession(unittest.TestCase):
         bad = self._in((16, 0), 70.0)
         bad = fs.FluxInputs(**{**bad.__dict__, "sale_priority": (("x", "y"),)})
         self.assertEqual(fs.plan(bad).mode, fs.MODE_EXPORT)
+
+
+class TestTheChargePlansOnADimmerDay(unittest.TestCase):
+    """v2.7. CliveS, 29-Sep-2026: "yes set it to 80% all year". The 2am charge plans
+    on CHARGE_PV_FACTOR of the solar forecast; nothing else in the planner does."""
+
+    DAY = datetime(2026, 9, 29, tzinfo=LONDON).date()
+
+    def _in(self, hhmm, soc, pv_kwh, **over):
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 9, 29),
+                       pv=_pv(self.DAY, pv_kwh, first_hour=8, last_hour=18), **over)
+
+    def test_the_factor_is_eighty_percent(self):
+        self.assertEqual(fs.CHARGE_PV_FACTOR, 0.8)
+
+    def test_the_charge_is_the_one_a_dimmer_forecast_would_make(self):
+        a = self._in((2, 30), 60.0, 15.0)
+        dim = self._in((2, 30), 60.0, 15.0)
+        dim = fs.FluxInputs(**{**dim.__dict__, "pv": dim.pv.scaled(0.8)})
+        saved = fs.CHARGE_PV_FACTOR
+        try:
+            got = fs.plan(a)
+            fs.CHARGE_PV_FACTOR = 1.0
+            want = fs.plan(dim)
+        finally:
+            fs.CHARGE_PV_FACTOR = saved
+        self.assertEqual(got.control_key(), want.control_key())
+
+    def test_the_29_september_night_buys_more_than_it_did(self):
+        # 60% at 2am, about 15 kWh forecast: the day brought 11 and the sale ran
+        # out at 17:46. Planned on 80% the charge goes higher.
+        inputs = self._in((2, 0), 60.0, 15.0)
+        saved = fs.CHARGE_PV_FACTOR
+        try:
+            new = fs.plan(inputs)
+            fs.CHARGE_PV_FACTOR = 1.0
+            old = fs.plan(inputs)
+        finally:
+            fs.CHARGE_PV_FACTOR = saved
+        self.assertEqual(new.mode, fs.MODE_CHARGE)
+        self.assertGreater(new.charge_cutoff_pct, old.charge_cutoff_pct
+                           if old.mode == fs.MODE_CHARGE else 60.0)
+
+    def test_nothing_outside_the_cheap_window_reads_the_factor(self):
+        saved = fs.CHARGE_PV_FACTOR
+        try:
+            for hhmm, soc in (((16, 30), 90.0), ((11, 0), 50.0), ((20, 0), 60.0)):
+                a = fs.plan(self._in(hhmm, soc, 15.0))
+                fs.CHARGE_PV_FACTOR = 1.0
+                b = fs.plan(self._in(hhmm, soc, 15.0))
+                fs.CHARGE_PV_FACTOR = saved
+                self.assertEqual(a.control_key(), b.control_key(), hhmm)
+        finally:
+            fs.CHARGE_PV_FACTOR = saved
+
+    def test_a_bright_day_still_buys_little(self):
+        d = fs.plan(self._in((2, 0), 40.0, 40.0))
+        bought = d.planned_kwh if d.mode == fs.MODE_CHARGE else 0.0
+        self.assertLess(bought, 6.0)
 
 
 if __name__ == "__main__":

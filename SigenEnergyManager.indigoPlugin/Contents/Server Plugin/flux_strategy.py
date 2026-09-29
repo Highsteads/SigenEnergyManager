@@ -4,10 +4,21 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.6 Claude Opus 5.5
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
-#              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026
-# Version:     2.6
+#              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026
+# Version:     2.7
+#
+# v2.7 (SigenEnergyManager 5.128.0) sizes the 02:00-05:00 charge on 80% of the solar
+# forecast, all year (CHARGE_PV_FACTOR). On 29-Sep-2026 the forecast said about 15 kWh
+# and the day brought 11, so the battery reached 4pm at 65% and the peak sale ran out
+# at 17:46 with 7 kWh sold of a possible 12. Replayed over every recorded day (161, 19
+# Apr to 28 Sep): planning on 80% sold 31 kWh more at the peak, left the sale short on
+# 5 days instead of 15, bought nothing in the day, and earned the same (+£2.34), because
+# a kWh sold at the peak (+10p) outweighs one whose sunshine then goes out at 9.7p (-6p).
+# A learned per-forecast-size factor earned no more. In winter the charge reaches 100%
+# anyway. CliveS, 29-Sep-2026: "yes set it to 80% all year". The rest of the planner
+# (the peak sale, the Axle cover) still reads the forecast as it stands.
 #
 # v2.6 (SigenEnergyManager 5.127.0) lines the peak sale up with a joined Saving
 # Session (inputs.sale_priority). A session has no energy of its own on Flux
@@ -83,7 +94,7 @@
 # Order of precedence in every decision: reserve floor > event commitments >
 # household demand > discretionary trading. Anything missing is a defer.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
 import math
 import re
@@ -129,6 +140,8 @@ MAX_FLOW_AGE_S      = 120            # power flows, for site headroom
 RESALE_PV_OPTIMISM       = 1.35
 RESALE_SPILL_TOLERANCE   = 0.2          # kWh of displaced energy ignored
 MIN_TRADE_KWH            = 0.5
+# v2.7: the 02:00-05:00 charge plans on this share of the solar forecast (see header).
+CHARGE_PV_FACTOR         = 0.8
 # Kept above the reserve at 2am by an Axle cover (5.125.4). CliveS, 28-Sep-2026:
 # Axle pays about £1/kWh and the dearest import is about 30p, so buying a little
 # too much to support an event is fine; running out before 2am should not happen.
@@ -1485,8 +1498,11 @@ def plan(inputs):
         # ── the cheap window ────────────────────────────────────────────────
         if in_window(inputs.now, tz, FLUX_CHEAP_START, FLUX_CHEAP_END):
             window_end = next_local(inputs.now, tz, FLUX_CHEAP_END)
+            # v2.7: plan the charge on a dimmer day than forecast, so a forecast that
+            # is too sunny no longer leaves the peak sale or the evening short.
             (target_pct, power_w, buy_kwh, margin_p,
-             household_kwh, infeasible) = _charge_plan(inputs)
+             household_kwh, infeasible) = _charge_plan(
+                 replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR)))
             # Say so when a booked free hour shaped the charge. An armed state has
             # to be visible BEFORE it fires, or the first anyone learns of a
             # smaller overnight charge is a battery that looks under-filled.
