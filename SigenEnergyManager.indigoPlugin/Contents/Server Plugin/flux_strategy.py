@@ -4,11 +4,23 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8 Claude Sonnet 5.5
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8-2.9 Claude Sonnet 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
-#              v2.8 30-09-2026
-# Version:     2.8
+#              v2.8 and v2.9 30-09-2026
+# Version:     2.9
+#
+# v2.9 (SigenEnergyManager 5.129.0) raises the 02:00-05:00 charge to at least
+# CHARGE_MIN_PCT (50%) every night, except on a day with a booked free hour, which
+# wants the room. CliveS, 30-Sep-2026: "we are not filling the battery and then
+# unable to export for the full 3 hours because of this, with the solar obviously
+# being wrong i want the battery to be topped up to at least 50% every night on cheap
+# rate". On 30-Sep the forecast was 31 kWh and the day brought 19, the battery left
+# the cheap window at 42% and sold 2 kWh of a possible 12 before the session. Replayed
+# over 161 recorded days: the floor acts on about a fifth of them and costs £4.31
+# (about £10 a year: energy bought at 14.6p whose room the sun then fills and sells at
+# 9.7p); 40% cost £1.52 and 60% £12.72. On 30-Sep it buys 2.9 kWh more and sells 2.7
+# more at the peak (+33p). In winter the charge is already near 100%.
 #
 # v2.8 (SigenEnergyManager 5.128.1) fixes two faults in the v2.6 session-first sale.
 #   * (Found by reading the code while chasing the fault below, not on a live day.) The
@@ -156,6 +168,8 @@ RESALE_SPILL_TOLERANCE   = 0.2          # kWh of displaced energy ignored
 MIN_TRADE_KWH            = 0.5
 # v2.7: the 02:00-05:00 charge plans on this share of the solar forecast (see header).
 CHARGE_PV_FACTOR         = 0.8
+# v2.9: and never leaves the cheap window below this level (see header).
+CHARGE_MIN_PCT           = 50.0
 # Kept above the reserve at 2am by an Axle cover (5.125.4). CliveS, 28-Sep-2026:
 # Axle pays about £1/kWh and the dearest import is about 30p, so buying a little
 # too much to support an event is fine; running out before 2am should not happen.
@@ -1275,6 +1289,34 @@ def _charge_plan(inputs):
     return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible
 
 
+def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, free_booked):
+    """(target_pct, power_w, buy_kwh, raised_kwh) with the nightly minimum applied (v2.9).
+
+    `target_pct` None means the plan found nothing to buy. The minimum does not apply
+    when a free hour is booked for the day (`free_booked`): that wants the room, and the
+    free electricity fills it. It never lowers a target, never exceeds the site's charge
+    ceiling, and sizes the power to reach the minimum by the end of the window, within
+    the site's charge rate and spare import capacity. `raised_kwh` is what it added
+    (battery side), 0.0 when it changed nothing.
+    """
+    site = inputs.site
+    minimum = min(CHARGE_MIN_PCT, float(site.max_charge_soc_pct))
+    soc = float(inputs.soc_pct)
+    if free_booked or minimum <= 0 or soc >= minimum - 0.05:
+        return target_pct, power_w, buy_kwh, 0.0
+    if target_pct is not None and float(target_pct) >= minimum:
+        return target_pct, power_w, buy_kwh, 0.0
+    need_kwh = (minimum - soc) / 100.0 * site.capacity_kwh          # battery side
+    hours_left = max(0.25, (window_end - inputs.now).total_seconds() / 3600.0)
+    wanted_w = int(need_kwh / site.one_way_efficiency / hours_left * 1000.0)
+    available = min(site.charge_power_w, import_headroom_w(inputs))
+    power = int(min(max(int(power_w or 0), wanted_w), available))
+    if power <= 0:
+        return target_pct, power_w, buy_kwh, 0.0
+    total = max(float(buy_kwh or 0.0), need_kwh)
+    return minimum, power, total, max(0.0, total - float(buy_kwh or 0.0))
+
+
 def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
     """Battery kWh above `base_kwh` worth buying at 02:00-05:00 to sell 4pm-7pm (v2.2).
 
@@ -1532,6 +1574,15 @@ def plan(inputs):
             if free_kwh >= MIN_TRADE_KWH:
                 free_note = (f", leaving room for up to {free_kwh:.0f} kWh of free "
                              f"Happy Hour electricity later in the day")
+            # v2.9: at least CHARGE_MIN_PCT by the end of the window, except on a
+            # day with a booked free hour.
+            min_note = ""
+            (target_pct, power_w, buy_kwh, raised_kwh) = _minimum_charge(
+                inputs, window_end, target_pct, power_w, buy_kwh,
+                free_booked=free_kwh >= MIN_TRADE_KWH)
+            if raised_kwh > 0:
+                min_note = (f", and {raised_kwh:.1f} kWh of that is to bring the "
+                            f"battery up to the {CHARGE_MIN_PCT:.0f}% minimum")
             if target_pct is None:
                 return FluxDecision(
                     mode=MODE_HOLD, owns=True, decision_at=inputs.now,
@@ -1551,10 +1602,10 @@ def plan(inputs):
                        f"{bands.import_cheap_p:.1f}p to {target_pct:.0f}%, of which "
                        f"{household_kwh:.1f} kWh is what the house and its "
                        f"commitments need")
-            if arb_kwh >= MIN_TRADE_KWH:
+            if arb_kwh >= MIN_TRADE_KWH and raised_kwh <= 0:
                 reason += (f", and {arb_kwh:.1f} kWh is for the peak window at a "
                            f"{margin_p:.1f}p margin")
-            reason += free_note
+            reason += min_note + free_note
             if infeasible > 0:
                 reason += (f". About {infeasible:.1f} kWh of what is needed will not "
                            f"fit in the battery, so the house will import some of it "

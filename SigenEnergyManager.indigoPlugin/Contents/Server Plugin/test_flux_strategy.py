@@ -259,8 +259,14 @@ class TestChronologicalBudget(unittest.TestCase):
         pv = fs.HourlyPvForecast(buckets, LONDON)
         lean = _bands(d, fs._wall(LONDON, d, fs.time(2, 30)),
                       exp={**EXPORT_P, "peak": 18.0})
-        decision = fs.plan(_inputs((2, 30), soc_pct=20.0, house=house, pv=pv,
-                                   bands=lean))
+        # v2.9: this test is about how the HOUSEHOLD charge is sized, so the nightly
+        # minimum (which would add 10 kWh from 20%) is switched off for it.
+        saved, fs.CHARGE_MIN_PCT = fs.CHARGE_MIN_PCT, 0.0
+        try:
+            decision = fs.plan(_inputs((2, 30), soc_pct=20.0, house=house, pv=pv,
+                                       bands=lean))
+        finally:
+            fs.CHARGE_MIN_PCT = saved
         self.assertLess(decision.planned_kwh, 6.0)
 
     def test_daytime_load_served_directly_by_pv_is_not_battery_headroom(self):
@@ -1626,6 +1632,80 @@ class TestTheSessionHoldbackAgreesWithAxle(unittest.TestCase):
         # Unchanged behaviour: nothing to hold for, nothing spare, roof generating.
         d = fs.plan(self._in((16, 45), 40.0, sessions=(), pv_kwh=30.0))
         self.assertEqual(d.mode, fs.MODE_SOLAR)
+
+
+class TestTheNightlyMinimumCharge(unittest.TestCase):
+    """v2.9. CliveS, 30-Sep-2026: "i want the battery to be topped up to at least 50%
+    every night on cheap rate" and "skip free-hour days"."""
+
+    DAY = datetime(2026, 9, 30, tzinfo=LONDON).date()
+
+    def _in(self, hhmm, soc, pv_kwh=40.0, free=(), **over):
+        # 40 kWh: bright enough that the plan alone stops short of 50% from a low start.
+        commitments = tuple(
+            fs.EventCommitment(source="octopus", kind="import",
+                               start=fs._wall(LONDON, self.DAY, fs.time(a, 0)),
+                               end=fs._wall(LONDON, self.DAY, fs.time(b, 0)),
+                               energy_kwh=10.0 * (b - a), event_id=f"hh-{a}")
+            for a, b in free)
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 9, 30), commitments=commitments,
+                       pv=_pv(self.DAY, pv_kwh, first_hour=8, last_hour=18), **over)
+
+    def _minimum_off(self, inputs):
+        saved, fs.CHARGE_MIN_PCT = fs.CHARGE_MIN_PCT, 0.0
+        try:
+            return fs.plan(inputs)
+        finally:
+            fs.CHARGE_MIN_PCT = saved
+
+    def test_the_minimum_is_fifty_percent(self):
+        self.assertEqual(fs.CHARGE_MIN_PCT, 50.0)
+
+    def test_a_bright_forecast_no_longer_leaves_the_battery_below_it(self):
+        # 30-Sep: 22% at 2am and a bright forecast bought only to 43%.
+        inputs = self._in((2, 0), 21.7)
+        without = self._minimum_off(inputs)
+        with_it = fs.plan(inputs)
+        self.assertEqual(with_it.mode, fs.MODE_CHARGE)
+        self.assertGreaterEqual(with_it.charge_cutoff_pct, 50.0)
+        self.assertLess(without.charge_cutoff_pct if without.mode == fs.MODE_CHARGE else 0.0, 50.0)
+        self.assertIn("50% minimum", with_it.reason)
+
+    def test_power_is_sized_to_reach_it_by_five(self):
+        d = fs.plan(self._in((4, 0), 30.0))
+        need = (50.0 - 30.0) / 100.0 * _site().capacity_kwh / _site().one_way_efficiency
+        self.assertGreaterEqual(d.charge_limit_w / 1000.0 * 1.0, need - 0.05)
+        self.assertLessEqual(d.charge_limit_w, _site().charge_power_w)
+
+    def test_a_battery_already_above_it_is_left_to_the_plan(self):
+        inputs = self._in((2, 30), 60.0)
+        self.assertEqual(fs.plan(inputs).control_key(), self._minimum_off(inputs).control_key())
+
+    def test_a_plan_that_already_reaches_it_is_unchanged(self):
+        inputs = self._in((2, 30), 20.0, pv_kwh=2.0)          # a dull day buys well over 50%
+        a = fs.plan(inputs)
+        self.assertGreaterEqual(a.charge_cutoff_pct, 50.0)
+        self.assertEqual(a.control_key(), self._minimum_off(inputs).control_key())
+
+    def test_a_booked_free_hour_skips_the_minimum(self):
+        inputs = self._in((2, 0), 21.7, free=((13, 15),))
+        self.assertEqual(fs.plan(inputs).control_key(), self._minimum_off(inputs).control_key())
+        self.assertNotIn("50% minimum", fs.plan(inputs).reason)
+
+    def test_it_never_exceeds_the_site_ceiling(self):
+        inputs = self._in((2, 0), 21.7, site=_site(max_charge_soc_pct=40.0))
+        d = fs.plan(inputs)
+        self.assertLessEqual(d.charge_cutoff_pct, 40.0)
+
+    def test_only_the_cheap_window_reads_it(self):
+        for hhmm, soc in (((11, 0), 30.0), ((16, 30), 60.0), ((20, 0), 30.0)):
+            inputs = self._in(hhmm, soc)
+            self.assertEqual(fs.plan(inputs).control_key(),
+                             self._minimum_off(inputs).control_key(), hhmm)
+
+    def test_once_there_the_charge_stops_asking(self):
+        inputs = self._in((3, 30), 50.2)
+        self.assertEqual(fs.plan(inputs).control_key(), self._minimum_off(inputs).control_key())
 
 
 class TestTheChargePlansOnADimmerDay(unittest.TestCase):

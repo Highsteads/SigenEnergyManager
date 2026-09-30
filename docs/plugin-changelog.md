@@ -21,6 +21,32 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.129.0 — 30-09-2026
+
+CliveS, 30-Sep-2026: "i want the battery to be topped up to at least 50% every night on cheap
+rate ... yes set it to 50%, skip free-hour days".
+- **flux_strategy 2.9 `CHARGE_MIN_PCT = 50.0` and `_minimum_charge()`**, applied in the
+  cheap-window branch after `_charge_plan`: when SOC and the plan's target are both under
+  the minimum, the target becomes `min(50, site.max_charge_soc_pct)`, the power is
+  `max(plan power, need / eff / hours_left)` capped by charge rate and spare import, and
+  a hold becomes a charge. Skipped when `free_kwh >= MIN_TRADE_KWH` (a free hour booked
+  for the day); never lowers a target; nothing outside 02:00-05:00 reads it. The reason
+  names the kWh added "to bring the battery up to the 50% minimum".
+- Why: 30-Sep forecast 31.3, actual ~19.5, 22% at 2am, 42% at 5am, 56% at 4pm, ~6 kWh
+  sellable. Replay of 161 days (chained SOC, 80% plan, sim 1.5): floor 0 / 40 / 50 / 60 =
+  £669.20 / 667.68 / 664.89 / 656.48 net; below 50% at 5am on 34 days; a 50% floor costs
+  £4.31 (~£10 a year). 30-Sep replayed: +2.9 kWh bought, +2.7 kWh sold at the peak, +33p.
+  The peak total over the 161 days does not change (the 80% plan already sells the full 12
+  kWh on nearly every recorded day), so the floor is insurance against misses like 30-Sep.
+- Simulator: only the four scenarios that started under 50% change (1, 3, 7, 8): 5am 35% ->
+  50%; scenario 7 (dull day after a sunny forecast, Axle) improves 43p, the very bright
+  days cost 42-55p. Winter and free-hour Sundays unchanged. 29 scenarios, every rule kept.
+- Tests (+9): the constant; a bright forecast no longer leaves it under 50%; power sized to
+  reach it by five; a battery already above it is left to the plan; a plan already above it is
+  unchanged; a booked free hour skips it; it never exceeds the site ceiling; only the cheap
+  window reads it; once there it stops asking. `test_the_same_energy_arriving_before_the_load_
+  is_not_bought` switches the minimum off (it tests household sizing). Three mutations caught.
+
 ## v5.128.1 — 30-09-2026
 
 - **flux_strategy 2.8.** `_sale_priority_holdback` subtracts `_commitment_kwh(commitments,

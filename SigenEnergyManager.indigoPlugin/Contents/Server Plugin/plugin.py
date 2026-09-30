@@ -59,8 +59,9 @@
 #              Claude Opus 5.5 (5.127.1 — an Axle pre-charge no longer stops a running 4pm-7pm sale)
 #              Claude Opus 5.5 (5.128.0 — the 2am charge plans on 80% of the solar forecast, all year)
 #              Claude Sonnet 5.5 (5.128.1 — a Saving Session no longer holds back energy an Axle event already covers, and the sale stops flipping)
+#              Claude Sonnet 5.5 (5.129.0 — the 2am charge reaches at least 50% every night, except on a free-hour day)
 # Date:        28-09-2026
-# Version:     5.128.1
+# Version:     5.129.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
