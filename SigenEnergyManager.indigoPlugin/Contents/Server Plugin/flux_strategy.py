@@ -11,12 +11,12 @@
 # Version:     2.8
 #
 # v2.8 (SigenEnergyManager 5.128.1) fixes two faults in the v2.6 session-first sale.
-# Found on 30-Sep-2026, when an Axle event and a Saving Session both ran 18:00-19:00:
-#   * The holdback reserved 4 kWh for the session although the Axle event over the same
-#     hour already had its own 4 kWh out of the sale (they export the same kWh once), so
-#     the 4pm sale stopped after about 2 kWh with energy still to sell. The holdback now
-#     subtracts the export commitments that cover the priority window.
-#   * While a window was being held for, a sale that dropped under MIN_TRADE_KWH handed
+#   * (Found by reading the code while chasing the fault below, not on a live day.) The
+#     holdback reserved 4 kWh for a session although an Axle event over the same hour
+#     already had its own 4 kWh out of the sale (they export the same kWh once). The
+#     holdback now subtracts the export commitments that cover the priority window.
+#   * (Live, 30-Sep-2026, a Saving Session at 18:00, no Axle event that day.) While a
+#     window was being held for, a sale that dropped under MIN_TRADE_KWH handed
 #     the inverter back to the manager, which banked the roof's surplus, which put the
 #     spare back over the threshold, so the sale started again: 12 times in 33 minutes
 #     (16:43-17:16). While holding for a window the planner now keeps the inverter and

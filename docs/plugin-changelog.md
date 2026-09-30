@@ -26,8 +26,13 @@ New entries go at the top, as they were kept in the file.
 - **flux_strategy 2.8.** `_sale_priority_holdback` subtracts `_commitment_kwh(commitments,
   a, b, "export")` over each priority window (an Axle event over the same hour already has its
   energy in the sale's floor, and the two export the same kWh once), so `hold` is
-  `cap x hours - roof - promised`, floored at zero. 30-Sep: Axle 18:00-19:00 + Saving Session
-  18:00-19:00, 4pm SOC 56%, the sale held a second 4 kWh and sold ~2 kWh before stopping.
+  `cap x hours - roof - promised`, floored at zero. Found by reading the code and the
+  simulator (scenario 10), NOT on 30-Sep: that day had a Saving Session at 18:00 and no Axle
+  event (the log's "Axle event: export 18:00 - 19:00" was the NEXT day's event, printed as a
+  bare time; the Axle Monitor's `eventStartTime` carries the date).
+  30-Sep itself: forecast 31.3 kWh (corrected), actual ~19-20 (0.6x, the dullest miss on
+  record with 3-May); the 80% plan reached only 43% at 05:00, 56% at 16:00, ~6.2 kWh sellable,
+  4.0 kept for the 18:00 session, ~2 kWh sold, then the flip below.
 - **`holding` is now `hold_raw >= MIN_TRADE_KWH`** (a window is being waited for, whatever is
   spare now) and the roof-surplus hand-back to the manager is skipped while holding, so the
   branch returns SUPPLY_HOUSE (charge limit 0: the roof's surplus goes out at the peak rate,

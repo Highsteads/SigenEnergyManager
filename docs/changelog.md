@@ -9,8 +9,8 @@ The newest version is at the top. A fuller, technical record of the recent versi
 
 ## 5.128.1 — 30 September 2026
 
-- **A Saving Session no longer holds back energy that an Axle event already covers.** On 30 September an Axle event and a Saving Session both ran 6pm to 7pm. The Axle event already keeps its own 4 kWh out of the 4pm sale, and the session is served by the same export, but the plugin kept back another 4 kWh for the session, so the sale stopped after about 2 kWh with energy still to sell. It now counts only what an event does not already cover. A session on its own still gets its share, as before.
-- **The sale no longer switches on and off while it waits for a session.** From 4:43pm to 5:16pm the plugin started the sale, handed the inverter back a minute later, banked the roof's surplus, and started again, twelve times. While it waits for a session it now keeps the inverter, runs the house from the battery and sells the roof's surplus at the peak rate, so there is nothing left to switch.
+- **A Saving Session no longer holds back energy that an Axle event already covers.** When an Axle event and a session share an hour, the Axle event already keeps its own 4 kWh out of the 4pm sale and the session is served by the same export, but the plugin kept back another 4 kWh for the session. It now counts only what an event does not already cover. A session on its own still gets its share, as before. This did not happen on 30 September (that day's Axle event was the next day's); it came from checking the code and the simulator.
+- **The sale no longer switches on and off while it waits for a session.** On 30 September, from 4:43pm to 5:16pm, the plugin started the sale, handed the inverter back a minute later, banked the roof's surplus, and started again, twelve times. While it waits for a session it now keeps the inverter, runs the house from the battery and sells the roof's surplus at the peak rate, so there is nothing left to switch.
 
 ## 5.128.0 — 29 September 2026
 
