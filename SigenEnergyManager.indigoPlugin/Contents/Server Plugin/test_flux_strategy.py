@@ -1558,6 +1558,76 @@ class TestThePeakSaleServesTheSession(unittest.TestCase):
         self.assertEqual(fs.plan(bad).mode, fs.MODE_EXPORT)
 
 
+class TestTheSessionHoldbackAgreesWithAxle(unittest.TestCase):
+    """v2.8. 30-Sep-2026: an Axle event and a Saving Session both ran 18:00-19:00. The
+    holdback reserved 4 kWh for the session on top of the Axle event's own 4 kWh, so the
+    4pm sale stopped after about 2 kWh; and while it held, the sale flipped between export
+    and a hand-back 12 times in 33 minutes (16:43-17:16)."""
+
+    DAY = datetime(2026, 9, 30, tzinfo=LONDON).date()
+    SESSION = (((18, 0), (19, 0)),)
+
+    def _in(self, hhmm, soc, sessions=SESSION, axle=(), pv_kwh=5.0):
+        now = fs._wall(LONDON, self.DAY, fs.time(*hhmm))
+        prio = tuple((fs._wall(LONDON, self.DAY, fs.time(*a)),
+                      fs._wall(LONDON, self.DAY, fs.time(*b))) for a, b in sessions)
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 9, 30),
+                       bands=_bands(self.DAY, now, imp={"cheap": 14.62, "day": 24.35, "peak": 34.10},
+                                    exp={"cheap": 4.21, "day": 9.71, "peak": 27.69}),
+                       site=_site(wear_p_per_kwh=2.0), house=_profile(21.0),
+                       pv=_pv(self.DAY, pv_kwh, first_hour=8, last_hour=18),
+                       commitments=tuple(_axle(self.DAY, a, b) for a, b in axle),
+                       sale_priority=prio)
+
+    def test_an_axle_event_over_the_session_needs_no_extra_hold(self):
+        inputs = self._in((16, 30), 62.0, axle=((18, 19),))
+        hold, _first = fs._sale_priority_holdback(inputs, fs._wall(LONDON, self.DAY, fs.time(19, 0)))
+        self.assertEqual(hold, 0.0)
+
+    def test_the_same_session_alone_still_holds_its_four_kwh(self):
+        inputs = self._in((16, 30), 62.0)
+        hold, first = fs._sale_priority_holdback(inputs, fs._wall(LONDON, self.DAY, fs.time(19, 0)))
+        self.assertAlmostEqual(hold, 4.0, places=1)
+        self.assertEqual(first.astimezone(LONDON).hour, 18)
+
+    def test_with_axle_the_sale_before_it_is_larger_than_without(self):
+        with_axle = fs.plan(self._in((16, 30), 66.0, axle=((18, 19),)))
+        alone = fs.plan(self._in((16, 30), 66.0, axle=((18, 19),), sessions=()))
+        self.assertEqual(with_axle.control_key(), alone.control_key(),
+                         "the session must not change a sale an Axle event already covers")
+
+    def test_half_covered_window_holds_only_the_rest(self):
+        # An Axle event for half the session hour: the other half still needs 2 kWh.
+        half = fs.EventCommitment(source="axle", kind="export",
+                                  start=fs._wall(LONDON, self.DAY, fs.time(18, 0)),
+                                  end=fs._wall(LONDON, self.DAY, fs.time(18, 30)),
+                                  energy_kwh=2.0, event_id="axle-half")
+        inputs = fs.FluxInputs(**{**self._in((16, 30), 62.0).__dict__, "commitments": (half,)})
+        hold, _f = fs._sale_priority_holdback(inputs, fs._wall(LONDON, self.DAY, fs.time(19, 0)))
+        self.assertAlmostEqual(hold, 2.0, places=1)
+
+    def test_holding_for_a_session_never_hands_back_to_the_solar_manager(self):
+        # The roof is still generating and the spare hovers around the trade threshold.
+        # Every one of these must keep the inverter: a hand-back banked the surplus,
+        # lifted the spare, and started the sale again.
+        for soc in range(45, 75):
+            d = fs.plan(self._in((16, 45), float(soc), pv_kwh=30.0))
+            self.assertNotEqual(d.mode, fs.MODE_SOLAR, (soc, d.reason))
+            self.assertTrue(d.owns, (soc, d.reason))
+
+    def test_the_decision_does_not_flip_as_the_spare_crosses_the_threshold(self):
+        modes = [fs.plan(self._in((16, 45), soc / 10.0, pv_kwh=30.0)).mode
+                 for soc in range(450, 750, 2)]
+        flips = sum(1 for a, b in zip(modes, modes[1:]) if a != b)
+        self.assertLessEqual(flips, 1, "export -> supply_house once as the spare falls")
+        self.assertNotIn(fs.MODE_SOLAR, modes)
+
+    def test_without_a_session_a_sun_still_up_still_hands_back(self):
+        # Unchanged behaviour: nothing to hold for, nothing spare, roof generating.
+        d = fs.plan(self._in((16, 45), 40.0, sessions=(), pv_kwh=30.0))
+        self.assertEqual(d.mode, fs.MODE_SOLAR)
+
+
 class TestTheChargePlansOnADimmerDay(unittest.TestCase):
     """v2.7. CliveS, 29-Sep-2026: "yes set it to 80% all year". The 2am charge plans
     on CHARGE_PV_FACTOR of the solar forecast; nothing else in the planner does."""

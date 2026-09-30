@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.128.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.128.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.128.1** — A Saving Session no longer holds back energy an Axle event already covers, and the 4pm to 7pm sale no longer switches on and off while it waits for a session.
+
 **v5.128.0** — The 2am charge plans on 80% of the solar forecast all year, so a forecast that is too sunny no longer leaves the 4pm to 7pm sale short.
 
 **v5.127.1** — The 4pm to 7pm sale no longer stops half an hour before an Axle event. It carries on, still keeping the event's energy back, until the event takes over two minutes before it starts.
@@ -98,6 +100,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.128.1 | 30 September 2026 | Session holdback agrees with Axle; no on-off cycling |
 | 5.128.0 | 29 September 2026 | The 2am charge plans on 80% of the solar forecast |
 | 5.127.1 | 28 September 2026 | The peak sale runs on until an Axle event starts |
 | 5.127.0 | 28 September 2026 | The peak sale is timed to fit a Saving Session |

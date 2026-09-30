@@ -21,6 +21,27 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.128.1 — 30-09-2026
+
+- **flux_strategy 2.8.** `_sale_priority_holdback` subtracts `_commitment_kwh(commitments,
+  a, b, "export")` over each priority window (an Axle event over the same hour already has its
+  energy in the sale's floor, and the two export the same kWh once), so `hold` is
+  `cap x hours - roof - promised`, floored at zero. 30-Sep: Axle 18:00-19:00 + Saving Session
+  18:00-19:00, 4pm SOC 56%, the sale held a second 4 kWh and sold ~2 kWh before stopping.
+- **`holding` is now `hold_raw >= MIN_TRADE_KWH`** (a window is being waited for, whatever is
+  spare now) and the roof-surplus hand-back to the manager is skipped while holding, so the
+  branch returns SUPPLY_HOUSE (charge limit 0: the roof's surplus goes out at the peak rate,
+  the battery keeps its charge). Before, `sell_now` hovering at 0.5 kWh alternated EXPORT and
+  a MODE_SOLAR hand-back that banked the surplus and lifted `sell_now` again: 12 cycles in 33
+  minutes (16:43-17:16), each a claim, a mode change and a release.
+- Simulator: scenario 10 (Axle + session over 18:00-19:00) now sells 6.0 kWh at the peak, the
+  same as Axle alone (was 5.8). Every other scenario is unchanged. 29 scenarios, every rule kept.
+- Tests (+7): an Axle event over the session needs no extra hold; a session alone still holds
+  4 kWh; with Axle the sale equals the no-session sale; a half-covered window holds only the
+  rest; holding never hands back to the manager (30 SOC values); the mode does not flip as the
+  spare crosses the threshold; with no session the hand-back is unchanged. Removing either fix
+  fails tests (3 and 2).
+
 ## v5.128.0 — 29-09-2026
 
 CliveS, 29-Sep-2026: "yes set it to 80% all year" (and: this plugin is for this house only).

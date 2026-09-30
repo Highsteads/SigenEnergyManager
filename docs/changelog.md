@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.128.1 — 30 September 2026
+
+- **A Saving Session no longer holds back energy that an Axle event already covers.** On 30 September an Axle event and a Saving Session both ran 6pm to 7pm. The Axle event already keeps its own 4 kWh out of the 4pm sale, and the session is served by the same export, but the plugin kept back another 4 kWh for the session, so the sale stopped after about 2 kWh with energy still to sell. It now counts only what an event does not already cover. A session on its own still gets its share, as before.
+- **The sale no longer switches on and off while it waits for a session.** From 4:43pm to 5:16pm the plugin started the sale, handed the inverter back a minute later, banked the roof's surplus, and started again, twelve times. While it waits for a session it now keeps the inverter, runs the house from the battery and sells the roof's surplus at the peak rate, so there is nothing left to switch.
+
 ## 5.128.0 — 29 September 2026
 
 - **The 2am charge now plans on 80% of the solar forecast, all year.** When the forecast was too sunny, the charge bought too little and the 4pm to 7pm sale ran out early. On 29 September the forecast said about 15 kWh of sun, the day brought 11, the battery reached 4pm at 65%, and the sale stopped at 5:46pm having sold 7 kWh of a possible 12. Replayed over every day on record (161 days, April to September), planning on 80% left the sale short on 5 days instead of 15, needed nothing from the grid in the day, and earned slightly more: a kWh sold at the peak earns about 10p, while one whose sunshine then goes to the grid at 9.7p costs about 6p. In winter the charge already reaches a full battery, so nothing changes then.

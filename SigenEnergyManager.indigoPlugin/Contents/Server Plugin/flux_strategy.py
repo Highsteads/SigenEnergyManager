@@ -4,10 +4,24 @@
 # Description: The Octopus Flux planner. Pure stdlib. Published paired rates, a
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
-# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5
+# Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8 Claude Sonnet 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
-#              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026
-# Version:     2.7
+#              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
+#              v2.8 30-09-2026
+# Version:     2.8
+#
+# v2.8 (SigenEnergyManager 5.128.1) fixes two faults in the v2.6 session-first sale.
+# Found on 30-Sep-2026, when an Axle event and a Saving Session both ran 18:00-19:00:
+#   * The holdback reserved 4 kWh for the session although the Axle event over the same
+#     hour already had its own 4 kWh out of the sale (they export the same kWh once), so
+#     the 4pm sale stopped after about 2 kWh with energy still to sell. The holdback now
+#     subtracts the export commitments that cover the priority window.
+#   * While a window was being held for, a sale that dropped under MIN_TRADE_KWH handed
+#     the inverter back to the manager, which banked the roof's surplus, which put the
+#     spare back over the threshold, so the sale started again: 12 times in 33 minutes
+#     (16:43-17:16). While holding for a window the planner now keeps the inverter and
+#     runs the house (the roof's surplus goes out at the peak rate) instead of handing
+#     back, so there is nothing to bank and nothing to flip.
 #
 # v2.7 (SigenEnergyManager 5.128.0) sizes the 02:00-05:00 charge on 80% of the solar
 # forecast, all year (CHARGE_PV_FACTOR). On 29-Sep-2026 the forecast said about 15 kWh
@@ -1413,7 +1427,8 @@ def _sale_priority_holdback(inputs, window_end):
 
     Only windows that start after now and inside this peak count; a window that
     is running is being served. Each takes what the export limit sells in its
-    part of the peak, less what the roof sends out through the same limit then.
+    part of the peak, less what the roof sends out through the same limit then
+    and less any export commitment already covering it (v2.8).
     """
     site = inputs.site
     cap_kw = min(site.discharge_power_w, site.export_limit_w) / 1000.0
@@ -1429,7 +1444,11 @@ def _sale_priority_holdback(inputs, window_end):
             continue
         hours = (b - a).total_seconds() / 3600.0
         roof = max(0.0, inputs.pv.kwh_between(a, b) - inputs.house.kwh_between(a, b))
-        hold += max(0.0, cap_kw * hours - roof)
+        # v2.8: an export commitment over the same hour (an Axle event) already
+        # has its energy out of the sale and exports the same kWh once, so the
+        # window needs nothing more.
+        promised = _commitment_kwh(inputs.commitments, a, b, "export")
+        hold += max(0.0, cap_kw * hours - roof - promised)
         first = start if first is None else min(first, start)
     return hold, first
 
@@ -1570,10 +1589,11 @@ def plan(inputs):
             # instead, which is what the day-rate purchase was for.
             day_rate_bought = bool(inputs.day_rate_import_today)
             # v2.6: keep what a later Saving Session in this peak can sell for it.
-            hold_kwh, hold_from = _sale_priority_holdback(inputs, window_end)
-            hold_kwh = min(hold_kwh, surplus_kwh)
+            hold_raw, hold_from = _sale_priority_holdback(inputs, window_end)
+            hold_kwh = min(hold_raw, surplus_kwh)
             sell_now = surplus_kwh - hold_kwh
-            holding = hold_kwh >= MIN_TRADE_KWH
+            # v2.8: "holding" is a window being waited for, whatever is spare now.
+            holding = hold_raw >= MIN_TRADE_KWH
             if (day_rate_bought or (not profitable) or sell_now < MIN_TRADE_KWH
                     or power_w <= 0):
                 # NOT exporting means mode 2 with the charge limit at zero, and
@@ -1593,7 +1613,12 @@ def plan(inputs):
                        if holding and surplus_kwh >= MIN_TRADE_KWH else
                        "there is nothing spare above what the house and its "
                        "commitments need before the cheap rate comes back")
-                if (pv_left - house_left) >= MIN_TRADE_KWH:
+                # v2.8: not while holding for a window. Handing back let the manager
+                # bank the roof's surplus, which lifted the spare over the threshold
+                # and started the sale again, over and over. Running the house keeps
+                # the battery's charge for the window and sells the roof's surplus at
+                # the peak rate.
+                if not holding and (pv_left - house_left) >= MIN_TRADE_KWH:
                     return FluxDecision(
                         mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
                         protect_soc_pct=sell_floor, household_floor_pct=house_floor,
