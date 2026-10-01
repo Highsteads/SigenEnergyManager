@@ -1824,28 +1824,33 @@ class TestPreChargeLeavesThePeakSaleRunning(_FluxCase):
         # 4 kWh of a 35 kWh pack is about 11 points, less round-trip losses.
         self.assertGreater(floors[True] - floors[False], 8.0, floors)
 
-    def test_no_sale_running_keeps_the_old_pre_charge(self):
+    # 5.131.0: pre-charge writes nothing in EVERY case, sale or no sale. The three
+    # tests below pinned the old "no sale -> floor at T-30" path and now pin the
+    # opposite: nothing at T-30, and not an owner, so the manager or Flux keeps the
+    # inverter until the window takes over.
+
+    def test_no_sale_running_writes_nothing_either(self):
         p, _ = self._selling()
         p.flux_executor = _FakeExecutor(owns=False)
         p._set_vpp_discharge_cutoff = MagicMock()
         p._start_vpp_precharge(p.store["vpp_event"])
-        p._set_vpp_discharge_cutoff.assert_called_once()
-        self.assertFalse(p.store["vpp_floor_deferred"])
-        self.assertIn("Axle VPP window", p._flux_other_owner())
+        p._set_vpp_discharge_cutoff.assert_not_called()
+        self.assertTrue(p.store["vpp_floor_deferred"])
+        self.assertEqual(p._flux_other_owner(), "")
 
-    def test_outside_the_peak_the_old_pre_charge_stands(self):
+    def test_outside_the_peak_it_writes_nothing(self):
         p, _ = self._selling()
         p._flux_peak_now = MagicMock(return_value=False)
         p._set_vpp_discharge_cutoff = MagicMock()
         p._start_vpp_precharge(p.store["vpp_event"])
-        p._set_vpp_discharge_cutoff.assert_called_once()
+        p._set_vpp_discharge_cutoff.assert_not_called()
 
-    def test_a_hold_is_not_a_sale(self):
+    def test_a_hold_is_treated_like_a_sale(self):
         p, _ = self._selling()
         p.store["flux_decision"] = types.SimpleNamespace(mode="hold")
         p._set_vpp_discharge_cutoff = MagicMock()
         p._start_vpp_precharge(p.store["vpp_event"])
-        p._set_vpp_discharge_cutoff.assert_called_once()
+        p._set_vpp_discharge_cutoff.assert_not_called()
 
     def test_the_window_releases_flux_first_then_writes_its_own_floors(self):
         """Flux's release restores a baseline floor. Written the other way round,
@@ -1868,13 +1873,14 @@ class TestPreChargeLeavesThePeakSaleRunning(_FluxCase):
         self.assertFalse(p.store["vpp_floor_deferred"])
         self.assertEqual(p._flux_dispatch_event_ids(), {"axle-1"})
 
-    def test_a_window_whose_pre_charge_wrote_the_floors_does_not_write_them_twice(self):
+    def test_with_no_sale_the_window_writes_its_floors_once_at_t_minus_2(self):
         p, _ = self._selling()
         p.flux_executor = _FakeExecutor(owns=False)
-        p._start_vpp_precharge(p.store["vpp_event"])
         p._set_vpp_discharge_cutoff = MagicMock()
-        p._vpp_transition(plugin.VPP_ACTIVE)
+        p._start_vpp_precharge(p.store["vpp_event"])
         p._set_vpp_discharge_cutoff.assert_not_called()
+        p._vpp_transition(plugin.VPP_ACTIVE)
+        p._set_vpp_discharge_cutoff.assert_called_once()
 
     def test_leaving_pre_charge_any_other_way_clears_the_deferral(self):
         p, _ = self._selling()

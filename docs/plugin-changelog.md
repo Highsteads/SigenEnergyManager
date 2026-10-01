@@ -21,6 +21,25 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.131.0 — 01-10-2026
+
+- **`_start_vpp_precharge` is read-only.** `vpp_floor_deferred` is set True always (was
+  `_flux_sale_running()`), so `_set_vpp_discharge_cutoff` runs only in `_vpp_transition` at
+  T-2min (the 5.127.1 path, live since 28-Sep); `_vpp_precharge_shares_flux()` is now True for
+  all of pre-charge, so it is not a Flux owner, not a dispatch for the floors, and not
+  `_driven_export_owns_registers`. The "[Flux] An Axle window starts..." line is logged only
+  when a sale is running.
+- **The VPP_PRE_CHARGING "stop charging, hold in Self Consumption" step is deleted** (and its
+  unused locals). It wrote 0x02 over a 0x05 Saving Session export on 21-Sep-2026; pre-charge
+  has not charged since the plugin stopped importing for events.
+- Kept: the T-30 sufficiency log and `_alert_vpp_shortfall` Pushover; the state name
+  `pre_charging` (persisted and shown on the Axle device). The energy itself comes from
+  `flux_strategy.event_cover` (5.124.0) and the Flux commitments.
+- Tests: nine that pinned the T-30 writes rewritten to pin their absence and the T-2 write
+  (floors written once at T-2 with no sale; release before the floor; shortfall check
+  read-only; no Self Consumption write with nothing exporting). Two mutations (T-30 floor back,
+  Self Consumption step back) caught by 7 and 5 tests. CliveS, 1-Oct-2026: "do it".
+
 ## v5.130.1 — 01-10-2026
 
 A review of 5.130.0 found three gaps; all three were real.

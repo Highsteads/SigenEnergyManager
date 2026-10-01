@@ -3108,12 +3108,13 @@ class TestVppShortfallAlert(unittest.TestCase):
         p._start_vpp_precharge(self._event())
         p._vpp_transition.assert_called_once_with(plugin.VPP_PRE_CHARGING, preempted=True)
 
-    def test_cutoff_is_still_set_when_short(self):
-        """The hardware discharge floor is what actually stops the export early
-        — it must be written whether or not the battery is short."""
+    def test_short_or_not_nothing_is_written_at_t_minus_30(self):
+        """5.131.0: the floor is written when the window takes over (T-2min), short
+        or not; the shortfall check here is read-only."""
         p = self._p(soc_pct=5.0)
         p._start_vpp_precharge(self._event())
-        p._set_vpp_discharge_cutoff.assert_called_once()
+        p._set_vpp_discharge_cutoff.assert_not_called()
+        self.assertTrue(p.store["vpp_floor_deferred"])
 
 
 class TestCostKwhVariables(unittest.TestCase):
@@ -7996,7 +7997,6 @@ class TestPreChargeNeverStopsARunningExport(unittest.TestCase):
         p = self._p(0x05)
         p._apply_vpp_event(self.event)
         p.modbus.set_self_consumption.assert_not_called()
-        self.assertTrue(p.store["vpp_charge_stopped"])
 
     def test_ess_first_export_is_left_alone(self):
         p = self._p(0x06)
@@ -8015,12 +8015,13 @@ class TestPreChargeNeverStopsARunningExport(unittest.TestCase):
         p._apply_vpp_event(self.event)
         p.modbus.set_self_consumption.assert_not_called()
 
-    def test_a_charging_inverter_is_still_stopped(self):
-        """Control: the step still does its job when nothing is exporting."""
+    def test_nothing_is_written_when_nothing_is_exporting_either(self):
+        """5.131.0: the "stop charging" step is gone — pre-charge charges nothing,
+        so it had nothing to stop. The inverter is left as it is until T-2min."""
         p = self._p(0x02)
         p._apply_vpp_event(self.event)
-        p.modbus.set_self_consumption.assert_called_once()
-        self.assertTrue(p.store["vpp_charge_stopped"])
+        p.modbus.set_self_consumption.assert_not_called()
+        p.modbus.set_remote_ems_mode.assert_not_called()
 
 
 

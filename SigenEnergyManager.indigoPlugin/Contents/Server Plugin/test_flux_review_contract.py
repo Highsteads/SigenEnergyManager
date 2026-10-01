@@ -315,13 +315,18 @@ class FluxEventIntegrationReviewTests(unittest.TestCase):
             p._dawn_target_pct=lambda:20.
             p._event_is_daytime=lambda _:True
             p._alert_vpp_shortfall=MagicMock()
+            p._drive_vpp_export=MagicMock()
             p._start_vpp_precharge(event)
-            floors=[x[1] for x in p.modbus.writes if isinstance(x,tuple) and x[0]=='backup_soc']
-            # 5.126.0: the later Saving Session reserves nothing on Flux, so the
-            # floor is the reserve and 35% covers the 4 kWh event above it.
-            self.assertEqual(floors[0],20.)
+            floor_writes=lambda: [x[1] for x in p.modbus.writes
+                                  if isinstance(x,tuple) and x[0]=='backup_soc']
+            # 5.131.0: nothing at T-30; the floor is written as the window takes over.
+            self.assertEqual(floor_writes(),[])
             self.assertEqual(p.store['vpp_state'],plugin.VPP_PRE_CHARGING)
             p._alert_vpp_shortfall.assert_not_called()
+            p._vpp_transition(plugin.VPP_ACTIVE)
+            # 5.126.0: the later Saving Session reserves nothing on Flux, so the
+            # floor is the reserve and 35% covers the 4 kWh event above it.
+            self.assertEqual(floor_writes()[0],20.)
 
     def test_flux_release_precedes_axle_cutoff_and_does_not_overwrite_it(self):
         from test_flux_supervisor import _mk_plugin, _FakeExecutor, _pinned_clock
@@ -342,12 +347,17 @@ class FluxEventIntegrationReviewTests(unittest.TestCase):
         p._dawn_target_pct=lambda:20.
         p._event_is_daytime=lambda _:True
         p._alert_vpp_shortfall=MagicMock()
+        p._drive_vpp_export=MagicMock()
         with _pinned_clock("2026-09-16 17:30") as now:
             event={'start_time':now+timedelta(minutes=30),
                    'end_time':now+timedelta(minutes=90),'import_export':'export'}
             p.store.update(vpp_state=plugin.VPP_ANNOUNCED,vpp_event=event)
             p._start_vpp_precharge(event)
-        self.assertEqual(order,['release','cutoff'])
+            # 5.131.0: pre-charge writes nothing and Flux keeps the inverter...
+            self.assertNotIn('cutoff',order)
+            p._vpp_transition(plugin.VPP_ACTIVE)
+        # ...and at T-2 the release still comes first, then the event's floor.
+        self.assertEqual(order[-2:],['release','cutoff'])
 
     def test_overlapping_later_session_only_reserves_its_tail(self):
         from test_flux_supervisor import _mk_plugin, _pinned_clock

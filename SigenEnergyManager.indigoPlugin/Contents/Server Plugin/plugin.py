@@ -64,8 +64,9 @@
 #              Claude Opus 5.5 (5.129.2 — such a day is valued provisionally, then re-priced when Octopus publishes)
 #              Claude Opus 5.5 (5.130.0 — the 50% minimum holds when Flux cannot plan; the manager runs the cheap window to 5am)
 #              Claude Opus 5.5 (5.130.1 — fallback charge sized to site headroom; minimum shortfall always checked; 5am report has no hidden tolerance)
+#              Claude Opus 5.5 (5.131.0 — the Axle 'pre-charge' writes nothing; the event floor is set at T-2min every time)
 # Date:        28-09-2026
-# Version:     5.130.1
+# Version:     5.131.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -10068,36 +10069,10 @@ class Plugin(indigo.PluginBase):
                 self._start_vpp_precharge(event)
 
         elif current_state == VPP_PRE_CHARGING:
-            required_soc       = self.store["vpp_pre_charge_soc"]
-            current_soc        = self.latest_inverter_data.get("batterySoc", 0.0)
-            charge_stopped     = self.store.get("vpp_charge_stopped",   False)
-            soc_ready          = current_soc >= required_soc
-
-            # Step 1: stop charging once SOC target is reached (fire once only).
-            # NEVER BY STOPPING AN EXPORT. The guard used to be `mode == 0x06`
-            # alone, from when Axle's cloud drove the dispatch and always used
-            # ESS-first. Since the plugin self-drives (5.28) a daylight export is
-            # 0x05, and a Saving Session or Flux peak running into the pre-charge
-            # half-hour uses the same driver — live 21-Sep-2026 18:01:32 this line
-            # wrote Self Consumption over a Saving Session export and the verify
-            # pass put it back 37 s later. Either discharge mode already means
-            # "not charging", so the intent is met and nothing is written.
-            if soc_ready and not charge_stopped and not self._vpp_precharge_shares_flux():
-                cur_mode = self.modbus.read_ems_mode() if self.modbus else None
-                exporting = (cur_mode in _VPP_EXPORT_MODES
-                             or bool(self.store.get("export_active"))
-                             or bool(self.store.get("saving_session_export_active")))
-                if exporting:
-                    self.store["vpp_charge_stopped"] = True
-                    vpp_log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
-                        f"{required_soc:.0f}% target. An export is already running "
-                        f"(mode {cur_mode if cur_mode is None else hex(cur_mode)}) — "
-                        f"leaving it alone; the battery is not charging.")
-                elif self.modbus:
-                    self.modbus.set_self_consumption()
-                    self.store["vpp_charge_stopped"] = True
-                    vpp_log(f"[VPP] Pre-charge complete — SOC {current_soc:.0f}% >= "
-                        f"{required_soc:.0f}% target. Holding in Self Consumption.")
+            # 5.131.0: the "stop charging, hold in Self Consumption" step that sat here
+            # is gone — pre-charge charges nothing, so it had nothing to stop, and its
+            # write fought a running export (21-Sep-2026). The battery is left exactly
+            # as the manager or the Flux sale has it until T-2min.
 
             # Start the self-driven export 2 min BEFORE the window opens, so we are
             # already exporting by the time Axle's meter window begins (v5.28).
@@ -10609,7 +10584,7 @@ class Plugin(indigo.PluginBase):
                 "snapshots for when it changed.", level="WARNING")
 
     def _start_vpp_precharge(self, event):
-        """Assess SOC 30 min before VPP event; raise discharge cutoff; no grid import.
+        """Assess SOC 30 min before VPP event; read-only since 5.131.0, no grid import.
 
         The discharge cutoff is raised here (not at announcement) so it only
         applies close to the event — avoiding unnecessary battery lockout hours
@@ -10655,20 +10630,20 @@ class Plugin(indigo.PluginBase):
 
         self.store["vpp_pre_charge_soc"] = required_soc
 
-        # Set discharge cutoff now (30 min before) — not at announcement time.
-        # UNLESS the Flux 4pm-7pm sale is running (5.127.1). Pre-charge never
-        # imports, so all this step would do is take the inverter off a sale that
-        # already keeps this event's energy back. Live 28-Sep-2026 17:31: the sale
-        # stopped with the battery at 88% for a 4 kWh event, and half an hour of
-        # the peak went unsold. The sale carries on; the VPP floors are written
-        # when the window takes over at T-2min (_vpp_transition).
-        self.store["vpp_floor_deferred"] = self._flux_sale_running()
-        if self.store["vpp_floor_deferred"]:
+        # 5.131.0: NOTHING IS WRITTEN 30 MINUTES AHEAD ANY MORE. Pre-charge has not
+        # charged since the plugin stopped importing for events, and the two writes
+        # it still made were leftovers: the event floor, which is now set when the
+        # window takes over at T-2min in every case (as 5.127.1 already did under a
+        # running Flux sale), and a switch to Self Consumption once the battery was
+        # "ready", which only ever got in the way (21-Sep-2026 it wrote over a
+        # Saving Session export). CliveS, 1-Oct-2026: "do it". What stays is this
+        # read-only check and its heads-up; the energy itself is planned hours
+        # earlier by the event cover (flux_strategy.event_cover, 5.124.0).
+        self.store["vpp_floor_deferred"] = True
+        if self._flux_sale_running():
             log("[Flux] An Axle window starts at "
                 f"{_local_time(event.get('start_time'))}. The peak sale already keeps "
                 "its energy back, so the sale carries on until the window takes over.")
-        else:
-            self._set_vpp_discharge_cutoff(event, is_daytime)
 
         if current_kwh >= required_kwh:
             if self._flux_armed():
@@ -13573,6 +13548,9 @@ class Plugin(indigo.PluginBase):
 
     def _vpp_precharge_shares_flux(self):
         """True while an Axle pre-charge has left the inverter to the Flux sale.
+
+        5.131.0: pre-charge always defers now, so this is True for the whole of
+        pre-charge — it writes nothing and owns nothing until T-2min.
 
         Set once, when pre-charge starts, and cleared when the VPP leaves
         pre-charge. Deliberately not re-derived each tick: if the sale sells out

@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.131.0 — 1 October 2026
+
+- **Nothing happens on the inverter half an hour before an Axle event any more.** The step still called "pre-charge" stopped charging the battery long ago, and the two things it still did were left over: it set the event's battery floor half an hour early, which gained nothing, and once the battery was ready it switched the inverter to Self Consumption, which only ever got in the way (on 21 September it wrote over a Saving Session export). The floor is now set two minutes before every event, as the event takes over, which is what already happened during the 4pm to 7pm sale. The half-hour check that the battery holds enough, and the Pushover when it does not, stay. The event's energy is still planned hours earlier, and topped up from the grid when the battery would not cover it.
+
 ## 5.130.1 — 1 October 2026
 
 - **The fallback charge fits inside the house's supply.** When the ordinary plan runs the 2am to 5am window, its charge is now sized the way the Flux strategy sizes one: the verified site import limit less what the house is drawing, and it is trimmed while it runs if a big load such as the car switches on. The inverter's own import cap already held the limit at the meter; this keeps the request itself within it.
