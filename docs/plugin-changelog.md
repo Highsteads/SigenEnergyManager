@@ -64,6 +64,28 @@ standing aside" at 03:48:11 changed nothing, because Flux had no decision to sta
   claim; takeover without writes; the shared rule through the plugin; the 05:00 record. Eleven
   mutations, all caught. Simulator unchanged (it runs the planner only). Suite 2,367.
 
+## v5.129.1 — 01-10-2026
+
+- **flux_strategy 2.9.1 `carry_forward_spans(spans, tz, until)`** -> (spans, stopped_at): repeats
+  the 24 local hours before the schedule's end, one LOCAL day per step (wall clock kept across
+  a clock change), until `until`; nothing when it already reaches, is empty, or holds less
+  than a day. derive_bands' shape and single-price checks still apply to the result.
+- **plugin `_flux_planning_spans(key)`**: the side whose schedule ends before the other side's
+  is carried to the other's end; one WARNING per (side, stop time) naming the prices used.
+  Only `_flux_inputs` (the planner) reads it. Every accounting and display reader keeps
+  `_flux_rate_spans` (published only), so `_banded_rate_for_day` still refuses a day it cannot
+  price from published bands (test_a_gap_in_the_published_bands_refuses_the_whole_day).
+- Why: 1-Oct-2026, region F (and A, C, P) FLUX-EXPORT-23-02-14 published to
+  2026-09-30T23:00Z only; import published to 3-Oct (13.9223 / 23.1946 / 32.4761p). Flux
+  deferred from 00:00:04 ("contiguous Flux shape"), with a peak sale, a joined Saving
+  Session (18:00-19:00) and an Axle event (18:00-19:00) due. CliveS: "if there are none, like
+  no export prices then we use the existing figures until it is updated".
+- Tests (+12, test_flux_carry_forward.py) on the real published spans: refused without it,
+  bands with it (Sept export 4.21/9.71/27.69p + Oct import), tonight's 2am bands, peak still
+  16:00-19:00 including across 25-Oct, nothing carried when reached / from under a day / once
+  published; plugin carries only the short side, logs once, nothing when the other side is
+  empty, money readers unchanged. Two mutations caught.
+
 ## v5.129.0 — 30-09-2026
 
 CliveS, 30-Sep-2026: "i want the battery to be topped up to at least 50% every night on cheap

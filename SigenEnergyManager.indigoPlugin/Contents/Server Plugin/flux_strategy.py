@@ -5,10 +5,10 @@
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
 # Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8-2.9 Claude Sonnet 5.5;
-#              v2.10 Claude Opus 5.5
+#              v2.9.1-2.10 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
-#              v2.8 and v2.9 30-09-2026; v2.10 01-10-2026
+#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026
 # Version:     2.10
 #
 # v2.10 (SigenEnergyManager 5.130.0) makes the 50% minimum hold when Flux cannot plan.
@@ -23,6 +23,15 @@
 #   * _minimum_charge sized its power on at least 15 minutes left, so at 04:55 it asked
 #     for a third of what five minutes needed. It now uses the real time left, and
 #     reports the part it cannot reach (minimum_shortfall_kwh) instead of staying silent.
+#
+# v2.9.1 (SigenEnergyManager 5.129.1) carry_forward_spans(). 1-Oct-2026: Octopus
+# published October's Flux import prices but no export price after midnight BST (every
+# region), so derive_bands refused and Flux planned nothing all day, with a 4pm-7pm sale,
+# a Saving Session and an Axle event due. CliveS: "if there are none, like no export
+# prices then we use the existing figures until it is updated". A side whose published
+# schedule stops short of the other side's is extended by repeating its last published
+# day, wall clock to wall clock, until Octopus publishes the real one. The caller says so
+# in the log; derive_bands' shape and single-price checks still apply to the result.
 #
 # v2.9 (SigenEnergyManager 5.129.0) raises the 02:00-05:00 charge to at least
 # CHARGE_MIN_PCT (50%) every night, except on a day with a booked free hour, which
@@ -847,6 +856,43 @@ def cheap_window_minimum_pct(site, commitments, now, tz):
 # ================================================================
 # The chronological energy budget
 # ================================================================
+
+def carry_forward_spans(spans, tz, until):
+    """(spans, carried_from): `spans` extended to reach `until` by repeating the last
+    published local day, or the spans unchanged and None (v2.9.1).
+
+    The last day is the 24 local hours before the schedule ends. Each repeat moves it
+    one local day on, so the bands stay on the wall clock across a clock change.
+    `carried_from` is where the published schedule stopped, for the caller to report.
+    Nothing is carried when the schedule already reaches `until`, when it is empty, or
+    when it does not hold a whole day to repeat.
+    """
+    if not spans or tz is None or until is None:
+        return list(spans or []), None
+    ordered = sorted(spans, key=lambda x: x.start)
+    last = max(x.end for x in ordered)
+    if last >= until:
+        return list(ordered), None
+
+    def _day_on(when, days=1):
+        local = when.astimezone(tz).replace(tzinfo=None) + timedelta(days=days)
+        return _attach(tz, local).astimezone(timezone.utc)
+
+    day_start = _day_on(last, -1)
+    if min(x.start for x in ordered) > day_start:
+        return list(ordered), None
+    template = []
+    for x in ordered:
+        a, b = max(x.start, day_start), min(x.end, last)
+        if b > a:
+            template.append((a, b, x.p))
+    out, k = list(ordered), 1
+    while max(x.end for x in out) < until and k <= 14:
+        for a, b, price in template:
+            out.append(RateSpan(start=_day_on(a, k), end=_day_on(b, k), p=price))
+        k += 1
+    return out, last
+
 
 def commitment_energy_kwh(commitments, a, b, kind="export"):
     """Public alias — the ONE overlap budget. Callers outside this module must
