@@ -21,6 +21,49 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.130.0 — 01-10-2026
+
+Root cause, 1-Oct-2026: Octopus's public schedule for E-1R-FLUX-EXPORT-23-02-14-F (and
+regions A, C, P) ends at 2026-09-30T23:00Z; October import prices are published (cheap
+13.9223p, day 23.1946p, peak 32.4761p). The account's export agreement is still that tariff,
+open-ended. `derive_bands` refused (export `_covered_until(now)` is None), Flux deferred from
+00:00:04 onwards (still deferring at 13:40), `_flux_owns_cheap_window` was False, and
+battery_manager's TOU import bought to its household target 44% (cutoff 47.5%), "Import
+complete" at 03:47:51 (44.9%), then self consumption: 5am about 42%. Flux's "No longer
+standing aside" at 03:48:11 changed nothing, because Flux had no decision to stand on.
+- **flux_strategy 2.10.** `cheap_window_minimum_pct(site, commitments, now, tz)` is the one
+  owner of the rule (CHARGE_MIN_PCT in 02:00-05:00, capped by the site ceiling; 0 outside it
+  and when `_free_hour_booked`). `_minimum_charge` takes the minimum from it, sizes power on
+  the real time left (`MIN_HOURS_LEFT` one minute, was 0.25 h: at 04:55 / 49% it asked for
+  1,445 W against the 4.3 kW five minutes need) and returns `shortfall_kwh`, carried as
+  `FluxDecision.minimum_shortfall_kwh` and in the reason. `bands_problem()` names the side and
+  the time coverage stops; plugin passes it as `FluxInputs.bands_problem` and `_validate`
+  defers with it.
+- **battery_manager 3.15.** Branch 1c CHEAP-WINDOW (after EVENT-COVER, before RESILIENCE): on
+  Flux, in the cheap window, `not flux_owns_cheap_window` -> START_IMPORT with
+  `import_purpose=CHEAP_WINDOW_PURPOSE` and target max(minimum, household target, reserve) on
+  every tick, holding included. Names only the reason(s) that set the level.
+  `_household_import_target` extracted from `_plan_import`.
+- **plugin.** `_drive_cheap_window_import`: Charge PV First, hardware cutoff at the level (or at
+  the present SOC when higher, i.e. a hold), discharge limit 0 (verify pass expects 0 while it
+  runs), level only rises. Any other decision ends it via `_end_cheap_window_import` (once,
+  with `prev_import` cleared so the ordinary teardown does not hand back twice); the
+  end-of-method target stop skips it. `_flux_other_owner` no longer counts it once holding
+  (SOC >= level - 0.5), so Flux plans; `_flux_owns_cheap_window` now also needs
+  `_flux_owns_control() or _flux_may_claim()`, so the manager keeps holding through the
+  stand-down; when Flux claims, `_forget_cheap_window_import` drops the bookkeeping and the
+  cutoff record with no writes (Flux's 05:00 release then restores 100%).
+  `_note_cheap_window_result`: one INFO/WARNING after 05:00 (achieved SOC vs minimum, who ran
+  it, Flux's deferral reason) and one line in `<data_dir>/cheap_window_results.jsonl`.
+- Tests (+36, `test_cheap_window_minimum.py`): the published 30-Sep/1-Oct spans refused at
+  midnight and named; new import prices read once export exists; the rule's one owner (window,
+  free hour, other day, ceiling); 04:55 sizing; charge-rate and zero-headroom shortfalls;
+  manager fallback at 03:38 / holding / tomorrow wins / free hour / Flux owns / 05:00 / Go;
+  plugin drive, no stop at target, hold above, 05:00 end below target with one hand-back,
+  level only rises; owner while charging not while holding; no ownership before Flux may
+  claim; takeover without writes; the shared rule through the plugin; the 05:00 record. Eleven
+  mutations, all caught. Simulator unchanged (it runs the planner only). Suite 2,367.
+
 ## v5.129.0 — 30-09-2026
 
 CliveS, 30-Sep-2026: "i want the battery to be topped up to at least 50% every night on cheap

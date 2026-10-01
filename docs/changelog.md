@@ -7,6 +7,14 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.130.0 — 1 October 2026
+
+- **The 50% overnight minimum now holds even when the Flux strategy cannot plan.** Since midnight on 1 October, Octopus has published October's Flux import prices but no export price at all, in any region, although the account is still on the same Flux export tariff. Without an export price the strategy rightly refuses to trade, so it stepped aside all night. The ordinary plan bought only to its own figure of 44%, then ran the house on the battery until 5am, so the day started at about 42%. Now, whenever the strategy is not running the 2am to 5am window, the ordinary plan charges to 50%, or to what tomorrow needs if that is more, and holds the battery there until 5am with the house on the cheap grid. It still never buys to sell at the peak, because that needs the export price. The free-hour exception is unchanged.
+- **The strategy takes the window back as soon as it can.** Once the ordinary plan has reached its level and is only holding it, the strategy plans again and, if it can, takes over.
+- **A late start is sized properly.** The minimum's charging power assumed at least 15 minutes were left, so after a restart at 4:55 it asked for about a third of what five minutes needed. It now uses the real time left, and says how far short it will fall when the charge rate cannot make it.
+- **5am reports what was achieved.** One line in the Event Log at 5am gives the battery level against the minimum and who ran the window. It is a warning when the battery is below 50%. Each night is also written to `cheap_window_results.jsonl` for the two-week review.
+- **The "no Flux decision" message says what is missing.** For example, "Octopus has not published the Flux export prices beyond 00:00 on 1 October", instead of "could not be read as a contiguous Flux shape".
+
 ## 5.129.0 — 30 September 2026
 
 - **The 2am charge now brings the battery up to at least 50% every night, except on a day with a booked free hour.** On 30 September the forecast was 31 kWh and the day brought about 19, the battery left the cheap window at 42%, and the 4pm sale ran out after about 2 kWh of a possible 12. Replayed over every day on record (161 days, April to September), a 50% minimum acts on about one day in five and costs about £10 a year: the extra energy is bought at 14.6p and, on a day the sun fills the battery anyway, the room it took is filled by sunshine sold at 9.7p. On 30 September it would have bought 2.9 kWh more and sold 2.7 kWh more at the peak, about 33p better. In winter the charge already reaches a full battery, so nothing changes then.

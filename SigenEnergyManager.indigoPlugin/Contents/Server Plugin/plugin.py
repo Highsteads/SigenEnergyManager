@@ -60,8 +60,9 @@
 #              Claude Opus 5.5 (5.128.0 — the 2am charge plans on 80% of the solar forecast, all year)
 #              Claude Sonnet 5.5 (5.128.1 — a Saving Session no longer holds back energy an Axle event already covers, and the sale stops flipping)
 #              Claude Sonnet 5.5 (5.129.0 — the 2am charge reaches at least 50% every night, except on a free-hour day)
+#              Claude Opus 5.5 (5.130.0 — the 50% minimum holds when Flux cannot plan; the manager runs the cheap window to 5am)
 # Date:        28-09-2026
-# Version:     5.129.0
+# Version:     5.130.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -292,7 +293,7 @@ from battery_manager  import (
     ACTION_SELF_CONSUMPTION, ACTION_START_IMPORT, ACTION_STOP_IMPORT,
     ACTION_SCHEDULE_IMPORT, ACTION_START_EXPORT, ACTION_STOP_EXPORT,
     ACTION_VPP_EXPORT, ACTION_SAVING_SESSION, ACTION_HAPPY_HOUR_IMPORT,
-    HAPPY_HOUR_FAIR_USE_KWH,
+    HAPPY_HOUR_FAIR_USE_KWH, CHEAP_WINDOW_PURPOSE,
     ACTION_SOLAR_OVERFLOW, FLOOD_PREV_SOC_THRESHOLD_PCT, FLOOD_PREV_TARGET_PCT,
     FLOOD_PREV_FORECAST_MULT,
     pv_tracking_factor as _pv_tracking_factor,
@@ -1769,6 +1770,10 @@ class Plugin(indigo.PluginBase):
         self.store["happy_hour_tokens"]         = None
         self.store["saving_session_export_active"] = False
         self.store["happy_hour_import_active"]  = False
+        # 5.130.0: the manager is running the Flux cheap window because Flux is not
+        # (battery_manager 3.15). Not persisted: a restart mid-window re-drives it
+        # from the next decision, and after the window there is nothing to resume.
+        self.store["cheap_window_import_active"] = False
         self.store["happy_hour_anchor_kwh"]     = None   # grid-import counter at window entry
         self.store["happy_hour_free_kwh"]       = 0.0    # free kWh banked in the last window
         # v5.112.0 booking. All three persisted (see _save_accumulators_locked).
@@ -4157,6 +4162,10 @@ class Plugin(indigo.PluginBase):
         # 6. Log if action changed or heartbeat
         self._log_manager_decision(decision, snapshot, soc_pct)
         self._note_import_hold(decision)
+        try:
+            self._note_cheap_window_result()
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Overnight] cheap-window note failed: {exc!r}")
 
         # 7 + 8. Verify and act — UNLESS the Flux supervisor is holding the
         # inverter. This is the whole of the "no overlay that fights the old
@@ -4186,6 +4195,9 @@ class Plugin(indigo.PluginBase):
             if owner:
                 self._flux_release(f"pre-empted by {owner}", preempted=True)
             if self._flux_owns_control():
+                if self.store.get("cheap_window_import_active"):
+                    self._forget_cheap_window_import(
+                        "it can plan the cheap window again")
                 self.store["manager_hands_off_reason"] = (
                     "the Flux supervisor holds the inverter")
                 self._update_manager_device(decision, snapshot)
@@ -5130,6 +5142,8 @@ class Plugin(indigo.PluginBase):
             import_pending     = bool(self.store.get("import_active")
                                       or self.store.get("import_scheduled_time") is not None),
             flux_owns_cheap_window = self._flux_owns_cheap_window(),
+            # 5.130.0: the agreed overnight minimum, from the same function Flux uses.
+            cheap_window_min_pct   = self._cheap_window_minimum_pct(),
             # 5.124.0: an Axle event the battery cannot cover alone.
             event_cover_active     = bool(_cover is not None and _cover.active),
             event_cover_target_pct = float(_cover.target_pct) if _cover else 0.0,
@@ -7348,7 +7362,22 @@ class Plugin(indigo.PluginBase):
             self.store["import_scheduled_time"]   = None
             self.store["import_scheduled_logged"] = False
 
-        if action == ACTION_START_IMPORT:
+        cheap_purpose = (getattr(decision, "import_purpose", None) == CHEAP_WINDOW_PURPOSE)
+        if (self.store.get("cheap_window_import_active")
+                and not (action == ACTION_START_IMPORT and cheap_purpose)):
+            # 5.130.0: the cheap-window charge runs to the END of the window and no
+            # further. Any other decision — 05:00 passing, Flux taking the window
+            # back, a VPP window — hands back here, whatever the battery reached,
+            # so it can never go on charging at the day rate.
+            self._end_cheap_window_import(
+                "the cheap window has closed" if not self._in_flux_cheap_window()
+                else f"the manager now wants '{action}'")
+            prev_import = False
+
+        if action == ACTION_START_IMPORT and cheap_purpose:
+            self._drive_cheap_window_import(decision, prev_import)
+
+        elif action == ACTION_START_IMPORT:
             if not prev_import:
                 log(f"[Manager] Starting grid import: {decision.reason}")
                 power_w = min(decision.power_watts or 10000,
@@ -7682,7 +7711,10 @@ class Plugin(indigo.PluginBase):
         # here would hand back to self consumption with the free hour still
         # running, and the manager — seeing its import flag still set — would
         # never re-drive it. The window end and the overrun backstop end it.
-        if self.store["import_active"] and not self.store.get("happy_hour_import_active"):
+        # 5.130.0: nor for the cheap-window charge, which HOLDS at its target to 05:00
+        # (the hardware cutoff stops the charging) and is ended above, not here.
+        if (self.store["import_active"] and not self.store.get("happy_hour_import_active")
+                and not self.store.get("cheap_window_import_active")):
             current_soc = self.latest_inverter_data.get("batterySoc", 0.0)
             target_soc  = self.store["import_target_soc"]
             if current_soc >= target_soc:
@@ -7732,6 +7764,198 @@ class Plugin(indigo.PluginBase):
             if self.modbus and self.modbus.connected:
                 self.modbus.set_charge_cutoff(100.0)
             self._set_import_cutoff(None)
+
+    def _in_flux_cheap_window(self, now=None):
+        """True inside 02:00-05:00 London. False when Flux code is unavailable."""
+        if _flux_strategy is None:
+            return False
+        try:
+            return bool(_flux_strategy.in_window(
+                now or datetime.now(timezone.utc), _london_tz(),
+                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END))
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Manager] cheap-window check failed: {exc!r}")
+            return False
+
+    def _cheap_window_minimum_pct(self):
+        """The agreed overnight minimum in force now, or 0.0 (5.130.0).
+
+        flux_strategy.cheap_window_minimum_pct is the one owner of the rule: 50% while
+        the Flux cheap window is open, none on a day with a booked free hour. Flux
+        accounts only — the minimum is a Flux policy, and the account's tariff is what
+        says so, not whether the Flux controller happens to be able to plan.
+        """
+        if _flux_strategy is None:
+            return 0.0
+        tariff_key = (self.latest_rates_data or {}).get("tariff_info", {}).get("tariff_key")
+        if tariff_key != TARIFF_FLUX:
+            return 0.0
+        try:
+            return float(_flux_strategy.cheap_window_minimum_pct(
+                self._flux_site(), self._flux_commitments(),
+                datetime.now(timezone.utc), _london_tz()))
+        except Exception as exc:                        # noqa: BLE001
+            # Fail towards the minimum, not away from it: an unreadable booking list
+            # must not quietly drop the floor the night it is needed.
+            self.logger.debug(f"[Manager] cheap-window minimum not worked out: {exc!r}")
+            return (_flux_strategy.CHARGE_MIN_PCT
+                    if self._in_flux_cheap_window() else 0.0)
+
+    def _cheap_window_import_holding(self):
+        """True when the manager's cheap-window charge has reached its level and is only
+        holding it. Holding is not an owner Flux must stand aside for (5.130.0): Flux
+        plans again and, if it can, takes the window back."""
+        if not self.store.get("cheap_window_import_active"):
+            return False
+        soc = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
+        return soc >= float(self.store.get("import_target_soc") or 0.0) - 0.5
+
+    def _drive_cheap_window_import(self, decision, prev_import):
+        """Run the Flux cheap window for Flux when Flux cannot (5.130.0).
+
+        Charge PV First with the hardware cutoff at the level wanted — or at the
+        battery's present level when that is already higher, which is a pure hold —
+        and the discharge pinned at zero, so the house runs on the cheap grid until
+        05:00 exactly as Flux's own hold does. The level only ever rises inside the
+        window. Ended by _end_cheap_window_import, never by reaching the target.
+        """
+        if not (self.modbus and self.modbus.connected):
+            return
+        soc    = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
+        target = float(decision.target_soc_pct or 0.0)
+        if not self.store.get("cheap_window_import_active"):
+            level   = min(100.0, max(target, round(soc, 1)))
+            power_w = min(int(decision.power_watts or 10000),
+                          int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
+            if prev_import:
+                ok = bool(self.modbus.set_charge_cutoff(level))
+            else:
+                ok = self._force_charge(power_w, level)
+            if not ok:
+                log("[Manager] The cheap-window charge could not be started (the inverter "
+                    "refused the command or did not answer); retrying next tick",
+                    level="WARNING")
+                return
+            self.store["import_active"]              = True
+            self.store["cheap_window_import_active"] = True
+            self.store["import_target_soc"]          = level
+            self.store["export_active"]              = False
+            if level > soc + 0.5:
+                self.store["had_import_today"] = True
+            self._set_import_cutoff(level)
+            # Best effort, as for a Happy Hour: _verify_ems_registers expects zero
+            # for as long as the cheap-window import runs and re-asserts it.
+            self.modbus.set_discharge_limit(0)
+            log(f"[Manager] {decision.reason}")
+            return
+        current = float(self.store.get("import_target_soc") or 0.0)
+        if target >= current + 1.0:
+            level = min(100.0, target)
+            if self.modbus.set_charge_cutoff(level):
+                self.store["import_target_soc"] = level
+                self.store["had_import_today"]  = True
+                self._set_import_cutoff(level)
+                log(f"[Manager] Cheap-window charge now to {level:.0f}%: {decision.reason}")
+
+    def _end_cheap_window_import(self, why):
+        """Hand the manager's cheap-window charge back to self consumption."""
+        soc = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
+        self.store["cheap_window_import_active"] = False
+        self.store["import_active"]              = False
+        self.store["import_target_soc"]          = 0.0
+        if self.modbus and self.modbus.connected:
+            if not self.modbus.set_self_consumption():
+                log("[Manager] Cheap-window hand-back to Self Consumption was NOT "
+                    "confirmed — retrying on the next tick", level="WARNING")
+                self.store["vpp_handback_pending"] = True
+            self._restore_import_cutoff()
+        else:
+            self.store["vpp_handback_pending"] = True
+        log(f"[Manager] Cheap-window charge ended ({why}) with the battery at {soc:.0f}%")
+
+    def _forget_cheap_window_import(self, why):
+        """Drop the bookkeeping, with NO writes, when Flux has taken the window back.
+
+        Flux owns the registers now and has written its own; a hand-back here would
+        put mode 2 over its charge. Clearing the cutoff record keeps Flux's 05:00
+        release from restoring the manager's old ceiling.
+        """
+        self.store["cheap_window_import_active"] = False
+        self.store["import_active"]              = False
+        self.store["import_target_soc"]          = 0.0
+        self._set_import_cutoff(None)
+        log(f"[Manager] Cheap-window charge handed to Flux ({why}).")
+
+    def _note_cheap_window_result(self):
+        """Once a day after 05:00 on Flux: what the window ACHIEVED, against the
+        minimum it was set (5.130.0). A configured target is not an achieved one, and
+        the two-week review of the 50% rule needs the achieved figure for every night.
+
+        One line in the event log (a WARNING when the minimum was missed) and one JSON
+        line in cheap_window_results.jsonl beside the plugin's other records.
+        """
+        if _flux_strategy is None:
+            return
+        tariff_key = (self.latest_rates_data or {}).get("tariff_info", {}).get("tariff_key")
+        if tariff_key != TARIFF_FLUX:
+            return
+        tz  = _london_tz()
+        now = datetime.now(timezone.utc)
+        if self._in_flux_cheap_window(now):
+            # Remember, through the window, the minimum that applied and who ran it.
+            minimum = self._cheap_window_minimum_pct()
+            rec = self.store.get("cheap_window_watch") or {}
+            day = str(now.astimezone(tz).date())
+            if rec.get("day") != day:
+                rec = {"day": day, "minimum_pct": 0.0, "manager_ran": False,
+                       "flux_ran": False, "flux_reason": ""}
+            rec["minimum_pct"] = max(float(rec.get("minimum_pct") or 0.0), minimum)
+            if self.store.get("cheap_window_import_active"):
+                rec["manager_ran"] = True
+            if self._flux_owns_control():
+                rec["flux_ran"] = True
+            else:
+                rec["flux_reason"] = str(self.store.get("flux_status") or "")[:200]
+            self.store["cheap_window_watch"] = rec
+            return
+        rec = self.store.get("cheap_window_watch") or {}
+        local = now.astimezone(tz)
+        if (not rec or rec.get("day") != str(local.date()) or rec.get("reported")
+                or local.time() < _flux_strategy.FLUX_CHEAP_END):
+            return
+        rec["reported"] = True
+        self.store["cheap_window_watch"] = rec
+        soc     = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
+        minimum = float(rec.get("minimum_pct") or 0.0)
+        who = ("Flux ran the window" if rec.get("flux_ran") and not rec.get("manager_ran")
+               else "the manager ran the window because Flux could not"
+               if rec.get("manager_ran") else "nothing ran the window")
+        if minimum <= 0:
+            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}% "
+                   f"({who}; no minimum tonight — a free hour is booked)")
+            level = "INFO"
+        elif soc >= minimum - 1.0:
+            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}%, "
+                   f"which meets the {minimum:.0f}% minimum ({who})")
+            level = "INFO"
+        else:
+            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}%, "
+                   f"BELOW the {minimum:.0f}% minimum ({who}"
+                   + (f"; Flux said: {rec.get('flux_reason')}" if rec.get("flux_reason")
+                      and not rec.get("flux_ran") else "") + ")")
+            level = "WARNING"
+        log(msg, level=level)
+        try:
+            path = os.path.join(self.data_dir, "cheap_window_results.jsonl")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "day": rec.get("day"), "soc_at_close_pct": round(soc, 1),
+                    "minimum_pct": minimum, "flux_ran": bool(rec.get("flux_ran")),
+                    "manager_ran": bool(rec.get("manager_ran")),
+                    "flux_reason": rec.get("flux_reason", ""),
+                    "met": bool(minimum <= 0 or soc >= minimum - 1.0)}) + "\n")
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Overnight] result not recorded: {exc!r}")
 
     def _driven_export_owns_registers(self):
         """True while a self-driven export window owns the mode and limit registers.
@@ -7866,6 +8090,10 @@ class Plugin(indigo.PluginBase):
         # discharge at zero so the house draws the free grid power instead. This
         # pass must hold that, not "correct" it back to maximum.
         if self.store.get("happy_hour_import_active"):
+            expected_discharge_w = 0
+        # 5.130.0: and inside the manager's cheap-window charge, which holds the
+        # battery for the house to run on the cheap grid, as Flux's hold does.
+        if self.store.get("cheap_window_import_active"):
             expected_discharge_w = 0
 
         # During solar overflow the charge limit is intentionally reduced.
@@ -13354,7 +13582,9 @@ class Plugin(indigo.PluginBase):
             # 5.124.0: an Axle event the battery cannot cover alone. The manager
             # buys the gap, so Flux must let go even in the peak.
             return "an Axle event needs a grid top-up"
-        if self.store.get("import_active"):
+        if self.store.get("import_active") and not self._cheap_window_import_holding():
+            # 5.130.0: a cheap-window charge that has reached its level is only
+            # holding it, and Flux may take the window back from a hold.
             return "the manager has a grid import in flight"
         if self.store.get("export_active"):
             return "the manager has an export in flight"
@@ -14160,6 +14390,10 @@ class Plugin(indigo.PluginBase):
             return True
         if self._flux_other_owner():
             return False
+        # 5.130.0: a plan Flux is not yet allowed to apply (the stand-down after an
+        # import) does not run the window, so the manager's hold stays until it can.
+        if not (self._flux_owns_control() or self._flux_may_claim()):
+            return False
         decision = self.store.get("flux_decision")
         return bool(decision is not None and getattr(decision, "mode", None)
                     in (_flux_strategy.MODE_CHARGE, _flux_strategy.MODE_HOLD))
@@ -14251,10 +14485,14 @@ class Plugin(indigo.PluginBase):
         verified, _why = self._flux_tariff_verified()
 
         bands = None
+        bands_why = ""
         try:
-            bands = _flux_strategy.derive_bands(
-                self._flux_rate_spans("flux_import_slots"),
-                self._flux_rate_spans("flux_export_slots"), tz, now)
+            imp_spans = self._flux_rate_spans("flux_import_slots")
+            exp_spans = self._flux_rate_spans("flux_export_slots")
+            bands = _flux_strategy.derive_bands(imp_spans, exp_spans, tz, now)
+            if bands is None:
+                # 5.130.0: say which side is missing and from when.
+                bands_why = _flux_strategy.bands_problem(imp_spans, exp_spans, tz, now)
         except Exception as exc:                        # noqa: BLE001
             self.logger.debug(f"[Flux] band derivation failed: {exc!r}")
 
@@ -14302,6 +14540,7 @@ class Plugin(indigo.PluginBase):
             flows_age_s     = max(0.0, time.time() - observed_at),
             day_rate_import_today = self._day_rate_import_today(),
             sale_priority   = self._flux_sale_priority(),
+            bands_problem   = bands_why,
         )
 
     def _flux_sale_priority(self):
