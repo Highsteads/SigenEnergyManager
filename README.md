@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.129.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.130.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.130.0** — The 50% overnight minimum now holds even when the Flux strategy cannot plan, and 5am reports the level the battery actually reached.
 
 **v5.129.2** — A day recorded before Octopus has published its prices is valued provisionally at the last published prices, then re-priced automatically once the real ones arrive.
 
@@ -106,6 +108,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.130.0 | 1 October 2026 | The 50% minimum holds when Flux cannot plan |
 | 5.129.2 | 1 October 2026 | Unpublished days valued provisionally, re-priced later |
 | 5.129.1 | 1 October 2026 | Missing Flux prices: plan on the last published day's |
 | 5.129.0 | 30 September 2026 | The 2am charge reaches at least 50% every night |

@@ -117,7 +117,10 @@ class TestTheDayBuysNothingForThePeak(unittest.TestCase):
     def test_the_cheap_window_still_buys_tomorrow(self):
         d = self.bm.evaluate(_snap(12.0, 3, 0))
         self.assertEqual(d.action, ACTION_START_IMPORT)
-        self.assertIn("cheap window (2am to 5am)", d.reason)
+        # 3.15: with Flux not running the window, the manager's cheap-window fallback
+        # buys it, and holds the battery to 5am.
+        self.assertEqual(d.import_purpose, "cheap_window")
+        self.assertIn("for tomorrow", d.reason)
 
     def test_an_unknown_cheap_window_holds_rather_than_buying_now(self):
         """One failed Octopus slot fetch used to mean 10 kW at once, at any hour."""

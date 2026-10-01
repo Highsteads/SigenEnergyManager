@@ -7,6 +7,14 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.130.0 — 1 October 2026
+
+- **The 50% overnight minimum now holds even when the Flux strategy cannot plan.** Since midnight on 1 October, Octopus has published October's Flux import prices but no export price at all, in any region, although the account is still on the same Flux export tariff. Without an export price the strategy rightly refuses to trade, so it stepped aside all night. The ordinary plan bought only to its own figure of 44%, then ran the house on the battery until 5am, so the day started at about 42%. Now, whenever the strategy is not running the 2am to 5am window, the ordinary plan charges to 50%, or to what tomorrow needs if that is more, and holds the battery there until 5am with the house on the cheap grid. It still never buys to sell at the peak, because that needs the export price. The free-hour exception is unchanged. Version 5.129.1 already lets the strategy plan through a missing export price, so this is the safety net for every other reason it might not be able to plan.
+- **The strategy takes the window back as soon as it can.** Once the ordinary plan has reached its level and is only holding it, the strategy plans again and, if it can, takes over.
+- **A late start is sized properly.** The minimum's charging power assumed at least 15 minutes were left, so after a restart at 4:55 it asked for about a third of what five minutes needed. It now uses the real time left, and says how far short it will fall when the charge rate cannot make it.
+- **5am reports what was achieved.** One line in the Event Log at 5am gives the battery level against the minimum and who ran the window. It is a warning when the battery is below 50%. Each night is also written to `cheap_window_results.jsonl` for the two-week review.
+- **The "no Flux decision" message says what is missing.** For example, "Octopus has not published the Flux export prices beyond 00:00 on 1 October", instead of "could not be read as a contiguous Flux shape".
+
 ## 5.129.2 — 1 October 2026
 
 - **A day recorded before Octopus has published its prices is no longer undervalued in the money tables.** With the October Flux export prices still unpublished, 1 October's exports would have been recorded at the last export price the plugin held (the 9.7p day rate) when most of them went out in the 4pm to 7pm peak at 27.7p. Such a day is now valued at the last published day's prices, the same figures the strategy plans on, and marked "provisional". The day Octopus publishes, the plugin weighs it again at the real prices, replaces the figure and, where the day's whole-house cost has already been settled, works the export income and the net out again. The Event Log says so when it happens.

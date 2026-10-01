@@ -4,9 +4,20 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 5; 3.12-3.14 Claude Opus 5.5
-# Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026
-# Version:     3.14
+# Author:      CliveS & Claude Opus 5; 3.12-3.15 Claude Opus 5.5
+# Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026; 3.15 01-10-2026
+# Version:     3.15
+# 3.15 — THE CHEAP WINDOW HAS A FALLBACK THAT KEEPS THE 50% MINIMUM. 1-Oct-2026:
+#       Octopus had published no October Flux export price, so the Flux controller
+#       could not plan; the manager bought to its own household target (44%), went back
+#       to self consumption at 03:48 and the house ran on the battery until 5am. On Flux,
+#       inside 02:00-05:00, whenever Flux is not running the window, the manager now
+#       does what Flux would: charges to the highest of the agreed minimum
+#       (snapshot.cheap_window_min_pct, from flux_strategy.cheap_window_minimum_pct, so
+#       one rule and one owner), tomorrow's household target and the power-cut floor,
+#       and holds the battery there until 05:00 with the house on the cheap grid. The
+#       import carries import_purpose CHEAP_WINDOW_PURPOSE so plugin.py runs it to the
+#       end of the window instead of stopping at the target.
 # 3.14 — THE DAY BUYS NOTHING BUT FREE HOURS AND AXLE COVER. CliveS, 27-Sep-2026:
 #       "the only time during the day that we import is when we have free hours or
 #       the battery gets near the lower battery limit", plus an Axle event the
@@ -275,6 +286,11 @@ ACTION_SOLAR_OVERFLOW   = "solar_overflow"      # daytime: cap charge so PV surp
 ACTION_VPP_EXPORT       = "vpp_export"          # VPP event window: self-drive export (ignore Axle dispatch)
 ACTION_SAVING_SESSION   = "saving_session"      # Octopus Saving Session: export above baseline for Octopoints
 ACTION_HAPPY_HOUR_IMPORT = "happy_hour_import"  # Octopus Weekend Happy Hour: bank FREE grid electricity
+
+# 3.15: Decision.import_purpose of the Flux cheap-window fallback. plugin.py runs an
+# import with this purpose to the END of the window (the hardware cutoff stops the
+# charging, the house stays on the cheap grid) rather than stopping at the target.
+CHEAP_WINDOW_PURPOSE = "cheap_window"
 
 # ── Octopus Saving Session export ───────────────────────────────────────────
 # Below the Axle VPP override on purpose, and it is not close: Axle pays about
@@ -834,6 +850,10 @@ class ManagerSnapshot:
     # other tariff and whenever Flux cannot plan, so the manager's own cheap-window
     # import stays as the fallback (CliveS, 26-Sep-2026: "let Flux own 2am").
     flux_owns_cheap_window: bool = False
+    # 3.15 — the agreed overnight minimum in force now (CHARGE_MIN_PCT on Flux inside
+    # 02:00-05:00), 0.0 outside the window, on a booked free-hour day and off Flux.
+    # Worked out by plugin.py with flux_strategy.cheap_window_minimum_pct.
+    cheap_window_min_pct:   float = 0.0
 
 
 @dataclass
@@ -899,7 +919,8 @@ class Decision:
     # and is gated on the round-trip comparison; "reserve" buys the power-cut floor
     # and is not. plugin.py words the hold notice from it. v5.117.0: the flat/TOU
     # resilience buffer is tagged "reserve" too, and only a "reserve" import fires
-    # the Emergency Import Triggered event. Nothing decides on this field.
+    # the Emergency Import Triggered event. 3.15: CHEAP_WINDOW_PURPOSE also makes
+    # plugin.py hold the import to the end of the window.
     import_purpose:  str   = "tomorrow"
     # v3.11 — set when the bank-first gate is what refused the overflow branch.
     # Carried as a FLAG, not as text: the overflow reason string is already close
@@ -1034,6 +1055,17 @@ class BatteryManager:
             "skipped — no Axle event needs covering"
             if not snapshot.event_cover_reason else
             f"skipped — planned, not yet time: {snapshot.event_cover_reason}")))
+
+        # 1c. The Flux cheap window when Flux is not running it (3.15).
+        cheap = self._check_cheap_window_fallback(snapshot, balance)
+        if cheap is not None:
+            audit.append(("CHEAP-WINDOW", f"matched -> {cheap.reason}"))
+            cheap.audit_trail = audit
+            return cheap
+        audit.append(("CHEAP-WINDOW", (
+            "skipped — the Flux controller runs the cheap window"
+            if snapshot.flux_owns_cheap_window else
+            "skipped — not the Flux cheap window")))
 
         # 2. Resilience buffer (flat-rate any-time; TOU only in the cheap window
         #    when tomorrow is already covered; Agile in the cheapest block, v5.101.0
@@ -1799,13 +1831,8 @@ class BatteryManager:
         Never imports for profit — only to cover a genuine tomorrow shortfall.
         Uses cheapest available time window for the active tariff.
         """
-        tariff      = snapshot.tariff
-        battery_kwh = snapshot.current_soc_pct / 100.0 * snapshot.capacity_kwh
-
-        # Target SOC: current SOC + the net import deficit.
-        # +2% safety buffer; capped at 98% to preserve solar headroom at sunrise.
-        target_kwh = battery_kwh + balance.import_kwh
-        target_soc = min(98.0, target_kwh / max(1.0, snapshot.capacity_kwh) * 100.0 + 2.0)
+        tariff     = snapshot.tariff
+        target_soc = self._household_import_target(snapshot, balance)
 
         # Defensive guard: battery already above target → no import needed.
         # Can occur if viability and snapshot are inconsistent (e.g. forecast race).
@@ -1839,6 +1866,74 @@ class BatteryManager:
         # to TARIFF_PRODUCT_PREFIXES.
         return self._hold_import(
             balance, f"the tariff '{tariff.tariff_key}' is not recognised")
+
+    @staticmethod
+    def _household_import_target(snapshot: ManagerSnapshot,
+                                 balance: SufficiencyBalance) -> float:
+        """Target SOC: current SOC + the net import deficit. +2% safety buffer;
+        capped at 98% to preserve solar headroom at sunrise."""
+        battery_kwh = snapshot.current_soc_pct / 100.0 * snapshot.capacity_kwh
+        target_kwh  = battery_kwh + balance.import_kwh
+        return min(98.0, target_kwh / max(1.0, snapshot.capacity_kwh) * 100.0 + 2.0)
+
+    def _check_cheap_window_fallback(self, snapshot: ManagerSnapshot,
+                                     balance: SufficiencyBalance) -> Optional[Decision]:
+        """The Flux cheap window, run by the manager when Flux is not running it (3.15).
+
+        Flux owns 02:00-05:00 whenever it can plan. When it cannot (1-Oct-2026: no
+        October export price published) this does what Flux would have done, short of
+        trading: charge to the highest of the agreed minimum, tomorrow's household
+        target and the power-cut floor, and hold the battery there until 05:00 with
+        the house on the cheap grid. It never buys to sell at the peak — that needs the
+        export price Flux was missing.
+
+        The decision is a START_IMPORT on every tick of the window, holding included,
+        with import_purpose CHEAP_WINDOW_PURPOSE; plugin.py stops the charging with the
+        hardware cutoff and ends the import at 05:00, never at the target.
+        """
+        tariff = snapshot.tariff
+        if tariff.tariff_key != TARIFF_FLUX or snapshot.flux_owns_cheap_window:
+            return None
+        if not tariff.cheap_start or not tariff.cheap_end:
+            return None
+        now_hm = self._to_local(snapshot.now).strftime("%H:%M")
+        if not self._time_in_window(now_hm, tariff.cheap_start, tariff.cheap_end):
+            return None
+        soc   = snapshot.current_soc_pct
+        wants = []                       # (level, why) — the highest one is bought
+        floor = float(snapshot.cheap_window_min_pct or 0.0)
+        if floor > 0:
+            wants.append((floor, f"the {floor:.0f}% minimum"))
+        if balance.import_needed:
+            wants.append((self._household_import_target(snapshot, balance),
+                          f"tomorrow ({balance.import_kwh_grid:.0f} kWh short)"))
+        if soc < snapshot.dawn_target_pct:
+            wants.append((min(snapshot.dawn_target_pct + 2.0, 98.0), "the reserve"))
+        target  = max([level for level, _ in wants] or [0.0])
+        # Name only what sets the level: "for the 20% minimum and tomorrow" when
+        # tomorrow alone decides it would credit the minimum with a charge it is
+        # not causing.
+        because = [why for level, why in wants if level >= target - 0.5]
+        target = min(target, 100.0)
+        until  = _spoken_hm(tariff.cheap_end)
+        if target > soc + 0.5:
+            buy_kwh = (target - soc) / 100.0 * snapshot.capacity_kwh
+            reason = (f"Flux is not running the cheap window: charging about "
+                      f"{buy_kwh:.0f} kWh to {target:.0f}% for {' and '.join(because)}, "
+                      f"then holding until {until} with the house on the cheap grid")
+        else:
+            reason = (f"Flux is not running the cheap window: holding the battery at "
+                      f"{soc:.0f}% until {until} with the house on the cheap grid")
+        return Decision(
+            action          = ACTION_START_IMPORT,
+            reason          = reason,
+            power_watts     = 10000,
+            target_soc_pct  = round(target, 1),
+            dawn_viable     = True,
+            soc_at_dawn_kwh = balance.battery_at_dawn_kwh,
+            import_kwh      = balance.import_kwh_grid,
+            import_purpose  = CHEAP_WINDOW_PURPOSE,
+        )
 
     @staticmethod
     def _check_event_cover(snapshot: ManagerSnapshot,

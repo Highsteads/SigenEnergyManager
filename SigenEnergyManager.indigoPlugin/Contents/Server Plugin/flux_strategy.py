@@ -5,11 +5,24 @@
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
 # Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8-2.9 Claude Sonnet 5.5;
-#              v2.9.1 Claude Opus 5.5
+#              v2.9.1-2.10 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
-#              v2.8 and v2.9 30-09-2026; v2.9.1 01-10-2026
-# Version:     2.9.1
+#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026
+# Version:     2.10
+#
+# v2.10 (SigenEnergyManager 5.130.0) makes the 50% minimum hold when Flux cannot plan.
+#   * 1-Oct-2026: Octopus published October's Flux IMPORT prices but no EXPORT price
+#     after 00:00 BST (every region; the account's export agreement is still
+#     FLUX-EXPORT-23-02-14, open-ended). derive_bands rightly refused, Flux deferred all
+#     night, and the ordinary manager bought to its own household target (44%) and then
+#     ran the house from the battery until 5am. The rule now has ONE owner,
+#     cheap_window_minimum_pct(), read by this planner and by the manager's fallback.
+#   * bands_problem() says WHICH side is missing and from when, instead of "could not be
+#     read as a contiguous Flux shape".
+#   * _minimum_charge sized its power on at least 15 minutes left, so at 04:55 it asked
+#     for a third of what five minutes needed. It now uses the real time left, and
+#     reports the part it cannot reach (minimum_shortfall_kwh) instead of staying silent.
 #
 # v2.9.1 (SigenEnergyManager 5.129.1) carry_forward_spans(). 1-Oct-2026: Octopus
 # published October's Flux import prices but no export price after midnight BST (every
@@ -358,6 +371,8 @@ class FluxInputs:
     # v2.6: (start, end) windows the peak sale serves FIRST (joined Saving Sessions).
     # Not a reservation: they only decide WHEN inside the peak the spare is sold.
     sale_priority:    Tuple[Tuple[datetime, datetime], ...] = field(default_factory=tuple)
+    # v2.10: why derive_bands refused, in words (bands_problem), when bands is None.
+    bands_problem:    str = ""
 
 
 @dataclass(frozen=True)
@@ -378,6 +393,9 @@ class FluxDecision:
     margin_p:              float              = 0.0
     committed_kwh:         float              = 0.0
     infeasible_kwh:        float              = 0.0
+    # v2.10: battery-side kWh the 50% minimum still needs that the time left and the
+    # charge rate cannot deliver before 05:00. A configured target is not an achieved one.
+    minimum_shortfall_kwh: float              = 0.0
 
     @property
     def deferred(self):
@@ -768,6 +786,71 @@ def derive_bands(import_spans, export_spans, tz, now, day=None):
     if any(v is None for v in prices.values()):
         return None
     return FluxBands(covers_until=min(imp_until, exp_until), **prices)
+
+
+def bands_problem(import_spans, export_spans, tz, now, day=None):
+    """Why derive_bands refuses, in words; "" when it does not (v2.10).
+
+    Says which side and from when, because the fix differs: a side Octopus has not
+    published yet (1-Oct-2026: no October export price) is waited out, a band shape
+    that is not Flux any more is a tariff change. Never a price, never a guess.
+    """
+    if tz is None:
+        return "the local timezone is unavailable"
+    now = _aware(now, "now")
+
+    def _side(spans, name):
+        if not spans:
+            return f"Octopus has published no Flux {name} prices at all"
+        until = _covered_until(spans, now)
+        if until is None:
+            last = max(s.end for s in spans).astimezone(tz)
+            if last <= now:
+                return (f"Octopus has not published the Flux {name} prices beyond "
+                        f"{last:%H:%M} on {last.day} {last:%B}, so there is no {name} "
+                        f"price for now")
+            return (f"the published Flux {name} prices have a gap or two different "
+                    f"prices for the same time")
+        return ""
+
+    for spans, name in ((import_spans, "import"), (export_spans, "export")):
+        why = _side(spans, name)
+        if why:
+            return why
+    day = day or _local_date(now, tz)
+    if _band_window(import_spans, tz, day, True) != (FLUX_CHEAP_START, FLUX_CHEAP_END):
+        return (f"today's published import prices do not have the Flux cheap band at "
+                f"{FLUX_CHEAP_START:%H:%M} to {FLUX_CHEAP_END:%H:%M}")
+    if _band_window(export_spans, tz, day, False) != (FLUX_PEAK_START, FLUX_PEAK_END):
+        return (f"today's published export prices do not have the Flux peak band at "
+                f"{FLUX_PEAK_START:%H:%M} to {FLUX_PEAK_END:%H:%M}")
+    if derive_bands(import_spans, export_spans, tz, now, day) is None:
+        return "one of today's Flux bands has more than one published price"
+    return ""
+
+
+def _free_hour_booked(commitments, window_end, tz):
+    """True when a booked free-import window falls in the day this cheap window
+    serves (v2.10: the one test, shared by the planner and the manager's fallback)."""
+    free_kwh = _commitment_kwh(commitments, window_end,
+                               next_local(window_end, tz, FLUX_CHEAP_START), "import")
+    return free_kwh >= MIN_TRADE_KWH
+
+
+def cheap_window_minimum_pct(site, commitments, now, tz):
+    """The agreed overnight minimum in force NOW, or 0.0 (v2.10).
+
+    CHARGE_MIN_PCT, capped by the site's charge ceiling, while the 02:00-05:00 window
+    is open; 0.0 outside it and on a day with a booked free hour, which wants the
+    room. ONE owner: the planner's _minimum_charge and the manager's fallback both
+    read this, so the rule cannot hold in one and lapse in the other (1-Oct-2026).
+    """
+    if tz is None or not in_window(now, tz, FLUX_CHEAP_START, FLUX_CHEAP_END):
+        return 0.0
+    window_end = next_local(now, tz, FLUX_CHEAP_END)
+    if _free_hour_booked(commitments, window_end, tz):
+        return 0.0
+    return max(0.0, min(CHARGE_MIN_PCT, float(site.max_charge_soc_pct)))
 
 
 # ================================================================
@@ -1198,8 +1281,9 @@ def _validate(inputs):
     if inputs.local_tz is None:
         raise FluxDeferred("the local timezone is unavailable")
     if inputs.bands is None:
-        raise FluxDeferred("the published Flux import and export rates could not be "
-                           "read as a contiguous Flux shape")
+        raise FluxDeferred(inputs.bands_problem
+                           or "the published Flux import and export rates could not be "
+                              "read as a contiguous Flux shape")
     _age(inputs.rates_age_s, "the Flux rates age", MAX_RATES_AGE_S)
     if inputs.bands.covers_until <= inputs.now:
         raise FluxDeferred("the published Flux rates do not reach the present moment")
@@ -1336,32 +1420,43 @@ def _charge_plan(inputs):
     return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible
 
 
-def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, free_booked):
-    """(target_pct, power_w, buy_kwh, raised_kwh) with the nightly minimum applied (v2.9).
+# v2.10: the shortest time left the minimum's power is sized on. Below a minute the
+# sum asks for absurd power that the charge rate caps anyway; the floor only keeps the
+# division finite, it is not a planning horizon (v2.9 used 15 minutes, see header).
+MIN_HOURS_LEFT = 1.0 / 60.0
 
-    `target_pct` None means the plan found nothing to buy. The minimum does not apply
-    when a free hour is booked for the day (`free_booked`): that wants the room, and the
-    free electricity fills it. It never lowers a target, never exceeds the site's charge
-    ceiling, and sizes the power to reach the minimum by the end of the window, within
-    the site's charge rate and spare import capacity. `raised_kwh` is what it added
-    (battery side), 0.0 when it changed nothing.
+
+def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, minimum):
+    """(target_pct, power_w, buy_kwh, raised_kwh, shortfall_kwh) with the nightly
+    minimum applied (v2.9; v2.10 sizes on the real time left and reports a shortfall).
+
+    `minimum` comes from cheap_window_minimum_pct, 0.0 on a free-hour day. `target_pct`
+    None means the plan found nothing to buy. It never lowers a target, never exceeds
+    the site's charge ceiling, and sizes the power to reach the minimum by the end of
+    the window, within the site's charge rate and spare import capacity. `raised_kwh` is
+    what it added (battery side); `shortfall_kwh` is the part of the minimum the time
+    left cannot deliver at that power, 0.0 when it is reachable.
     """
     site = inputs.site
-    minimum = min(CHARGE_MIN_PCT, float(site.max_charge_soc_pct))
     soc = float(inputs.soc_pct)
-    if free_booked or minimum <= 0 or soc >= minimum - 0.05:
-        return target_pct, power_w, buy_kwh, 0.0
+    if minimum <= 0 or soc >= minimum - 0.05:
+        return target_pct, power_w, buy_kwh, 0.0, 0.0
     if target_pct is not None and float(target_pct) >= minimum:
-        return target_pct, power_w, buy_kwh, 0.0
+        return target_pct, power_w, buy_kwh, 0.0, 0.0
     need_kwh = (minimum - soc) / 100.0 * site.capacity_kwh          # battery side
-    hours_left = max(0.25, (window_end - inputs.now).total_seconds() / 3600.0)
-    wanted_w = int(need_kwh / site.one_way_efficiency / hours_left * 1000.0)
+    hours_left = max(MIN_HOURS_LEFT, (window_end - inputs.now).total_seconds() / 3600.0)
+    wanted_w = int(math.ceil(need_kwh / site.one_way_efficiency / hours_left * 1000.0))
     available = min(site.charge_power_w, import_headroom_w(inputs))
     power = int(min(max(int(power_w or 0), wanted_w), available))
+    reachable_kwh = max(0, power) / 1000.0 * hours_left * site.one_way_efficiency
+    shortfall = max(0.0, need_kwh - reachable_kwh)
+    if shortfall < 0.01:
+        shortfall = 0.0
     if power <= 0:
-        return target_pct, power_w, buy_kwh, 0.0
+        return target_pct, power_w, buy_kwh, 0.0, round(need_kwh, 2)
     total = max(float(buy_kwh or 0.0), need_kwh)
-    return minimum, power, total, max(0.0, total - float(buy_kwh or 0.0))
+    return (minimum, power, total, max(0.0, total - float(buy_kwh or 0.0)),
+            round(shortfall, 2))
 
 
 def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
@@ -1624,12 +1719,17 @@ def plan(inputs):
             # v2.9: at least CHARGE_MIN_PCT by the end of the window, except on a
             # day with a booked free hour.
             min_note = ""
-            (target_pct, power_w, buy_kwh, raised_kwh) = _minimum_charge(
-                inputs, window_end, target_pct, power_w, buy_kwh,
-                free_booked=free_kwh >= MIN_TRADE_KWH)
+            minimum = cheap_window_minimum_pct(site, inputs.commitments, inputs.now, tz)
+            (target_pct, power_w, buy_kwh, raised_kwh,
+             shortfall_kwh) = _minimum_charge(
+                inputs, window_end, target_pct, power_w, buy_kwh, minimum)
             if raised_kwh > 0:
                 min_note = (f", and {raised_kwh:.1f} kWh of that is to bring the "
-                            f"battery up to the {CHARGE_MIN_PCT:.0f}% minimum")
+                            f"battery up to the {minimum:.0f}% minimum")
+            if shortfall_kwh > 0:
+                min_note += (f". The time left and the charge rate fall about "
+                             f"{shortfall_kwh:.1f} kWh short of the {minimum:.0f}% "
+                             f"minimum by {FLUX_CHEAP_END:%H:%M}")
             if target_pct is None:
                 return FluxDecision(
                     mode=MODE_HOLD, owns=True, decision_at=inputs.now,
@@ -1641,9 +1741,10 @@ def plan(inputs):
                     protect_soc_pct=house_floor, household_floor_pct=house_floor,
                     margin_p=margin_p, committed_kwh=committed,
                     infeasible_kwh=infeasible,
+                    minimum_shortfall_kwh=shortfall_kwh,
                     reason=("the cheap window is open and the battery already holds "
                             "everything the day ahead is forecast to need"
-                            + free_note))
+                            + min_note + free_note))
             arb_kwh = max(0.0, buy_kwh - household_kwh)
             reason  = (f"cheap window — buying about {buy_kwh:.1f} kWh at "
                        f"{bands.import_cheap_p:.1f}p to {target_pct:.0f}%, of which "
@@ -1665,7 +1766,8 @@ def plan(inputs):
                 decision_until=_decision_until(inputs, window_end),
                 protect_soc_pct=house_floor, household_floor_pct=house_floor,
                 planned_kwh=round(buy_kwh, 2), margin_p=margin_p,
-                committed_kwh=committed, infeasible_kwh=infeasible, reason=reason)
+                committed_kwh=committed, infeasible_kwh=infeasible,
+                minimum_shortfall_kwh=shortfall_kwh, reason=reason)
 
         # ── the peak window ─────────────────────────────────────────────────
         if in_window(inputs.now, tz, FLUX_PEAK_START, FLUX_PEAK_END):
