@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.129.1 — 1 October 2026
+
+- **When Octopus has not published one side of the Flux prices yet, the strategy plans on the last published day's prices until it does.** From midnight on 1 October Octopus published October's import prices but no export prices, in any region, so the strategy refused to plan all day: no peak sale, and nothing to serve that evening's Saving Session. Now a side that stops short of the other is filled in by repeating its last published day, with the bands on the same clock times, and the Event Log warns once with the prices it is using. It never does this when Octopus has published neither side. The day's money is still valued only at prices Octopus actually published.
+
 ## 5.129.0 — 30 September 2026
 
 - **The 2am charge now brings the battery up to at least 50% every night, except on a day with a booked free hour.** On 30 September the forecast was 31 kWh and the day brought about 19, the battery left the cheap window at 42%, and the 4pm sale ran out after about 2 kWh of a possible 12. Replayed over every day on record (161 days, April to September), a 50% minimum acts on about one day in five and costs about £10 a year: the extra energy is bought at 14.6p and, on a day the sun fills the battery anyway, the room it took is filled by sunshine sold at 9.7p. On 30 September it would have bought 2.9 kWh more and sold 2.7 kWh more at the peak, about 33p better. In winter the charge already reaches a full battery, so nothing changes then.

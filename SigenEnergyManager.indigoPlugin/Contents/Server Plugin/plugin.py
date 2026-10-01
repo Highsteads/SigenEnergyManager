@@ -60,8 +60,9 @@
 #              Claude Opus 5.5 (5.128.0 — the 2am charge plans on 80% of the solar forecast, all year)
 #              Claude Sonnet 5.5 (5.128.1 — a Saving Session no longer holds back energy an Axle event already covers, and the sale stops flipping)
 #              Claude Sonnet 5.5 (5.129.0 — the 2am charge reaches at least 50% every night, except on a free-hour day)
+#              Claude Opus 5.5 (5.129.1 — a Flux side Octopus has not published yet uses the last published day's prices)
 # Date:        28-09-2026
-# Version:     5.129.0
+# Version:     5.129.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -13912,6 +13913,49 @@ class Plugin(indigo.PluginBase):
             return None
         return value / covered
 
+    _FLUX_SIDE_NAMES = {"flux_import_slots": "import", "flux_export_slots": "export"}
+
+    def _flux_planning_spans(self, key):
+        """Spans for one side of the pair FOR PLANNING, the last published day carried
+        forward where Octopus has not yet published as far as the other side (5.129.1).
+
+        Planning only. The day's money (_banded_rate_for_day) and the price shown
+        are still read from what Octopus actually published, so a carried price is
+        never recorded as earned.
+
+        1-Oct-2026: October's import prices were out, the export side stopped at
+        midnight, and Flux planned nothing all day with a peak sale, a Saving Session
+        and an Axle event due. CliveS: "if there are none, like no export prices then
+        we use the existing figures until it is updated". Never both sides: if
+        Octopus has published neither, nothing is carried and Flux waits.
+        """
+        spans = self._flux_rate_spans(key)
+        other = "flux_export_slots" if key == "flux_import_slots" else "flux_import_slots"
+        other_spans = self._flux_rate_spans(other)
+        if _flux_strategy is None or not spans or not other_spans:
+            return spans
+        until = max(x.end for x in other_spans)
+        try:
+            carried, stopped = _flux_strategy.carry_forward_spans(spans, _london_tz(), until)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] carry-forward failed: {exc!r}")
+            return spans
+        if stopped is not None:
+            mark = f"{key}:{stopped.isoformat()}"
+            if self.store.get("flux_carry_logged") != mark:
+                self.store["flux_carry_logged"] = mark
+                tz = _london_tz()
+                last_day = [x for x in carried if x.start < stopped
+                            and x.end > stopped - timedelta(days=1)]
+                prices = sorted({round(float(x.p), 2) for x in last_day})
+                side = self._FLUX_SIDE_NAMES.get(key, key)
+                local = stopped.astimezone(tz)
+                log(f"[Flux] Octopus has not published the Flux {side} prices beyond "
+                    f"{local:%H:%M} on {local.day} {local:%B}. Using the last published "
+                    f"day's {side} prices ({', '.join(f'{p}p' for p in prices)}) until "
+                    f"it does.", level="WARNING")
+        return carried
+
     def _flux_rate_spans(self, key):
         """Published spans for one side of the pair, from the store.
 
@@ -14252,9 +14296,11 @@ class Plugin(indigo.PluginBase):
 
         bands = None
         try:
+            # 5.129.1: planning reads a side Octopus has not published yet as the
+            # last published day's prices; see _flux_planning_spans.
             bands = _flux_strategy.derive_bands(
-                self._flux_rate_spans("flux_import_slots"),
-                self._flux_rate_spans("flux_export_slots"), tz, now)
+                self._flux_planning_spans("flux_import_slots"),
+                self._flux_planning_spans("flux_export_slots"), tz, now)
         except Exception as exc:                        # noqa: BLE001
             self.logger.debug(f"[Flux] band derivation failed: {exc!r}")
 
