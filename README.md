@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.129.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.129.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -54,6 +54,8 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
+**v5.129.2** — A day recorded before Octopus has published its prices is valued provisionally at the last published prices, then re-priced automatically once the real ones arrive.
+
 **v5.129.1** — When Octopus has not published one side of the Flux prices yet, the strategy plans on the last published day's prices until it does.
 
 **v5.129.0** — The 2am charge now brings the battery up to at least 50% every night, except on a day with a booked free hour, so a forecast that is too sunny no longer leaves too little to sell at the peak.
@@ -104,6 +106,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.129.2 | 1 October 2026 | Unpublished days valued provisionally, re-priced later |
 | 5.129.1 | 1 October 2026 | Missing Flux prices: plan on the last published day's |
 | 5.129.0 | 30 September 2026 | The 2am charge reaches at least 50% every night |
 | 5.128.1 | 30 September 2026 | Session holdback agrees with Axle; no on-off cycling |

@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.129.2 — 1 October 2026
+
+- **A day recorded before Octopus has published its prices is no longer undervalued in the money tables.** With the October Flux export prices still unpublished, 1 October's exports would have been recorded at the last export price the plugin held (the 9.7p day rate) when most of them went out in the 4pm to 7pm peak at 27.7p. Such a day is now valued at the last published day's prices, the same figures the strategy plans on, and marked "provisional". The day Octopus publishes, the plugin weighs it again at the real prices, replaces the figure and, where the day's whole-house cost has already been settled, works the export income and the net out again. The Event Log says so when it happens.
+
 ## 5.129.1 — 1 October 2026
 
 - **When Octopus has not published one side of the Flux prices yet, the strategy plans on the last published day's prices until it does.** From midnight on 1 October Octopus published October's import prices but no export prices, in any region, so the strategy refused to plan all day: no peak sale, and nothing to serve that evening's Saving Session. Now a side that stops short of the other is filled in by repeating its last published day, with the bands on the same clock times, and the Event Log warns once with the prices it is using. It never does this when Octopus has published neither side. The day's money is still valued only at prices Octopus actually published.

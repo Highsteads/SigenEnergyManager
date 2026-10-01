@@ -61,8 +61,9 @@
 #              Claude Sonnet 5.5 (5.128.1 — a Saving Session no longer holds back energy an Axle event already covers, and the sale stops flipping)
 #              Claude Sonnet 5.5 (5.129.0 — the 2am charge reaches at least 50% every night, except on a free-hour day)
 #              Claude Opus 5.5 (5.129.1 — a Flux side Octopus has not published yet uses the last published day's prices)
+#              Claude Opus 5.5 (5.129.2 — such a day is valued provisionally, then re-priced when Octopus publishes)
 # Date:        28-09-2026
-# Version:     5.129.1
+# Version:     5.129.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -13741,6 +13742,21 @@ class Plugin(indigo.PluginBase):
             mean = self._band_day_mean_p(side, date_str)
             if mean is not None:
                 return mean, "time-average"
+        if reason in ("gap", "no bands"):
+            # 5.129.2: Octopus has not published this side for the day yet. Weigh
+            # it at the last published day's prices (the planner's own figures) and
+            # say so; _reprice_provisional_days puts the published figure in its
+            # place the day Octopus publishes. "estimated" stays for a day that
+            # cannot be priced even that way.
+            try:
+                carried, _ = self._banded_rate_for_day(
+                    side, date_str,
+                    spans=self._flux_planning_spans(self._BAND_SIDES[side][0]))
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[Economics] {side} provisional weighting: {exc!r}")
+                carried = None
+            if carried is not None:
+                return carried, "provisional"
         return fallback_p, "estimated"
 
     def _agreement_started(self, side):
@@ -13803,7 +13819,7 @@ class Plugin(indigo.PluginBase):
         """A day's imports valued at the bands they were bought in, or None."""
         return self._banded_rate_for_day("import", date_str)[0]
 
-    def _banded_rate_for_day(self, side, date_str):
+    def _banded_rate_for_day(self, side, date_str, spans=None):
         """(weighted pence, reason). The pence are None whenever the answer would
         not be a measurement, and `reason` says which refusal it was.
 
@@ -13831,7 +13847,10 @@ class Plugin(indigo.PluginBase):
         if not self._tariff_is_banded(side):
             return None, "not banded"
         slots_key, column, _ = self._BAND_SIDES[side]
-        spans = self._flux_rate_spans(slots_key)
+        # `spans` is only passed for a provisional figure (5.129.2); the record of
+        # money otherwise reads what Octopus published and nothing else.
+        if spans is None:
+            spans = self._flux_rate_spans(slots_key)
         if not spans:
             return None, "no bands"
         if self._day_bounds_utc(date_str) is None:
@@ -13887,6 +13906,101 @@ class Plugin(indigo.PluginBase):
         if total_kwh <= 0:
             return None, "nothing flowed"
         return round(total_p / total_kwh, 4), "weighted"
+
+    # The daily-history field that carries each side's rate (5.129.2).
+    _RATE_FIELDS = {"import": ("rate_today_p", "import_rate_basis"),
+                    "export": ("export_rate_p", "export_rate_basis")}
+
+    def _reprice_provisional_days(self, max_days=62):
+        """Put the published price in place of a provisional one (5.129.2).
+
+        A day recorded while Octopus had not published one side of the Flux prices
+        was valued at the last published day's prices and marked "provisional".
+        Once the published schedule covers it, the day is weighed again exactly as
+        any other day, its rate and basis replaced, and — if the whole-house cost
+        had already been settled on the provisional rate — the settled money worked
+        out again from the same kWh and bill, so the tables carry the real figure.
+        A day still not covered is left as it is and tried on the next refresh.
+        """
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                records = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(records, list):
+            return 0
+        changed = 0
+        for rec in records[-max_days:]:
+            if not isinstance(rec, dict):
+                continue
+            date_str = str(rec.get("date") or "")
+            for side, (rate_key, basis_key) in self._RATE_FIELDS.items():
+                if rec.get(basis_key) != "provisional":
+                    continue
+                try:
+                    weighted, _why = self._banded_rate_for_day(side, date_str)
+                except Exception as exc:                # noqa: BLE001
+                    self.logger.debug(f"[Economics] re-pricing {date_str}: {exc!r}")
+                    continue
+                if weighted is None:
+                    continue
+                old = rec.get(rate_key)
+                rec[rate_key]  = round(float(weighted), 4)
+                rec[basis_key] = "weighted"
+                rec[f"{rate_key}_provisional"] = old
+                self._resettle_day_money(rec)
+                changed += 1
+                try:
+                    shown = datetime.strptime(date_str, "%Y-%m-%d")
+                    shown = f"{shown.day} {shown:%B}"
+                except ValueError:
+                    shown = date_str
+                log(f"[Economics] {shown} re-priced at the {side} prices Octopus has now "
+                    f"published: {float(weighted):.2f}p a kWh, in place of the provisional "
+                    f"{float(old or 0):.2f}p.")
+        if changed:
+            try:
+                _atomic_write_json(path, records)
+            except Exception as exc:                    # noqa: BLE001
+                log(f"[Economics] Could not save the re-priced days: {exc}", level="WARNING")
+                return 0
+        return changed
+
+    @staticmethod
+    def _resettle_day_money(rec):
+        """Work a settled day's money out again from its (new) rates. Same sums as
+        economics._settle_whole_house_costs; a day not yet settled is left for it."""
+        if not rec.get("cost_settled"):
+            return
+        try:
+            exp_kwh = float(rec.get("grid_export_kwh") or 0.0)
+            exp_p   = float(rec.get("export_rate_p"))
+        except (TypeError, ValueError):
+            return
+        update = {}
+        try:
+            bill = float(rec.get("whole_house_bill_gbp"))
+        except (TypeError, ValueError):
+            return
+        try:
+            # The import side, only where the row carries its own rate: the settle
+            # fell back to the ledger rate for a row without one, and that stands.
+            unit_cost = float(rec.get("import_kwh_octo")) * float(rec.get("rate_today_p")) / 100.0
+            bill = (unit_cost + float(rec.get("elec_standing_gbp") or 0.0)
+                    + float(rec.get("gas_unit_cost_gbp") or 0.0)
+                    + float(rec.get("gas_standing_gbp") or 0.0))
+            update["elec_unit_cost_gbp"]   = round(unit_cost, 2)
+            update["whole_house_bill_gbp"] = round(bill, 2)
+        except (TypeError, ValueError):
+            pass
+        revenue = exp_kwh * exp_p / 100.0
+        update.update({
+            "export_revenue_gbp": round(revenue, 2),
+            "wh_net_gbp":         round(revenue - bill, 2),
+            "covered":            bool(revenue >= bill),
+        })
+        rec.update(update)
 
     @staticmethod
     def _export_price_over(a, b, spans):
@@ -14035,6 +14149,11 @@ class Plugin(indigo.PluginBase):
             self.store["flux_export_slots"]  = exp
             self.store["flux_rates_at"]      = time.time()
             self.store["flux_rates_problem"] = ""
+            # 5.129.2: a day valued on carried prices gets the published ones now.
+            try:
+                self._reprice_provisional_days()
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[Economics] provisional re-pricing failed: {exc!r}")
         except Exception as exc:                        # noqa: BLE001
             self.store["flux_rates_problem"] = f"{type(exc).__name__}: {exc}"
             self.logger.debug(f"[Flux] rate refresh failed: {exc!r}")

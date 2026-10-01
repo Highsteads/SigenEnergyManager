@@ -21,6 +21,28 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.129.2 — 01-10-2026
+
+- **`_banded_rate_and_basis`**: when the published weighting refuses with "gap" or "no bands",
+  weigh the day against `_flux_planning_spans` (`_banded_rate_for_day(..., spans=)`) and return
+  basis **"provisional"**; "estimated" (the fallback rate) only when even that cannot price it.
+- **`_reprice_provisional_days(max_days=62)`**, run after every successful
+  `_refresh_flux_rates`: for each history row whose `export_rate_basis` / `import_rate_basis`
+  is "provisional", re-weigh against PUBLISHED spans only; once covered, write the rate and
+  basis "weighted", keep the old figure as `<rate field>_provisional`, and
+  `_resettle_day_money` (export_revenue_gbp, wh_net_gbp, covered; the import unit cost and
+  bill only where the row carries its own `rate_today_p`) if the day was already
+  `cost_settled`. One INFO line per re-priced side. A row still not covered is retried on the
+  next refresh.
+- Why: 1-Oct's record would otherwise have used the sticky `export_rate_p` (9.71p, the last
+  published day band) with basis "estimated" for a day whose export is mostly 27.69p peak,
+  understating it by about 17p a kWh for good — nothing ever re-priced an estimated day.
+- Tests (+9, test_provisional_day_pricing.py): published-only still refuses; the record goes
+  provisional at the carried weighting; unpriceable stays estimated; nothing changes while
+  unpublished; publication replaces rate and settled money and logs; a row without its own
+  import rate keeps its bill; a new import rate rebuilds the bill; weighted rows untouched; a
+  successful refresh runs the pass and a failed one does not. Six mutations caught.
+
 ## v5.129.1 — 01-10-2026
 
 - **flux_strategy 2.9.1 `carry_forward_spans(spans, tz, until)`** -> (spans, stopped_at): repeats
