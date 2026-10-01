@@ -63,8 +63,9 @@
 #              Claude Opus 5.5 (5.129.1 — a Flux side Octopus has not published yet uses the last published day's prices)
 #              Claude Opus 5.5 (5.129.2 — such a day is valued provisionally, then re-priced when Octopus publishes)
 #              Claude Opus 5.5 (5.130.0 — the 50% minimum holds when Flux cannot plan; the manager runs the cheap window to 5am)
+#              Claude Opus 5.5 (5.130.1 — fallback charge sized to site headroom; minimum shortfall always checked; 5am report has no hidden tolerance)
 # Date:        28-09-2026
-# Version:     5.130.0
+# Version:     5.130.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -7827,8 +7828,7 @@ class Plugin(indigo.PluginBase):
         target = float(decision.target_soc_pct or 0.0)
         if not self.store.get("cheap_window_import_active"):
             level   = min(100.0, max(target, round(soc, 1)))
-            power_w = min(int(decision.power_watts or 10000),
-                          int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000))
+            power_w = self._cheap_window_charge_w(decision.power_watts)
             if prev_import:
                 ok = bool(self.modbus.set_charge_cutoff(level))
             else:
@@ -7850,6 +7850,12 @@ class Plugin(indigo.PluginBase):
             self.modbus.set_discharge_limit(0)
             log(f"[Manager] {decision.reason}")
             return
+        # 5.130.1: keep the charge inside the site's import headroom as the house
+        # load moves (an EV on a 2am timer, say), as the Flux planner does.
+        allowed = self._cheap_window_charge_w(decision.power_watts)
+        if abs(allowed - int(self.store.get("import_power_w") or 0)) >= 500:
+            if self.modbus.set_charge_limit(allowed):
+                self.store["import_power_w"] = allowed
         current = float(self.store.get("import_target_soc") or 0.0)
         if target >= current + 1.0:
             level = min(100.0, target)
@@ -7858,6 +7864,29 @@ class Plugin(indigo.PluginBase):
                 self.store["had_import_today"]  = True
                 self._set_import_cutoff(level)
                 log(f"[Manager] Cheap-window charge now to {level:.0f}%: {decision.reason}")
+
+    def _cheap_window_charge_w(self, requested_w):
+        """The fallback charge power, inside the site's import headroom (5.130.1).
+
+        The same rule as flux_strategy.import_headroom_w: the verified site import
+        limit less what the house is drawing net of the panels, and never above the
+        inverter's rating. The inverter's own import cap (registers 40040-41, held
+        by the verify pass while Flux is armed) enforces the limit at the meter as
+        well; this keeps the request honest when that cap is not being asserted.
+        An unverified site limit falls back to the inverter rating, as before.
+        """
+        inv_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
+        power = min(int(requested_w or inv_w), inv_w)
+        try:
+            site = self._flux_site()
+            if site.import_limit_verified and site.import_limit_w > 0:
+                inv = self.latest_inverter_data or {}
+                house_net = max(0.0, float(inv.get("homePowerWatts", 0) or 0)
+                                - max(0.0, float(inv.get("pvPowerWatts", 0) or 0)))
+                power = min(power, int(site.import_limit_w - house_net))
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Manager] cheap-window headroom not worked out: {exc!r}")
+        return max(0, power)
 
     def _end_cheap_window_import(self, why):
         """Hand the manager's cheap-window charge back to self consumption."""
@@ -7932,17 +7961,25 @@ class Plugin(indigo.PluginBase):
         who = ("Flux ran the window" if rec.get("flux_ran") and not rec.get("manager_ran")
                else "the manager ran the window because Flux could not"
                if rec.get("manager_ran") else "nothing ran the window")
+        # 5.130.1: met means AT the minimum. A reading a fraction under it is said
+        # as such, with the gap, rather than counted as met (the old one-point
+        # allowance recorded 49% as a success).
+        short = round(max(0.0, minimum - soc), 1)
         if minimum <= 0:
             msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}% "
                    f"({who}; no minimum tonight — a free hour is booked)")
             level = "INFO"
-        elif soc >= minimum - 1.0:
-            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}%, "
+        elif short < 0.05:
+            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.1f}%, "
                    f"which meets the {minimum:.0f}% minimum ({who})")
             level = "INFO"
+        elif short <= 1.0:
+            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.1f}%, "
+                   f"{short:.1f} points under the {minimum:.0f}% minimum ({who})")
+            level = "WARNING"
         else:
             msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}%, "
-                   f"BELOW the {minimum:.0f}% minimum ({who}"
+                   f"BELOW the {minimum:.0f}% minimum, {short:.1f} points short ({who}"
                    + (f"; Flux said: {rec.get('flux_reason')}" if rec.get("flux_reason")
                       and not rec.get("flux_ran") else "") + ")")
             level = "WARNING"
@@ -7955,7 +7992,8 @@ class Plugin(indigo.PluginBase):
                     "minimum_pct": minimum, "flux_ran": bool(rec.get("flux_ran")),
                     "manager_ran": bool(rec.get("manager_ran")),
                     "flux_reason": rec.get("flux_reason", ""),
-                    "met": bool(minimum <= 0 or soc >= minimum - 1.0)}) + "\n")
+                    "met": bool(minimum <= 0 or short < 0.05),
+                    "short_pct": short}) + "\n")
         except Exception as exc:                        # noqa: BLE001
             self.logger.debug(f"[Overnight] result not recorded: {exc!r}")
 
@@ -8102,6 +8140,9 @@ class Plugin(indigo.PluginBase):
         # Use the stored cap as the expected value so verify() doesn't fight it.
         if self.store.get("solar_overflow_active"):
             expected_charge_w = self.store.get("solar_overflow_charge_cap_w", inv_max_w)
+        elif self.store.get("cheap_window_import_active"):
+            # 5.130.1: the fallback charge is sized to the site headroom.
+            expected_charge_w = int(self.store.get("import_power_w") or inv_max_w)
         else:
             expected_charge_w = inv_max_w
 

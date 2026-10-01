@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.130.1 — 1 October 2026
+
+- **The fallback charge fits inside the house's supply.** When the ordinary plan runs the 2am to 5am window, its charge is now sized the way the Flux strategy sizes one: the verified site import limit less what the house is drawing, and it is trimmed while it runs if a big load such as the car switches on. The inverter's own import cap already held the limit at the meter; this keeps the request itself within it.
+- **A shortfall against the 50% minimum is always reported.** When the strategy's own target was above 50%, it did not check that 50% could actually be reached in the time left, so a late or slow charge reported no shortfall. It now checks every time, and raises a charge that was sized too small.
+- **5am no longer counts 49% as meeting 50%.** The morning line says the battery met the minimum only when it did; a fraction under is reported with the gap ("0.4 points under the 50% minimum"), and the nightly record carries the gap too.
+
 ## 5.130.0 — 1 October 2026
 
 - **The 50% overnight minimum now holds even when the Flux strategy cannot plan.** Since midnight on 1 October, Octopus has published October's Flux import prices but no export price at all, in any region, although the account is still on the same Flux export tariff. Without an export price the strategy rightly refuses to trade, so it stepped aside all night. The ordinary plan bought only to its own figure of 44%, then ran the house on the battery until 5am, so the day started at about 42%. Now, whenever the strategy is not running the 2am to 5am window, the ordinary plan charges to 50%, or to what tomorrow needs if that is more, and holds the battery there until 5am with the house on the cheap grid. It still never buys to sell at the peak, because that needs the export price. The free-hour exception is unchanged. Version 5.129.1 already lets the strategy plan through a missing export price, so this is the safety net for every other reason it might not be able to plan.

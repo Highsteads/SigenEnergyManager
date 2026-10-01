@@ -515,5 +515,142 @@ class TestTheMorningSaysWhatWasAchieved(unittest.TestCase):
         self.assertEqual(rows[0]["soc_at_close_pct"], 42.0)
 
 
+# ============================================================================
+# 5.130.1 — the review of 5.130.0 (1-Oct-2026)
+# ============================================================================
+
+class TestTheMinimumIsCheckedEvenUnderAHigherTarget(unittest.TestCase):
+
+    def _min(self, hh, mm, soc, target, power_w, headroom):
+        inputs = _inputs_at(hh, mm, soc)
+        with patch.object(fs, "import_headroom_w", return_value=headroom):
+            return fs._minimum_charge(inputs, _local(2026, 10, 1, 5, 0),
+                                      target, power_w, 5.0, 50.0)
+
+    def test_the_reviewed_case_reports_its_shortfall(self):
+        # 40% at 04:55, plan aiming at 60%, 1 kW available: 3.5 kWh needed for the
+        # minimum, about 0.08 deliverable. v2.10 reported 0.0.
+        target, power, buy, raised, short = self._min(4, 55, 40.0, 60.0, 1000, 1000)
+        self.assertEqual(target, 60.0)
+        need = 0.10 * 35.04
+        self.assertAlmostEqual(short, need - 1.0 * (5 / 60) * 0.97, places=1)
+        self.assertGreater(short, 3.3)
+
+    def test_a_small_plan_power_is_raised_to_what_the_minimum_needs(self):
+        target, power, *_ = self._min(4, 0, 40.0, 60.0, 500, 16000)
+        self.assertGreaterEqual(power / 1000.0 * 1.0 * 0.97, 0.10 * 35.04 - 1e-6)
+        self.assertEqual(target, 60.0)
+
+    def test_a_plan_that_reaches_it_reports_nothing(self):
+        *_rest, short = self._min(2, 0, 40.0, 60.0, 10000, 16000)
+        self.assertEqual(short, 0.0)
+
+
+def _mk_site(soc=40.0, home_w=500.0, pv_w=0.0, verified=True):
+    p = _mk(soc=soc, prefs={"fluxSiteImportLimitKw": "16",
+                            "fluxSiteImportVerified": verified})
+    p.latest_inverter_data.update(homePowerWatts=home_w, pvPowerWatts=pv_w)
+    p._wear_p_per_kwh = MagicMock(return_value=2.0)
+    p._flux_planner_floor_pct = MagicMock(return_value=20.0)
+    return p
+
+
+class TestTheFallbackChargeFitsTheSite(unittest.TestCase):
+
+    def test_an_ev_on_the_2am_timer_leaves_nine_kw(self):
+        self.assertEqual(_mk_site(home_w=7000.0)._cheap_window_charge_w(10000), 9000)
+
+    def test_a_quiet_house_gets_the_inverter_rating(self):
+        self.assertEqual(_mk_site(home_w=500.0)._cheap_window_charge_w(10000), 10000)
+
+    def test_the_panels_offset_the_house(self):
+        self.assertEqual(_mk_site(home_w=8000.0, pv_w=2000.0)._cheap_window_charge_w(10000),
+                         10000)
+
+    def test_an_unverified_limit_is_not_used(self):
+        self.assertEqual(_mk_site(home_w=7000.0, verified=False)
+                         ._cheap_window_charge_w(10000), 10000)
+
+    def test_the_charge_starts_inside_the_headroom(self):
+        p = _mk_site(home_w=7000.0)
+        with patch.object(p, "_in_flux_cheap_window", return_value=True):
+            p._act_on_decision(_decision(50.0))
+        self.assertEqual(p.modbus.force_charge.call_args.args[0], 9000)
+
+    def test_a_load_switching_on_trims_the_running_charge(self):
+        p = _mk_site(home_w=500.0)
+        p.modbus.set_charge_limit.return_value = True
+        with patch.object(p, "_in_flux_cheap_window", return_value=True):
+            p._act_on_decision(_decision(50.0))
+            p.store["import_power_w"] = 10000
+            p.latest_inverter_data["homePowerWatts"] = 7400.0
+            p._act_on_decision(_decision(50.0))
+        p.modbus.set_charge_limit.assert_called_with(8600)
+        self.assertEqual(p.store["import_power_w"], 8600)
+
+    def test_the_verify_pass_keeps_the_sized_limit(self):
+        p = _mk_site(home_w=7000.0)
+        p.store.update(import_active=True, cheap_window_import_active=True,
+                       import_power_w=9000, import_target_soc=50.0)
+        p.modbus.read_ems_mode.return_value = 0x04
+        p.modbus.read_discharge_limit.return_value = 0
+        p.modbus.read_charge_limit.return_value = 9000
+        p.modbus.read_discharge_cutoff.return_value = None
+        p.modbus.read_charge_cutoff.return_value = None
+        with patch.object(p, "_driven_export_owns_registers", return_value=False), \
+             patch.object(p, "_flux_armed", return_value=False):
+            try:
+                p._verify_ems_registers()
+            except Exception:
+                pass
+        for c in p.modbus.set_charge_limit.call_args_list:
+            self.assertNotEqual(c.args[0], 10000)
+
+
+class TestTheMorningReportHasNoHiddenAllowance(unittest.TestCase):
+
+    def _close_at(self, soc_at_close, minimum=50.0):
+        p = _mk(soc=40.0)
+        logged = []
+        with tempfile.TemporaryDirectory() as tmp:
+            p.data_dir = tmp
+            p.store["cheap_window_watch"] = {"day": "2026-10-01", "minimum_pct": minimum,
+                                             "manager_ran": False, "flux_ran": True,
+                                             "flux_reason": ""}
+            p.latest_inverter_data["batterySoc"] = soc_at_close
+
+            class _DT(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return _local(2026, 10, 1, 5, 1)
+            with patch.object(plugin, "datetime", _DT), \
+                 patch.object(p, "_in_flux_cheap_window", return_value=False), \
+                 patch.object(plugin, "log", side_effect=lambda m, level="INFO":
+                              logged.append((level, m))):
+                p._note_cheap_window_result()
+            with open(os.path.join(tmp, "cheap_window_results.jsonl"),
+                      encoding="utf-8") as fh:
+                row = json.loads(fh.readline())
+        return logged[0], row
+
+    def test_49_6_is_not_met_and_says_by_how_much(self):
+        (level, msg), row = self._close_at(49.6)
+        self.assertFalse(row["met"])
+        self.assertEqual(row["short_pct"], 0.4)
+        self.assertEqual(level, "WARNING")
+        self.assertIn("0.4 points under the 50% minimum", msg)
+
+    def test_fifty_is_met(self):
+        (level, msg), row = self._close_at(50.0)
+        self.assertTrue(row["met"])
+        self.assertEqual(level, "INFO")
+        self.assertIn("meets the 50% minimum", msg)
+
+    def test_well_below_says_how_far(self):
+        (level, msg), row = self._close_at(42.0)
+        self.assertIn("8.0 points short", msg)
+        self.assertEqual(row["short_pct"], 8.0)
+
+
 if __name__ == "__main__":
     unittest.main()

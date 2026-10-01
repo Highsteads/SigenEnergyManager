@@ -21,6 +21,28 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.130.1 — 01-10-2026
+
+A review of 5.130.0 found three gaps; all three were real.
+- **Fallback headroom.** `_cheap_window_charge_w(requested)`: min(requested, inverter rating,
+  verified `import_limit_w` - max(0, house - PV)), as `flux_strategy.import_headroom_w`. Used at
+  the start of `_drive_cheap_window_import` and re-checked every tick (`set_charge_limit` when
+  it moves by 500 W or more); `_verify_ems_registers` expects `import_power_w` while
+  `cheap_window_import_active`. Mitigated before by the inverter's whole-site import cap
+  (40040-41, asserted while Flux is armed and the limit verified), now right in the request.
+- **flux_strategy 2.10.1 `_minimum_charge`.** The reachability check ran only when the plan's
+  target was under the minimum, so a higher target returned shortfall 0 (40%, 04:55, 1 kW:
+  ~3.42 kWh undeliverable, reported 0). It now runs whenever SOC is under the minimum; with a
+  higher target the power is raised to what the minimum needs (within headroom) and the
+  shortfall returned.
+- **`_note_cheap_window_result`.** The one-point allowance (`soc >= minimum - 1.0` counted as
+  met) is gone: met means short < 0.05; up to one point under is a WARNING saying the gap;
+  JSONL gains `short_pct`.
+- Tests (+13, test_cheap_window_minimum.py): the reviewed case, plan power raised, no false
+  shortfall; EV-on-timer headroom, quiet house, PV offset, unverified limit, start inside the
+  headroom, a load trims the running charge, verify keeps the sized limit; 49.6 not met with
+  its gap, 50.0 met, 42.0 says how far. Seven mutations caught.
+
 ## v5.130.0 — 01-10-2026
 
 Root cause, 1-Oct-2026: Octopus's public schedule for E-1R-FLUX-EXPORT-23-02-14-F (and

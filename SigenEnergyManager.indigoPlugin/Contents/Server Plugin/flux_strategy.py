@@ -9,7 +9,12 @@
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
 #              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026
-# Version:     2.10
+# Version:     2.10.1
+#
+# v2.10.1 (SigenEnergyManager 5.130.1): _minimum_charge checks the minimum is reachable
+# even when the plan's own target is above it (it returned no shortfall at 40% with five
+# minutes and 1 kW left, about 3.4 kWh short), and raises a smaller plan power to what the
+# minimum needs, within the same headroom.
 #
 # v2.10 (SigenEnergyManager 5.130.0) makes the 50% minimum hold when Flux cannot plan.
 #   * 1-Oct-2026: Octopus published October's Flux IMPORT prices but no EXPORT price
@@ -1441,8 +1446,6 @@ def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, minimum):
     soc = float(inputs.soc_pct)
     if minimum <= 0 or soc >= minimum - 0.05:
         return target_pct, power_w, buy_kwh, 0.0, 0.0
-    if target_pct is not None and float(target_pct) >= minimum:
-        return target_pct, power_w, buy_kwh, 0.0, 0.0
     need_kwh = (minimum - soc) / 100.0 * site.capacity_kwh          # battery side
     hours_left = max(MIN_HOURS_LEFT, (window_end - inputs.now).total_seconds() / 3600.0)
     wanted_w = int(math.ceil(need_kwh / site.one_way_efficiency / hours_left * 1000.0))
@@ -1452,6 +1455,12 @@ def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, minimum):
     shortfall = max(0.0, need_kwh - reachable_kwh)
     if shortfall < 0.01:
         shortfall = 0.0
+    shortfall = round(shortfall, 2)
+    if target_pct is not None and float(target_pct) >= minimum:
+        # v2.10.1: a plan already aiming above the minimum still has to be able to
+        # REACH it. The power rises to what the minimum needs if the plan asked for
+        # less, and whatever the time left cannot deliver is reported, not hidden.
+        return target_pct, max(int(power_w or 0), power), buy_kwh, 0.0, shortfall
     if power <= 0:
         return target_pct, power_w, buy_kwh, 0.0, round(need_kwh, 2)
     total = max(float(buy_kwh or 0.0), need_kwh)
