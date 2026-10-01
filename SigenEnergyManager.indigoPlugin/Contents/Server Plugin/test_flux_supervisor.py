@@ -163,7 +163,8 @@ class _FakeModbus:
     def read_remote_ems_enabled(self):
         return True
 
-    def set_backup_soc(self, pct):
+    def set_backup_soc(self, pct, quiet=False):
+        self.backup_quiet = quiet
         self.writes.append(("backup_soc", pct))
         return True
 
@@ -2533,6 +2534,14 @@ class TestRawDriver(unittest.TestCase):
     def test_the_inverter_maximum_comes_from_the_preference(self):
         d = plugin._FluxRawDriver(_FakeModbus(), {"inverterMaxKw": "8.5"})
         self.assertEqual(d.inverter_max_w, 8500)
+
+    def test_the_floor_write_is_quiet(self):
+        """5.131.1: the executor reads every write back itself, and in a peak sale
+        the floor moves every few minutes, so the write logs at DEBUG."""
+        m = _FakeModbus()
+        d = plugin._FluxRawDriver(m, {"inverterMaxKw": "10"})
+        self.assertTrue(d.set_discharge_cutoff(45.0))
+        self.assertTrue(m.backup_quiet)
 
     def test_writes_return_real_booleans(self):
         d = plugin._FluxRawDriver(_FakeModbus(), {"inverterMaxKw": "10"})

@@ -1376,7 +1376,28 @@ class TestDischargeLimitLogsOnChangeOnly(unittest.TestCase):
         info, _ = self._counts(modbus)
         self.assertEqual(info, 2, "a new connection is no proof of the old register")
 
+class TestBackupReserveQuietWrite(unittest.TestCase):
+    """1.18: set_backup_soc(quiet=True) logs at DEBUG, default unchanged."""
+
+    def _m(self):
+        m = _make_modbus()[0]
+        m._write_single_register = MagicMock(return_value=True)
+        m.logger = MagicMock()
+        return m
+
+    def test_quiet_logs_at_debug(self):
+        m = self._m()
+        self.assertTrue(m.set_backup_soc(48.0, quiet=True))
+        m.logger.info.assert_not_called()
+        m.logger.debug.assert_called_once()
+
+    def test_the_default_still_logs_at_info(self):
+        m = self._m()
+        self.assertTrue(m.set_backup_soc(48.0))
+        m.logger.info.assert_called_once()
+
 
 if __name__ == "__main__":
     print("Running SigenEnergyManager Modbus register tests")
     unittest.main(verbosity=2)
+

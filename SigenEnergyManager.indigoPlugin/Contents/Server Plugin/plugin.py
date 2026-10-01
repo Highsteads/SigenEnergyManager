@@ -65,8 +65,9 @@
 #              Claude Opus 5.5 (5.130.0 — the 50% minimum holds when Flux cannot plan; the manager runs the cheap window to 5am)
 #              Claude Opus 5.5 (5.130.1 — fallback charge sized to site headroom; minimum shortfall always checked; 5am report has no hidden tolerance)
 #              Claude Opus 5.5 (5.131.0 — the Axle 'pre-charge' writes nothing; the event floor is set at T-2min every time)
+#              Claude Opus 5.5 (5.131.1 — the peak sale moves its floor without stopping, and logs its plan once)
 # Date:        28-09-2026
-# Version:     5.131.0
+# Version:     5.131.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1565,7 +1566,9 @@ class _FluxRawDriver:
         # hardware watchdog, so whatever floor Flux last wrote survives a lost
         # connection — on 40048 that would lock the house out of its own battery
         # in a power cut that followed; on 40046 the battery stays fully usable.
-        ok = bool(self._modbus.set_backup_soc(float(pct)))
+        # quiet: the executor reads it back itself, and in a peak sale the floor
+        # moves every few minutes (5.131.1).
+        ok = bool(self._modbus.set_backup_soc(float(pct), quiet=True))
         if ok and self._on_backup_written is not None:
             self._on_backup_written(float(pct))
         return ok

@@ -321,25 +321,36 @@ class FluxExecutor:
                     self._valid_target(target, _utc(self.clock()))
                     self.last_error = ''
                     return 'applied'
-            # SAME MODE AND ENERGY BAND, NEW POWER ONLY: adjust the limits in place.
-            # A full _apply neutralises first (mode 2; until 5.125.1 both limits to 0
-            # as well), which is
-            # right for a change of mode or cutoffs but, measured live 17-Sep-2026,
-            # dropped a 4 kW peak export to zero for ~20-30 s on every tick the
-            # planned power moved. Staying in the verified mode and moving only the
-            # limit in the permitted direction is the same end state without the gap.
-            # Falls back to the full _apply on any unacknowledged write.
+            # SAME MODE: adjust whatever moved in place. A full _apply neutralises
+            # first (mode 2; until 5.125.1 both limits to 0 as well), which is right
+            # for a change of MODE but, measured live, stops a 4 kW peak export for
+            # ~15-30 s every time: on 17-Sep-2026 when the planned power moved, and
+            # on 1-Oct-2026 (SigenEnergyManager 5.131.1) when the floor moved — the
+            # sale holds back what the house needs until 2am, which falls a point
+            # every few minutes, and 16:00-18:00 went through mode 2 seventeen times.
+            # The mode is unchanged and verified, and every write is read back, so the
+            # worst a half-finished sequence leaves is a value between the old target
+            # and the new one in the SAME mode. Only the values that moved are
+            # written. Falls back to the full _apply on any unacknowledged write.
             if (previous is not None and previous.ems_mode == target.ems_mode
-                    and previous.charge_cutoff_pct == target.charge_cutoff_pct
-                    and previous.discharge_cutoff_pct == target.discharge_cutoff_pct
                     and self._verify(previous.ems_mode, previous.charge_limit_w,
                                      previous.discharge_limit_w,
                                      previous.charge_cutoff_pct, previous.discharge_cutoff_pct)):
                 d = self.raw
-                if (self._set_read(d.set_charge_limit, d.read_charge_limit, target.charge_limit_w, 1)
-                        and self._set_read(d.set_discharge_limit, d.read_discharge_limit,
-                                           target.discharge_limit_w, 1)
-                        and self._verify(*settings(target))):
+                ok = True
+                for old, new, setter, reader, tol in (
+                        (previous.charge_cutoff_pct, target.charge_cutoff_pct,
+                         d.set_charge_cutoff, d.read_charge_cutoff, .04),
+                        (previous.discharge_cutoff_pct, target.discharge_cutoff_pct,
+                         d.set_discharge_cutoff, d.read_discharge_cutoff, .04),
+                        (previous.charge_limit_w, target.charge_limit_w,
+                         d.set_charge_limit, d.read_charge_limit, 1),
+                        (previous.discharge_limit_w, target.discharge_limit_w,
+                         d.set_discharge_limit, d.read_discharge_limit, 1)):
+                    if old != new and not self._set_read(setter, reader, new, tol):
+                        ok = False
+                        break
+                if ok and self._verify(*settings(target)):
                     self._valid_target(target, _utc(self.clock()))
                     self.last_error = ''
                     return 'applied'

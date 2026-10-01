@@ -204,14 +204,27 @@ class FluxExecutionTests(unittest.TestCase):
         self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=500))
         self.d.writes.clear(); self.now+=timedelta(seconds=5)
         self.assertEqual(self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3900),self.now),'applied')
-        self.assertEqual(self.d.writes,[('charge',0),('discharge',3900)])
+        # 5.131.1: only the value that moved is written.
+        self.assertEqual(self.d.writes,[('discharge',3900)])
         self.assertEqual((self.d.values['mode'],self.d.values['discharge']),(5,3900))
 
-    def test_mode_or_band_change_still_neutralises_first(self):
+    def test_a_floor_change_in_the_same_mode_adjusts_in_place(self):
+        """1-Oct-2026 live: the peak sale's floor fell a point every few minutes
+        and every move took the inverter through mode 2, seventeen times 16:00-18:00."""
         self.now=self.now.replace(hour=16)
         self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
         self.d.writes.clear(); self.now+=timedelta(seconds=5)
-        self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000,discharge_cutoff_pct=40.),self.now)
+        self.assertEqual(self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000,
+                                                 discharge_cutoff_pct=40.),self.now),'applied')
+        self.assertNotIn(('mode',2),self.d.writes)
+        self.assertEqual(self.d.values['mode'],5)
+
+    def test_a_mode_change_still_neutralises_first(self):
+        self.now=self.now.replace(hour=16)
+        self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
+        self.d.writes.clear(); self.now+=timedelta(seconds=5)
+        self.e.step(self.target(ems_mode=2,charge_limit_w=0,discharge_limit_w=10000,
+                                discharge_cutoff_pct=40.),self.now)
         # 5.125.1: mode 2 first, and the limits are never zeroed on the way.
         self.assertEqual(self.d.writes[0],('mode',2))
         self.assertNotIn(('discharge',0),self.d.writes)
@@ -222,8 +235,8 @@ class FluxExecutionTests(unittest.TestCase):
         self.d.writes.clear(); self.now+=timedelta(seconds=5); self.d.lie='discharge'
         self.assertEqual(self.e.step(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3900),self.now),'pending')
         # The in-place write is tried, then the full apply's neutralise (mode 2).
-        self.assertEqual(self.d.writes[:2],[('charge',0),('discharge',3900)])
-        self.assertIn(('mode',2),self.d.writes[2:])
+        self.assertEqual(self.d.writes[:1],[('discharge',3900)])
+        self.assertIn(('mode',2),self.d.writes[1:])
 
     def test_realistic_slow_staging_within_observation_budget(self):
         self.e.step(None,self.now)

@@ -21,6 +21,23 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.131.1 — 01-10-2026
+
+CliveS, 1-Oct-2026, pasting two plan notes six minutes apart (floor 49% then 48%): "I dont need
+to see these logs every minute or two". 16:00-18:00 had 16 plan notes and 17 mode-2 writes.
+- **flux_execution `step()`**: the in-place path covers any change within the SAME verified
+  mode (was limits only, cutoffs equal). Only values that moved are written, each read back;
+  then the full `_verify`; any failure falls back to `_apply` (neutralise first). A mode
+  change still neutralises first.
+- **flux_strategy 2.10.2 `note_control_key`**: the discharge floor is out of the key (the charge
+  target stays: it is the overnight plan and moves a few times a night).
+- **sigenergy_modbus 1.18 `set_backup_soc(quiet=False)`**: DEBUG when quiet; `_FluxRawDriver`
+  passes quiet=True (the executor reads every write back). SigenVPP's copy synced.
+- Tests: executor floor-in-place, mode change still neutralises, only moved values written,
+  failed in-place write falls back; peak note one line however the floor moves; quiet floor
+  write; set_backup_soc quiet/default. Mutations: floor forcing full apply, unchanged values
+  written, read-back removed, note keyed on the floor - all caught.
+
 ## v5.131.0 — 01-10-2026
 
 - **`_start_vpp_precharge` is read-only.** `vpp_floor_deferred` is set True always (was

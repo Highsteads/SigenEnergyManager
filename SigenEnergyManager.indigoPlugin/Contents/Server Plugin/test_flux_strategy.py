@@ -1056,8 +1056,10 @@ class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
         self.assertEqual(len(self._lines(ticks)), 4,
                          "one line per target, not one per tick")
 
-    def test_the_peak_window_is_one_line_per_floor(self):
-        """16:00-19:00 as it ran: 19.0 kWh spare decaying to 6.3, floor 42/41/40."""
+    def test_the_peak_window_is_one_line_however_the_floor_moves(self):
+        """16:00-19:00 as it ran: 19.0 kWh spare decaying to 6.3, floor 42/41/40.
+        5.131.1: one line, not one per floor. CliveS, 1-Oct-2026: "I dont need to
+        see these logs every minute or two" (16 lines 16:00-18:00 that day)."""
         ticks = []
         for floor, hi, lo in ((42, 19.0, 12.1), (41, 12.0, 8.1), (40, 8.0, 6.3)):
             kwh = hi
@@ -1065,7 +1067,7 @@ class TestNoteKeyDedupesOnPlanNotProse(unittest.TestCase):
                 ticks.append(self._export(kwh, floor))
                 kwh -= 0.1
         self.assertGreater(len(ticks), 100)
-        self.assertEqual(len(self._lines(ticks)), 3)
+        self.assertEqual(len(self._lines(ticks)), 1)
 
     def test_the_old_key_could_not_dedupe_anything(self):
         """The regression this fixes. Proven, not asserted from memory."""

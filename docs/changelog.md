@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.131.1 — 1 October 2026
+
+- **The 4pm to 7pm sale no longer stops for a few seconds every few minutes.** The sale holds back what the house will need until 2am, and that figure falls a point at a time as the evening goes on. Each time it moved, the plugin took the inverter back to Self Consumption for about 15 seconds and then started the sale again: seventeen times between 4pm and 6pm on 1 October. Within the same mode it now changes only the setting that moved, in place, as it already did for the selling power, and every write is still read back.
+- **The plan is written to the Event Log once, not every few minutes.** The same sentence appeared sixteen times in those two hours, once for each one-point move of the floor. A new kind of plan, or a new explanation, still gets its line. The overnight charge target still gets a line when it changes, because it is the plan.
+
 ## 5.131.0 — 1 October 2026
 
 - **Nothing happens on the inverter half an hour before an Axle event any more.** The step still called "pre-charge" stopped charging the battery long ago, and the two things it still did were left over: it set the event's battery floor half an hour early, which gained nothing, and once the battery was ready it switched the inverter to Self Consumption, which only ever got in the way (on 21 September it wrote over a Saving Session export). The floor is now set two minutes before every event, as the event takes over, which is what already happened during the 4pm to 7pm sale. The half-hour check that the battery holds enough, and the Pushover when it does not, stay. The event's energy is still planned hours earlier, and topped up from the grid when the battery would not cover it.

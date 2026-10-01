@@ -9,7 +9,10 @@
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
 #              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026
-# Version:     2.10.1
+# Version:     2.10.2
+#
+# v2.10.2 (SigenEnergyManager 5.131.1): note_control_key no longer keys on the discharge
+# floor, so a floor moving a point at a time through a sale is not a new log line.
 #
 # v2.10.1 (SigenEnergyManager 5.130.1): _minimum_charge checks the minimum is reachable
 # even when the plan's own target is above it (it returned no shortfall at 40% with five
@@ -1928,9 +1931,14 @@ def note_control_key(decision):
     percentages: when the text says 41% and then 42%, that is a visible change
     and deserves a line; 41.4% against 41.2% is not.
     """
+    # 2.10.2 (SigenEnergyManager 5.131.1): NOT the floor. In a peak sale the floor
+    # is what the house needs until 2am, which falls a point every few minutes, and
+    # keying on it wrote the same sentence 16 times between 16:00 and 18:00 on
+    # 1-Oct-2026. CliveS: "I dont need to see these logs every minute or two". The
+    # charge TARGET stays: it is the overnight plan and moves a few times a night.
     return (decision.mode, decision.ems_mode,
             decision.charge_limit_w > 0, decision.discharge_limit_w > 0,
-            round(decision.charge_cutoff_pct), round(decision.discharge_cutoff_pct))
+            round(decision.charge_cutoff_pct))
 
 
 def note_key(decision):

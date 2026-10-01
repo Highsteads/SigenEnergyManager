@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.131.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.131.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.131.1** — The 4pm to 7pm sale no longer stops for a few seconds every few minutes as its reserve moves, and its plan is logged once rather than every few minutes.
 
 **v5.131.0** — Nothing happens on the inverter half an hour before an Axle event any more; the event's battery floor is set two minutes before it starts, as the event takes over.
 
@@ -112,6 +114,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.131.1 | 1 October 2026 | Peak sale moves its floor without stopping; one log line |
 | 5.131.0 | 1 October 2026 | Axle "pre-charge" writes nothing; floor set at the start |
 | 5.130.1 | 1 October 2026 | Fallback charge sized to the site; shortfalls always shown |
 | 5.130.0 | 1 October 2026 | The 50% minimum holds when Flux cannot plan |
