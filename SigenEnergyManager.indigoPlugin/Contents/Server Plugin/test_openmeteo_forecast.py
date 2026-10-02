@@ -18,6 +18,7 @@ import os
 import sys
 import openmeteo_forecast
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 
@@ -497,7 +498,11 @@ class TestPartialFetch(unittest.TestCase):
             "todayKwh": 50.0, "tomorrowKwh": 40.0,
             "arrays_ok": n, "arrays_total": n, "forecastStatus": "OK",
             "_hourly_p50_today": {}, "_hourly_p50_tomorrow": {}, "_dawn_times": {},
+            # Review 02-10-2026: a fallback must be today's and young enough, so
+            # the fixture says when it is from.
+            "forecastDate": self.f._now_local().strftime("%Y-%m-%d"),
         }
+        self.f._cached_time = time.time()
         self._mock_arrays(ok_count=1)                       # next fetch is partial
         result = self.f.fetch_forecast(force=True)
         self.assertEqual(result["todayKwh"], 50.0)          # served the complete cache

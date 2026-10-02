@@ -362,7 +362,9 @@ class TestPersistenceAndMigration(_Tmp):
         self.assertFalse(p.store["energy_day_partial"])
 
     def test_pre_589_file_on_another_day_seeds_nothing(self):
-        legacy = {"today_date": D1, "pv_lifetime_start_kwh": 7613.16}
+        # Two days old (review 02-10-2026): a file from YESTERDAY is now restored
+        # as yesterday so its midnight is recorded; an older one still is not.
+        legacy = {"today_date": "2026-09-03", "pv_lifetime_start_kwh": 7613.16}
         with open(os.path.join(self.tmp, "accumulators.json"), "w", encoding="utf-8") as fh:
             json.dump(legacy, fh)
         p = _mk(self.tmp)

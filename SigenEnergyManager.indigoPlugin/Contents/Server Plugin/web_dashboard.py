@@ -191,7 +191,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             return True
         if self._client_is_loopback():
             return True
-        return hmac.compare_digest(self._presented_token(), self._auth_token)
+        # As bytes (review 02-10-2026): compare_digest refuses str holding any
+        # non-ASCII character, so ?token=%C3%A9 raised and the request got no
+        # answer at all instead of a 401.
+        return hmac.compare_digest(str(self._presented_token()).encode("utf-8"),
+                                   str(self._auth_token).encode("utf-8"))
 
     def _send_unauthorised(self):
         body = (b'{"error":"unauthorised - append ?token=... or send '

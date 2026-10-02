@@ -191,6 +191,10 @@ class TestMissingAnchorsRecoveryAndPartialDays(unittest.TestCase):
         self.assertEqual(de.today()["values"]["pv"], 10.0)
         # the plant re-based PV to zero (firmware replacement)
         de.observe(_full(pv=0.5), MID_D1 + 7200, D1)
+        # review 02-10-2026: one low read is an outlier, not yet a reset
+        self.assertEqual(de.last_backwards, ())
+        self.assertEqual(de.today()["values"]["pv"], 10.0)
+        de.observe(_full(pv=0.5), MID_D1 + 7215, D1)                # it persists
         self.assertEqual(de.last_backwards, ("pv",))
         self.assertEqual(de.today()["sources"]["pv"], "late")
         self.assertEqual(de.today()["values"]["pv"], 0.0)

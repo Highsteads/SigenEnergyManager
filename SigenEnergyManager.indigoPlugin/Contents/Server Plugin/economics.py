@@ -4,8 +4,8 @@
 # Description: Whole-house cost settlement and the daily / yesterday / period / calendar
 #              economics summaries. Lifted out of plugin.py, and Indigo-free by design.
 # Author:      CliveS & Claude Opus 5
-# Date:        25-08-2026
-# Version:     1.0
+# Date:        02-10-2026
+# Version:     1.1 (review 02-10-2026: settle gate measured against the real day length)
 
 """Money, worked out from the daily history.
 
@@ -56,7 +56,8 @@ class Economics:
     """
 
     COST_SETTLE_WINDOW_DAYS = 14   # settle whole-house cost for the last N days
-    COST_SETTLE_MIN_SLOTS   = 46   # require a (near-)complete electricity day
+    COST_SETTLE_MIN_SLOTS   = 46   # require a (near-)complete electricity day (of 48)
+    COST_SETTLE_MAX_MISSING = 2    # ...i.e. at most 2 half-hours short of the real day
 
     def __init__(self, data_dir, octopus=None, logger=None, now_fn=None):
         self.data_dir  = data_dir
@@ -69,6 +70,26 @@ class Economics:
         self._wh_hist_mtime = None
 
     # ---- clock ------------------------------------------------------------
+    @classmethod
+    def _settle_min_slots(cls, date_str):
+        """Half-hours needed before a local day may settle: its real slot count less
+        COST_SETTLE_MAX_MISSING. 46 on a normal day, 44 on the 23-hour clocks-forward
+        day, 48 on the 25-hour clocks-back day. Falls back to COST_SETTLE_MIN_SLOTS
+        when the day length cannot be worked out (no tz database, bad date)."""
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d")
+            start = london_time.london_localise(d)
+            end   = london_time.london_localise(d + timedelta(days=1))
+            if start is None or end is None:
+                return cls.COST_SETTLE_MIN_SLOTS
+            n = int((end.astimezone(timezone.utc) - start.astimezone(timezone.utc))
+                    .total_seconds() // 1800)
+        except (TypeError, ValueError):
+            return cls.COST_SETTLE_MIN_SLOTS
+        if n <= cls.COST_SETTLE_MAX_MISSING:
+            return cls.COST_SETTLE_MIN_SLOTS
+        return n - cls.COST_SETTLE_MAX_MISSING
+
     def _now(self):
         """Current time as an aware Europe/London datetime."""
         return self._now_fn()
@@ -797,7 +818,14 @@ class Economics:
             # in a near-zero bill permanently (cost_settled). Wait until the day is whole.
             if not imp or imp.get("kwh") is None:
                 continue
-            if imp.get("slots", 0) < self.COST_SETTLE_MIN_SLOTS:
+            # review 02-10-2026: the gate was a fixed 46, so on the 25-hour clocks-back
+            # day (50 slots; next 25-Oct-2026) a day still missing its last 4 slots
+            # settled and froze low. Measure against the real length of the local day:
+            # 46 of 48 as before, 44 of 46 in March, 48 of 50 in October. An explicit
+            # `complete: False` from Octopus (readings stop short of day end) also waits.
+            if imp.get("slots", 0) < self._settle_min_slots(date_str):
+                continue
+            if imp.get("complete") is False:
                 continue
 
             # Gas: gate on FULL-DAY COVERAGE, not a 46-slot half-hourly count.

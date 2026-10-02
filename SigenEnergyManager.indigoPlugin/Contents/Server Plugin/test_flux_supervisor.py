@@ -504,15 +504,30 @@ class TestAccountEvidencePlumbing(unittest.TestCase):
         self.assertEqual(used, {"FLUX-IMPORT-23-02-14", "FLUX-EXPORT-23-02-14"})
         p.octopus._probe_product_by_prefix.assert_not_called()
 
-    def test_a_failed_account_read_clears_the_evidence_and_the_prices(self):
+    def test_a_failed_account_read_keeps_the_proof_and_stamps_nothing(self):
+        """CONTRACT CHANGED 02-10-2026 (CliveS, review of 5.131.1). A failed read
+        used to wipe the proof, so one Octopus timeout switched Flux control off
+        until the next good read (19:06-19:36 on 1 Oct). The proof carries its own
+        fetched_at, which _flux_tariff_verified limits to six hours, so keeping it
+        cannot keep stale proof alive — and the prices are still never re-stamped."""
         p = self._plugin_with_octopus({})
-        p.store["flux_account_evidence"] = _evidence()
+        kept = p.store["flux_account_evidence"] = _evidence()
         stamp = p.store["flux_rates_at"] = time.time() - 500
         p._refresh_flux_rates()
-        self.assertEqual(p.store["flux_account_evidence"], {})
+        self.assertIs(p.store["flux_account_evidence"], kept)
         self.assertEqual(p.store["flux_rates_at"], stamp,
                          "prices were stamped fresh on a failed account read")
-        self.assertIn("nothing is proven", p.store["flux_rates_problem"])
+        self.assertIn("last proof stands", p.store["flux_rates_problem"])
+
+    def test_kept_proof_still_expires_on_its_own_age(self):
+        p = self._plugin_with_octopus({})
+        old = _evidence()
+        old["fetched_at"] = time.time() - plugin.FLUX_ACCOUNT_EVIDENCE_MAX_AGE_S - 60
+        p.store["flux_account_evidence"] = old
+        p._refresh_flux_rates()
+        ok, why = p._flux_tariff_verified()
+        self.assertFalse(ok)
+        self.assertIn("recently enough", why)
 
     def test_an_account_with_no_export_agreement_fetches_no_rates(self):
         evidence = _evidence()
@@ -2851,17 +2866,31 @@ class TestDayRateImportStopsThePeakExport(_FluxCase):
         p, when = self._at((12, 5), soc=45.0)
         p.modbus = MagicMock()
         p._note_day_rate_import = MagicMock()
-        p.latest_inverter_data["emsWorkMode"] = "Charge Grid First"
+        # Review 02-10-2026: the evidence is the REMOTE mode register (40031) as
+        # the verify pass read it. This test used to set emsWorkMode (30003) to
+        # "Charge Grid First", a value that register never holds — so it passed
+        # while the check could not fire on the real inverter.
+        p.store["remote_ems_mode_seen"] = (0x03, time.time())
         dec = MagicMock(action=plugin.ACTION_SCHEDULE_IMPORT, target_soc_pct=40.0,
                         scheduled_time=when, reason="test")
         p._act_on_decision(dec)
         p._note_day_rate_import.assert_called_once()
 
+    def test_an_old_reading_of_the_mode_records_nothing(self):
+        p, when = self._at((12, 5), soc=45.0)
+        p.modbus = MagicMock()
+        p._note_day_rate_import = MagicMock()
+        p.store["remote_ems_mode_seen"] = (0x03, time.time() - 600)
+        dec = MagicMock(action=plugin.ACTION_SCHEDULE_IMPORT, target_soc_pct=40.0,
+                        scheduled_time=when, reason="test")
+        p._act_on_decision(dec)
+        p._note_day_rate_import.assert_not_called()
+
     def test_self_consumption_on_the_inverter_records_nothing(self):
         p, when = self._at((12, 5), soc=45.0)
         p.modbus = MagicMock()
         p._note_day_rate_import = MagicMock()
-        p.latest_inverter_data["emsWorkMode"] = "Max Self Consumption"
+        p.store["remote_ems_mode_seen"] = (0x02, time.time())
         dec = MagicMock(action=plugin.ACTION_SCHEDULE_IMPORT, target_soc_pct=40.0,
                         scheduled_time=when, reason="test")
         p._act_on_decision(dec)

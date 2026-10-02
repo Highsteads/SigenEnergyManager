@@ -307,7 +307,18 @@ class FluxExecutor:
                     raise RuntimeError('Baseline restoration not acknowledged')
                 self._owns = self._pending = False
                 self._target = None
-                self._save()
+                # review 02-10-2026: the restore is VERIFIED, so a journal that
+                # cannot be written must not put the claim back. It used to raise
+                # into the handler below, which re-set pending: twelve restore
+                # writes every tick and owns_control True for ever. A stale
+                # journal is safe — the constructor treats it as diagnostic and
+                # always reconciles after a restart.
+                try:
+                    self._save()
+                except (OSError, ValueError, TypeError) as exc:
+                    self.last_error = (f'Released, but the ownership journal could '
+                                       f'not be written: {exc}')
+                    return 'released'
                 self.last_error = invalid or ''
                 return 'released'  # new targets only on a subsequent fresh step
             previous = self._target

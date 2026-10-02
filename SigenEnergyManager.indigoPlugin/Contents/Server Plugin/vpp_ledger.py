@@ -5,8 +5,8 @@
 #              beside what we observed ourselves, and never merged into one
 #              ambiguous number.
 # Author:      CliveS & Claude Opus 5
-# Date:        18-08-2026
-# Version:     1.2
+# Date:        02-10-2026
+# Version:     1.3 (review 02-10-2026: an email- stand-in never evicts Axle's real row)
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -165,6 +165,12 @@ def save_ledger(path, ledger):
 # Importing Axle's own numbers
 # ======================================================================
 
+def _is_email_stand_in(transaction_id):
+    """True for a row made from Axle's settlement EMAIL (`email-<start>`, the id
+    convention axle_email.py and the hand-typed rows share), not Axle's account."""
+    return str(transaction_id or "").startswith("email-")
+
+
 def import_axle_payload(ledger, payload, fetched_at=None):
     """Merge an Axle account payload into the ledger.
 
@@ -235,6 +241,15 @@ def import_axle_payload(ledger, payload, fetched_at=None):
         if tid not in existing:
             clash = by_window.get(w) if w else None
             if clash and clash != tid:
+                # review 02-10-2026: the mail scan re-imports every settlement email
+                # every six hours, so after the account import had replaced
+                # `email-<start>` with Axle's real transaction, the next scan popped
+                # the real row and put the stand-in back (losing settlement_date and
+                # payment_status). A stand-in may only supersede another stand-in;
+                # an authentic row holding the window wins and the email is ignored.
+                if (_is_email_stand_in(tid)
+                        and not _is_email_stand_in(clash)):
+                    continue
                 # Same window, different id: the incoming row supersedes.
                 existing.pop(clash, None)
             else:

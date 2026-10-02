@@ -7,6 +7,20 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.132.0 — 2 October 2026
+
+The second part of an independent review of the plugin.
+
+- **Octopus being slow no longer holds up the battery.** The tariff check now runs on its own, so a run of Octopus timeouts can no longer stop the plugin watching the inverter. On 1 October it went three minutes without a look during an Axle event.
+- **One failed Octopus check no longer switches Flux off.** The proof that the account is on Flux now stands for its full six hours when Octopus cannot be reached, and survives a restart. On 1 October a restart during an Octopus outage left Flux off for half an hour. A check that shows the house is not on Flux still stops it at once.
+- **A blip in the Axle connection no longer cancels an event.** A failed poll before an event was read as Axle withdrawing it, so the battery's floor was undone and the plugin checked again only every ten minutes, which could start the paid window late. Only a clean answer with no event cancels it now, and a cancelled event no longer shows a countdown.
+- **The 4pm to 7pm sale no longer starts and stops on sunny afternoons.** With the roof still producing, the sale sold itself down, handed back, banked the sun and started again, up to a hundred times an evening. It now sells the roof's surplus straight out once the spare is used up.
+- **The 2am charge reaches its target** instead of stopping about 1% short every night.
+- **Covering an Axle event no longer buys at the peak price.** If the cover was still running at 4pm it went on buying the whole evening's energy at the peak rate. Inside the peak it now buys only what the event itself needs.
+- **The summer overnight drain no longer sells energy Flux buys back.** On Flux it now stops at the 50% the 2am charge would otherwise buy back, rather than selling down to 40% at 9.7p and buying the difference at 14.6p. Its reason now gives the real export rate rather than 12p.
+- **Smaller fixes to control and money.** A charge ceiling is no longer left in place all day when the hand-back happens with the inverter briefly unreachable. Flux prices come from the product the account is billed on, and are kept rather than dropped when one fetch fails. A failed MeteoAlarm read is no longer taken as an all-clear, and a Minor (green) alert no longer counts as yellow. An old solar forecast is no longer shown as current, and saving Configure no longer resets the forecast correction until midnight.
+- **Records and history.** A restart across midnight now records the day that ended. An unreadable history or earnings file is moved aside rather than overwritten. The clocks-change night keeps all its half-hours. An Axle event across midnight no longer settles negative. Axle's own earnings record is no longer swapped back for the email figure. A free-hour credit no longer goes to a claim that is still being measured. The battery's temperatures and settings are no longer written as zero after an inverter outage, a reboot's zero energy reading is no longer taken as a meter reset, and the solar forecast device no longer shows 0 kWh for half an hour after a restart.
+
 ## 5.131.2 — 2 October 2026
 
 - **The inverter goes back to Self Consumption when the plugin stops.** Indigo stops a plugin's background work before it asks the plugin to shut down, and from then on the short pauses between inverter writes failed. Only the first of the four writes that hand the inverter back reached it, so a charge or a sale running at the time carried on with nothing to stop it until the plugin started again. All four now reach it.

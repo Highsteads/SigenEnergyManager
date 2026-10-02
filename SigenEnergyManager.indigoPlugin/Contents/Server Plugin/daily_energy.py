@@ -5,9 +5,16 @@
 #              counters anchored at local midnight. Nothing is accumulated, nothing
 #              is reset, no guard can latch, and the inverter's own clock plays no
 #              part. Design note: docs/daily-energy-revamp.md.
-# Author:      CliveS & Claude Fable 5.1
-# Date:        05-09-2026 12:40
-# Version:     1.0
+# Author:      CliveS & Claude Fable 5.1; Claude Opus 5.5 (1.1)
+# Date:        05-09-2026 12:40; 1.1 02-10-2026
+# Version:     1.1 (review 02-10-2026: a backwards step is a meter reset only
+#              when it persists over RESET_CONFIRM_READS fresh reads, and only
+#              today's anchor is re-based; a provisional midnight anchor is
+#              upgraded per key, from keys actually read after midnight
+#              (readings_from_data honours _energyFreshKeys); recovery values
+#              larger than the lifetime reading or than a day can hold are
+#              rejected; completed() reads None across a reset, not 0.)
+#              prior 1.0 (initial)
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -85,6 +92,18 @@ PROVISIONAL_MAX_AGE_S = 900
 # rather than rounding noise (the counters are integer hundredths of a kWh).
 BACKWARDS_TOLERANCE_KWH = 0.011
 
+# review 02-10-2026: ONE low read is not a meter reset. An inverter that answers
+# just after a reboot, before its counters are loaded, gave one bad read; it was
+# taken as a reset, today's anchor was re-based on it, and the next good read
+# made today's figure the whole lifetime counter. A real reset persists, so it
+# must be seen on this many consecutive fresh reads before it is accepted.
+RESET_CONFIRM_READS = 2
+
+# review 02-10-2026: a device daily counter above this is not a day's energy for
+# a house, it is a sentinel (0xFFFFFFFF at gain 100 is 42,949,672.95 kWh, which
+# MAX_PLAUSIBLE_LIFETIME_KWH cannot catch). Used to vet anchor recovery.
+MAX_PLAUSIBLE_DAILY_KWH = 200.0
+
 
 def local_midnight_epoch(date_str):
     """Epoch seconds of local (Europe/London) midnight starting `date_str`.
@@ -129,6 +148,10 @@ class DailyEnergy:
         self.latest     = {}
         # keys whose counter stepped backwards on the last observe (meter reset)
         self.last_backwards = ()
+        # key -> {"kwh": first low reading, "reads": consecutive low reads}.
+        # A backwards step waiting for RESET_CONFIRM_READS before it counts.
+        # Not persisted: a restart simply starts the count again.
+        self._reset_suspects = {}
 
     # ------------------------------------------------------------------
     # Observation
@@ -173,25 +196,54 @@ class DailyEnergy:
         readings = {k: float(v) for k, v in (readings or {}).items()
                     if k in KEYS and v is not None
                     and 0.0 <= float(v) < MAX_PLAUSIBLE_LIFETIME_KWH}
+        # review 02-10-2026: a recovery value is a day's energy. One larger than
+        # a day can hold (a U32 sentinel), or than the lifetime counter it is
+        # subtracted from, would turn today's figure into the lifetime total.
         recovery = {k: float(v) for k, v in (recovery or {}).items()
-                    if k in RECOVERY_DATA_KEYS and v is not None and float(v) >= 0.0}
+                    if k in RECOVERY_DATA_KEYS and v is not None
+                    and 0.0 <= float(v) <= MAX_PLAUSIBLE_DAILY_KWH}
+        recovery = {k: v for k, v in recovery.items()
+                    if k not in readings or v <= readings[k]}
+        self.last_backwards = ()
         if today != self.today_date:
             self.rollover(today)
         if not fresh or not readings:
             return
 
-        # Meter-reset guard: a lifetime counter cannot go down. If it did, the
-        # plant re-based it, and every anchor for that key is meaningless.
-        backwards = []
-        for key, kwh in readings.items():
+        # Meter-reset guard: a lifetime counter cannot go down. If it did and
+        # STAYED down (review 02-10-2026: one low read is an outlier — an
+        # inverter answering before its counters load), the plant re-based it
+        # and today's anchor for that key is meaningless. Until it is confirmed
+        # the low reading is ignored and `latest` keeps the good value.
+        backwards, reanchor_at = [], {}
+        for key in list(readings):
+            kwh  = readings[key]
             prev = self.latest.get(key)
-            if prev is not None and kwh < prev["kwh"] - BACKWARDS_TOLERANCE_KWH:
-                backwards.append(key)
+            if prev is None or kwh >= prev["kwh"] - BACKWARDS_TOLERANCE_KWH:
+                self._reset_suspects.pop(key, None)
+                continue
+            suspect = self._reset_suspects.get(key)
+            if suspect is not None and kwh >= suspect["kwh"] - BACKWARDS_TOLERANCE_KWH:
+                suspect["reads"] += 1
+            else:
+                suspect = {"kwh": kwh, "reads": 1}
+                self._reset_suspects[key] = suspect
+            if suspect["reads"] < RESET_CONFIRM_READS:
+                del readings[key]
+                continue
+            backwards.append(key)
+            reanchor_at[key] = suspect["kwh"]       # the first post-reset reading
+            del self._reset_suspects[key]
         self.last_backwards = tuple(backwards)
+        # Only TODAY's anchor is re-based. Yesterday's is a real boundary
+        # reading and stays; completed() reads None across the reset.
+        today_anchor = self.anchors.get(today)
         for key in backwards:
-            for anchor in self.anchors.values():
-                anchor["values"].pop(key, None)
-                anchor["sources"].pop(key, None)
+            if today_anchor is not None:
+                today_anchor["values"].pop(key, None)
+                today_anchor["sources"].pop(key, None)
+        if not readings:
+            return
 
         for key, kwh in readings.items():
             self.latest[key] = {"kwh": kwh, "read_at": float(read_at)}
@@ -204,29 +256,41 @@ class DailyEnergy:
 
         midnight = local_midnight_epoch(today)
         if anchor.get("provisional") and midnight is not None and read_at >= midnight:
+            # review 02-10-2026: settled PER KEY. A cycle reads only some of the
+            # energy blocks fresh (the rest are cache, possibly pre-midnight),
+            # so a key is upgraded only when it was itself read after midnight;
+            # the others stay "provisional" until they are, or the window shuts.
+            pending = [k for k in anchor["values"]
+                       if anchor["sources"].get(k) == "provisional"]
             if read_at - midnight <= PROVISIONAL_UPGRADE_WINDOW_S:
                 # The first genuine post-midnight reading: the real boundary value.
                 for key, kwh in readings.items():
                     anchor["values"][key]  = kwh
                     anchor["sources"][key] = "midnight"
+                settled = not any(anchor["sources"].get(k) == "provisional"
+                                  for k in anchor["values"])
             elif midnight - float(anchor.get("captured_at") or 0.0) <= PROVISIONAL_MAX_AGE_S:
                 # No reading arrived near midnight (plugin down), but the
                 # provisional one was taken just before it: keep it as the
                 # boundary. Recovery still wins for the keys it covers.
-                for key in list(anchor["values"]):
+                for key in pending:
                     if key in recovery and key in readings:
                         anchor["values"][key]  = max(0.0, readings[key] - recovery[key])
                         anchor["sources"][key] = "recovered"
                     else:
                         anchor["sources"][key] = "boundary"
+                settled = True
             else:
                 # Down over midnight AND the last reading was hours old: the
                 # morning is unattributable. Anchor late, say so, recover
                 # whatever the device's own daily counters can tell us.
-                anchor["values"].clear()
-                anchor["sources"].clear()
-            anchor["provisional"] = False
-            anchor["captured_at"] = float(read_at)
+                for key in pending:
+                    anchor["values"].pop(key, None)
+                    anchor["sources"].pop(key, None)
+                settled = True
+            if settled:
+                anchor["provisional"] = False
+                anchor["captured_at"] = float(read_at)
             if anchor.get("soc_pct") is None and soc_pct is not None:
                 anchor["soc_pct"] = float(soc_pct)
 
@@ -240,7 +304,7 @@ class DailyEnergy:
                 anchor["values"][key]  = max(0.0, kwh - recovery[key])
                 anchor["sources"][key] = "recovered"
             else:
-                anchor["values"][key]  = kwh
+                anchor["values"][key]  = reanchor_at.get(key, kwh)
                 anchor["sources"][key] = "late"
         if anchor.get("soc_pct") is None and soc_pct is not None:
             anchor["soc_pct"] = float(soc_pct)
@@ -393,7 +457,10 @@ class DailyEnergy:
         values, sources = {}, {}
         for key in KEYS:
             a, b = anchor["values"].get(key), end["values"].get(key)
-            if a is None or b is None:
+            # review 02-10-2026: an end below the start beyond rounding is a
+            # meter reset between the two anchors — the day is unknowable for
+            # that key, so it reads absent rather than a clamped 0.
+            if a is None or b is None or b < a - BACKWARDS_TOLERANCE_KWH:
                 values[key]  = None
                 sources[key] = anchor["sources"].get(key) or "absent"
                 continue
@@ -500,9 +567,19 @@ class DailyEnergy:
 
 
 def readings_from_data(data):
-    """Pull the lifetime readings out of a read_all() dict: {key: kwh}."""
+    """Pull the lifetime readings out of a read_all() dict: {key: kwh}.
+
+    review 02-10-2026: when the dict names the keys read fresh this cycle
+    (`_energyFreshKeys`, sigenergy_modbus 1.19+), only those are returned —
+    the rest are slow-cache values up to ten minutes old, and observe() must
+    never take a midnight anchor from one. A dict without the list (older
+    modbus, tests) is taken whole, as before.
+    """
     out = {}
+    fresh_keys = data.get("_energyFreshKeys") if data else None
     for key, data_key in LIFETIME_DATA_KEYS.items():
+        if fresh_keys is not None and data_key not in fresh_keys:
+            continue
         v = data.get(data_key) if data else None
         if v is not None:
             out[key] = v

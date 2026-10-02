@@ -641,8 +641,17 @@ class TestDailyEventFlagPersistence(unittest.TestCase):
     def test_same_day_restores_completed_vpp(self):
         self.assertIs(self._restored("2026-09-08", {"had_vpp_today": True})["had_vpp_today"], True)
 
-    def test_previous_day_does_not_mark_today(self):
-        self.assertNotIn("had_vpp_today", self._restored("2026-09-07", {"had_vpp_today": True}))
+    def test_an_older_day_does_not_mark_today(self):
+        self.assertNotIn("had_vpp_today", self._restored("2026-09-06", {"had_vpp_today": True}))
+
+    def test_yesterday_is_restored_as_yesterday(self):
+        """CONTRACT CHANGED 02-10-2026 (review of 5.131.1): a file from the day
+        just ended is restored AS that day, so the first tick's midnight task
+        records it and then clears the flags for today. Skipping it lost the
+        ended day's row entirely."""
+        store = self._restored("2026-09-07", {"had_vpp_today": True})
+        self.assertEqual(store["today_date"], "2026-09-07")
+        self.assertIs(store["had_vpp_today"], True)
 
     def test_old_file_without_flags_defaults_to_false(self):
         self.assertIs(self._restored("2026-09-08", {})["had_vpp_today"], False)

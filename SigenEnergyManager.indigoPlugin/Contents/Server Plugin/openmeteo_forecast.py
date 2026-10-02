@@ -6,9 +6,15 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Opus 4.8; v1.9 Claude Opus 5.5
-# Date:        05-09-2026 14:00; v1.9 22-09-2026
-# Version:     1.9 (six days fetched, not three, and the days after tomorrow kept as
+# Author:      CliveS & Claude Opus 4.8; v1.9, v1.10 Claude Opus 5.5
+# Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026
+# Version:     1.10 (review 02-10-2026: a failed fetch falls back to the in-memory
+#              forecast only inside STALE_FALLBACK_TTL and only if it is for today,
+#              else the "No data" empty forecast — an 85-hour-old forecast was being
+#              served as "OK"; a cache from yesterday is no longer served after
+#              midnight; morning baselines are kept per date so a fetch just after
+#              midnight no longer erases yesterday's before it is recorded.)
+#              prior 1.9 (six days fetched, not three, and the days after tomorrow kept as
 #              `_hourly_p50_ahead` / `aheadDayKwh` — SigenEnergyManager 5.112.0 books
 #              Octopus Weekend Happy Hours when the slots open on a THURSDAY, and a
 #              three-day fetch could not see the Sunday it was deciding about.
@@ -148,6 +154,10 @@ REQUEST_TIMEOUT = 10    # seconds per array call (Open-Meteo answers <1s;
 # cache is too stale to act on — better to report the failure than fabricate
 # a confident 'OK' forecast from day-old data.
 STALE_FALLBACK_TTL = 24 * 3600
+# Morning baselines kept, one per local date (review 02-10-2026). Yesterday's
+# must outlive the first complete fetch of today, which can land before the
+# plugin's midnight task records it; a few days covers a late or missed run.
+BASELINE_DAYS_KEPT = 4
 CACHE_TTL       = 1800  # 30 minutes — well within 10,000 call/day free tier
 RETRY_ATTEMPTS  = 2     # total attempts per array call (1 initial + 1 retry)
 RETRY_BACKOFF_S = 2     # seconds between attempts on transient network errors
@@ -244,10 +254,11 @@ class OpenMeteoForecast:
         self._network_down_this_cycle = False
 
         # Bias correction state. The morning baseline is captured on the FIRST
-        # complete fetch of each local day (a genuine day-ahead forecast), tagged
-        # with its date and persisted so a restart doesn't drop the day's record.
-        self._morning_forecast_kwh  = 0.0
-        self._morning_forecast_date = None
+        # complete fetch of each local day (a genuine day-ahead forecast), keyed
+        # by its date and persisted so a restart doesn't drop the day's record.
+        # review 02-10-2026: one baseline PER DATE, not a single slot — see
+        # BASELINE_DAYS_KEPT.
+        self._morning_baselines = {}   # {"YYYY-MM-DD": forecast kWh}
         self._correction_factor    = 1.0  # overall kWh-weighted scalar (display only)
         self._correction_bands     = [(c, 1.0) for c in BIAS_BAND_CENTRES_KWH]
 
@@ -284,7 +295,8 @@ class OpenMeteoForecast:
         now       = time.time()
         cache_age = now - self._cached_time
 
-        if not force and cache_age < CACHE_TTL and self._cached_forecast:
+        if (not force and cache_age < CACHE_TTL and self._cached_forecast
+                and self._cache_is_for_today(self._cached_forecast)):
             self.logger.debug(
                 f"[OpenMeteo] Using cached forecast (age {cache_age:.0f}s / TTL {CACHE_TTL}s)"
             )
@@ -295,14 +307,14 @@ class OpenMeteoForecast:
             combined = self._fetch_all_arrays()
         except Exception as e:
             self.logger.error(f"[OpenMeteo] Fetch failed: {e}")
-            if self._cached_forecast:
+            if self._cache_usable_as_fallback():
                 self.logger.warning("[OpenMeteo] Returning stale cached forecast")
                 return self._enrich_forecast(self._cached_forecast)
             return self._empty_forecast(f"Fetch error: {e}")
 
         if combined is None:
             self.logger.error("[OpenMeteo] All array fetches failed")
-            if self._cached_forecast:
+            if self._cache_usable_as_fallback():
                 return self._enrich_forecast(self._cached_forecast)
             return self._empty_forecast("All array fetches failed")
 
@@ -317,7 +329,9 @@ class OpenMeteoForecast:
             # of the self-sufficiency goal. So a partial result must NEVER be
             # stamped "OK", and must NEVER clobber a complete cached forecast.
             prev          = self._cached_forecast
-            prev_complete = bool(prev) and prev.get("arrays_ok", 0) >= prev.get("arrays_total", 1)
+            prev_complete = (bool(prev)
+                             and prev.get("arrays_ok", 0) >= prev.get("arrays_total", 1)
+                             and self._cache_usable_as_fallback())
             if prev_complete:
                 self.logger.warning(
                     f"[OpenMeteo] Partial fetch ({arrays_ok}/{arrays_total} arrays) — "
@@ -350,14 +364,20 @@ class OpenMeteoForecast:
         # midnight). The baseline used to be captured AT midnight from the ~23:30
         # cache — a near-zero-lead hindcast of the day just ended, never the
         # day-ahead forecast the calibration is supposed to grade (v5.43 fix).
+        #
+        # review 02-10-2026: keyed by date. The single slot was overwritten by the
+        # first complete fetch after midnight, which the tick runs BEFORE the
+        # midnight task records yesterday — so record_accuracy(yesterday) found
+        # today's date, skipped at DEBUG, and the bias bands lost the day.
         today_str = self._now_local().strftime("%Y-%m-%d")
-        if self._morning_forecast_date != today_str:
-            self._morning_forecast_kwh  = combined.get("todayKwh", 0.0)
-            self._morning_forecast_date = today_str
+        if today_str not in self._morning_baselines:
+            self._morning_baselines[today_str] = float(combined.get("todayKwh", 0.0) or 0.0)
+            for old in sorted(self._morning_baselines)[:-BASELINE_DAYS_KEPT]:
+                del self._morning_baselines[old]
             self._save_morning_baseline()
             self.logger.debug(
                 f"[OpenMeteo] Morning baseline captured for {today_str}: "
-                f"{self._morning_forecast_kwh:.1f} kWh"
+                f"{self._morning_baselines[today_str]:.1f} kWh"
             )
 
         # Write forecast file for the battery optimiser script
@@ -365,15 +385,52 @@ class OpenMeteoForecast:
 
         return self._enrich_forecast(combined)
 
+    def _cache_is_for_today(self, cache):
+        """True when a combined forecast's "today" is today's LOCAL date.
+
+        Reads forecastDate, falling back to the first today-bucket for a cache
+        written before that key existed. No date at all is not today.
+        """
+        day = str((cache or {}).get("forecastDate") or "")
+        if not day:
+            keys = sorted(((cache or {}).get("_hourly_p50_today") or {}).keys())
+            day = str(keys[0])[:10] if keys else ""
+        return bool(day) and day == self._now_local().strftime("%Y-%m-%d")
+
+    def _cache_usable_as_fallback(self):
+        """May the in-memory forecast stand in for a failed fetch?
+
+        review 02-10-2026: the combined fallbacks served `_cached_forecast` with
+        no age limit and no day check, still stamped "OK" — an 85-hour-old
+        forecast was served as current while every array failed. Same ceiling
+        as the per-array path: STALE_FALLBACK_TTL and the v5.43 day-shift guard.
+        Beyond it the caller returns the empty forecast, whose "No data" status
+        plugin.py already treats as unavailable (warns, blocks night export
+        condition 3, does not stamp forecast_ok_at).
+        """
+        if not self._cached_forecast:
+            return False
+        age = time.time() - self._cached_time
+        if not 0 <= age < STALE_FALLBACK_TTL:
+            self.logger.warning(
+                f"[OpenMeteo] Cached forecast is {age / 3600:.1f}h old — too stale "
+                f"to stand in for a failed fetch")
+            return False
+        if not self._cache_is_for_today(self._cached_forecast):
+            self.logger.warning(
+                "[OpenMeteo] Cached forecast is for another day — not serving it "
+                "in place of a failed fetch")
+            return False
+        return True
+
     def _morning_baseline_path(self):
         return os.path.join(self.data_dir, "morning_baseline.json")
 
     def _save_morning_baseline(self):
-        """Persist the day's baseline so a restart doesn't drop the day's record."""
+        """Persist the baselines so a restart doesn't drop a day's record."""
         try:
             self._atomic_write_json(self._morning_baseline_path(),
-                                    {"date": self._morning_forecast_date,
-                                     "forecast_kwh": self._morning_forecast_kwh})
+                                    {"baselines": dict(self._morning_baselines)})
         except Exception as e:
             self.logger.debug(f"[OpenMeteo] Baseline save failed: {e}")
 
@@ -381,8 +438,22 @@ class OpenMeteoForecast:
         try:
             with open(self._morning_baseline_path(), encoding="utf-8") as f:
                 data = json.load(f)
-            self._morning_forecast_date = data.get("date")
-            self._morning_forecast_kwh  = float(data.get("forecast_kwh", 0.0))
+            if isinstance(data.get("baselines"), dict):
+                raw = data["baselines"]
+            elif data.get("date"):
+                # The single-slot file written before review 02-10-2026.
+                raw = {data["date"]: data.get("forecast_kwh", 0.0)}
+            else:
+                raw = {}
+            baselines = {}
+            for day, kwh in raw.items():
+                try:
+                    baselines[str(day)] = float(kwh)
+                except (TypeError, ValueError):
+                    continue
+            for old in sorted(baselines)[:-BASELINE_DAYS_KEPT]:
+                del baselines[old]
+            self._morning_baselines = baselines
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -400,21 +471,19 @@ class OpenMeteoForecast:
                            the off-by-one that occurs when datetime.now() has
                            already rolled over to the new day.
         """
-        if self._morning_forecast_kwh <= 0.0:
-            self.logger.debug("[OpenMeteo] No morning forecast captured — skipping record")
-            return
-
         if date_str is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
 
-        # The baseline must belong to the day being recorded — a mismatch means
-        # the day's capture was missed (restart before the first fetch, etc.)
+        # The baseline must belong to the day being recorded — none for that date
+        # means the day's capture was missed (restart before the first fetch, etc.)
         # and pairing actual PV with another day's forecast would poison the
         # bias bands. Skip rather than record garbage.
-        if self._morning_forecast_date != date_str:
+        morning_kwh = self._morning_baselines.get(date_str, 0.0)
+        if morning_kwh <= 0.0:
             self.logger.debug(
-                f"[OpenMeteo] Baseline date {self._morning_forecast_date} != "
-                f"{date_str} — skipping accuracy record for this day"
+                f"[OpenMeteo] No morning baseline for {date_str} (have "
+                f"{sorted(self._morning_baselines) or 'none'}) — skipping accuracy "
+                f"record for this day"
             )
             return
 
@@ -424,10 +493,9 @@ class OpenMeteoForecast:
         record = {
             "date":         today_str,
             "month":        month_str,
-            "forecast_kwh": round(self._morning_forecast_kwh, 2),
+            "forecast_kwh": round(morning_kwh, 2),
             "actual_kwh":   round(actual_pv_kwh, 2),
-            "factor":       round(actual_pv_kwh / self._morning_forecast_kwh, 4)
-                            if self._morning_forecast_kwh > 0 else 1.0,
+            "factor":       round(actual_pv_kwh / morning_kwh, 4),
         }
 
         records = self._load_accuracy_records()
@@ -437,7 +505,7 @@ class OpenMeteoForecast:
         self._save_accuracy_records(records)
 
         self.logger.info(
-            f"[OpenMeteo] Accuracy: forecast={self._morning_forecast_kwh:.1f} kWh, "
+            f"[OpenMeteo] Accuracy: forecast={morning_kwh:.1f} kWh, "
             f"actual={actual_pv_kwh:.1f} kWh, factor={record['factor']:.3f}"
         )
 
@@ -445,9 +513,9 @@ class OpenMeteoForecast:
         self._correction_bands  = self._compute_correction_bands(records)
         self._log_bands("Updated")
 
-        # Consumed — the new day's first complete fetch captures its own baseline.
-        self._morning_forecast_kwh  = 0.0
-        self._morning_forecast_date = None
+        # Consumed — only this date's baseline; today's (if already captured)
+        # stays for its own midnight. A second call for the same day now skips.
+        self._morning_baselines.pop(date_str, None)
         self._save_morning_baseline()
 
     def repair_zero_actuals(self, lookup):

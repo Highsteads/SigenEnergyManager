@@ -119,13 +119,25 @@ def to_text(body):
     return _RE_WS.sub(" ", text).strip()
 
 
+def _from_axle(sender):
+    """True when the sender's ADDRESS is at axle.energy or a subdomain of it.
+
+    Review 02-10-2026: a substring test passed "axle.energy.payouts-example.net",
+    "notaxle.energy" and a display name of "axle.energy". The From line can
+    still be forged whatever this checks; it only stops the easy lookalikes.
+    """
+    _name, addr = email.utils.parseaddr(str(sender or ""))
+    domain = addr.rpartition("@")[2].strip().lower().rstrip(".")
+    return bool(addr) and (domain == SENDER_DOMAIN or domain.endswith("." + SENDER_DOMAIN))
+
+
 def is_settlement_email(sender, subject):
     """True when this message is an Axle per-event settlement mail.
 
     Both halves are required. The subject alone is guessable by anyone, and the
     figures parsed here are written into an earnings record.
     """
-    if not sender or SENDER_DOMAIN not in str(sender).lower():
+    if not _from_axle(sender):
         return False
     subj = (subject or "").lower()
     return all(tok in subj for tok in SUBJECT_TOKENS)

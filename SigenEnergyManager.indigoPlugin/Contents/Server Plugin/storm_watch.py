@@ -14,9 +14,10 @@
 #              Met Office warnings are calibrated for real disruption/power-cut
 #              risk, avoiding false positives from ordinary windy days.
 #              Returns a severity string: "none", "yellow", "amber", or "red".
-# Author:      CliveS & Claude Fable 5
-# Date:        27-09-2026
-# Version:     1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
+# Author:      CliveS & Claude Fable 5; v1.7 Claude Opus 5.5
+# Date:        27-09-2026; v1.7 02-10-2026
+# Version:     1.7 (a non-Atom body is unknown, not all-clear; CAP "Minor" is green, not yellow)
+#              1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
 #              1.5 (failure paths return None — caller holds previous level, no false all-clear)
 
 import re
@@ -127,8 +128,11 @@ def _warning_covers_location(entry, ns, lat, lon):
 # Legacy MeteoAlarm numeric awareness-level codes -> severity string (fallback)
 _MA_LEVEL_MAP = {"2": "yellow", "3": "amber", "4": "red"}
 
-# CAP severity -> colour, used when the title carries no explicit colour word
-_MA_SEVERITY_MAP = {"minor": "yellow", "moderate": "yellow",
+# CAP severity -> colour, used when the title carries no explicit colour word.
+# review 02-10-2026: "minor" is MeteoAlarm's GREEN level (no special awareness),
+# so it maps to nothing and the entry is skipped, as the legacy path skips code 1.
+# It used to map to yellow and engaged the storm reserve on a green day.
+_MA_SEVERITY_MAP = {"moderate": "yellow",
                     "severe": "amber", "extreme": "red"}
 
 # Hazard keywords (matched against cap:event / atom:title) that carry genuine
@@ -216,6 +220,13 @@ def check_storm_level(lat, lon, location_name="your location"):
         "atom": "http://www.w3.org/2005/Atom",
         "cap":  "urn:oasis:names:tc:emergency:cap:1.2",
     }
+
+    # review 02-10-2026: a body that parses but is not an Atom feed (an XML error
+    # document, an XHTML maintenance page) has no entries, so the drift guard
+    # below cannot fire and it read as a confident all-clear — dropping an active
+    # storm reserve on one bad poll. Only a real feed can say "no warnings".
+    if root.tag != "{http://www.w3.org/2005/Atom}feed":
+        return None, f"MeteoAlarm returned a non-Atom document (root <{root.tag}>)"
 
     now_utc       = datetime.now(timezone.utc)
     horizon_utc   = now_utc + timedelta(hours=STORM_ACTIVATE_HOURS)

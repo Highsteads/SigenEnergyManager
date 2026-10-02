@@ -5,11 +5,29 @@
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
 # Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8-2.9 Claude Sonnet 5.5;
-#              v2.9.1-2.11 Claude Opus 5.5
+#              v2.9.1-2.12 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
-#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026; v2.11 02-10-2026
-# Version:     2.11
+#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026; v2.11 02-10-2026;
+#              v2.12 02-10-2026
+# Version:     2.12
+#
+# v2.12 (review 02-10-2026), four faults found by replaying the planner:
+#   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
+#     16:00 has passed, so a 5pm Axle event stopped counting as in the peak and the
+#     cover bought the whole evening (about 12 kWh) at the peak price. It now uses
+#     the peak on the event's own day; inside it, it buys only for the event itself.
+#   * The peak sale with no Saving Session flipped export / hand back every tick on
+#     a sunny afternoon (104 changes 16:00-19:00): the sale stopped under
+#     MIN_TRADE_KWH, the manager banked the roof, the spare came back. A sale that
+#     has run the spare under the threshold now keeps the inverter and runs the
+#     house, so the roof is sold rather than banked. At or below the sell floor the
+#     roof is still banked for the evening.
+#   * walk() counted a step straddling no_charge_until (19:00) as wholly unbanked,
+#     so the export floor rose about 0.9 kWh through each half-hour and fell back at
+#     the next; it now banks the step's share after the boundary.
+#   * The 02:00-05:00 charge used MIN_TRADE_KWH as its stop test and stopped about
+#     0.5 kWh short of its own target every night. It now runs to the cutoff.
 #
 # v2.10.2 (SigenEnergyManager 5.131.1): note_control_key no longer keys on the discharge
 # floor, so a floor moving a point at a time through a sale is not a new log line.
@@ -1071,7 +1089,21 @@ def walk(site, steps, start_kwh, serve_house=True, no_charge_until=None):
             energy   -= take
             out_left -= take
 
+        # Review 02-10-2026: a step that STRADDLES no_charge_until banks only its
+        # share after it. The whole step used to count as no-charge, so the peak
+        # export floor rose by up to half an hour of sunshine (about 0.9 kWh on a
+        # June evening) as `now` moved through each half-hour and fell back at the
+        # next, which alone was enough to start and stop the sale. The unbanked
+        # share goes to the grid on purpose and is not spill. Steps wholly on one
+        # side are unchanged.
         if no_charge_until is None or cursor >= no_charge_until:
+            frac = 1.0
+        else:
+            after = (cursor + timedelta(hours=hours) - no_charge_until).total_seconds()
+            frac = max(0.0, min(1.0, after / 3600.0 / hours)) if hours > 0 else 0.0
+        if frac > 0:
+            surplus *= frac
+            max_in  *= frac
             if surplus > 0:
                 # Same arithmetic as before free windows existed, written so the
                 # part that did not fit can be counted: min(capacity, e + x*eff).
@@ -1400,7 +1432,14 @@ def _charge_plan(inputs):
                       - max(have_kwh, household_target_kwh))
 
     buy_kwh = household_buy_kwh + arb_kwh
-    if buy_kwh < MIN_TRADE_KWH:
+    # Review 02-10-2026: MIN_TRADE_KWH was also the STOP test, so every night the
+    # charge stopped about 0.5 kWh (1.5%) short of its own target. The planner has
+    # no record of its last decision, but it does not need one here: inside
+    # 02:00-05:00 both decisions pin discharge to zero, so the battery can only
+    # rise and nothing can restart a finished charge. The charge now runs until
+    # the SOC reaches the whole-percent cutoff. The cost is that a battery opening
+    # the window within 0.5 kWh of its target also tops up that last bit, once.
+    if buy_kwh <= 0:
         return None, 0, 0.0, margin_p, household_buy_kwh, infeasible
 
     # The charge cutoff is a ceiling on SOC, so it is the target the battery
@@ -1412,9 +1451,15 @@ def _charge_plan(inputs):
     # about half the time, and flooring that gives away a whole percent.
     target_pct = min(site.max_charge_soc_pct,
                      float(math.floor(_pct(target_kwh, site.capacity_kwh) + 1e-3)))
+    # Done once the SOC is at the cutoff (the same 0.05% slack _minimum_charge
+    # uses, so a reading of 83.96% against an 84% cutoff is not a new charge).
+    if target_pct <= float(inputs.soc_pct) + 0.05:
+        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible
 
     hours_left = max(1.0 / 60.0, (window_end - inputs.now).total_seconds() / 3600.0)
-    wanted_w   = int((buy_kwh / eff / hours_left) * 1000.0)
+    # max(1, ...): a tail of a few Wh must not round to 0 W and read as "no
+    # spare import capacity" (review 02-10-2026).
+    wanted_w   = max(1, int((buy_kwh / eff / hours_left) * 1000.0))
     available  = min(site.charge_power_w, import_headroom_w(inputs))
     power_w    = max(0, min(wanted_w, available))
     if power_w <= 0:
@@ -1581,15 +1626,31 @@ def event_cover(inputs, source="axle", avoid_peak=True):
         return None
     event_start = upcoming[0].start
     deadline    = event_start
+    need_until  = until
+    in_peak     = False
     if avoid_peak:
-        peak_start = next_local(now, tz, FLUX_PEAK_START)
-        peak_end   = next_local(peak_start, tz, FLUX_PEAK_END)
-        if peak_start < event_start < peak_end:
-            deadline = peak_start
+        # Review 02-10-2026: the peak on the EVENT's own local day. next_local(now)
+        # rolled to tomorrow's 4pm once 16:00 had passed, so a 5pm event stopped
+        # counting as "in the peak" and the cover bought the whole evening at the
+        # peak price.
+        ev_day     = event_start.astimezone(tz).date()
+        peak_start = _wall(tz, ev_day, FLUX_PEAK_START)
+        peak_end   = _wall(tz, ev_day, FLUX_PEAK_END)
+        if peak_start <= event_start < peak_end:
+            if now < peak_start:
+                deadline = peak_start
+            else:
+                # Already inside the peak: buy only for the event itself (its
+                # energy and the house during it, above the reserve and margin).
+                # The evening after 7pm is cheaper imported at the day rate when it
+                # comes, and anything else inside the peak costs the same peak price
+                # straight from the grid, without the battery's losses.
+                in_peak    = True
+                need_until = max(c.end for c in upcoming if c.start == event_start)
     try:
         floor_kwh = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
         needed, _infeasible = required_start_kwh(
-            inputs, deadline, until,
+            inputs, deadline, need_until,
             min(site.capacity_kwh, floor_kwh + COVER_MARGIN_KWH))
         now_kwh = float(inputs.soc_pct) / 100.0 * site.capacity_kwh
         arriving, _low, _unmet, _high = simulate(inputs, now_kwh, now, deadline)
@@ -1607,8 +1668,9 @@ def event_cover(inputs, source="axle", avoid_peak=True):
                      float(math.ceil(_pct(now_kwh + short, site.capacity_kwh))))
     active     = now >= start_by
     when       = deadline.astimezone(tz).strftime("%H:%M")
-    reason     = (f"the Axle event at {event_start.astimezone(tz):%H:%M} and the house "
-                  f"until 2am need about {_pct(needed, site.capacity_kwh):.0f}% by "
+    who        = ("on its own needs" if in_peak else "and the house until 2am need")
+    reason     = (f"the Axle event at {event_start.astimezone(tz):%H:%M} {who} "
+                  f"about {_pct(needed, site.capacity_kwh):.0f}% by "
                   f"{when}, and running the house the battery would have about "
                   f"{_pct(arriving, site.capacity_kwh):.0f}%, so about "
                   f"{buy_kwh:.1f} kWh is bought from the grid")
@@ -1833,6 +1895,10 @@ def _plan(inputs):
                 # the one thing a single-direction target cannot express.
                 pv_left = inputs.pv.kwh_between(inputs.now, window_end)
                 house_left = inputs.house.kwh_between(inputs.now, window_end)
+                # Review 02-10-2026: a sale that is allowed and has run the spare
+                # down under MIN_TRADE_KWH, but not to the floor (see below).
+                tail_of_sale = (not day_rate_bought and profitable and power_w > 0
+                                and sell_now > 0.0)
                 why = ("the battery was topped up at the day rate today, and "
                        "selling that back at the peak price loses money after "
                        "losses and wear" if day_rate_bought else
@@ -1841,6 +1907,8 @@ def _plan(inputs):
                        (f"the {hold_kwh:.1f} kWh spare is kept for the Saving Session "
                         f"at {hold_from.astimezone(tz):%H:%M}, so it sells then")
                        if holding and surplus_kwh >= MIN_TRADE_KWH else
+                       (f"the {sell_now:.1f} kWh still spare is too little to be worth "
+                        f"selling") if tail_of_sale else
                        "there is nothing spare above what the house and its "
                        "commitments need before the cheap rate comes back")
                 # v2.8: not while holding for a window. Handing back let the manager
@@ -1848,7 +1916,16 @@ def _plan(inputs):
                 # and started the sale again, over and over. Running the house keeps
                 # the battery's charge for the window and sells the roof's surplus at
                 # the peak rate.
-                if not holding and (pv_left - house_left) >= MIN_TRADE_KWH:
+                # Review 02-10-2026: nor when a sale is allowed and has only run the
+                # spare down under MIN_TRADE_KWH. The same flip happened with no
+                # session at all (104 mode changes 16:00-19:00 on a sunny replay).
+                # The planner has no record of its last decision, so the hysteresis
+                # is in where the roof goes: above the sell floor it is sold, not
+                # banked, so the spare cannot climb back over the threshold. At or
+                # below the floor (nothing spare) the roof is still banked, for the
+                # evening. What is left under the threshold stays for the house.
+                if (not holding and not tail_of_sale
+                        and (pv_left - house_left) >= MIN_TRADE_KWH):
                     return FluxDecision(
                         mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
                         protect_soc_pct=sell_floor, household_floor_pct=house_floor,

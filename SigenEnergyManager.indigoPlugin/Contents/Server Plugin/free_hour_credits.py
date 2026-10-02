@@ -5,8 +5,8 @@
 #              Happy Hour, and whether it has been paid. Pure stdlib: claims in,
 #              credits in, a verdict and the plain-English words out.
 # Author:      CliveS & Claude Opus 5.5
-# Date:        26-09-2026
-# Version:     1.0
+# Date:        02-10-2026
+# Version:     1.1 (review 02-10-2026: a MEASURING claim takes no credits and ages out)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -37,8 +37,13 @@
 # * kWh comes from Octopus's own meter reading for the hour (what they bill on)
 #   once it has settled, and from the inverter's grid counter until then, labelled
 #   as an estimate. Capped at 16 kWh an hour, the free allowance.
-# * Credits are matched oldest claim first, and only to a claim dated on or before
-#   the credit. A credit is never counted twice.
+# * Credits are matched only to a claim dated on or before the credit whose amount
+#   is known: a claim whose outstanding sum matches the credit within 5p first,
+#   else the oldest. A credit is never counted twice. A credit with no such claim
+#   yet waits for the next run rather than landing on a MEASURING claim.
+# * A claim still MEASURING 30 days after its last hour (CLAIM_LOOKBACK_DAYS — the
+#   same horizon after which an hour is no longer recorded) is closed, and dropped
+#   7 days later like a nothing-due one.
 # * paid:  credited >= expected - 5p.   short: some credit, but more than 5p less.
 #   late:  nothing credited 14 days after the free hour.  A short claim stays open
 #   for the rest; a paid one is shown for 14 days and then dropped.
@@ -223,21 +228,36 @@ def assign_credits(ledger, credits):
                    key=lambda c: (str(c.get("posted")), str(c.get("id"))))
     assigned = []
     for c in fresh:
+        amount = int(round(_num(c["amount_p"])))
+        # review 02-10-2026: a claim whose expected value is None (MEASURING) used to
+        # be eligible, and since "paid in full" could never be true of it, it took
+        # every later credit and left the Sunday Octopus actually paid going LATE.
+        # Only claims with a known amount outstanding are candidates now; among them
+        # one whose outstanding sum matches the credit (within MATCH_TOLERANCE_P) wins,
+        # else the oldest. No candidate -> the credit stays unassigned and is tried
+        # again on the next run, once the meter has settled.
+        candidates = []
         for day in sorted(ledger.get("claims", {})):
             claim = ledger["claims"][day]
             if claim.get("closed_at") or day > str(c.get("posted")):
                 continue
             exp = expected_pence(claim)
+            if exp is None:
+                continue                       # still measuring
             paid = sum(x["amount_p"] for x in claim["credits"])
-            if exp is not None and paid >= exp - MATCH_TOLERANCE_P:
+            if paid >= exp - MATCH_TOLERANCE_P:
                 continue                       # already paid in full
-            claim["credits"].append({"id": str(c.get("id")), "posted": str(c.get("posted")),
-                                     "amount_p": int(round(_num(c["amount_p"]))),
-                                     "title": c.get("title") or "",
-                                     "reason": c.get("reason") or ""})
-            ledger["assigned_credit_ids"].append(str(c.get("id")))
-            assigned.append(c)
-            break
+            candidates.append((claim, exp - paid))
+        if not candidates:
+            continue
+        exact = [cl for cl, owed in candidates if abs(owed - amount) <= MATCH_TOLERANCE_P]
+        claim = exact[0] if exact else candidates[0][0]
+        claim["credits"].append({"id": str(c.get("id")), "posted": str(c.get("posted")),
+                                 "amount_p": amount,
+                                 "title": c.get("title") or "",
+                                 "reason": c.get("reason") or ""})
+        ledger["assigned_credit_ids"].append(str(c.get("id")))
+        assigned.append(c)
     return assigned
 
 
@@ -269,6 +289,19 @@ def prune(ledger, now):
         claim = ledger["claims"][day]
         st = status(claim, now)
         if st["state"] in (STATE_PAID, STATE_NOTHING_DUE) and not claim.get("closed_at"):
+            claim["closed_at"] = _iso(now)
+        # review 02-10-2026: a claim stuck MEASURING (no meter, no estimate, or no
+        # rate) was never closed and sat for ever. After CLAIM_LOOKBACK_DAYS — the
+        # horizon past which record_hours stops recording an hour — give up on it.
+        # A claim with no hours (made by add_inverter_kwh alone) ages from its date.
+        age = st["days_waiting"]
+        if not claim.get("hours"):
+            try:
+                age = (now.date() - datetime.strptime(day, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = 0
+        if (st["state"] == STATE_MEASURING and not claim.get("closed_at")
+                and age >= CLAIM_LOOKBACK_DAYS):
             claim["closed_at"] = _iso(now)
         closed = _parse(claim.get("closed_at"))
         keep = KEEP_PAID_DAYS if st["state"] == STATE_PAID else KEEP_NOTHING_DUE_DAYS

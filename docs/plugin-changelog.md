@@ -21,6 +21,51 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.132.0 — 02-10-2026
+
+Independent review of 5.131.1, batches 2 and 3 (control, money, records). Every fix has a test
+watched failing first: `test_review_2026_10_02.py` (plugin) and `_core` / `_exec` / `_money` /
+`_modbus` (one per module group). 2,415 -> 2,503 tests; `tools/scenario_sim.py --season all` 29/29.
+- **plugin**: `_refresh_octopus_rates` runs on a worker (`_start_octopus_refresh`, one at a time) —
+  inline, Octopus timeouts held the tick 18:55:41-18:58:51 on 01-Oct; the rebuilt rates dict carries
+  the last NUMERIC `export_rate_p` (readers float() it). A failed account read KEEPS
+  `flux_account_evidence` (CliveS) — its own `fetched_at` 6 h limit governs — and the evidence is
+  saved in accumulators and restored whatever the day. `_poll_vpp`: a failed poll in
+  ANNOUNCED/PRE_CHARGING re-applies the STORED event instead of None (was "cancelled" + 600 s poll);
+  the cancel branch clears `vpp_event`. `_end_cheap_window_import`/`_end_happy_hour_import` clear the
+  import ceiling record unconditionally. Day-rate guard reads 40031 via
+  `store["remote_ems_mode_seen"]` (set by `_verify_ems_registers`; emsWorkMode is 30003 and never
+  held "Charge Grid First"); the dead `inverter_stuck` branch removed (verify corrects a stuck mode).
+  `_init_modules` loads the bias correction (a Configure save had reset the bands to 1.0).
+  `_load_accumulators` restores a file from YESTERDAY as yesterday so the first tick records the
+  ended day. `_write_daily_history` moves an unreadable file aside (`.unreadable-<ts>`) instead of
+  overwriting it; `_record_vpp_ledger_event` refuses a ledger with `load_error`. Half-hourly insert is
+  an UPSERT that adds to a repeated slot (clocks-back night). `export_count_today` persisted.
+  `_export_total_for_ended_day` re-bases a midnight-spanning Axle window from the rollover projection.
+  Slow inverter states written only when present. Solar forecast device no longer seeded 0.0.
+- **flux_strategy 2.12**: `event_cover` uses the event day's own peak and, inside it, buys only for
+  the event; peak tail returns SUPPLY_HOUSE (sell the roof) instead of handing back, and `walk`
+  banks only the share of a step after `no_charge_until` (the straddling step lifted the floor
+  ~0.9 kWh per half-hour); the cheap-window charge runs to the whole-percent cutoff (MIN_TRADE_KWH
+  was also the stop test).
+- **battery_manager 3.16**: on Flux the flood drain floor is max(40, dawn target, CHARGE_MIN_PCT);
+  reason prints the real export rate.
+- **flux_execution**: a verified restore releases even if the journal cannot be written.
+- **storm_watch 1.7**: non-Atom XML is unknown (None), Minor severity is green.
+- **openmeteo_forecast 1.10**: a cached fallback must be today's and inside STALE_FALLBACK_TTL
+  (else empty "No data"); morning baselines kept per date (`morning_baseline.json` `baselines`).
+- **octopus_api 1.5**: `_get_tou_rates` serves last good bands with a negative-cache back-off; the
+  active TOU tariff uses the billed product; import/export day sums pass `complete`; Saving Session
+  reward parse tolerant. **economics 1.1**: settle needs the local day's slots less 2 (44/46, 46/48,
+  48/50). **free_hour_credits 1.1**: measuring claims skipped and aged out after 30 days.
+  **vpp_ledger 1.3**: an email stand-in never evicts Axle's real row.
+- **sigenergy_modbus 1.19** (SigenVPP re-synced): exact-zero lifetimes are absent; `_slow_primed`
+  reset on connect; `_energyFreshKeys`; U32 sentinel rejected; `_write_uint32_registers` validates.
+  **daily_energy 1.1**: a reset needs two consecutive low reads; yesterday's anchor never popped;
+  per-key provisional anchors; implausible recovery rejected.
+- **axle_email**: sender domain parsed; **web_dashboard**: token compared as bytes. NOT changed: the
+  token still does not apply to loopback, because the Dashboards proxy reaches this server there.
+
 ## v5.131.2 — 02-10-2026
 
 Independent review of 5.131.1 (02-Oct-2026), batch 1: the three P1-level faults, each with a test

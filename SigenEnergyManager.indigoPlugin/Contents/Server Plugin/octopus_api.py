@@ -4,8 +4,16 @@
 # Description: Octopus Energy API client - tariff rates for Tracker/Go/Flux/iGo/iFlux
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
-# Date:        26-06-2026
-# Version:     1.4 (gas_unit m3/kwh selection — avoids ~11x overstatement on kWh meters)
+# Date:        02-10-2026
+# Version:     1.5 (review 02-10-2026: TOU stale-on-failure, billed product for the active tariff)
+#
+# v1.5 (02-10-2026) — review fixes: _get_tou_rates serves the last good bands and
+#   negative-caches a failed refetch; _find_product_code uses the account's billed
+#   product for whichever tariff is ACTIVE (not just Tracker/Agile); import/export
+#   per-day sums carry the `complete` flag; Saving Sessions reward rates parsed
+#   per event so one odd value cannot fail the fetch.
+#
+# v1.4 (26-06-2026) — gas_unit m3/kwh selection (avoids ~11x overstatement on kWh meters).
 #
 # v1.3 (21-06-2026) — GraphQL queries parameterised (variables, not raw
 #   account/key string-interpolation); import-vs-export classified by MPAN not
@@ -258,6 +266,21 @@ def _rate_in_force(rates, when_utc):
 # refused with "Account's region is outside of the target regions" (EVENT_77,
 # regions 8-12) did not. Region F = 6.
 GSP_REGION_IDS = {letter: n for n, letter in enumerate("ABCDEFGHJKLMNP", start=1)}
+
+
+def _points(raw):
+    """A Saving Sessions reward rate as an int, or 0 when absent or unreadable.
+
+    review 02-10-2026: a bare int() sat outside any try, so one event carrying a
+    numeric string like "1600.0" (or junk) failed the WHOLE fetch and lost every
+    other session with it. Per-event tolerance instead.
+    """
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _region_ids(raw):
@@ -823,7 +846,8 @@ class OctopusAPI:
     def get_export_kwh_for_date(self, date_str, export_mpan, export_serial):
         """Sum all half-hourly export readings for one local (Europe/London) day.
 
-        Returns { "kwh": float|None, "slots": int } or None on failure.
+        Returns { "kwh": float|None, "slots": int, "complete": bool } or None on failure
+        ("complete" present whenever the day sum reports it).
         """
         if not export_mpan or not export_serial:
             return None
@@ -834,12 +858,18 @@ class OctopusAPI:
         r = self._sum_consumption_for_date(url, date_str)
         if r is None:
             return None
-        return {"kwh": r["value"], "slots": r["slots"]}
+        # review 02-10-2026: carry `complete` through — settling gated on a fixed slot
+        # count alone, which a 50-slot clocks-back day passes four slots short.
+        out = {"kwh": r["value"], "slots": r["slots"]}
+        if "complete" in r:
+            out["complete"] = r["complete"]
+        return out
 
     def get_import_kwh_for_date(self, date_str):
         """Sum grid-import kWh for one local day (settled data only).
 
-        Returns { "kwh": float|None, "slots": int } or None on failure.
+        Returns { "kwh": float|None, "slots": int, "complete": bool } or None on failure
+        ("complete" present whenever the day sum reports it).
         """
         if not self.mpan or not self.serial:
             return None
@@ -850,7 +880,12 @@ class OctopusAPI:
         r = self._sum_consumption_for_date(url, date_str)
         if r is None:
             return None
-        return {"kwh": r["value"], "slots": r["slots"]}
+        # review 02-10-2026: carry `complete` through — settling gated on a fixed slot
+        # count alone, which a 50-slot clocks-back day passes four slots short.
+        out = {"kwh": r["value"], "slots": r["slots"]}
+        if "complete" in r:
+            out["complete"] = r["complete"]
+        return out
 
     def get_gas_kwh_for_date(self, date_str):
         """Sum gas consumption for one local day, returning both m3 and kWh.
@@ -1239,7 +1274,7 @@ class OctopusAPI:
                 "code":                  e.get("code"),
                 "start_at":              start_at,
                 "end_at":                end_at,
-                "reward_per_kwh_points": int(e.get("rewardPerKwhInOctoPoints") or 0),
+                "reward_per_kwh_points": _points(e.get("rewardPerKwhInOctoPoints")),
                 "joined":                str(e.get("id")) in joined_ids,
                 # WHICH WAY the session runs. Only TURN_DOWN is earned by exporting;
                 # TURN_UP wants MORE consumption and WEEKEND_HAPPY_HOUR is free power
@@ -1725,18 +1760,30 @@ class OctopusAPI:
         cached = self._rates_cache.get(cache_key)
         if not force and cached and now - cached["cached_at"] < RATES_CACHE_TTL:
             return cached["data"]
+        # review 02-10-2026: a failed refetch used to return {} — the Flux bands and
+        # cheap window vanished, the manager's cheap-window and reserve charges held,
+        # and every tick refetched with no back-off. Same pattern as
+        # _get_tracker_rates: debounce failures, serve the last good value meanwhile.
+        if not force and now - self._rates_neg_at.get(cache_key, 0.0) < RATES_NEG_CACHE_TTL:
+            return cached["data"] if cached else {}
 
         product_code = self._find_product_code(tariff_key)
         if not product_code:
             self.logger.debug(f"Cannot find product code for {tariff_key}")
-            return {}
+            self._rates_neg_at[cache_key] = now
+            return cached["data"] if cached else {}
 
         tariff_code = self._build_tariff_code(product_code)
         today       = self._london_today()   # local day — UTC date is yesterday 23:00-00:00Z in BST
         slots       = self._fetch_rate_schedule(product_code, tariff_code, today)
 
         if not slots:
-            return {}
+            self._rates_neg_at[cache_key] = now
+            if cached:
+                self.logger.debug(
+                    f"[Octopus] {tariff_key} rate fetch returned nothing — serving the "
+                    f"last good bands")
+            return cached["data"] if cached else {}
 
         # Prefer the window the RATES actually show; fall back to the table only when the
         # shape is not a single nightly window. See _derive_cheap_window.
@@ -1756,6 +1803,7 @@ class OctopusAPI:
 
         result = self._parse_tou_slots(slots, window)
 
+        self._rates_neg_at.pop(cache_key, None)
         self._rates_cache[cache_key] = {"data": result, "cached_at": now}
         return result
 
@@ -1920,17 +1968,16 @@ class OctopusAPI:
             # Fall back to public products listing (SILVER-* or TRACKER-VAR-* prefixes)
             return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 
-        if tariff_key == TARIFF_AGILE:
-            # v5.100.0: the account names the product the house is billed on; the
-            # public listing is a guess that picks the NEWEST "AGILE-" product, which
-            # diverges the day Octopus issues an Agile version this account is not
-            # moved to (and its prefix also matches AGILE-OUTGOING-*). Same shape as
-            # Tracker above. The probe remains the route while billed elsewhere —
-            # that is the log-only shadow comparison.
-            info = self.get_current_tariff()
-            if (info and info.get("tariff_key") == TARIFF_AGILE
-                    and info.get("product_code")):
-                return info.get("product_code", "")
+        # v5.100.0 (Agile), review 02-10-2026 (every tariff): the account names the
+        # product the house is billed on; the public listing is a guess that picks the
+        # NEWEST product with the prefix, which diverges the day Octopus relaunches
+        # Flux / Go / Agile and this account is not moved — the planner would then
+        # price the cheap and peak bands off a product nobody is billed on. Same shape
+        # as Tracker above. The probe remains the route for comparison-only tariffs.
+        info = self.get_current_tariff()
+        if (info and info.get("tariff_key") == tariff_key
+                and info.get("product_code")):
+            return info.get("product_code", "")
 
         return self._probe_product_by_prefix(TARIFF_PRODUCT_PREFIXES.get(tariff_key, ()))
 

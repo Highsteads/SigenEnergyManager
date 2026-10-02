@@ -67,8 +67,9 @@
 #              Claude Opus 5.5 (5.131.0 — the Axle 'pre-charge' writes nothing; the event floor is set at T-2min every time)
 #              Claude Opus 5.5 (5.131.1 — the peak sale moves its floor without stopping, and logs its plan once)
 #              Claude Opus 5.5 (5.131.2 — review batch 1: hand-back at shutdown, 2am charge band, Happy Hour refusals)
+#              Claude Opus 5.5 (5.132.0 — review batches 2-3: control, money and records)
 # Date:        02-10-2026
-# Version:     5.131.2
+# Version:     5.132.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2010,7 +2011,7 @@ class Plugin(indigo.PluginBase):
         self._init_modules()
         self._init_timeseries_db()
         if self.forecast:
-            self.forecast.load_correction_factor()
+            # (The bias correction is loaded in _init_modules, review 02-10-2026.)
             # v5.106.0: reconstruct any accuracy record whose actual PV was lost to
             # the inverter's midnight counter reset (see _check_midnight_impl). The
             # settled total is in daily_history.json, so the pairing can be redone
@@ -3393,12 +3394,16 @@ class Plugin(indigo.PluginBase):
             dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 
         elif type_id == "solarForecast":
-            dev.updateStatesOnServer([
-                {"key": "todayKwh",       "value": "0.0"},
-                {"key": "tomorrowKwh",    "value": "0.0"},
-                {"key": "forecastStatus", "value": "Initialising"},
-                {"key": "lastUpdate",     "value": "Initialising..."},
-            ])
+            # Review 02-10-2026: the kWh figures are not seeded, for the reason the
+            # inverter's numbers are not. startup() has already fetched and written
+            # the real forecast by now, and the next refresh is half an hour away,
+            # so seeding 0.0 / "Initialising" put a false zero in SQL history on
+            # every restart and showed it for thirty minutes.
+            if not getattr(self, "latest_forecast_data", None):
+                dev.updateStatesOnServer([
+                    {"key": "forecastStatus", "value": "Initialising"},
+                    {"key": "lastUpdate",     "value": "Initialising..."},
+                ])
             dev.updateStateImageOnServer(indigo.kStateImageSel.SensorOn)
 
         elif type_id == "tariffMonitor":
@@ -3540,9 +3545,13 @@ class Plugin(indigo.PluginBase):
             self._evaluate_manager()
             self.store["last_manager"] = now
 
-        # 4. Octopus rates
-        if now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL:
-            self._refresh_octopus_rates()
+        # 4. Octopus rates — on a worker (review 02-10-2026). Inline, a run of
+        #    Octopus timeouts (15 s each) held the whole tick: no Modbus poll and
+        #    no Flux supervision from 18:55:41 to 18:58:51 on 1 Oct, inside a
+        #    paid Axle window. The menu and action refreshes already run this
+        #    on Indigo's own thread, so a second thread is nothing new for it.
+        if (now - self.store["last_octopus"] >= OCTOPUS_RATES_INTERVAL
+                and self._start_octopus_refresh()):
             self.store["last_octopus"] = now
 
         # 5. Consumption profile (daily)
@@ -3908,6 +3917,23 @@ class Plugin(indigo.PluginBase):
         residual = de.residual()
         if residual is not None:
             self.store["energy_balance_kwh"] = residual
+
+    def _export_total_for_ended_day(self, ended_day):
+        """The day's export total as it stood when the day ended.
+
+        Review 02-10-2026: since the 5.89.0 revamp the first post-midnight poll
+        has already rolled the store over to the new day by the time the midnight
+        task runs, so the live key reads about 0 and an Axle window spanning
+        midnight was re-based on nothing and settled negative. The projection
+        taken at that rollover holds the old day.
+        """
+        proj = self.store.get("energy_yesterday_projection") or {}
+        if proj.get("date") == ended_day and proj.get("gridExport") is not None:
+            try:
+                return float(proj["gridExport"])
+            except (TypeError, ValueError):
+                pass
+        return float(self.store.get("grid_export_daily_kwh", 0.0) or 0.0)
 
     def _energy_projection_snapshot(self, date_str=None):
         """The projection as a plain dict, stamped with the day it describes."""
@@ -7102,11 +7128,13 @@ class Plugin(indigo.PluginBase):
                 log("[Manager] Happy Hour hand-back to Self Consumption was NOT "
                     "confirmed — retrying on the next tick", level="WARNING")
                 self.store["vpp_handback_pending"] = True
-            self._restore_import_cutoff()
         else:
             log("[Manager] Happy Hour ended with the inverter unreachable — the "
                 "hand-back will be re-asserted when it returns", level="WARNING")
             self.store["vpp_handback_pending"] = True
+        # After the mode, whether or not the inverter answered (review 02-10-2026)
+        # — see _end_cheap_window_import.
+        self._restore_import_cutoff()
 
         banked_str = f"{banked:.2f} kWh banked free" if banked is not None else "amount unknown"
         log(f"[Manager] Happy Hour import ended ({why}) — {banked_str}")
@@ -7350,8 +7378,12 @@ class Plugin(indigo.PluginBase):
         # (Never reached while Flux holds the inverter, so its own cheap-window
         # charge is not mistaken for one; _note_day_rate_import ignores the cheap
         # window regardless. VPP pre-charge and a free Happy Hour own their charge.)
+        # Review 02-10-2026: read the REMOTE mode register (40031, as the verify
+        # pass saw it this minute). This compared emsWorkMode, which is 30003 and
+        # never says "Charge Grid First", so the check had never fired.
+        _seen = self.store.get("remote_ems_mode_seen") or (None, 0.0)
         if (not prev_import
-                and self.latest_inverter_data.get("emsWorkMode", "") == "Charge Grid First"
+                and _seen[0] == 0x03 and time.time() - _seen[1] < 120.0
                 and not self.store.get("happy_hour_import_active")
                 and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE):
             self._note_day_rate_import()
@@ -7660,12 +7692,10 @@ class Plugin(indigo.PluginBase):
                             "NOT confirmed — retrying on the next tick", level="WARNING")
                         self.store["vpp_handback_pending"] = True
 
-            # Determine if inverter is currently in a non-self-consumption mode.
-            # Check store flags first; fall back to actual emsWorkMode from inverter data
-            # so a restart (which resets all flags to False) can still recover a stuck mode.
-            ems_mode_str   = self.latest_inverter_data.get("emsWorkMode", "")
-            inverter_stuck = ems_mode_str in ("Discharge ESS First", "Charge Grid First",
-                                              "Charge PV First")
+            # A mode left stuck across a restart is corrected by _verify_ems_registers,
+            # which reads the remote mode register (40031) every manager tick. The
+            # check that used to sit here compared emsWorkMode (30003) with 40031's
+            # names, could never be true, and was removed (review 02-10-2026).
 
             if prev_import:
                 # Only cancel an active import if the target SOC has been reached.
@@ -7716,11 +7746,6 @@ class Plugin(indigo.PluginBase):
                 self.store["solar_overflow_charge_cap_w"] = 0
                 # Starts the manager's re-engage dwell (battery_manager v3.10).
                 self.store["solar_overflow_released_at"]  = datetime.now(timezone.utc)
-            elif inverter_stuck:
-                # Inverter is in wrong mode (e.g. stuck in 0x06 after restart cleared store flags)
-                log(f"[Manager] Inverter stuck in '{ems_mode_str}' — forcing self-consumption",
-                    level="WARNING")
-                self.modbus.set_self_consumption()
 
         # Check if active import has reached target SOC. NOT for a free Happy
         # Hour (v5.112.0): that import runs to the END of its window, with its
@@ -7914,9 +7939,14 @@ class Plugin(indigo.PluginBase):
                 log("[Manager] Cheap-window hand-back to Self Consumption was NOT "
                     "confirmed — retrying on the next tick", level="WARNING")
                 self.store["vpp_handback_pending"] = True
-            self._restore_import_cutoff()
         else:
             self.store["vpp_handback_pending"] = True
+        # Unconditional (review 02-10-2026). Inside the connected branch only, a
+        # hand-back with the socket down kept the ceiling RECORDED, so the verify
+        # pass went on expecting it and Flux's release restored it: PV could not
+        # charge past ~55% for the rest of the day. It skips the write while
+        # disconnected and clears the record, so the verify pass puts 100% back.
+        self._restore_import_cutoff()
         log(f"[Manager] Cheap-window charge ended ({why}) with the battery at {soc:.0f}%")
 
     def _forget_cheap_window_import(self, why):
@@ -8184,6 +8214,11 @@ class Plugin(indigo.PluginBase):
                 expected_mode = 0x02  # Max Self Consumption
 
             actual_mode = self.modbus.read_ems_mode()
+            if actual_mode is not None:
+                # The remote EMS mode (40031) as last read, for the day-rate check
+                # in _act (review 02-10-2026). emsWorkMode is 30003, which never
+                # holds these names, so that check could not fire.
+                self.store["remote_ems_mode_seen"] = (actual_mode, time.time())
             if actual_mode is not None and actual_mode != expected_mode:
                 log(
                     f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
@@ -8612,6 +8647,24 @@ class Plugin(indigo.PluginBase):
     # Octopus Refresh
     # ================================================================
 
+    def _start_octopus_refresh(self):
+        """Run one rate refresh on a worker. False while one is still running,
+        so the tick tries again rather than stacking refreshes."""
+        worker = getattr(self, "_octopus_worker", None)
+        if worker is not None and worker.is_alive():
+            return False
+        worker = threading.Thread(target=self._octopus_refresh_worker,
+                                  name="OctopusRefresh", daemon=True)
+        self._octopus_worker = worker
+        worker.start()
+        return True
+
+    def _octopus_refresh_worker(self):
+        try:
+            self._refresh_octopus_rates()
+        except Exception as exc:                        # noqa: BLE001
+            log(f"[Octopus] Rate refresh error: {exc}", level="ERROR")
+
     def _refresh_octopus_rates(self, force=False):
         """Fetch current tariff rates from Octopus API."""
         if not self.octopus:
@@ -8632,10 +8685,16 @@ class Plugin(indigo.PluginBase):
                     monitored["shadow_agile_slots"] = []
                     self.logger.debug(f"[Shadow] Agile comparison rates unavailable: {exc!r}")
 
-            self.latest_rates_data = {
-                "tariff_info": tariff_info,
-                **monitored,
-            }
+            fresh = {"tariff_info": tariff_info, **monitored}
+            # Carried over until it is recomputed below: the refresh runs on a
+            # worker now, and a tick reading the new dict in between must not see
+            # no export rate and fall back to the flat 12p. Only a real number is
+            # carried — readers do float(get("export_rate_p", 0.0)), so a None
+            # would break them.
+            _prev_export = (self.latest_rates_data or {}).get("export_rate_p")
+            if isinstance(_prev_export, (int, float)):
+                fresh["export_rate_p"] = _prev_export
+            self.latest_rates_data = fresh
             # The paired Flux schedules. Fetched when the controller is armed —
             # it cannot price a trade without them — AND whenever the ACCOUNT is
             # detected as Flux, even with the controller switched off, because
@@ -9916,6 +9975,17 @@ class Plugin(indigo.PluginBase):
         event = self.axle.get_next_event()   # NETWORK — unlocked (v5.45.0)
         self._record_vpp_api_status(self.axle.last_error)
         with self._state_lock:
+            # A FAILED POLL IS NOT A CANCELLATION (review 02-10-2026). The API
+            # returns None for "no event" and for a timeout or a 5xx alike; read
+            # as "cancelled", one blip before a window undid its floor, dropped to
+            # IDLE and slowed polling to every 10 minutes, so the paid window could
+            # start up to ten minutes late. A window we already hold is re-applied
+            # from what we stored, so its clock still moves it on; only a poll that
+            # answered cleanly with nothing cancels it.
+            if (event is None and self.axle.last_error
+                    and self.store.get("vpp_state") in (VPP_ANNOUNCED, VPP_PRE_CHARGING)
+                    and self.store.get("vpp_event")):
+                event = self.store["vpp_event"]
             self._apply_vpp_event(event)
 
     def _check_vpp_overrun(self):
@@ -10017,6 +10087,9 @@ class Plugin(indigo.PluginBase):
                 self.store["vpp_charge_stopped"] = False
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
+                # Every other way to IDLE clears the stored event; this one left it
+                # set, so the dashboard kept a countdown to a cancelled window.
+                self.store["vpp_event"] = None
 
             self._update_vpp_device()
             return
@@ -11387,7 +11460,7 @@ class Plugin(indigo.PluginBase):
         # negative (see _vpp_export_anchor_after_midnight). Must run BEFORE
         # the reset — it needs the pre-reset total.
         if self.store.get("vpp_state", VPP_IDLE) == VPP_ACTIVE:
-            _pre_total = self.store.get("grid_export_daily_kwh", 0.0)
+            _pre_total = self._export_total_for_ended_day(yesterday)
             _old_start = self.store.get("vpp_export_start_kwh", 0.0)
             self.store["vpp_export_start_kwh"] = _vpp_export_anchor_after_midnight(
                 _old_start, _pre_total)
@@ -11656,22 +11729,44 @@ class Plugin(indigo.PluginBase):
 
         path    = os.path.join(self.data_dir, "daily_history.json")
         records = []
+        unreadable = None
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     records = json.load(f)
-        except Exception:
-            pass
+                if not isinstance(records, list):
+                    unreadable = "it does not hold a list of days"
+        except Exception as exc:                        # noqa: BLE001
+            unreadable = str(exc)
 
-        records.append(record)
-        # Retention: keep every record indefinitely (v5.7).  Each record is
-        # ~280 bytes; even 50 years of daily data is < 6 MB JSON.  The user
-        # explicitly asked to never lose history.  No pruning.
+        if unreadable is not None:
+            # NEVER OVERWRITE HISTORY WE COULD NOT READ (review 02-10-2026). The old
+            # `except: pass` left records = [] and the atomic write then replaced
+            # every day ever recorded with this one. The bad file is moved aside
+            # whole, so nothing is lost, and this day goes into a fresh file.
+            aside = f"{path}.unreadable-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            try:
+                os.replace(path, aside)
+                log(f"Daily history could not be read ({unreadable}); it was moved to "
+                    f"{os.path.basename(aside)} untouched and a new file started. "
+                    f"Nothing has been deleted.", level="ERROR")
+            except OSError as exc:
+                log(f"Daily history could not be read ({unreadable}) and could not be "
+                    f"moved aside ({exc}); today's record was NOT written so the file "
+                    f"is left exactly as it is.", level="ERROR")
+                records = None
+            else:
+                records = []
 
-        try:
-            _atomic_write_json(path, records)
-        except Exception as e:
-            log(f"Cannot write daily history: {e}", level="ERROR")
+        if records is not None:
+            records.append(record)
+            # Retention: keep every record indefinitely (v5.7).  Each record is
+            # ~280 bytes; even 50 years of daily data is < 6 MB JSON.  The user
+            # explicitly asked to never lose history.  No pruning.
+            try:
+                _atomic_write_json(path, records)
+            except Exception as e:
+                log(f"Cannot write daily history: {e}", level="ERROR")
 
         # Reset daily counters
         self.store["had_import_today"]   = False
@@ -11983,8 +12078,6 @@ class Plugin(indigo.PluginBase):
         # via _as_int/_as_float so a missing/odd Modbus value can never crash the
         # state write. Categorical states (emsWorkMode, gridStatus, etc.) stay str.
         states = [
-            {"key": "emsWorkMode",              "value": str(data.get("emsWorkMode", ""))},
-            {"key": "gridSensorConnected",      "value": str(data.get("gridSensorConnected", False))},
             {"key": "gridPowerWatts",           "value": _as_int(data.get("gridPowerWatts"), 0)},
             {"key": "gridStatus",               "value": str(data.get("gridStatus", ""))},
             # 0 only on a GENUINE off-grid status — an unmapped "Unknown (N)" read must
@@ -11994,13 +12087,6 @@ class Plugin(indigo.PluginBase):
             {"key": "pvPowerWatts",             "value": _as_int(data.get("pvPowerWatts"), 0)},
             {"key": "batteryPowerWatts",        "value": _as_int(data.get("batteryPowerWatts"), 0)},
             {"key": "homePowerWatts",           "value": _as_int(data.get("homePowerWatts"), 0)},
-            {"key": "plantRunningState",        "value": str(data.get("plantRunningState", ""))},
-            _num_state("dischargeCutoffSoc",       _as_float(data.get("dischargeCutoffSoc"), 0.0),    1),
-            _num_state("batterySoh",               _as_float(data.get("batterySoh"), 0.0),            1),
-            _num_state("batteryTempC",             _as_float(data.get("batteryTempC"), 0.0),          1),
-            _num_state("batteryCellVoltage",       _as_float(data.get("batteryCellVoltage"), 0.0),    3),
-            _num_state("batteryMaxTempC",          _as_float(data.get("batteryMaxTempC"), 0.0),       1),
-            _num_state("batteryMinTempC",          _as_float(data.get("batteryMinTempC"), 0.0),       1),
             # v5.89.0: from the projection, never from data — the inverter's daily
             # registers are present only on the cycle they were read, and a 0.0
             # written on the other cycles would chart as a real reading.
@@ -12014,6 +12100,18 @@ class Plugin(indigo.PluginBase):
             {"key": "modbusConnected",          "value": "True"},
             {"key": "lastUpdate",               "value": data.get("lastUpdate", "")},
         ]
+        # The slower registers, each written ONLY when this snapshot carries it
+        # (review 02-10-2026). After an outage longer than their cache the first
+        # snapshots lacked most of them, and the defaults here wrote 0.0 C, a 0%
+        # cutoff, "False" and "" into SQL history as if they were readings.
+        for _key in ("emsWorkMode", "gridSensorConnected", "plantRunningState"):
+            if data.get(_key) is not None:
+                states.append({"key": _key, "value": str(data[_key])})
+        for _key, _places in (("dischargeCutoffSoc", 1), ("batterySoh", 1),
+                              ("batteryTempC", 1), ("batteryCellVoltage", 3),
+                              ("batteryMaxTempC", 1), ("batteryMinTempC", 1)):
+            if data.get(_key) is not None:
+                states.append(_num_state(_key, _as_float(data.get(_key), 0.0), _places))
         # Per-PV-string readings (v5.67.0). Written only for strings the
         # inverter actually reported — an unreported string's states stay at
         # their last value rather than being stamped with a fabricated 0
@@ -12450,14 +12548,33 @@ class Plugin(indigo.PluginBase):
         con = None
         try:
             con = sqlite3.connect(db_path, timeout=5.0)
+            # A slot that already exists is ADDED TO, never dropped (review
+            # 02-10-2026). The labels are naive local time, so the clocks-back night
+            # repeats 01:00-02:00 and the second pass collided with the first:
+            # INSERT OR IGNORE threw away about an hour of energy while the anchors
+            # moved on. Merging keeps every kWh; the repeated hour simply shows as
+            # one hour holding both passes.
             con.execute(
-                """INSERT OR IGNORE INTO halfhourly
+                """INSERT INTO halfhourly
                    (slot_start, slot_end,
                     grid_import_kwh, grid_export_kwh, pv_kwh, home_kwh,
                     battery_soc_start_pct, battery_soc_end_pct, battery_net_kwh,
                     tracker_price_p, agile_price_p, manager_action,
                     battery_charge_kwh, battery_discharge_kwh)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(slot_start) DO UPDATE SET
+                    slot_end            = excluded.slot_end,
+                    grid_import_kwh     = grid_import_kwh + excluded.grid_import_kwh,
+                    grid_export_kwh     = grid_export_kwh + excluded.grid_export_kwh,
+                    pv_kwh              = pv_kwh + excluded.pv_kwh,
+                    home_kwh            = home_kwh + excluded.home_kwh,
+                    battery_soc_end_pct = excluded.battery_soc_end_pct,
+                    battery_net_kwh     = COALESCE(battery_net_kwh, 0)
+                                          + COALESCE(excluded.battery_net_kwh, 0),
+                    battery_charge_kwh  = COALESCE(battery_charge_kwh, 0)
+                                          + COALESCE(excluded.battery_charge_kwh, 0),
+                    battery_discharge_kwh = COALESCE(battery_discharge_kwh, 0)
+                                          + COALESCE(excluded.battery_discharge_kwh, 0)""",
                 (slot_start, slot_end,
                  delta_import, delta_export, delta_pv, delta_home,
                  anchor_soc, cur_soc, battery_net,
@@ -12862,6 +12979,13 @@ class Plugin(indigo.PluginBase):
             path   = self._vpp_ledger_path()
             rate   = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
             ledger = _vpp_ledger.load_ledger(path)
+            if ledger.get("load_error"):
+                # The same refusal _merge_axle_payload makes (review 02-10-2026):
+                # saving here replaced every settled Axle row with this one event.
+                vpp_log(f"[VPP] Ledger not updated: {os.path.basename(path)} did not "
+                        f"parse ({ledger['load_error']}). It has been left as it is; "
+                        f"this event is still in the VPP log.", level="WARNING")
+                return
             _vpp_ledger.record_local_event(ledger, start, end, export_kwh, rate,
                                            driver=driver, log_path=log_path,
                                            window_kwh=window_kwh)
@@ -14375,9 +14499,18 @@ class Plugin(indigo.PluginBase):
             # go on trading it.
             evidence = self.octopus.get_account_agreements(force=force)
             if not evidence:
-                self.store["flux_account_evidence"] = {}
+                # A FAILED READ KEEPS THE LAST PROOF UNTIL ITS OWN AGE RUNS OUT
+                # (CliveS, review 02-10-2026). Wiping it turned one Octopus
+                # timeout into Flux control switched off until the next good read:
+                # 19:06-19:36 on 1 Oct after a restart. The old worry above was
+                # stale proof kept alive by something else succeeding; the proof
+                # now carries its own fetched_at, which _flux_tariff_verified
+                # holds to FLUX_ACCOUNT_EVIDENCE_MAX_AGE_S, and nothing here
+                # re-stamps it or the prices. A read that SUCCEEDS and says the
+                # house is not on Flux still replaces it at once.
                 self.store["flux_rates_problem"] = (
-                    "the account's agreements could not be read, so nothing is proven")
+                    "the account's agreements could not be read this time; the last "
+                    "proof stands until it is too old")
                 return
             self.store["flux_account_evidence"] = evidence
             imp_agreement = evidence.get("import") or {}
@@ -16429,6 +16562,15 @@ class Plugin(indigo.PluginBase):
                 longitude=site_lon,
                 arrays=arrays_override,
             )
+            # The bias correction belongs to the object, so it is loaded wherever
+            # the object is built (review 02-10-2026). Only startup() loaded it, so
+            # a Configure save rebuilt the forecast with every band at 1.0 and the
+            # manager planned on the raw model figure until the next midnight.
+            try:
+                self.forecast.load_correction_factor()
+            except Exception as exc:                    # noqa: BLE001
+                log(f"[OpenMeteo] Could not load the bias correction: {exc}",
+                    level="WARNING")
 
         # Octopus
         self.octopus = OctopusAPI(
@@ -16634,6 +16776,9 @@ class Plugin(indigo.PluginBase):
             # Daily event flags must survive a same-day restart after dispatch.
             "had_vpp_today":             bool(self.store.get("had_vpp_today", False)),
             "had_import_today":          bool(self.store.get("had_import_today", False)),
+            # Review 02-10-2026: the export count was lost on a same-day restart,
+            # so the day's export_events under-reported.
+            "export_count_today":        int(self.store.get("export_count_today", 0) or 0),
             "pv_lifetime_start_kwh":     self.store["pv_lifetime_start_kwh"],
             "import_lifetime_start_kwh": self.store["import_lifetime_start_kwh"],
             "export_lifetime_start_kwh": self.store["export_lifetime_start_kwh"],
@@ -16671,6 +16816,10 @@ class Plugin(indigo.PluginBase):
             "bank_first_logged_date":        self.store.get("bank_first_logged_date", ""),
             "bank_first_release_logged":     self.store.get("bank_first_release_logged", False),
             "bank_first_minutes_soc_ge_95":  self.store.get("bank_first_minutes_soc_ge_95", 0),
+            # Review 02-10-2026: the Flux proof survives a restart, so a restart
+            # during an Octopus outage does not switch Flux control off. It is
+            # restored whatever the day; its own fetched_at limits its life.
+            "flux_account_evidence":         self.store.get("flux_account_evidence") or {},
             "bank_first_minutes_soc_ge_99":  self.store.get("bank_first_minutes_soc_ge_99", 0),
             "bank_first_clip_boundary_min":  self.store.get("bank_first_clip_boundary_min", 0),
             "bank_first_arm_minutes":        self.store.get("bank_first_arm_minutes", 0),
@@ -16845,6 +16994,10 @@ class Plugin(indigo.PluginBase):
                     _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
             if data.get("happy_hour_free_kwh") is not None:
                 self.store["happy_hour_free_kwh"] = data.get("happy_hour_free_kwh", 0.0)
+            _ev = data.get("flux_account_evidence")
+            if (isinstance(_ev, dict) and type(_ev.get("fetched_at")) in (int, float)
+                    and not self.store.get("flux_account_evidence")):
+                self.store["flux_account_evidence"] = _ev
             # Restart-critical control state, restored regardless of day.
             # pluginPrefs copies (written by the same paths) are kept as a
             # fallback for installs upgrading from before v5.43 — startup()'s
@@ -16916,10 +17069,26 @@ class Plugin(indigo.PluginBase):
             if isinstance(data.get("energy_yesterday_projection"), dict):
                 self.store["energy_yesterday_projection"] = data["energy_yesterday_projection"]
             today = _local_today_str()   # Europe/London, matches the save/midnight basis
-            if data.get("today_date") == today:
-                # Same day — restore accumulators and lifetime anchors
+            # A file from YESTERDAY is restored as yesterday (review 02-10-2026), so
+            # the first tick's midnight task records the day that ended exactly as
+            # it would have had the plugin kept running. Skipping it, as before,
+            # left today_date at today and the ended day was never recorded:
+            # no daily history row, no accuracy sample, no Monday backup.
+            try:
+                yesterday = (datetime.strptime(today, "%Y-%m-%d").date()
+                             - timedelta(days=1)).isoformat()
+            except ValueError:
+                yesterday = ""
+            saved_day = data.get("today_date")
+            if saved_day in (today, yesterday) and saved_day:
+                restore_day = saved_day
+                # Same day (or the day just ended) — restore accumulators and lifetime anchors
                 for event_flag in ("had_vpp_today", "had_import_today"):
                     self.store[event_flag] = bool(data.get(event_flag, False))
+                try:
+                    self.store["export_count_today"] = int(data.get("export_count_today", 0) or 0)
+                except (TypeError, ValueError):
+                    self.store["export_count_today"] = 0
                 self.store["pv_daily_kwh"]              = data.get("pv_daily_kwh", 0.0)
                 self.store["grid_import_daily_kwh"]     = data.get("grid_import_daily_kwh", 0.0)
                 self.store["grid_export_daily_kwh"]     = data.get("grid_export_daily_kwh", 0.0)
@@ -16928,7 +17097,7 @@ class Plugin(indigo.PluginBase):
                 self.store["min_soc"]                   = data.get("min_soc", 100.0)
                 self.store["peak_pv_w"]                 = data.get("peak_pv_w", 0)
                 self.store["peak_pv_time"]              = data.get("peak_pv_time", "")
-                self.store["today_date"]                = today
+                self.store["today_date"]                = restore_day
                 # Restore lifetime anchors so delta computation continues correctly
                 self.store["pv_lifetime_start_kwh"]     = data.get("pv_lifetime_start_kwh")
                 self.store["import_lifetime_start_kwh"] = data.get("import_lifetime_start_kwh")
@@ -16947,7 +17116,7 @@ class Plugin(indigo.PluginBase):
                 # the first read (daily_energy.observe, recovery=).
                 if not isinstance(_de, dict) and getattr(self, "daily_energy", None) is not None:
                     _seeded = self.daily_energy.migrate_legacy(
-                        today, data.get("pv_lifetime_start_kwh"),
+                        restore_day, data.get("pv_lifetime_start_kwh"),
                         data.get("import_lifetime_start_kwh"), data.get("export_lifetime_start_kwh"))
                     if _seeded:
                         log(f"[Energy] Midnight anchors for {', '.join(_seeded)} carried over from "

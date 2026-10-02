@@ -183,7 +183,12 @@ class FluxExecutionTests(unittest.TestCase):
         self.e._save=fail; self.d.writes.clear()
         self.assertEqual(self.e.step(self.target(),self.now),'pending')
         self.assertNotIn(('mode',3),self.d.writes); self.assertEqual(self.d.values['mode'],2)
-        self.assertEqual(self.e.step(None,self.now),'pending'); self.assertEqual(self.d.values['top'],100.)
+        # CONTRACT CHANGED 02-10-2026 (review of 5.131.1): a VERIFIED restore
+        # releases even when the journal cannot be written. 'pending' here kept the
+        # claim for ever and repeated a 12-write restore every tick; a restart
+        # reconciles a stale journal anyway.
+        self.assertEqual(self.e.step(None,self.now),'released'); self.assertEqual(self.d.values['top'],100.)
+        self.assertFalse(self.e.owns_control)
     def test_failed_stop_never_lifts_cutoffs_while_exporting(self):
         self.now=self.now.replace(hour=16); self.arm(self.target(ems_mode=5,charge_limit_w=0,discharge_limit_w=3000))
         self.d.lie='mode'; self.d.writes.clear()

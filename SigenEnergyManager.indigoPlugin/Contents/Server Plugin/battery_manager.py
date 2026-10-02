@@ -4,9 +4,16 @@
 # Description: 24-hour sufficiency model — export surplus today, import only
 #              when tomorrow's battery+solar falls short of tomorrow's daily load.
 #              No overnight forced discharge.
-# Author:      CliveS & Claude Opus 5; 3.12-3.15 Claude Opus 5.5
-# Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026; 3.15 01-10-2026
-# Version:     3.15
+# Author:      CliveS & Claude Opus 5; 3.12-3.16 Claude Opus 5.5
+# Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026; 3.15 01-10-2026;
+#              3.16 02-10-2026
+# Version:     3.16
+# 3.16 — (review 02-10-2026) THE FLOOD DRAIN STOPS AT THE FLUX MINIMUM. On Flux the
+#       overnight pre-drain went to 40% at the 9.7p export rate and the 02:00 charge
+#       (flux_strategy.CHARGE_MIN_PCT, 50%) bought it straight back at 14.6p. On Flux
+#       the drain floor is now at least that minimum, for a new drain and one already
+#       running; other tariffs are unchanged. The drain's reason also prints the
+#       export rate it was priced at instead of a hard-coded "12p".
 # 3.15 — THE CHEAP WINDOW HAS A FALLBACK THAT KEEPS THE 50% MINIMUM. 1-Oct-2026:
 #       Octopus had published no October Flux export price, so the Flux controller
 #       could not plan; the manager bought to its own household target (44%), went back
@@ -431,6 +438,15 @@ MIN_EXPORT_KWH = 0.3
 FLOOD_PREV_SOC_THRESHOLD_PCT = 55.0   # min SOC % to trigger overnight pre-drain
 FLOOD_PREV_TARGET_PCT        = 40.0   # drain to this SOC % before sunrise
 FLOOD_PREV_FORECAST_MULT     = 3.0    # tomorrow solar must be >= this × tomorrow need
+
+# 3.16 (review 02-10-2026): on Flux the drain stops at the cheap-window minimum. Below
+# it, 02:00 buys straight back at 14.6p what the drain sold at the 9.7p night export
+# rate. Imported from its one owner, flux_strategy.CHARGE_MIN_PCT (pure stdlib); the
+# fallback mirrors it only so this module still imports on its own.
+try:
+    from flux_strategy import CHARGE_MIN_PCT as FLUX_CHARGE_MIN_PCT
+except ImportError:
+    FLUX_CHARGE_MIN_PCT = 50.0   # mirror of flux_strategy.CHARGE_MIN_PCT
 
 # Solar overflow constants (daytime forecast-based export)
 # Mode stays 0x02 (Max Self Consumption) throughout.
@@ -2867,6 +2883,20 @@ class BatteryManager:
         """
         return _to_london(dt)
 
+    @staticmethod
+    def _flood_floor_pct(snapshot: ManagerSnapshot) -> float:
+        """Lowest SOC % an overnight flood drain may reach (3.16).
+
+        FLOOD_PREV_TARGET_PCT, raised by the storm/seasonal dawn target and, on Flux,
+        by the cheap-window minimum (FLUX_CHARGE_MIN_PCT): selling below it at the
+        night export rate only for 02:00 to buy it back at the cheap import rate is
+        a loss. Other tariffs are unchanged.
+        """
+        floor = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
+        if snapshot.tariff.tariff_key == TARIFF_FLUX:
+            floor = max(floor, FLUX_CHARGE_MIN_PCT)
+        return floor
+
     def _check_flood_prevention(
         self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> Optional[Decision]:
@@ -2918,6 +2948,9 @@ class BatteryManager:
         export_kwh        = preview["expected_export_kwh"]
         revenue_gbp       = preview["expected_revenue_gbp"]
         refill_label      = preview["refill_label"]
+        # 3.16 (review 02-10-2026): the rate the revenue was worked out at, not a
+        # hard-coded "12p" (Flux exports at 9.7p overnight).
+        rate_p            = snapshot.export_rate_p or 12.0
 
         if refill_vpp_kwh > 0.01:
             demand_str = (
@@ -2930,7 +2963,8 @@ class BatteryManager:
             action          = ACTION_START_EXPORT,
             reason          = (
                 f"Flood prevention: SOC {snapshot.current_soc_pct:.1f}% → "
-                f"{effective_target:.0f}% ({export_kwh:.1f} kWh @ 12p = ~£{revenue_gbp:.2f}). "
+                f"{effective_target:.0f}% ({export_kwh:.1f} kWh @ {rate_p:.1f}p = "
+                f"~£{revenue_gbp:.2f}). "
                 f"{refill_label} {refill_solar_kwh:.1f} kWh forecast "
                 f">= {FLOOD_PREV_FORECAST_MULT:.0f}x need ({demand_str}) "
                 f"— solar refills without reimport. "
@@ -2972,7 +3006,7 @@ class BatteryManager:
         refill_demand_kwh  = refill_need_kwh + refill_vpp_kwh
         gate_threshold_kwh = FLOOD_PREV_FORECAST_MULT * refill_demand_kwh
         ratio              = (refill_solar_kwh / refill_demand_kwh) if refill_demand_kwh > 0 else 0.0
-        effective_target   = max(FLOOD_PREV_TARGET_PCT, snapshot.dawn_target_pct)
+        effective_target   = self._flood_floor_pct(snapshot)
         soc                = snapshot.current_soc_pct
 
         # refill_demand_kwh > 0 required: with demand 0 (user enters 0 in both
@@ -3057,7 +3091,9 @@ class BatteryManager:
 
         # A storm override may have raised dawn_target_pct above the drain target
         # after the drain started — never drain below the higher of the two.
-        effective_stop = max(target, snapshot.dawn_target_pct)
+        # 3.16: and never below the Flux cheap-window minimum, so a drain started
+        # by an older version (target 40%) stops there too.
+        effective_stop = max(target, self._flood_floor_pct(snapshot))
 
         # Dawn broke — stop now; ACTION_SOLAR_OVERFLOW first-entry handles cutoff reset
         if balance.is_daytime:
