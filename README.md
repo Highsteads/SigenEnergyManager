@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.131.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.131.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.131.2** — The inverter is handed back properly when the plugin stops, the 2am charge can no longer be refused all night on a day with an Axle event, and a refused Happy Hour booking is no longer counted as booked.
 
 **v5.131.1** — The 4pm to 7pm sale no longer stops for a few seconds every few minutes as its reserve moves, and its plan is logged once rather than every few minutes.
 
@@ -114,6 +116,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.131.2 | 2 October 2026 | Hand-back at shutdown; 2am charge never refused; Happy Hour refusals |
 | 5.131.1 | 1 October 2026 | Peak sale moves its floor without stopping; one log line |
 | 5.131.0 | 1 October 2026 | Axle "pre-charge" writes nothing; floor set at the start |
 | 5.130.1 | 1 October 2026 | Fallback charge sized to the site; shortfalls always shown |

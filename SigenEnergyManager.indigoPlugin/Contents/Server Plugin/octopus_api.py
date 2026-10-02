@@ -35,6 +35,7 @@
 import base64
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -192,6 +193,17 @@ TARIFF_WINDOWS = {
     TARIFF_IFLUX: {"cheap_start": "19:00", "cheap_end": "16:00"},  # 21h non-peak window (avoids 16:00-19:00 peak)
 }
 
+
+
+# A Happy Hour refusal that is really a success says THIS slot is already booked;
+# one that mentions a limit is a refusal whatever else it says (review 02-10-2026).
+_ALREADY_BOOKED_RE = re.compile(
+    r"\balready\s+(?:been\s+)?(?:booked|signed\s+up|joined)\b"
+    r"(?:\s+(?:on|to|for|in|onto))?(?:\s+(?:this|that|the))?"
+    r"\s*(?:event|slot|session|hour|happy\s+hour)?\s*[.!]?\s*$",
+    re.IGNORECASE)
+_BOOKING_LIMIT_RE = re.compile(r"\b(?:maximum|max|limit|no\s+more|too\s+many|other)\b",
+                               re.IGNORECASE)
 
 class OctopusApiError(Exception):
     pass
@@ -1558,10 +1570,14 @@ class OctopusAPI:
             if code == "OE-0102":
                 self._kraken_token = None
                 return dict(blank, reason=f"auth rejected ({code}): {detail}")
-            if "already" in detail.lower():
+            if _ALREADY_BOOKED_RE.search(detail) and not _BOOKING_LIMIT_RE.search(detail):
                 # The join mutation reports "already signed up" as an error that
                 # is really a success (OE-1308). Read a booking the same way, but
-                # only on the words, since the booking code has not been seen.
+                # only on the words, since the booking code has not been seen —
+                # and only words that say THIS slot is booked (review 02-10-2026).
+                # "You have already booked the maximum number of slots" is a
+                # refusal; read as a booking it would have the battery import at
+                # the day rate in an hour that is not free.
                 return {"ok": True, "already": True, "permanent": False,
                         "reason": "already booked"}
             return dict(blank, permanent=True,

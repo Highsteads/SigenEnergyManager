@@ -21,6 +21,26 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.131.2 — 02-10-2026
+
+Independent review of 5.131.1 (02-Oct-2026), batch 1: the three P1-level faults, each with a test
+watched failing first (`test_review_2026_10_02.py`, two in `test_octopus_api.py`).
+- **`shutdown()`**: Indigo's `_pre_shutdown()` calls `stop_concurrent_thread()` BEFORE `shutdown()`,
+  so `self.sleep()` raises StopThread at once. The driver sleeps through `sleep_func=self.sleep`, so
+  `set_self_consumption()` wrote 40029 and died on its 0.15 s verify pause (swallowed); `_flux_release`
+  the same. Live match: the 01-Oct 19:06 shutdown logged "Enabling Remote EMS control" and no mode
+  write. `shutdown()` now swaps `self.modbus._sleep = time.sleep` first.
+- **flux_strategy 2.11 `plan()`** wraps `_plan()` and clamps `discharge_cutoff_pct` to
+  `charge_cutoff_pct` when it is above it. A MODE_CHARGE target below `house_floor` (the roof covers
+  an Axle event the floor counts in full) was refused by `FluxExecutor._valid_target` as "Invalid
+  target energy band" every tick, while `_flux_owns_cheap_window` kept the manager standing aside.
+- **plugin `_flux_note_refused`**: a 'released' step with `last_error` while the decision owns sets
+  `store["flux_refused"]` (one WARNING per episode) and `_flux_owns_cheap_window` returns False until
+  Flux applies again.
+- **octopus_api `book_happy_hour_event`**: "already" counts as booked only through
+  `_ALREADY_BOOKED_RE` and never with a limit word (`_BOOKING_LIMIT_RE`); "already booked the maximum
+  number of slots" is a permanent refusal.
+
 ## v5.131.1 — 01-10-2026
 
 CliveS, 1-Oct-2026, pasting two plan notes six minutes apart (floor 49% then 48%): "I dont need

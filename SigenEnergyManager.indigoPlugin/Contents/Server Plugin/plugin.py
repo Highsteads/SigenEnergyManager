@@ -66,8 +66,9 @@
 #              Claude Opus 5.5 (5.130.1 — fallback charge sized to site headroom; minimum shortfall always checked; 5am report has no hidden tolerance)
 #              Claude Opus 5.5 (5.131.0 — the Axle 'pre-charge' writes nothing; the event floor is set at T-2min every time)
 #              Claude Opus 5.5 (5.131.1 — the peak sale moves its floor without stopping, and logs its plan once)
-# Date:        28-09-2026
-# Version:     5.131.1
+#              Claude Opus 5.5 (5.131.2 — review batch 1: hand-back at shutdown, 2am charge band, Happy Hour refusals)
+# Date:        02-10-2026
+# Version:     5.131.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2355,6 +2356,16 @@ class Plugin(indigo.PluginBase):
 
     def shutdown(self):
         log(f"{PLUGIN_NAME} shutting down")
+        # INDIGO STOPS THE CONCURRENT THREAD BEFORE IT CALLS shutdown() (review
+        # 02-10-2026, plugin_base._pre_shutdown), and from then on self.sleep()
+        # raises StopThread whatever the duration. The Modbus driver sleeps
+        # through self.sleep, so every write after the first died on its throttle
+        # or verify pause: the Flux release and the return to Self Consumption
+        # below wrote register 40029 and nothing else, leaving a forced charge or
+        # export running with nothing to stop it. Plain sleeps from here on; each
+        # is at most a second, well inside Indigo's shutdown budget.
+        if self.modbus is not None:
+            self.modbus._sleep = time.sleep
         # Give the inverter up BEFORE anything else stops. The executor's journal
         # survives this process, so a claim left standing is a claim the next
         # start has to reconcile against hardware it cannot see the history of —
@@ -14579,6 +14590,8 @@ class Plugin(indigo.PluginBase):
         # import) does not run the window, so the manager's hold stays until it can.
         if not (self._flux_owns_control() or self._flux_may_claim()):
             return False
+        if self.store.get("flux_refused"):
+            return False                  # the executor would not run Flux's plan
         decision = self.store.get("flux_decision")
         return bool(decision is not None and getattr(decision, "mode", None)
                     in (_flux_strategy.MODE_CHARGE, _flux_strategy.MODE_HOLD))
@@ -15078,12 +15091,32 @@ class Plugin(indigo.PluginBase):
         if result == "applied":
             self.store["flux_applied_key"]   = decision.control_key()
             self.store["flux_pending_since"] = 0.0
+            self.store["flux_refused"]       = False
         else:
             self.store["flux_applied_key"] = None
             if result == "pending":
                 self._flux_note_pending(ex, decision)
             else:
                 self.store["flux_pending_since"] = 0.0
+                self._flux_note_refused(ex, decision, result)
+
+    def _flux_note_refused(self, ex, decision, result):
+        """A plan the executor would not run must not keep the manager waiting.
+
+        Review 02-10-2026: the executor refused a cheap-window charge it judged
+        invalid, released, and said so only in `last_error`. Nothing here read
+        it, so `_flux_owns_cheap_window` went on telling the manager that Flux
+        had the window, and neither of them charged. Now a refusal is logged
+        once per episode and hands the window back until Flux applies again.
+        """
+        err = str(getattr(ex, "last_error", "") or "")
+        if result != "released" or not err or not getattr(decision, "owns", False):
+            return
+        if not self.store.get("flux_refused"):
+            log(f"[Flux] The inverter controller refused the plan ({err}), so Flux is "
+                f"not running it. The manager's own plan covers this window until "
+                f"Flux can apply one.", level="WARNING")
+        self.store["flux_refused"] = True
 
     def _flux_note_pending(self, ex, decision):
         """Record an unacknowledged command and keep retrying it.

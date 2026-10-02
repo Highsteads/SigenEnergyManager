@@ -1011,6 +1011,25 @@ class TestBookHappyHourEvent(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertTrue(r["already"])
 
+    def test_a_limit_refusal_that_says_already_is_not_a_booking(self):
+        """Review 02-10-2026: any "already" counted as booked, so a refusal for
+        having booked the maximum would have imported at the day rate in an
+        hour that is not free."""
+        self._post(_book_err("OE-1309", "Booking refused.",
+                             reason="You have already booked the maximum number of "
+                                    "slots for this day."))
+        r = self.api.book_happy_hour_event("E1")
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["already"])
+        self.assertTrue(r["permanent"])
+
+    def test_already_booked_this_slot_is_still_success(self):
+        for words in ("You have already booked this event.", "Already booked",
+                      "Already booked onto this Happy Hour"):
+            self._post(_book_err("OE-1308", "x", reason=words))
+            r = self.api.book_happy_hour_event("E1")
+            self.assertTrue(r["ok"] and r["already"], words)
+
     def test_auth_failure_is_retryable_and_purges_the_token(self):
         self.api._kraken_token = "stale"
         self._post(_book_err("OE-0102", "'Authorization' header is invalid"))

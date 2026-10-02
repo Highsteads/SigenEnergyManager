@@ -5,11 +5,11 @@
 #              solar forecast, a household profile, event commitments and one
 #              battery observation in; one decision, or a refusal, out.
 # Author:      CliveS & Claude Opus 5 (1M context); v2.1-2.7 Claude Opus 5.5; v2.8-2.9 Claude Sonnet 5.5;
-#              v2.9.1-2.10 Claude Opus 5.5
+#              v2.9.1-2.11 Claude Opus 5.5
 # Date:        16-09-2026; v2.1 22-09-2026; v2.2 24-09-2026; v2.3 26-09-2026;
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
-#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026
-# Version:     2.10.2
+#              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026; v2.11 02-10-2026
+# Version:     2.11
 #
 # v2.10.2 (SigenEnergyManager 5.131.1): note_control_key no longer keys on the discharge
 # floor, so a floor moving a point at a time through a sale is not a new log line.
@@ -1685,7 +1685,25 @@ def _export_plan(inputs):
 # ================================================================
 
 def plan(inputs):
-    """Inputs in, one decision out. Pure. `owns` False means release."""
+    """Inputs in, one decision out. Pure. `owns` False means release.
+
+    EVERY DECISION LEAVES WITH A BAND THE EXECUTOR ACCEPTS (review 02-10-2026):
+    the floor never above the ceiling. A cheap-window charge whose target sat
+    below the household floor (the roof covers an Axle event the floor counts in
+    full) asked for exactly that. The executor refused it every tick as "Invalid
+    target energy band", the manager stood aside for Flux, and nothing charged
+    all night. With the floor brought down to the ceiling the battery is still
+    never asked to go below what it is being filled to.
+    """
+    decision = _plan(inputs)
+    top, bottom = decision.charge_cutoff_pct, decision.discharge_cutoff_pct
+    if top is not None and bottom is not None and bottom > top:
+        decision = replace(decision, discharge_cutoff_pct=top)
+    return decision
+
+
+def _plan(inputs):
+    """The decision itself; plan() makes its band safe."""
     try:
         floor_guess = _reserve_floor_pct(inputs.site)
     except (TypeError, ValueError, OverflowError, AttributeError):

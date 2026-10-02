@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.131.2 — 2 October 2026
+
+- **The inverter goes back to Self Consumption when the plugin stops.** Indigo stops a plugin's background work before it asks the plugin to shut down, and from then on the short pauses between inverter writes failed. Only the first of the four writes that hand the inverter back reached it, so a charge or a sale running at the time carried on with nothing to stop it until the plugin started again. All four now reach it.
+- **The 2am charge can no longer be refused all night.** On a sunny day with an Axle event, the plan could ask the inverter to keep more in the battery than it was being charged to. The part of the plugin that drives the inverter refused that every minute, the ordinary plan stood aside for Flux, and nothing charged. The plan no longer asks for that, and if a plan is ever refused the plugin says so once in the Event Log and the ordinary plan runs the window.
+- **A refused Weekend Happy Hour booking is no longer counted as booked.** Any refusal from Octopus containing the word "already" was read as a booking, so one saying the day's slots were all taken would have had the battery buy at the day rate in an hour that was not free. Only a reply saying this slot is already booked counts now.
+
 ## 5.131.1 — 1 October 2026
 
 - **The 4pm to 7pm sale no longer stops for a few seconds every few minutes.** The sale holds back what the house will need until 2am, and that figure falls a point at a time as the evening goes on. Each time it moved, the plugin took the inverter back to Self Consumption for about 15 seconds and then started the sale again: seventeen times between 4pm and 6pm on 1 October. Within the same mode it now changes only the setting that moved, in place, as it already did for the selling power, and every write is still read back.
