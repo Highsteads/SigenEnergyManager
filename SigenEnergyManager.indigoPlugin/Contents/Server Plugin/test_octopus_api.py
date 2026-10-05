@@ -181,6 +181,10 @@ class TestPerDayConsumption(unittest.TestCase):
         self.assertFalse(self.api.get_gas_kwh_for_date("2026-06-20")["complete"])
 
 
+def _reading(start, kwh):
+    return {"consumption": kwh, "interval_start": start}
+
+
 class TestConsumptionCoverage(unittest.TestCase):
     """_sum_consumption_for_date `complete` flag (v5.46.0) — full-day coverage.
 
@@ -225,6 +229,19 @@ class TestConsumptionCoverage(unittest.TestCase):
                           "interval_end":   "2026-07-01T23:00:00Z"}])
         self.assertEqual(out["slots"], 1)
         self.assertTrue(out["complete"])
+
+    def test_next_days_first_slot_is_not_counted(self):
+        # Octopus returns 49 slots for a local day: the 49th is the NEXT day's
+        # 00:00-00:30, because period_to is inclusive (measured 05-10-2026).
+        out = self._run([self._slot(i) for i in range(49)])
+        self.assertEqual(out["slots"], 48)
+        self.assertAlmostEqual(out["value"], 0.48)
+
+    def test_previous_days_last_slot_is_not_counted(self):
+        before = self._slot(0)
+        before["interval_start"] = "2026-06-30T22:30:00Z"
+        out = self._run([before] + [self._slot(i) for i in range(48)])
+        self.assertEqual(out["slots"], 48)
 
     def test_no_data_is_incomplete(self):
         out = self._run([])
@@ -1265,11 +1282,35 @@ class TestSessionResultsAndCredits(unittest.TestCase):
         api = _make_api()
         start = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
         end = datetime(2026, 9, 27, 13, tzinfo=timezone.utc)
-        api._paginate = lambda url, params, authenticated=False: [{"consumption": 8.1}]
+        api._paginate = lambda url, params, authenticated=False: [
+            _reading("2026-09-27T12:00:00Z", 8.1)]
         self.assertIsNone(api.get_import_kwh_between(start, end))
         api._paginate = lambda url, params, authenticated=False: [
-            {"consumption": 8.1}, {"consumption": 7.9}]
+            _reading("2026-09-27T12:00:00Z", 8.1), _reading("2026-09-27T12:30:00Z", 7.9)]
         self.assertEqual(api.get_import_kwh_between(start, end), 16.0)
+
+    def test_the_half_hour_starting_at_the_end_is_not_counted(self):
+        # Octopus returns the slot that BEGINS at period_to as well. The real
+        # 27-09-2026 1pm-2pm hour came back as these three; only the first two
+        # are the hour. Counting the third made the free hour 19.0 kWh, not 12.3.
+        from datetime import datetime, timezone
+        api = _make_api()
+        start = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 27, 13, tzinfo=timezone.utc)
+        api._paginate = lambda url, params, authenticated=False: [
+            _reading("2026-09-27T13:30:00+01:00", 5.893),
+            _reading("2026-09-27T13:00:00+01:00", 6.358),
+            _reading("2026-09-27T14:00:00+01:00", 6.796)]
+        self.assertEqual(api.get_import_kwh_between(start, end), 12.251)
+
+    def test_a_reading_with_no_start_is_not_counted(self):
+        from datetime import datetime, timezone
+        api = _make_api()
+        start = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 27, 13, tzinfo=timezone.utc)
+        api._paginate = lambda url, params, authenticated=False: [
+            _reading("2026-09-27T12:00:00Z", 8.1), {"consumption": 7.9}]
+        self.assertIsNone(api.get_import_kwh_between(start, end))
 
 
 if __name__ == "__main__":

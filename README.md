@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.132.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.132.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.132.1** — The free-hour check no longer says Octopus paid short. It was counting an extra half hour of electricity in each free hour; Octopus had paid the 27 September free hours in full. Daily electricity and gas totals no longer include the first half hour of the next day.
 
 **v5.132.0** — Octopus being slow no longer holds up the battery, one failed check no longer switches Flux off, an Axle blip no longer cancels an event, and the 4pm sale no longer starts and stops on sunny afternoons. Plus fixes to the 2am charge, event cover, the summer drain and the daily records.
 
@@ -118,6 +120,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.132.1 | 5 October 2026 | Free-hour check and daily meter totals count only their own half hours |
 | 5.132.0 | 2 October 2026 | Review part 2: control, money and records fixes |
 | 5.131.2 | 2 October 2026 | Hand-back at shutdown; 2am charge never refused; Happy Hour refusals |
 | 5.131.1 | 1 October 2026 | Peak sale moves its floor without stopping; one log line |

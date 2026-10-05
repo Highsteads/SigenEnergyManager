@@ -225,6 +225,31 @@ def _safe_float(value, default=None):
         return default
 
 
+def _readings_inside(intervals, start_utc, end_utc):
+    """The meter readings that START inside [start_utc, end_utc), nothing else.
+
+    Octopus's consumption endpoint treats period_to as INCLUSIVE: it also returns
+    the half hour that begins at period_to (measured 05-10-2026 — a 12:00-13:00Z
+    request returned 12:00, 12:30 AND 13:00, and a local day returned 49 slots,
+    the 49th being the next day's 00:00). Summing everything it hands back
+    therefore added one extra half hour to every free hour and every daily total.
+    A reading with no readable start cannot be placed, so it is left out rather
+    than guessed into the window.
+    """
+    out = []
+    for interval in intervals or []:
+        try:
+            st = datetime.fromisoformat(
+                str((interval or {}).get("interval_start", "")).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if st.tzinfo is None:
+            continue
+        if start_utc <= st < end_utc:
+            out.append(interval)
+    return out
+
+
 def _half_hourly_unit_rates(raw):
     """Kraken HalfHourlyTariff unitRates as [{valid_from, valid_to, value_inc_vat}].
 
@@ -807,6 +832,7 @@ class OctopusAPI:
             return None
         if intervals is None:
             return None
+        intervals = _readings_inside(intervals, day_start, day_end)
         if not intervals:
             return {"value": None, "slots": 0, "complete": False}
 
@@ -1401,6 +1427,7 @@ class OctopusAPI:
         except Exception as exc:                      # noqa: BLE001
             self.logger.debug(f"[Octopus] Import fetch failed {start_utc}-{end_utc}: {exc}")
             return None
+        intervals = _readings_inside(intervals, start_utc, end_utc)
         if not intervals:
             return None
         want = int(round((end_utc - start_utc).total_seconds() / 1800.0))

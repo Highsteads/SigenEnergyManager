@@ -68,8 +68,9 @@
 #              Claude Opus 5.5 (5.131.1 — the peak sale moves its floor without stopping, and logs its plan once)
 #              Claude Opus 5.5 (5.131.2 — review batch 1: hand-back at shutdown, 2am charge band, Happy Hour refusals)
 #              Claude Opus 5.5 (5.132.0 — review batches 2-3: control, money and records)
-# Date:        02-10-2026
-# Version:     5.132.0
+#              Claude Opus 5.5 (5.132.1 — Octopus meter sums no longer count the half hour after the window)
+# Date:        05-10-2026
+# Version:     5.132.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6642,6 +6643,10 @@ class Plugin(indigo.PluginBase):
                 data = json.load(fh)
             if isinstance(data, dict) and isinstance(data.get("claims"), dict):
                 data.setdefault("assigned_credit_ids", [])
+                if _fh_credits.upgrade(data):
+                    log("[FreeHour] Reading the free-hour meter figures again: the "
+                        "earlier ones counted an extra half hour in each hour")
+                    self._save_free_hour_ledger(data)
                 return data
         except FileNotFoundError:
             pass

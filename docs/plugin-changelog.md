@@ -21,6 +21,26 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.132.1 — 05-10-2026
+
+Octopus's REST `consumption/` endpoint treats `period_to` as INCLUSIVE: it also returns the
+half hour that STARTS at `period_to` (measured 05-10-2026 — a 12:00-13:00Z request returned
+12:00, 12:30 and 13:00; a local day returns 49 slots). `get_import_kwh_between` and
+`_sum_consumption_for_date` summed whatever came back.
+- **octopus_api**: new `_readings_inside(intervals, start, end)` keeps readings whose
+  `interval_start` is in `[start, end)`; a reading with no parseable, tz-aware start is dropped.
+  Both summing paths filter through it. The free hours of 27-Sep read 19.047 + 13.128 (capped
+  16 + 13.128 = 29.1 kWh, £7.09) against a true 12.251 + 12.992 = 25.243 kWh (£6.15); Octopus's
+  317p + 299p was right, and the "93p short" push was false.
+- **free_hour_credits 1.2**: `LEDGER_VERSION = 2`, `upgrade()` drops `meter_kwh` on open claims
+  so they are re-read; `_load_free_hour_ledger` runs it and saves once.
+- **scripts/mend_meter_extra_slot_2026_10.py**: one-off repair of settled `daily_history.json`
+  rows (import_kwh_octo, gas_m3/gas_kwh and the cost fields); a row changes only when its stored
+  figure equals its own day plus the extra slot. 65 of 123 settled days changed: 0.13 kWh import,
+  1.76 kWh gas, bills 1p in all.
+- Tests: 2,503 -> 2,512 (four in `test_octopus_api`, five in `test_free_hour_credits`), the four
+  new octopus_api tests watched failing with the filter disabled.
+
 ## v5.132.0 — 02-10-2026
 
 Independent review of 5.131.1, batches 2 and 3 (control, money, records). Every fix has a test

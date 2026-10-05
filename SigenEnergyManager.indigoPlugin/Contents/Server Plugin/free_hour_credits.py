@@ -6,7 +6,7 @@
 #              credits in, a verdict and the plain-English words out.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        02-10-2026
-# Version:     1.1 (review 02-10-2026: a MEASURING claim takes no credits and ages out)
+# Version:     1.2 (05-10-2026: ledger version 2 re-reads meter figures that counted an extra half hour)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -75,8 +75,38 @@ STATE_PAID        = "paid"
 _OPEN = (STATE_AWAITING, STATE_LATE, STATE_SHORT)
 
 
+LEDGER_VERSION = 2
+
+
 def new_ledger():
-    return {"version": 1, "claims": {}, "assigned_credit_ids": []}
+    return {"version": LEDGER_VERSION, "claims": {}, "assigned_credit_ids": []}
+
+
+def upgrade(ledger):
+    """Bring a stored ledger up to LEDGER_VERSION. Returns True if it changed.
+
+    Version 2 (05-10-2026): meter readings stored before it counted one extra
+    half hour per hour (the slot starting at the hour's end, which Octopus's
+    consumption endpoint also returns). 27-Sep-2026 read 29.1 kWh against a real
+    25.2 and reported a 93p shortfall on a credit that was right to the penny.
+    Every open claim's readings are dropped so they are read again correctly;
+    the inverter estimate stands in until then, as it always does.
+    """
+    if not isinstance(ledger, dict):
+        return False
+    try:
+        version = int(ledger.get("version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version >= LEDGER_VERSION:
+        return False
+    for claim in (ledger.get("claims") or {}).values():
+        if claim.get("closed_at"):
+            continue
+        for hour in (claim.get("hours") or {}).values():
+            hour["meter_kwh"] = None
+    ledger["version"] = LEDGER_VERSION
+    return True
 
 
 def _iso(dt):

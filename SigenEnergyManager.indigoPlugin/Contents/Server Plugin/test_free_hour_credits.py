@@ -282,5 +282,53 @@ class TestDisplayAndPruning(unittest.TestCase):
         self.assertIn("2026-09-27", late["claims"])
 
 
+
+class TestLedgerUpgrade(unittest.TestCase):
+    """Version 2 (05-10-2026): readings stored by version 1 counted one extra half
+    hour per hour, so open claims drop them and read again."""
+
+    def _v1(self):
+        led = ledger_with_hours(rate=24.3543)
+        led["version"] = 1
+        fh.set_meter_kwh(led, 6540, 19.047)        # what version 1 stored on 27-Sep
+        fh.set_meter_kwh(led, 6541, 13.128)
+        return led
+
+    def test_open_claims_drop_their_readings(self):
+        led = self._v1()
+        self.assertTrue(fh.upgrade(led))
+        self.assertEqual(led["version"], fh.LEDGER_VERSION)
+        hours = led["claims"]["2026-09-27"]["hours"].values()
+        self.assertTrue(all(h["meter_kwh"] is None for h in hours))
+
+    def test_a_closed_claim_is_left_alone(self):
+        led = self._v1()
+        led["claims"]["2026-09-27"]["closed_at"] = "2026-10-01T00:00:00+00:00"
+        fh.upgrade(led)
+        self.assertEqual(led["claims"]["2026-09-27"]["hours"]["6540"]["meter_kwh"], 19.047)
+
+    def test_runs_once(self):
+        led = self._v1()
+        fh.upgrade(led)
+        fh.set_meter_kwh(led, 6540, 12.251)
+        self.assertFalse(fh.upgrade(led))
+        self.assertEqual(led["claims"]["2026-09-27"]["hours"]["6540"]["meter_kwh"], 12.251)
+
+    def test_a_new_ledger_needs_nothing(self):
+        self.assertFalse(fh.upgrade(fh.new_ledger()))
+
+    def test_the_real_27_september_credits_are_paid_in_full(self):
+        # Octopus's own half hours for 1pm-2pm and 2pm-3pm BST, and its two credits.
+        led = ledger_with_hours(rate=24.3543)
+        fh.set_meter_kwh(led, 6540, 6.358 + 5.893)
+        fh.set_meter_kwh(led, 6541, 6.796 + 6.196)
+        fh.assign_credits(led, [
+            credit("3608220286", "2026-10-04", 317, "WEEKEND_HAPPY_HOUR", "Weekend Happy Hour"),
+            credit("3608258710", "2026-10-04", 299, "WEEKEND_HAPPY_HOUR", "Weekend Happy Hour")])
+        st = fh.status(led["claims"]["2026-09-27"], day_after(7))
+        self.assertEqual(st["state"], fh.STATE_PAID)
+        self.assertEqual(st["paid_p"], 616)
+
+
 if __name__ == "__main__":
     unittest.main()
