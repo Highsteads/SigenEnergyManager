@@ -202,6 +202,57 @@ TARIFF_WINDOWS = {
 }
 
 
+def fixed_tou_window(tariff_key):
+    """The published local-time bands of a fixed-band tariff, or None for any other.
+
+    v5.132.3. Go, Flux, iGo and iFlux run on the clock, so when Octopus cannot be
+    reached the windows are still known: only the prices are missing. The manager used
+    to hold its import with "the cheap window times are not known" in that case. A
+    window read from live rates (_derive_cheap_window) still wins over this table.
+    """
+    window = TARIFF_WINDOWS.get(tariff_key)
+    if not window:
+        return None
+    out = {"cheap_start": window["cheap_start"], "cheap_end": window["cheap_end"]}
+    if tariff_key == TARIFF_FLUX:
+        out["peak_start"], out["peak_end"] = "16:00", "19:00"
+    return out
+
+
+def carry_slots_forward_one_day(slots):
+    """The same rate bands one LONDON calendar day later, for a day Octopus has not
+    published yet. [] when any slot cannot be read: half a day of prices is worse than
+    none, because the optimiser plans on whatever list it is given.
+
+    Local time is moved, not the UTC instant, so a 02:00 band stays at 02:00 across
+    the clocks changing (24 Oct 01:00Z becomes 25 Oct 02:00Z, not 01:00Z). Only for
+    fixed-band tariffs: a Tracker or Agile price is different every day.
+    """
+    tz = london_tz()
+    if tz is None or not slots:
+        return []
+    out = []
+    try:
+        for slot in slots:
+            if not slot.get("valid_from"):
+                return []
+            moved = dict(slot)
+            for key in ("valid_from", "valid_to"):
+                raw = slot.get(key)
+                if not raw:
+                    continue                      # open-ended stays open-ended
+                local   = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(tz)
+                shifted = london_localise(local.replace(tzinfo=None) + timedelta(days=1))
+                if shifted is None:
+                    return []
+                moved[key] = shifted.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            moved["carried_from_today"] = True
+            out.append(moved)
+    except (TypeError, ValueError, AttributeError):
+        return []
+    return out
+
+
 
 # A Happy Hour refusal that is really a success says THIS slot is already booked;
 # one that mentions a limit is a refusal whatever else it says (review 02-10-2026).

@@ -200,7 +200,11 @@ MIN_ARBITRAGE_MARGIN_P = 1.0
 DEFAULT_WEAR_P_PER_KWH = 5.0
 DEFAULT_RESERVE_PCT    = 20.0
 
-MAX_RATES_AGE_S     = 3 * 3600
+# 36 hours, not 3 (5.132.3). The prices are published as long-lived spans that carry
+# their own valid_from / valid_to, so an old fetch is not an old price. CliveS,
+# 18-Oct-2026: "if you cannot get a price then use the last known price until a
+# update arrives". Three hours stopped the Flux controller after one slow morning.
+MAX_RATES_AGE_S     = 36 * 3600
 MAX_FORECAST_AGE_S  = 3 * 3600
 MAX_TELEMETRY_AGE_S = 120
 MAX_PROFILE_AGE_S   = 7 * 86400      # rebuilt daily; a week old is a fault

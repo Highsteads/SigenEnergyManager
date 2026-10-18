@@ -7,6 +7,13 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.132.3 — 18 October 2026
+
+- **Flux, Go, iGo and iFlux keep their cheap-window times when Octopus has not answered.** They run on the clock, so the times are known without a fetch. After a restart with Octopus unreachable the plugin used to hold the grid import ("the cheap window times are not known"). It now plans on the fixed window, and uses the real one the moment Octopus supplies it. Prices already held stay; none are invented.
+- **Tomorrow's rates variable is never a day behind.** `elec_rates_tomorrow_json` kept whatever it held the day before, so after midnight it carried today's bands with today's dates. On a fixed-band tariff it now carries today's bands one day on, with the clock time unchanged across the clocks changing, until Octopus publishes the real ones. Tracker and Agile prices, which change daily, get no stand-in.
+- **The Flux controller accepts rates up to 36 hours old, not 3.** The prices are published as spans with their own start and end, so an old fetch is not an old price.
+- **The "Battery import held" Pushover stops blaming the Octopus connection** on a fixed-band tariff, where the cause is never a lost connection.
+
 ## 5.132.2 — 18 October 2026
 
 - **The 5am import hold no longer blocks tomorrow's cheap window.** Once the 2am window had closed, the planner judged tomorrow's window against this morning's sunrise rather than the sunrise that ends its own night, so the import was held and the Pushover blamed the price feed, which was fine. The check now uses the window's own night, and an unknown sunrise never holds an import.

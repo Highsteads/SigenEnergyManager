@@ -21,6 +21,13 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.132.3 — 18-10-2026
+
+- Fixed-band tariffs (Flux, Go, iGo, iFlux) keep their cheap-window times when Octopus has not answered: `_build_tariff_data` fills a missing window from `TARIFF_WINDOWS` (`octopus_api.fixed_tou_window`); a live window is never overridden. Day-rate scheduled imports now drop as past their window instead of firing when the window was unknown.
+- `elec_rates_tomorrow_json` carries today's bands one London day on (`carry_slots_forward_one_day`) while tomorrow is unpublished, on fixed-band tariffs only. It used to keep a day-old copy.
+- `flux_strategy.MAX_RATES_AGE_S` 3 h -> 36 h.
+- Held-import Pushover no longer says "check the Octopus connection" on a fixed-band tariff.
+
 ## v5.132.2 — 18-10-2026
 
 - The 05:00 import hold judges tomorrow's 02:00 cheap window against that night's own sunrise, not this morning's. The hold had been stopping the grid import every morning after the window closed, and its Pushover blamed the price feed.

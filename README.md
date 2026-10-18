@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.132.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.132.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.132.3** — Flux, Go, iGo and iFlux run on the clock, so the plugin now keeps their cheap-window times and last known prices when Octopus has not answered, instead of holding the grid import. Tomorrow's rates variable now carries today's bands one day on until Octopus publishes, where before it kept a day-old copy. The Flux controller accepts rates up to 36 hours old (was 3). The held-import Pushover no longer blames the Octopus connection on these tariffs.
 
 **v5.132.2** — The 5am import hold no longer blocks tomorrow's cheap window. Once the 2am window had closed, the plugin compared it with this morning's sunrise rather than the sunrise that ends its own night, so it held the grid import and blamed the price feed. The hold now looks at the right sunrise.
 
@@ -122,6 +124,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.132.3 | 18 October 2026 | Fixed-band tariffs keep their windows and last known prices when Octopus is silent |
 | 5.132.2 | 18 October 2026 | The 5am import hold judges tomorrow's cheap window against its own night's sunrise |
 | 5.132.1 | 5 October 2026 | Free-hour check and daily meter totals count only their own half hours |
 | 5.132.0 | 2 October 2026 | Review part 2: control, money and records fixes |

@@ -70,8 +70,9 @@
 #              Claude Opus 5.5 (5.132.0 — review batches 2-3: control, money and records)
 #              Claude Opus 5.5 (5.132.1 — Octopus meter sums no longer count the half hour after the window)
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
+#              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 # Date:        05-10-2026
-# Version:     5.132.2
+# Version:     5.132.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -263,6 +264,7 @@ from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIF
                               TARIFF_UNKNOWN, GAS_KWH_PER_M3)
 from octopus_api      import SAVING_SESSION_TURN_DOWN, SAVING_SESSION_HAPPY_HOUR
 from octopus_api      import octopoints_to_pence as _points_to_pence
+from octopus_api      import fixed_tou_window, carry_slots_forward_one_day
 
 # ── Weekend Happy Hour scheme (v5.107.0) ─────────────────────────────────────
 # All three are VENDOR FACTS read off Octopus's own pages on 15-09-2026 and all
@@ -1402,6 +1404,23 @@ def _tou_band_now(tou, now_local=None):
     if _inside(tou.get("cheap_start"), tou.get("cheap_end")):
         return "cheap"
     return "standard"
+
+
+# (tariff key, London date) pairs already announced, so the fixed-window fallback
+# speaks once a day however often the manager rebuilds its tariff data.
+_FIXED_WINDOW_NOTED = set()
+
+
+def _note_fixed_window(tariff_key, window):
+    """Say, once a day, that a fixed-band tariff is planning on its clock times
+    because Octopus has not supplied rates since this plugin started."""
+    mark = (tariff_key, _london_today().isoformat())
+    if mark in _FIXED_WINDOW_NOTED:
+        return
+    _FIXED_WINDOW_NOTED.add(mark)
+    log(f"[Octopus] No {tariff_key} rates have arrived yet, so planning on its fixed "
+        f"{window['cheap_start']} to {window['cheap_end']} cheap window. The prices "
+        f"follow when Octopus answers.")
 
 
 def _tou_rate_now_p(tou, now_local=None):
@@ -4315,12 +4334,19 @@ class Plugin(indigo.PluginBase):
             )
         else:
             title = "Battery import held tonight"
+            # A fixed-band tariff (Flux, Go, iGo, iFlux) knows its times without a
+            # fetch, so its hold is not a lost connection and must not say so (18-Oct-2026:
+            # a planner fault sent "check the Octopus connection" with the feed working).
+            _key = str(((getattr(self, "latest_rates_data", None) or {}).get("tariff_info")
+                        or {}).get("tariff_key") or "")
+            _where = ("Check the plugin log." if fixed_tou_window(_key)
+                      else "Check the Octopus connection and the plugin log.")
             body  = (
                 f"Tomorrow needs about {kwh:.0f} kWh more than the battery and the solar "
                 f"forecast can supply, but the plugin could not price a grid import: "
                 f"{why}. Until it can, the house draws from the grid as it needs to, "
                 f"which costs the daytime rate instead of a cheaper overnight one. "
-                f"Check the Octopus connection and the plugin log."
+                f"{_where}"
             )
         self._send_pushover(title, body)
 
@@ -7353,6 +7379,16 @@ class Plugin(indigo.PluginBase):
         tariff_key  = tariff_info.get("tariff_key", TARIFF_UNKNOWN)
 
         tou = rates.get(tariff_key, {})          # cheap window data for Go/Flux/iGo/iFlux
+        # A FIXED-BAND TARIFF KEEPS ITS WINDOWS WITHOUT A FETCH (5.132.3). Flux, Go,
+        # iGo and iFlux run on the clock, so a rate block that is empty (Octopus not
+        # reached since a restart) still has known times. Without them the manager
+        # held the grid import with "the cheap window times are not known". Any price
+        # already in the block stays; only the missing window is filled from the
+        # table, and a window read from live rates is never overridden.
+        _fixed = fixed_tou_window(tariff_key)
+        if _fixed and not (tou.get("cheap_start") and tou.get("cheap_end")):
+            tou = {**tou, **_fixed}
+            _note_fixed_window(tariff_key, _fixed)
         today_rate_p, tomorrow_rate_p = self._rates_for_tariff(tariff_key, rates)
 
         return TariffData(
@@ -8775,6 +8811,24 @@ class Plugin(indigo.PluginBase):
             tomorrow_slots = sched.get("tomorrow_slots") or []
             today_p        = tracker.get("today_p")
             tomorrow_p     = tracker.get("tomorrow_p")
+
+            # TOMORROW IS NEVER YESTERDAY'S TOMORROW (5.132.3). Before ~16:00 Octopus
+            # has not published tomorrow, and this variable was then left holding what
+            # it was given the day before, i.e. TODAY's bands with today's dates, from
+            # midnight onwards (18-Oct-2026). A fixed-band tariff (Flux, Go, iGo,
+            # iFlux) repeats every day, so the honest stand-in is today's bands moved
+            # one day on, until Octopus publishes the real ones. A price that moves
+            # each day (Tracker, Agile) gets no stand-in: it keeps the old behaviour.
+            _tkey = str((tariff_info or {}).get("tariff_key") or "")
+            if not tomorrow_slots and today_slots and fixed_tou_window(_tkey):
+                _carried = carry_slots_forward_one_day(today_slots)
+                if _carried:
+                    tomorrow_slots = _carried
+                    _mark = _london_today().isoformat()
+                    if self.store.get("tomorrow_carried_noted") != _mark:
+                        self.store["tomorrow_carried_noted"] = _mark
+                        log("[Octopus] Tomorrow's rates are not published yet, so "
+                            "tomorrow's bands are today's moved on one day until they are.")
 
             writes = []
             if today_slots:

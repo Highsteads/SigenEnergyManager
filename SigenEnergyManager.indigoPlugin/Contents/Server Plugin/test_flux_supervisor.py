@@ -2855,6 +2855,10 @@ class TestDayRateImportStopsThePeakExport(_FluxCase):
         p.modbus.force_charge.return_value = True
         p._note_day_rate_import = MagicMock()
         p._flux_owns_cheap_window = MagicMock(return_value=False)   # the fallback path
+        # 5.132.3: a fixed-band tariff always knows its window, so a day-rate firing at
+        # 11:30 is now DROPPED as past its window. This test is about the recording, so
+        # it stands in for a window that has not closed.
+        p._scheduled_import_missed_its_window = MagicMock(return_value=False)
         p.store["import_scheduled_time"] = when.astimezone(timezone.utc) - timedelta(minutes=1)
         p.store["import_target_soc"] = 40.0
         p._check_scheduled_import_impl()
