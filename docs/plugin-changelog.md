@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.132.2 — 18-10-2026
+
+- The 05:00 import hold judges tomorrow's 02:00 cheap window against that night's own sunrise, not this morning's. The hold had been stopping the grid import every morning after the window closed, and its Pushover blamed the price feed.
+
 ## v5.132.1 — 05-10-2026
 
 Octopus's REST `consumption/` endpoint treats `period_to` as INCLUSIVE: it also returns the

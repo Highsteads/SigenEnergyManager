@@ -2028,7 +2028,14 @@ class BatteryManager:
             )
 
         next_window_dt = self._next_window_start(now, cheap_start)
-        if next_window_dt is None or (dawn_dt is not None and next_window_dt >= dawn_dt):
+        # Judged against the dawn that ENDS THE NIGHT the window belongs to, not
+        # `dawn_dt` (the next dawn from now). After the cheap window closes at 05:00,
+        # `dawn_dt` is still this morning's sunrise, and tomorrow's 02:00 window is
+        # always "after" it, so the import was held every morning. 18-Oct-2026.
+        window_day = (self._to_local(next_window_dt).strftime("%Y-%m-%d")
+                      if next_window_dt is not None else None)
+        if next_window_dt is None or self._window_is_after_its_own_dawn(
+                next_window_dt, snapshot.dawn_times, window_day):
             # Not reachable with any Go/Flux window today; kept for a malformed one.
             # 3.14: held rather than bought at once, for the same reason as above.
             return self._hold_import(
@@ -3176,6 +3183,22 @@ class BatteryManager:
             return start <= t < end
         else:
             return t >= start or t < end   # overnight window
+
+    @staticmethod
+    def _window_is_after_its_own_dawn(window_dt: datetime, dawn_times: dict,
+                                      window_day: Optional[str]) -> bool:
+        """True only when the window opens at or after the dawn of ITS OWN night.
+
+        window_day is the window's LOCAL date (YYYY-MM-DD), the key dawn_times uses.
+        With no dawn known for that night the answer is False: an unknown sunrise
+        must not hold an import on its own. 18-Oct-2026.
+        """
+        if window_day is None:
+            return False
+        own_dawn = dawn_times.get(window_day)
+        if own_dawn is None:
+            return False
+        return window_dt >= own_dawn
 
     @staticmethod
     def _next_window_start(now: datetime, window_start_str: str) -> Optional[datetime]:

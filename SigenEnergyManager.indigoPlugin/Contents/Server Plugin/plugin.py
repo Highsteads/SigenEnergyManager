@@ -69,8 +69,9 @@
 #              Claude Opus 5.5 (5.131.2 — review batch 1: hand-back at shutdown, 2am charge band, Happy Hour refusals)
 #              Claude Opus 5.5 (5.132.0 — review batches 2-3: control, money and records)
 #              Claude Opus 5.5 (5.132.1 — Octopus meter sums no longer count the half hour after the window)
+#              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 # Date:        05-10-2026
-# Version:     5.132.1
+# Version:     5.132.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

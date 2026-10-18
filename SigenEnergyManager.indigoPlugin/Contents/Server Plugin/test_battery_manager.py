@@ -483,6 +483,29 @@ class TestTouWindowLocalTime(unittest.TestCase):
         # 00:30 LOCAL == 00:30 UTC in GMT
         self.assertEqual(result.astimezone(timezone.utc).strftime("%H:%M"), "00:30")
 
+    def test_tomorrows_2am_window_is_not_after_its_own_dawn(self):
+        # 18-Oct-2026, 05:00 BST: the cheap window had just closed and this morning's
+        # sunrise (07:36) was still ahead. Tomorrow's 02:00 window sits BEFORE
+        # tomorrow's sunrise, so it is reachable and must not be held.
+        dawn_times = {"2026-10-18": datetime(2026, 10, 18, 6, 36, tzinfo=timezone.utc),
+                      "2026-10-19": datetime(2026, 10, 19, 6, 38, tzinfo=timezone.utc)}
+        window     = datetime(2026, 10, 19, 1, 0, tzinfo=timezone.utc)  # 02:00 BST
+        self.assertFalse(BatteryManager._window_is_after_its_own_dawn(
+            window, dawn_times, "2026-10-19"))
+
+    def test_window_after_its_own_dawn_is_unreachable(self):
+        # A window that opens after the sunrise of its own night really is unreachable.
+        dawn_times = {"2026-10-19": datetime(2026, 10, 19, 6, 38, tzinfo=timezone.utc)}
+        window     = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
+        self.assertTrue(BatteryManager._window_is_after_its_own_dawn(
+            window, dawn_times, "2026-10-19"))
+
+    def test_unknown_dawn_never_holds_an_import(self):
+        self.assertFalse(BatteryManager._window_is_after_its_own_dawn(
+            datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc), {}, "2026-10-19"))
+        self.assertFalse(BatteryManager._window_is_after_its_own_dawn(
+            datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc), {}, None))
+
     def test_in_window_check_uses_local_clock(self):
         # 22:45 UTC in summer == 23:45 BST, which IS inside an iGo 23:30–05:30 window.
         bst_2245 = datetime(2026, 6, 15, 22, 45, tzinfo=timezone.utc)

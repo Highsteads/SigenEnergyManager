@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.132.2 — 18 October 2026
+
+- **The 5am import hold no longer blocks tomorrow's cheap window.** Once the 2am window had closed, the planner judged tomorrow's window against this morning's sunrise rather than the sunrise that ends its own night, so the import was held and the Pushover blamed the price feed, which was fine. The check now uses the window's own night, and an unknown sunrise never holds an import.
+
 ## 5.132.1 — 5 October 2026
 
 - **The free-hour check no longer says Octopus paid short.** On 5 October it pushed "Octopus paid 93p short for the free hours". Octopus had paid the 27 September free hours in full: £3.17 and £2.99 for 13.0 kWh and 12.3 kWh at 24.4p. The plugin had counted 29.1 kWh because, when it asked Octopus for an hour of meter readings, it also counted the half hour starting at the end of that hour. It now counts only the readings inside the hour, and reads its stored free-hour figures again once, so the 27 September hours show as paid.
