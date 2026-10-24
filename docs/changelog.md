@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.134.1 — 24 October 2026
+
+- **No false alarm after a restart.** The first plan after a restart runs a few seconds before the Octopus tariff has been read. If tomorrow needed a grid import, that plan sent "Battery import held tonight" and said the tariff was not recognised, even though Octopus answered a moment later. The alert now waits for the tariff, as the battery control already did, for up to five minutes. If Octopus has still not answered by then, the alert goes out and says the tariff has not been read yet.
+
 ## 5.134.0 — 24 October 2026
 
 - **An ordinary night stores 95%.** The cheap-window charge aims at 95% of the battery. Conversion losses are already counted in what it buys from the grid. A warning still fills to 100%, and so does a night with an announced Axle event, because the battery owes that energy. A booked free hour's room is still kept back on an ordinary night.

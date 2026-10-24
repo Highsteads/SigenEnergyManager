@@ -677,6 +677,9 @@ class TariffData:
     peak_start:       Optional[str]   = None   # "HH:MM" local (Flux 16:00)
     peak_end:         Optional[str]   = None   # "HH:MM" local (Flux 19:00)
     peak_rate_p:      Optional[float] = None   # peak band import rate (Flux)
+    # 5.134.1: False when Octopus has not been read since the restart, so an UNKNOWN
+    # key means "no tariff yet" rather than "a tariff we do not recognise".
+    tariff_fetched:   bool            = True
 
 
 @dataclass
@@ -1879,7 +1882,11 @@ class BatteryManager:
         # Unknown tariff — HOLD (v5.100.0; was "import now at half inverter power").
         # There is no price to buy at, so passthrough is the honest baseline;
         # _classify_tariff_code has already warned, naming the product code to add
-        # to TARIFF_PRODUCT_PREFIXES.
+        # to TARIFF_PRODUCT_PREFIXES. Before the first Octopus read there is no
+        # tariff at all, which is a different thing to report (5.134.1).
+        if not tariff.tariff_fetched:
+            return self._hold_import(
+                balance, "the Octopus tariff has not been read yet")
         return self._hold_import(
             balance, f"the tariff '{tariff.tariff_key}' is not recognised")
 

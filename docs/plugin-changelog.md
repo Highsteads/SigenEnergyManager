@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.134.1 — 24-10-2026
+
+- **Import-hold alert waits for the first tariff.** `_note_import_hold` (step 6 of `_evaluate_manager_impl`) ran before the step-8a tariff guard, so the first tick after a restart, planned with no tariff, sent the once-a-day Pushover "the tariff 'unknown' is not recognised" (live 24-Oct-2026 10:11:03; Flux arrived 10:11:13). New `_tariff_pending()` holds the single `tariff_wait_since` clock (TARIFF_WAIT_S, 300 s) for both: the guard returns before acting, and `_note_import_hold` returns without stamping `import_hold_noted_date`, so a real hold later that day still reports. After the wait it reports as before. `TariffData.tariff_fetched` (default True; `_build_tariff_data` sets `bool(tariff_info)`) lets the planner's unknown branch say "the Octopus tariff has not been read yet" instead of "not recognised". Tests: `test_agile_readiness.TestHoldWaitsForTheFirstTariff` (7), mutation-checked against both halves.
+
 ## v5.134.0 — 24-10-2026
 
 - **Nightly cap 95% stored.** `flux_strategy.NIGHTLY_CHARGE_PCT = 95.0`. `_charge_plan` uses `cap_pct`, which is the site ceiling (100) when `storm_fill` is set or an export commitment is present, and `min(ceiling, 95)` otherwise. Test: `test_a_normal_night_stores_95_and_a_warning_stores_100`. Decision for CliveS 24-Oct-2026: a storm overrides everything; a free hour's room is reserved on ordinary nights; an Axle export keeps the full ceiling.

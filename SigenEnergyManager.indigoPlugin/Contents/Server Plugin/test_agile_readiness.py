@@ -12,6 +12,7 @@
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -373,6 +374,9 @@ def _p(import_active=True):
     p.modbus.night_export.return_value = True
     p.pluginPrefs = {"inverterMaxKw": "10.0", "batteryHealthCutoff": "1"}
     p.latest_inverter_data = {"batterySoc": 40.0}
+    # A running plugin that has read its tariff. Without one, the import-hold notice
+    # waits for the first Octopus read (5.134.1) and these tests would see silence.
+    p.latest_rates_data    = {"tariff_info": {"tariff_key": TARIFF_AGILE}}
     p._restore_import_cutoff = MagicMock()
     p._set_import_cutoff     = MagicMock()
     p._set_flood_prev_target = MagicMock()
@@ -489,6 +493,78 @@ class TestImportHoldIsAudible(unittest.TestCase):
             p._note_import_hold(Decision(action=ACTION_SELF_CONSUMPTION))
         self.assertFalse(log.called)
         self.assertFalse(p._send_pushover.called)
+
+
+class TestHoldWaitsForTheFirstTariff(unittest.TestCase):
+    """5.134.1. Straight after a restart the first plan runs before Octopus has been
+    read, so the tariff is UNKNOWN and the planner holds. On 24-Oct-2026 that hold sent
+    "Battery import held tonight: the tariff 'unknown' is not recognised" at 10:11:03;
+    the tariff arrived as Flux at 10:11:13. Waiting for the tariff is not a fault."""
+
+    def _held(self):
+        return Decision(action=ACTION_SELF_CONSUMPTION, import_held=True,
+                        reason="held", import_kwh=3.9,
+                        import_held_why="the Octopus tariff has not been read yet")
+
+    def _note(self, p):
+        with patch.object(plugin, "log") as log, \
+                patch.object(plugin, "_london_today", return_value=date(2026, 10, 24)):
+            p._note_import_hold(self._held())
+        return [c for c in log.call_args_list if c.kwargs.get("level") == "WARNING"]
+
+    def test_no_tariff_yet_is_silent_and_leaves_the_day_unstamped(self):
+        p = _p(import_active=False)
+        p.latest_rates_data = {}
+        self.assertEqual(self._note(p), [])
+        self.assertFalse(p._send_pushover.called)
+        self.assertNotIn("import_hold_noted_date", p.store)
+
+    def test_a_real_hold_once_the_tariff_arrives_still_pages_that_day(self):
+        p = _p(import_active=False)
+        p.latest_rates_data = {}
+        self._note(p)
+        p.latest_rates_data = {"tariff_info": {"tariff_key": TARIFF_AGILE}}
+        self.assertEqual(len(self._note(p)), 1)
+        self.assertEqual(p._send_pushover.call_count, 1)
+
+    def test_octopus_still_unread_after_the_wait_does_page(self):
+        p = _p(import_active=False)
+        p.latest_rates_data = {}
+        p.store["tariff_wait_since"] = time.time() - plugin.TARIFF_WAIT_S - 1
+        self.assertEqual(len(self._note(p)), 1)
+        _title, body = p._send_pushover.call_args.args[:2]
+        self.assertIn("Octopus connection", body)
+        self.assertIn("has not been read yet", body)
+
+    def test_the_alert_and_the_hardware_guard_share_one_clock(self):
+        import ast
+        tree = ast.parse(open(plugin.__file__, encoding="utf-8").read())
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        for name in ("_evaluate_manager_impl", "_note_import_hold"):
+            calls = [n.func.attr for n in ast.walk(fns[name])
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+            self.assertIn("_tariff_pending", calls, name)
+        self.assertNotIn("tariff_wait_since", ast.unparse(fns["_evaluate_manager_impl"]))
+
+    def test_the_planner_says_not_read_rather_than_not_recognised(self):
+        snap = _snap([], now_off=4.0, tariff_key="unknown")
+        snap.tariff.tariff_fetched = False
+        d = BatteryManager().evaluate(snap)
+        self.assertTrue(d.import_held)
+        self.assertIn("has not been read yet", d.reason)
+        self.assertNotIn("not recognised", d.reason)
+
+    def test_an_unrecognised_tariff_still_says_so(self):
+        d = BatteryManager().evaluate(_snap([], now_off=4.0, tariff_key="unknown"))
+        self.assertTrue(d.import_held)
+        self.assertIn("not recognised", d.reason)
+
+    def test_the_tariff_data_records_whether_octopus_was_read(self):
+        p = _p(import_active=False)
+        p.latest_rates_data = {}
+        self.assertFalse(p._build_tariff_data().tariff_fetched)
+        p.latest_rates_data = {"tariff_info": {"tariff_key": TARIFF_AGILE}}
+        self.assertTrue(p._build_tariff_data().tariff_fetched)
 
 
 class TestHoldReachesTheExecutor(unittest.TestCase):

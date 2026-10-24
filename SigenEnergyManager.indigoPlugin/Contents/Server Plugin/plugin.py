@@ -71,8 +71,9 @@
 #              Claude Opus 5.5 (5.132.1 — Octopus meter sums no longer count the half hour after the window)
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
+#              Claude Opus 5.5 (5.134.1 — no import-held alert while the first tariff read is awaited)
 # Date:        05-10-2026
-# Version:     5.134.0
+# Version:     5.134.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -4316,17 +4317,9 @@ class Plugin(indigo.PluginBase):
         #    the device state); only the hardware ACTION waits for the tariff, up to
         #    TARIFF_WAIT_S; after that, carry on as before rather than never
         #    managing the battery because Octopus is down.
-        if not (self.latest_rates_data or {}).get("tariff_info"):
-            waited_since = self.store.get("tariff_wait_since")
-            if waited_since is None:
-                self.store["tariff_wait_since"] = waited_since = time.time()
-                log("[Manager] Waiting for the first Octopus tariff refresh before "
-                    "acting, so the first plan after a restart uses the real tariff.")
-            if time.time() - waited_since < TARIFF_WAIT_S:
-                self._update_manager_device(decision, snapshot)
-                return
-        else:
-            self.store["tariff_wait_since"] = None
+        if self._tariff_pending():
+            self._update_manager_device(decision, snapshot)
+            return
 
         self._act_on_decision(decision)
 
@@ -4337,6 +4330,31 @@ class Plugin(indigo.PluginBase):
         #     reports the SAME gate the manager acts on (single source of truth — stops
         #     the advisory re-deriving and drifting; see the 23/24-Jun-2026 case).
         self._publish_flood_preview(snapshot, decision)
+
+    def _tariff_pending(self):
+        """True while the first Octopus tariff read after a restart is still awaited.
+
+        Starts the clock the first time it is asked with no tariff, and stays True
+        for TARIFF_WAIT_S. After that it answers False even with no tariff, so the
+        manager carries on rather than never managing the battery because Octopus
+        is down. The clock resets once a tariff arrives.
+
+        One clock for both of its callers (5.134.1). The import-hold alert runs a
+        step before the hardware guard, so with a clock of its own in the guard
+        only, the first plan after a restart — made with no tariff yet — sent
+        "Battery import held tonight: the tariff 'unknown' is not recognised" while
+        the Octopus read was three seconds away (24-Oct-2026, 10:11:03; the tariff
+        arrived as Flux at 10:11:13).
+        """
+        if (self.latest_rates_data or {}).get("tariff_info"):
+            self.store["tariff_wait_since"] = None
+            return False
+        waited_since = self.store.get("tariff_wait_since")
+        if waited_since is None:
+            self.store["tariff_wait_since"] = waited_since = time.time()
+            log("[Manager] Waiting for the first Octopus tariff refresh before "
+                "acting, so the first plan after a restart uses the real tariff.")
+        return time.time() - waited_since < TARIFF_WAIT_S
 
     def _note_import_hold(self, decision):
         """Say, once a day, that tomorrow needed a grid import and none could be priced.
@@ -4349,6 +4367,12 @@ class Plugin(indigo.PluginBase):
         (Log_Error_Watch collects it) and one Pushover a day at normal priority.
         """
         if not getattr(decision, "import_held", False):
+            return
+        # No tariff yet, straight after a restart: the hold is the planner waiting
+        # for its prices, not a fault. Say nothing, and leave today unstamped so a
+        # real hold later today still reports. If the wait runs out with Octopus
+        # still unread, this falls through and reports it — that one is real.
+        if self._tariff_pending():
             return
         today = _london_today().isoformat()
         if self.store.get("import_hold_noted_date") == today:
@@ -7469,6 +7493,7 @@ class Plugin(indigo.PluginBase):
             peak_start      = tou.get("peak_start"),
             peak_end        = tou.get("peak_end"),
             peak_rate_p     = tou.get("peak_p"),
+            tariff_fetched  = bool(tariff_info),
         )
 
     def _act_on_decision(self, decision):
