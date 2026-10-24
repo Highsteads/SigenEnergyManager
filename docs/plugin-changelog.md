@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.134.0 — 24-10-2026
+
+- **Nightly cap 95% stored.** `flux_strategy.NIGHTLY_CHARGE_PCT = 95.0`. `_charge_plan` uses `cap_pct`, which is the site ceiling (100) when `storm_fill` is set or an export commitment is present, and `min(ceiling, 95)` otherwise. Test: `test_a_normal_night_stores_95_and_a_warning_stores_100`. Decision for CliveS 24-Oct-2026: a storm overrides everything; a free hour's room is reserved on ordinary nights; an Axle export keeps the full ceiling.
+
 ## v5.133.2 — 24-10-2026
 
 - **Met Office window is UTC.** `storm_watch._mo_window` had attached `Europe/London` to the RSS's `valid from HHMM` times; the feed is UTC (its 1100 yellow is the page's 12:00 BST). Each window ran an hour early at both ends. Test: `test_the_rss_window_is_utc_not_uk_local`.

@@ -179,6 +179,9 @@ from typing import Mapping, Optional, Tuple
 # --- The structural Flux clock. Also pinned in flux_execution._valid_target;
 # derive_bands refuses to plan if the published rates disagree with it. ---
 FLUX_CHEAP_START = time(2, 0)
+# 5.134.0 (CliveS, 24-Oct-2026): a normal night stores this much, counting free-hour room.
+# A warning stores the full ceiling instead (FluxInputs.storm_fill).
+NIGHTLY_CHARGE_PCT = 95.0
 FLUX_CHEAP_END   = time(5, 0)
 FLUX_PEAK_START  = time(16, 0)
 FLUX_PEAK_END    = time(19, 0)
@@ -1390,6 +1393,12 @@ def _charge_plan(inputs):
     tz     = inputs.local_tz
     bands  = inputs.bands
     eff    = site.one_way_efficiency
+    # 5.134.0: a normal night stores NIGHTLY_CHARGE_PCT; a warning stores the full ceiling.
+    # An announced export commitment (an Axle event) is energy the battery owes, so it
+    # keeps the full ceiling: capping it at 95 would quietly under-deliver the event.
+    owes_export = any(c.kind == "export" for c in inputs.commitments)
+    cap_pct = (float(site.max_charge_soc_pct) if (inputs.storm_fill or owes_export)
+               else min(float(site.max_charge_soc_pct), NIGHTLY_CHARGE_PCT))
 
     window_end  = next_local(inputs.now, tz, FLUX_CHEAP_END)
     horizon_end = next_local(window_end, tz, FLUX_CHEAP_START)
@@ -1415,14 +1424,14 @@ def _charge_plan(inputs):
     # overstate the charge by a whole window's consumption. It does compete for
     # site import capacity, and that is handled where it belongs, in the power
     # calculation below.
-    household_target_kwh = min(need_at_end, site.capacity_kwh * site.max_charge_soc_pct / 100.0)
+    household_target_kwh = min(need_at_end, site.capacity_kwh * cap_pct / 100.0)
     household_buy_kwh    = max(0.0, household_target_kwh - have_kwh)
 
     # Headroom: only the NET surplus the sun is expected to put INTO the battery
     # is worth leaving room for. It can never push the target below what the
     # house and the commitments need. A booked free-import hour is in the walk
     # too (v5.112.0), so the room it will fill is left empty rather than bought.
-    ceiling_kwh = site.capacity_kwh * site.max_charge_soc_pct / 100.0
+    ceiling_kwh = site.capacity_kwh * cap_pct / 100.0
     _end, _low, _unmet, peak_kwh = simulate(inputs, household_target_kwh,
                                             window_end, horizon_end)
     solar_gain_kwh = max(0.0, peak_kwh - household_target_kwh)
@@ -1461,7 +1470,7 @@ def _charge_plan(inputs):
     # The epsilon is not cosmetic: the requirement comes from a binary search
     # that converges to within a tolerance, so an exact 80% lands at 79.9999
     # about half the time, and flooring that gives away a whole percent.
-    target_pct = min(site.max_charge_soc_pct,
+    target_pct = min(cap_pct,
                      float(math.floor(_pct(target_kwh, site.capacity_kwh) + 1e-3)))
     # Done once the SOC is at the cutoff (the same 0.05% slack _minimum_charge
     # uses, so a reading of 83.96% against an 84% cutoff is not a new charge).

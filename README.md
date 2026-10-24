@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.133.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.134.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.134.0** — An ordinary night's cheap-window charge now stores 95%, not 100%. A storm warning still fills to 100%, and so does a night with an announced Axle event, which the battery owes. A booked free hour's room is still kept back on an ordinary night.
 
 **v5.133.2** — The Met Office warnings feed gives its times in UTC, and the plugin now reads them as UTC. Before, it read them as UK time, so each warning started and ended an hour early.
 
@@ -130,6 +132,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.134.0 | 24 October 2026 | Ordinary nights store 95% from the cheap window; warnings and announced Axle events still fill to 100% |
 | 5.133.2 | 24 October 2026 | Met Office times read as UTC, so warnings no longer start and end an hour early |
 | 5.133.1 | 24 October 2026 | A Met Office read failure is logged, not silent |
 | 5.133.0 | 24 October 2026 | Any storm warning fills the battery in the cheap window; the Met Office is a second warning source |

@@ -1703,6 +1703,13 @@ class TestTheNightlyMinimumCharge(unittest.TestCase):
         self.assertEqual(storm.charge_cutoff_pct, 100.0)
         self.assertLess(plain.charge_cutoff_pct, 100.0)
 
+    def test_a_normal_night_stores_95_and_a_warning_stores_100(self):
+        """5.134.0 (CliveS, 24-Oct-2026): 95% stored on an ordinary night, 100% under a warning."""
+        plain = fs.plan(self._in((2, 0), 40.0))
+        storm = fs.plan(self._in((2, 0), 40.0, storm_fill=True))
+        self.assertLessEqual(plain.charge_cutoff_pct, fs.NIGHTLY_CHARGE_PCT)
+        self.assertEqual(storm.charge_cutoff_pct, 100.0)
+
     def test_a_warning_fill_is_a_no_op_when_already_full(self):
         storm = fs.plan(self._in((2, 0), 100.0, storm_fill=True))
         self.assertNotEqual(storm.mode, fs.MODE_CHARGE)

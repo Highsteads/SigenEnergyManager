@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.134.0 — 24 October 2026
+
+- **An ordinary night stores 95%.** The cheap-window charge aims at 95% of the battery. Conversion losses are already counted in what it buys from the grid. A warning still fills to 100%, and so does a night with an announced Axle event, because the battery owes that energy. A booked free hour's room is still kept back on an ordinary night.
+
 ## 5.133.2 — 24 October 2026
 
 - **Met Office warning times are read as UTC.** The Met Office feed gives its times in UTC, not UK time. The plugin read them as UK time, so each warning began and ended an hour early. The Met Office page and the feed now agree.

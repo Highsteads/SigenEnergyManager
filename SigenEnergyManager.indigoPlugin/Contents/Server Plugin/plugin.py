@@ -72,7 +72,7 @@
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 # Date:        05-10-2026
-# Version:     5.133.2
+# Version:     5.134.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
