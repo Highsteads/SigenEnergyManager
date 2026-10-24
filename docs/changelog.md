@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.133.1 — 24 October 2026
+
+- **A Met Office read failure is now logged.** If the Met Office cannot be read, or its page is not the warnings feed, the plugin logs a warning and carries on with MeteoAlarm. Before, that failure was silent.
+
 ## 5.133.0 — 24 October 2026
 
 - **Any warning now fills the battery to full in the cheap window.** A yellow, amber or red wind warning charges the battery to 100% between 2am and 5am, whatever the day needs. Before, a yellow warning stood the Flux charge down, so the cheap window went unused. Outside the window a warning still hands the inverter back to the ordinary manager. A booked free-import hour no longer keeps room in the battery while a warning stands.

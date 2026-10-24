@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.133.1 — 24-10-2026
+
+- **Met Office failures are logged.** `_check_storm_watch` wrote nothing when the Met Office result was `None`, so a failed second source looked like a MeteoAlarm-only reading. It now logs `[Storm] Met Office check unreadable, using MeteoAlarm alone` at WARNING with the reason. Added after the 5.133.0 restart read yellow when the Met Office held amber, with no sign of why.
+
 ## v5.133.0 — 24-10-2026
 
 - **Storm warnings fill the battery in the cheap window.** `FluxInputs.storm_fill` (set from `_storm_active()`) makes `flux_strategy._charge_plan` buy up to `ceiling_kwh` rather than the planned need, so the charge targets `max_charge_soc_pct` (100 unless the pref says otherwise). `_flux_other_owner` now stands Flux down for a storm only outside `_flux_cheap_window_open()`. A booked free-import hour's room is not kept back in that case. Test: `test_a_warning_fills_the_battery_to_the_ceiling_in_the_window` and the flipped `test_a_storm_inside_the_window_leaves_the_charge_to_flux`.

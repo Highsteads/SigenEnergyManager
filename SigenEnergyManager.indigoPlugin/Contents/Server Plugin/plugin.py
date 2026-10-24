@@ -72,7 +72,7 @@
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 # Date:        05-10-2026
-# Version:     5.133.0
+# Version:     5.133.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -5926,6 +5926,11 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 mo = (None, f"Met Office check raised: {exc}")
             mo_level = mo[0]
+            if mo_level is None:
+                # Silent here, the storm level would read as MeteoAlarm alone with no sign
+                # that the second source had failed.
+                log(f"[Storm] Met Office check unreadable, using MeteoAlarm alone: {mo[1]}",
+                    level="WARNING")
             if mo_level is not None and mo_level != ma_level:
                 pair = f"{ma_level}/{mo_level}"
                 if self.store.get("storm_disagree_logged") != pair:
