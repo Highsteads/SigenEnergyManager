@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.133.2 — 24 October 2026
+
+- **Met Office warning times are read as UTC.** The Met Office feed gives its times in UTC, not UK time. The plugin read them as UK time, so each warning began and ended an hour early. The Met Office page and the feed now agree.
+
 ## 5.133.1 — 24 October 2026
 
 - **A Met Office read failure is now logged.** If the Met Office cannot be read, or its page is not the warnings feed, the plugin logs a warning and carries on with MeteoAlarm. Before, that failure was silent.

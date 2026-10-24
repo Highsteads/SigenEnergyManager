@@ -16,7 +16,7 @@
 #              Returns a severity string: "none", "yellow", "amber", or "red".
 # Author:      CliveS & Claude Fable 5; v1.7 Claude Opus 5.5
 # Date:        27-09-2026; v1.7 02-10-2026
-# Version:     1.8 (Met Office RSS as a second source, check_met_office_level)
+# Version:     1.8 (Met Office RSS as a second source, check_met_office_level; RSS times are UTC)
 #              1.7 (a non-Atom body is unknown, not all-clear; CAP "Minor" is green, not yellow)
 #              1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
 #              1.5 (failure paths return None — caller holds previous level, no false all-clear)
@@ -392,7 +392,8 @@ MET_OFFICE_WARNINGS_URL = "https://www.metoffice.gov.uk/public/data/PWSCache/War
 
 # Title shape: "Amber warning of wind affecting North East England"
 _MO_TITLE_RE = re.compile(r"^(yellow|amber|red)\s+warning\s+of\s+(.+?)\s+affecting\s+(.+)$", re.I)
-# Description shape: "... valid from 2000 Sat 24 Oct to 2100 Sun 25 Oct" (UK local, no year)
+# Description shape: "... valid from 2000 Sat 24 Oct to 2100 Sun 25 Oct" (UTC, no year).
+# The RSS is UTC: its yellow reads 1100 where the Met Office web page says 12:00 BST.
 _MO_VALID_RE = re.compile(r"valid from (\d{4}) \w{3} (\d{1,2}) (\w{3}) to (\d{4}) \w{3} (\d{1,2}) (\w{3})", re.I)
 
 
@@ -401,15 +402,13 @@ def _mo_window(description, now_utc):
     m = _MO_VALID_RE.search(description or "")
     if not m:
         return None
-    tz_uk = ZoneInfo("Europe/London")
-    year = now_utc.astimezone(tz_uk).year
+    year = now_utc.year
     try:
         start = datetime.strptime(f"{year} {m.group(2)} {m.group(3)} {m.group(1)}", "%Y %d %b %H%M")
         end   = datetime.strptime(f"{year} {m.group(5)} {m.group(6)} {m.group(4)}", "%Y %d %b %H%M")
     except ValueError:
         return None
-    return (start.replace(tzinfo=tz_uk).astimezone(timezone.utc),
-            end.replace(tzinfo=tz_uk).astimezone(timezone.utc))
+    return (start.replace(tzinfo=timezone.utc), end.replace(tzinfo=timezone.utc))
 
 
 def check_met_office_level(region, now_utc=None, xml_bytes=None):

@@ -7,7 +7,7 @@
 #              two sources wins. No network: the feed is passed in as bytes.
 # Author:      CliveS & Claude Haiku 5.5
 # Date:        24-10-2026
-# Version:     1.0
+# Version:     1.1 (RSS times are UTC)
 
 import os
 import sys
@@ -46,9 +46,9 @@ class TestMetOfficeParser(unittest.TestCase):
         self.assertIn("YELLOW wind", reason)
 
     def test_a_warning_inside_the_horizon_is_active_at_its_onset_hour(self):
-        # Amber starts 20:00 BST = 19:00 UTC, which is inside the 24-hour horizon.
+        # Amber starts 20:00 UTC, which is inside the 24-hour horizon.
         level, _ = storm_watch.check_met_office_level(
-            "North East England", datetime(2026, 10, 24, 18, 30, tzinfo=timezone.utc),
+            "North East England", datetime(2026, 10, 24, 19, 30, tzinfo=timezone.utc),
             xml_bytes=_RSS)
         self.assertEqual(level, "amber")
 
@@ -56,6 +56,12 @@ class TestMetOfficeParser(unittest.TestCase):
         level, reason = storm_watch.check_met_office_level("Cornwall", _NOW, xml_bytes=_RSS)
         self.assertEqual(level, "none")
         self.assertIn("not yet active", reason)
+
+    def test_the_rss_window_is_utc_not_uk_local(self):
+        # "valid from 2000" is 20:00 UTC: 21:00 BST, matching the Met Office page.
+        window = storm_watch._mo_window("valid from 2000 Sat 24 Oct to 2100 Sun 25 Oct", _NOW)
+        self.assertEqual(window[0], datetime(2026, 10, 24, 20, 0, tzinfo=timezone.utc))
+        self.assertEqual(window[1], datetime(2026, 10, 25, 21, 0, tzinfo=timezone.utc))
 
     def test_fog_is_not_a_power_cut_hazard(self):
         level, _ = storm_watch.check_met_office_level(

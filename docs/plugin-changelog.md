@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.133.2 — 24-10-2026
+
+- **Met Office window is UTC.** `storm_watch._mo_window` had attached `Europe/London` to the RSS's `valid from HHMM` times; the feed is UTC (its 1100 yellow is the page's 12:00 BST). Each window ran an hour early at both ends. Test: `test_the_rss_window_is_utc_not_uk_local`.
+
 ## v5.133.1 — 24-10-2026
 
 - **Met Office failures are logged.** `_check_storm_watch` wrote nothing when the Met Office result was `None`, so a failed second source looked like a MeteoAlarm-only reading. It now logs `[Storm] Met Office check unreadable, using MeteoAlarm alone` at WARNING with the reason. Added after the 5.133.0 restart read yellow when the Met Office held amber, with no sign of why.
