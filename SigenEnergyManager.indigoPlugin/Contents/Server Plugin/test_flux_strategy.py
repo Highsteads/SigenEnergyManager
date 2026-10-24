@@ -1694,6 +1694,19 @@ class TestTheNightlyMinimumCharge(unittest.TestCase):
         self.assertEqual(fs.plan(inputs).control_key(), self._minimum_off(inputs).control_key())
         self.assertNotIn("50% minimum", fs.plan(inputs).reason)
 
+    def test_a_warning_fills_the_battery_to_the_ceiling_in_the_window(self):
+        """5.133.0 (CliveS, 24-Oct-2026): any warning charges to the ceiling, whatever
+        the day needs. Without one the charge still stops at the planned need."""
+        plain = fs.plan(self._in((2, 0), 40.0))
+        storm = fs.plan(self._in((2, 0), 40.0, storm_fill=True))
+        self.assertEqual(storm.mode, fs.MODE_CHARGE)
+        self.assertEqual(storm.charge_cutoff_pct, 100.0)
+        self.assertLess(plain.charge_cutoff_pct, 100.0)
+
+    def test_a_warning_fill_is_a_no_op_when_already_full(self):
+        storm = fs.plan(self._in((2, 0), 100.0, storm_fill=True))
+        self.assertNotEqual(storm.mode, fs.MODE_CHARGE)
+
     def test_it_never_exceeds_the_site_ceiling(self):
         inputs = self._in((2, 0), 21.7, site=_site(max_charge_soc_pct=40.0))
         d = fs.plan(inputs)

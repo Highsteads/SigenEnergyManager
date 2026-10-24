@@ -1996,7 +1996,6 @@ class BatteryManager:
         """
         tariff      = snapshot.tariff
         now         = snapshot.now
-        dawn_dt     = balance.dawn_dt
         cheap_start = tariff.cheap_start
         cheap_end   = tariff.cheap_end
         short_kwh   = balance.import_kwh_grid

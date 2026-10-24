@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.133.0 — 24-10-2026
+
+- **Storm warnings fill the battery in the cheap window.** `FluxInputs.storm_fill` (set from `_storm_active()`) makes `flux_strategy._charge_plan` buy up to `ceiling_kwh` rather than the planned need, so the charge targets `max_charge_soc_pct` (100 unless the pref says otherwise). `_flux_other_owner` now stands Flux down for a storm only outside `_flux_cheap_window_open()`. A booked free-import hour's room is not kept back in that case. Test: `test_a_warning_fills_the_battery_to_the_ceiling_in_the_window` and the flipped `test_a_storm_inside_the_window_leaves_the_charge_to_flux`.
+- **Met Office RSS as a second storm source.** `storm_watch.check_met_office_level` (storm_watch 1.8) reads `metoffice.gov.uk/public/data/PWSCache/WarningsRSS/Region/UK`, matches the title's region exactly, keeps wind, snow, ice, thunderstorm, rain and flood hazards (the same word-boundary filter as MeteoAlarm), reads the "valid from HHMM Day D Mon" window in Europe/London, and applies the same 24-hour horizon. A non-RSS body is unknown, not all-clear. `_combine_storm_sources` takes the higher level and holds the previous level only when both sources are unreadable. A disagreement logs one WARNING per change. Pref `metOfficeRegion` (default North East England in code and in PluginConfig; blank = off).
+- **Lint.** Removed an unused `dawn_dt` in `battery_manager._plan_tou_import` (F841) and two unused imports in `test_fixed_windows_and_carried_prices.py`. These were already failing `ruff check .` in CI.
+- **Tests.** 2552 pass. New file `test_met_office_second_source.py` (15 tests against a fixture shaped like the live feed).
+
+---
+
 ## v5.132.3 — 18-10-2026
 
 - Fixed-band tariffs (Flux, Go, iGo, iFlux) keep their cheap-window times when Octopus has not answered: `_build_tariff_data` fills a missing window from `TARIFF_WINDOWS` (`octopus_api.fixed_tou_window`); a live window is never overridden. Day-rate scheduled imports now drop as past their window instead of firing when the window was unknown.

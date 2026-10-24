@@ -16,7 +16,8 @@
 #              Returns a severity string: "none", "yellow", "amber", or "red".
 # Author:      CliveS & Claude Fable 5; v1.7 Claude Opus 5.5
 # Date:        27-09-2026; v1.7 02-10-2026
-# Version:     1.7 (a non-Atom body is unknown, not all-clear; CAP "Minor" is green, not yellow)
+# Version:     1.8 (Met Office RSS as a second source, check_met_office_level)
+#              1.7 (a non-Atom body is unknown, not all-clear; CAP "Minor" is green, not yellow)
 #              1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
 #              1.5 (failure paths return None — caller holds previous level, no false all-clear)
 
@@ -24,6 +25,7 @@ import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # There is deliberately NO default site (v1.6). A baked-in position meant a
 # user with none configured got storm warnings for somebody else's area. The
@@ -372,5 +374,110 @@ def check_storm_level(lat, lon, location_name="your location"):
             # read is visible rather than indistinguishable from a quiet day.
             base += (f" | {len(ignored)} non-power-cut event(s) ignored: "
                      + ", ".join(sorted(set(ignored))[:3]))
+        return "none", base
+    return highest, " | ".join(reasons[:3])
+
+
+# ============================================================
+# Met Office RSS (second source, v1.8)
+# ============================================================
+#
+# MeteoAlarm is a relay, and it can lag the Met Office. On 24-Oct-2026 the Met
+# Office issued an amber wind warning for County Durham at 08:43; the MeteoAlarm
+# feed still carried only the yellow at 06:51 and the next poll had no amber for
+# North East England. The Met Office's own RSS names the region, the colour and
+# the hours, so it is read alongside MeteoAlarm and the higher level wins.
+
+MET_OFFICE_WARNINGS_URL = "https://www.metoffice.gov.uk/public/data/PWSCache/WarningsRSS/Region/UK"
+
+# Title shape: "Amber warning of wind affecting North East England"
+_MO_TITLE_RE = re.compile(r"^(yellow|amber|red)\s+warning\s+of\s+(.+?)\s+affecting\s+(.+)$", re.I)
+# Description shape: "... valid from 2000 Sat 24 Oct to 2100 Sun 25 Oct" (UK local, no year)
+_MO_VALID_RE = re.compile(r"valid from (\d{4}) \w{3} (\d{1,2}) (\w{3}) to (\d{4}) \w{3} (\d{1,2}) (\w{3})", re.I)
+
+
+def _mo_window(description, now_utc):
+    """(start_utc, end_utc) for a Met Office item, or None when the text has no window."""
+    m = _MO_VALID_RE.search(description or "")
+    if not m:
+        return None
+    tz_uk = ZoneInfo("Europe/London")
+    year = now_utc.astimezone(tz_uk).year
+    try:
+        start = datetime.strptime(f"{year} {m.group(2)} {m.group(3)} {m.group(1)}", "%Y %d %b %H%M")
+        end   = datetime.strptime(f"{year} {m.group(5)} {m.group(6)} {m.group(4)}", "%Y %d %b %H%M")
+    except ValueError:
+        return None
+    return (start.replace(tzinfo=tz_uk).astimezone(timezone.utc),
+            end.replace(tzinfo=tz_uk).astimezone(timezone.utc))
+
+
+def check_met_office_level(region, now_utc=None, xml_bytes=None):
+    """
+    Check the Met Office warnings RSS for wind/storm warnings for one region.
+
+    Args:
+        region     the Met Office region name exactly as the feed writes it, e.g.
+                   "North East England". The caller skips the check when blank.
+        now_utc    test seam; defaults to the current time.
+        xml_bytes  test seam; defaults to a live fetch of the feed.
+
+    Returns (level, reason) like check_storm_level. level is None when the feed
+    could not be read, which means "unknown", not all-clear.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if xml_bytes is None:
+        try:
+            req = urllib.request.Request(MET_OFFICE_WARNINGS_URL,
+                                         headers={"User-Agent": "SigenEnergyManager/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                xml_bytes = resp.read()
+        except Exception as exc:
+            return None, f"Met Office unavailable: {exc}"
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as exc:
+        return None, f"Met Office XML parse error: {exc}"
+
+    channel = root.find("channel") if root.tag == "rss" else None
+    if channel is None:
+        return None, f"Met Office returned a non-RSS document (root <{root.tag}>)"
+
+    horizon_utc = now_utc + timedelta(hours=STORM_ACTIVATE_HOURS)
+    wanted      = region.strip().lower()
+    highest     = "none"
+    reasons     = []
+    pending     = []
+
+    for item in channel.findall("item"):
+        title = (item.findtext("title") or "").strip()
+        m = _MO_TITLE_RE.match(title)
+        if not m or m.group(3).strip().lower() != wanted:
+            continue
+        colour, hazard = m.group(1).lower(), m.group(2)
+        if not _HAZARD_RE.search(_normalise_hazard(hazard)):
+            continue   # fog, heat, etc. carry no power-cut risk
+
+        window = _mo_window(item.findtext("description"), now_utc)
+        start_utc, end_utc = window if window else (None, None)
+        if end_utc is not None and end_utc <= now_utc:
+            continue   # expired
+        if start_utc is not None and start_utc > horizon_utc:
+            hrs_away = (start_utc - now_utc).total_seconds() / 3600
+            pending.append(f"Met Office {colour.upper()} (in {hrs_away:.0f}h, not yet active): {title}")
+            continue
+
+        highest = _level_max(highest, colour)
+        if start_utc is not None:
+            reasons.append(f"Met Office {colour.upper()} {hazard} from "
+                           f"{start_utc.astimezone(ZoneInfo('Europe/London')):%a %d %b %H:%M}: {title}")
+        else:
+            reasons.append(f"Met Office {colour.upper()} {hazard}: {title}")
+
+    if highest == "none":
+        base = f"Met Office: no active wind/storm warnings for {region}"
+        if pending:
+            base += " | " + " | ".join(pending[:2])
         return "none", base
     return highest, " | ".join(reasons[:3])

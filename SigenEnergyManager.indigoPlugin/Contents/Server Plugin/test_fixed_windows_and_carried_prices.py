@@ -14,7 +14,7 @@ import sys
 import threading
 import types
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 if "indigo" not in sys.modules:

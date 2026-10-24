@@ -403,6 +403,9 @@ class FluxInputs:
     sale_priority:    Tuple[Tuple[datetime, datetime], ...] = field(default_factory=tuple)
     # v2.10: why derive_bands refused, in words (bands_problem), when bands is None.
     bands_problem:    str = ""
+    # v2.11 (5.133.0): a Met Office or MeteoAlarm warning stands. Inside the cheap
+    # window the charge then fills to the ceiling rather than to the planned need.
+    storm_fill:       bool = False
 
 
 @dataclass(frozen=True)
@@ -1443,6 +1446,11 @@ def _charge_plan(inputs):
     # rise and nothing can restart a finished charge. The charge now runs until
     # the SOC reaches the whole-percent cutoff. The cost is that a battery opening
     # the window within 0.5 kWh of its target also tops up that last bit, once.
+    # A warning fills the battery to the ceiling in this window, whatever the day
+    # needs (CliveS, 24-Oct-2026: battery health is not the priority). A booked
+    # free-import hour's room is not kept back in that case.
+    if inputs.storm_fill:
+        buy_kwh = max(buy_kwh, ceiling_kwh - have_kwh)
     if buy_kwh <= 0:
         return None, 0, 0.0, margin_p, household_buy_kwh, infeasible
 

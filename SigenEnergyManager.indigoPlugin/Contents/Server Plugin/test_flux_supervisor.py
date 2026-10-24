@@ -2928,9 +2928,17 @@ class TestFluxOwnsTheCheapWindow(_FluxCase):
         self.assertFalse(self._owns(p, when))
 
     def test_something_outranking_flux_hands_the_window_back(self):
+        p, when = self._at((2, 30), soc=25.0)
+        p.store["flux_decision"] = fs.FluxDecision(mode=fs.MODE_CHARGE, owns=True, reason="t")
+        p.store["flux_manual_preempt"] = "a manual change"
+        self.assertFalse(self._owns(p, when))
+
+    def test_a_storm_inside_the_window_leaves_the_charge_to_flux(self):
+        """5.133.0 (CliveS, 24-Oct-2026): a warning fills the battery in the cheap
+        window, so the storm no longer takes the window back from Flux."""
         p, when = self._at((2, 30), soc=25.0, storm_level="amber")
         p.store["flux_decision"] = fs.FluxDecision(mode=fs.MODE_CHARGE, owns=True, reason="t")
-        self.assertFalse(self._owns(p, when))
+        self.assertTrue(self._owns(p, when))
 
     def test_a_manager_import_in_flight_is_left_to_finish(self):
         p, when = self._at((2, 30), soc=25.0, import_active=True)

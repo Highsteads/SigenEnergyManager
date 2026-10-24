@@ -48,6 +48,12 @@
     <Field id="siteLocationName" type="textfield" defaultValue="">
         <Label>Location name (used in storm-watch alerts, e.g. "York" — blank shows "your area"):</Label>
     </Field>
+    <Field id="metOfficeRegion" type="textfield" defaultValue="North East England">
+        <Label>Met Office region (second storm source):</Label>
+    </Field>
+    <Field id="metOfficeRegionInfo" type="label">
+        <Label>The Met Office warning is read alongside MeteoAlarm and the higher colour wins. Spell the region as the Met Office writes it, e.g. North East England, Yorkshire &amp; Humber or Wales. Leave it blank to turn the Met Office check off.</Label>
+    </Field>
     <Field id="siteArraysJson" type="textfield" defaultValue="">
         <Label>PV array specs (JSON list of {name, tilt, azimuth, kwp, shade}, blank = defaults):</Label>
     </Field>

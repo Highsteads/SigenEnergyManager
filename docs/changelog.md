@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.133.0 — 24 October 2026
+
+- **Any warning now fills the battery to full in the cheap window.** A yellow, amber or red wind warning charges the battery to 100% between 2am and 5am, whatever the day needs. Before, a yellow warning stood the Flux charge down, so the cheap window went unused. Outside the window a warning still hands the inverter back to the ordinary manager. A booked free-import hour no longer keeps room in the battery while a warning stands.
+- **The Met Office is now a second warning source.** MeteoAlarm can lag the Met Office. On 24 October the Met Office had an amber wind warning for County Durham at 08:43, and MeteoAlarm still showed yellow. The plugin now reads both and uses the higher colour, and it logs a warning when they disagree. The region is set in Configure as "Met Office region". This house is set to North East England. A blank field turns the Met Office check off.
+
 ## 5.132.3 — 18 October 2026
 
 - **Flux, Go, iGo and iFlux keep their cheap-window times when Octopus has not answered.** They run on the clock, so the times are known without a fetch. After a restart with Octopus unreachable the plugin used to hold the grid import ("the cheap window times are not known"). It now plans on the fixed window, and uses the real one the moment Octopus supplies it. Prices already held stay; none are invented.

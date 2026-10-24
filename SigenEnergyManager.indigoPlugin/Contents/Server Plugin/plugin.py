@@ -72,7 +72,7 @@
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 # Date:        05-10-2026
-# Version:     5.132.3
+# Version:     5.133.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -318,7 +318,7 @@ from battery_manager  import (
     BANK_FIRST_PROMOTE_MARGIN_KWH,
 )
 from axle_api      import AxleAPI
-from storm_watch   import check_storm_level
+from storm_watch   import check_storm_level, check_met_office_level
 from economics     import Economics
 from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
                            DASHBOARD_BIND_LOOPBACK)
@@ -858,6 +858,43 @@ ENERGY_VAR_INTERVAL  = 1800  # 30 minutes — write running totals to Indigo var
 
 # Storm-level hierarchy (mirrors storm_watch._LEVELS)
 STORM_LEVELS = ["none", "yellow", "amber", "red"]
+
+# Met Office region the second storm source reads (storm_watch.check_met_office_level).
+# Set for this house; the Configure field "metOfficeRegion" overrides it, and a blank
+# field turns the second source off.
+MET_OFFICE_REGION_DEFAULT = "North East England"
+
+
+def _storm_level_active(level):
+    """True for a yellow, amber or red storm level; "none", "clear" and blank are not."""
+    return str(level or "").lower() not in ("", "none", "clear")
+
+
+def _flux_cheap_window_open(now_utc=None):
+    """True while the Flux cheap window (02:00-05:00 London) is open."""
+    try:
+        return bool(_flux_strategy.in_window(
+            now_utc or datetime.now(timezone.utc), _london_tz(),
+            _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _combine_storm_sources(ma, mo):
+    """(level, reason) for the higher of MeteoAlarm and the Met Office.
+
+    ma and mo are (level, reason) pairs from the two checks, or None when that
+    source was not asked (no Met Office region). A level of None means that
+    source could not be read: the other source decides, and when neither can be
+    read the result stays None so the caller holds the previous level.
+    """
+    sources = [(name, pair) for name, pair in (("MeteoAlarm", ma), ("Met Office", mo))
+               if pair is not None]
+    readable = [(name, lvl, why) for name, (lvl, why) in sources if lvl is not None]
+    if not readable:
+        return None, " | ".join(why for _name, (_lvl, why) in sources)
+    _name, level, reason = max(readable, key=lambda r: STORM_LEVELS.index(r[1]))
+    return level, reason
 
 # Storm reserve SOC — the minimum the battery is held at during a warning so the
 # house can ride out a power cut. CliveS's decision (26-Jun-2026): a FLAT 50% for
@@ -5873,10 +5910,34 @@ class Plugin(indigo.PluginBase):
             return
         self.store["storm_no_position_logged"] = False
         try:
-            new_level, reason = check_storm_level(site_lat, site_lon, loc_name)
+            ma_level, ma_reason = check_storm_level(site_lat, site_lon, loc_name)
         except Exception as exc:
             log(f"[Storm] check_storm_level() raised: {exc}", level="WARNING")
             return
+
+        # v5.133.0: the Met Office is a second source. MeteoAlarm can lag it (24-Oct-2026:
+        # an amber for County Durham was on the Met Office page at 08:43 and absent from
+        # MeteoAlarm), so the higher of the two is used and a disagreement is logged.
+        mo = None
+        mo_region = str(self.pluginPrefs.get("metOfficeRegion", MET_OFFICE_REGION_DEFAULT) or "").strip()
+        if mo_region:
+            try:
+                mo = check_met_office_level(mo_region)
+            except Exception as exc:
+                mo = (None, f"Met Office check raised: {exc}")
+            mo_level = mo[0]
+            if mo_level is not None and mo_level != ma_level:
+                pair = f"{ma_level}/{mo_level}"
+                if self.store.get("storm_disagree_logged") != pair:
+                    self.store["storm_disagree_logged"] = pair
+                    log(f"[Storm] The sources disagree for {mo_region}: Met Office says "
+                        f"{mo_level.upper()}, MeteoAlarm says {str(ma_level or 'unreadable').upper()}. "
+                        f"Using the higher level. MeteoAlarm can lag the Met Office.",
+                        level="WARNING")
+            else:
+                self.store["storm_disagree_logged"] = ""
+
+        new_level, reason = _combine_storm_sources((ma_level, ma_reason), mo)
 
         with self._state_lock:   # v5.45.0: poll unlocked, merge locked
             self._apply_storm_result(new_level, reason)
@@ -13383,6 +13444,10 @@ class Plugin(indigo.PluginBase):
         except Exception:                                    # noqa: BLE001
             return False
 
+    def _storm_active(self):
+        """True while any Met Office or MeteoAlarm warning (yellow, amber or red) stands."""
+        return _storm_level_active(self.store.get("storm_level"))
+
     def _flux_armed(self):
         """True when the strategy is on, whether or not it holds the inverter.
 
@@ -13818,7 +13883,9 @@ class Plugin(indigo.PluginBase):
             return "flood prevention is holding a discharge floor"
         if self._power_cut_window_active():
             return "a power-cut lockout is in force"
-        if str(self.store.get("storm_level", "") or "").lower() not in ("", "none", "clear"):
+        if _storm_level_active(self.store.get("storm_level")) and not _flux_cheap_window_open():
+            # 5.133.0: inside the cheap window a warning is the reason to charge, so Flux
+            # keeps the inverter there. Outside it a storm still hands the inverter back.
             return f"a storm warning ({self.store.get('storm_level')})"
         return ""
 
@@ -14923,6 +14990,7 @@ class Plugin(indigo.PluginBase):
             pv              = pv,
             flows           = flows,
             commitments     = self._flux_commitments(),
+            storm_fill      = self._storm_active(),
             tariff_verified = verified,
             commissioned    = _as_bool(prefs.get("fluxCommissioned", False)),
             enabled         = _as_bool(prefs.get("fluxEnabled", False)),
