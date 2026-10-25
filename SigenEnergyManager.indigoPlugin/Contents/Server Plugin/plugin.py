@@ -73,8 +73,9 @@
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 #              Claude Opus 5.5 (5.134.1 — no import-held alert while the first tariff read is awaited)
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
+#              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 # Date:        25-10-2026
-# Version:     5.135.0
+# Version:     5.136.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1844,6 +1845,8 @@ class Plugin(indigo.PluginBase):
         # from the next decision, and after the window there is nothing to resume.
         self.store["cheap_window_import_active"] = False
         self.store["happy_hour_anchor_kwh"]     = None   # grid-import counter at window entry
+        self.store["happy_hour_battery_anchor_kwh"] = None   # battery charge counter at entry (5.136.0)
+        self.store["happy_hour_battery_kwh"]    = None   # what the last free hour stored
         self.store["happy_hour_free_kwh"]       = 0.0    # free kWh banked in the last window
         # v5.112.0 booking. All three persisted (see _save_accumulators_locked).
         self.store["happy_hour_notes_sent"]     = []     # "kind:day[:codes]" keys, never prose
@@ -6685,12 +6688,16 @@ class Plugin(indigo.PluginBase):
         except Exception:                                           # noqa: BLE001
             return None
 
-    def _happy_hour_result_note(self, banked_kwh, now_utc=None):
+    def _happy_hour_result_note(self, banked_kwh, now_utc=None, battery_kwh=None):
         """Say what the day's free hours banked, once the last of them has ended.
 
         The free-kWh figure accumulates across the day's windows (two booked hours
         need not be next to each other), and the note waits until no booked hour
         is left today, so a day's free power gets one message, not one per slot.
+
+        5.136.0: battery_kwh, what the battery stored, accumulates the same way.
+        One window without it makes the day's figure unknown, so the note then
+        says nothing about the battery rather than under-count it.
         """
         if _hh_booking is None:
             return
@@ -6704,6 +6711,12 @@ class Plugin(indigo.PluginBase):
             used = {"day": today, "spans": [], "kwh": 0.0}
         if banked_kwh is not None:
             used["kwh"] = round(float(used.get("kwh") or 0.0) + float(banked_kwh), 2)
+            if battery_kwh is None or used.get("battery_unknown"):
+                used["battery_unknown"] = True
+                used.pop("battery_kwh", None)
+            else:
+                used["battery_kwh"] = round(float(used.get("battery_kwh") or 0.0)
+                                            + float(battery_kwh), 2)
         self.store["happy_hour_used"] = used
         for w in self.store.get("saving_sessions_windows") or []:
             if w.get("direction") != SAVING_SESSION_HAPPY_HOUR:
@@ -6724,7 +6737,8 @@ class Plugin(indigo.PluginBase):
                 continue
         title, body = _hh_booking.result_message(
             used.get("kwh") if banked_kwh is not None else None,
-            slots, tz, self._happy_hour_cheap_rate_p())
+            slots, tz, self._happy_hour_cheap_rate_p(),
+            battery_kwh=used.get("battery_kwh") if banked_kwh is not None else None)
         self._send_happy_hour_note(f"result:{today}", title, body)
 
     def _saving_session_for_us(self, event):
@@ -7244,6 +7258,16 @@ class Plugin(indigo.PluginBase):
                 self._note_free_hour_kwh(banked)
             except Exception as exc:                    # noqa: BLE001 — never block the hand-back
                 self.logger.debug(f"[FreeHour] could not note the free kWh: {exc!r}")
+        # 5.136.0: what the battery stored, from its own daily charge counter.
+        # The grid figure above is the free power; this is where it went.
+        battery = None
+        battery_anchor = _as_float(self.store.get("happy_hour_battery_anchor_kwh"), None)
+        battery_now    = _as_float((getattr(self, "latest_inverter_data", None) or {})
+                                   .get("batteryDailyChargeKwh"), None)
+        if battery_anchor is not None and battery_now is not None:
+            battery = round(max(0.0, battery_now - battery_anchor), 2)
+        self.store["happy_hour_battery_kwh"]        = battery
+        self.store["happy_hour_battery_anchor_kwh"] = None
         self.store["happy_hour_import_active"] = False
         self.store["happy_hour_anchor_kwh"]    = None
         self.store["import_active"]            = False
@@ -7263,9 +7287,11 @@ class Plugin(indigo.PluginBase):
         self._restore_import_cutoff()
 
         banked_str = f"{banked:.2f} kWh banked free" if banked is not None else "amount unknown"
+        if battery is not None:
+            banked_str += f", {battery:.2f} kWh of it into the battery"
         log(f"[Manager] Happy Hour import ended ({why}) — {banked_str}")
         try:
-            self._happy_hour_result_note(banked)
+            self._happy_hour_result_note(banked, battery_kwh=battery)
         except Exception:                                           # noqa: BLE001
             self.logger.exception("[HappyHour] Could not send the result note")
         self._save_accumulators()
@@ -7756,6 +7782,11 @@ class Plugin(indigo.PluginBase):
                     self.store["happy_hour_import_active"] = True
                     self.store["happy_hour_anchor_kwh"] = self.store.get(
                         "grid_import_daily_kwh", 0.0)
+                    # 5.136.0: and the battery's own charge counter, so the result
+                    # can say how much of the free power was stored rather than
+                    # assume it. None when the inverter has not given a reading.
+                    self.store["happy_hour_battery_anchor_kwh"] = _as_float(
+                        (self.latest_inverter_data or {}).get("batteryDailyChargeKwh"), None)
                     self.store["import_active"] = True
                     self.store["import_target_soc"] = target
                     self._set_import_cutoff(cutoff)
@@ -8252,12 +8283,18 @@ class Plugin(indigo.PluginBase):
         The one door every manager import goes through, so the mode the verify
         pass expects and the mode the import wrote cannot disagree. See
         EMS_CHARGE_PV_FIRST for why PV First.
+
+        5.136.0: an import replaces Solar Overflow, so it ends it here. Overflow
+        starting already cleared import_active; nothing cleared the other way, and
+        the stale overflow cap is what held the 25-Oct-2026 free hour to 200 W.
         """
         ok = self.modbus.force_charge(power_w, cutoff_soc=cutoff, pv_first=True)
         if ok:
             self.store["import_ems_mode"]       = EMS_CHARGE_PV_FIRST
             self.store["import_power_w"]        = int(power_w)
             self.store["pv_first_short_passes"] = 0
+            self.store["solar_overflow_active"]       = False
+            self.store["solar_overflow_charge_cap_w"] = 0
         return ok
 
     def _import_ems_mode(self):
@@ -8304,6 +8341,21 @@ class Plugin(indigo.PluginBase):
         self.store["pv_first_short_passes"] = passes
         if passes < PV_FIRST_SHORTFALL_PASSES:
             return
+        # 5.136.0: read the charge limit before blaming the mode. On 25-Oct-2026
+        # the battery was held at 200 W by a stale Solar Overflow cap; this check
+        # switched to Grid First, which cannot lift a limit and turned the panels
+        # off for 55 minutes. A limit well below the import's rate is the fault.
+        actual_limit_w = None
+        if self.modbus and self.modbus.connected:
+            actual_limit_w = self.modbus.read_charge_limit()
+        if actual_limit_w is not None and actual_limit_w < 0.8 * limit_w:
+            log(f"[Manager] The grid import is not reaching the battery because the "
+                f"inverter's charge limit is {actual_limit_w:.0f} W, not the "
+                f"{limit_w:.0f} W this import set. Putting the limit back and keeping "
+                f"Charge PV First.", level="WARNING")
+            self.modbus.set_charge_limit(int(limit_w))
+            self.store["pv_first_short_passes"] = 0
+            return
         log(f"[Manager] The grid import is not reaching the battery in Charge PV "
             f"First: the battery is taking {batt_w:.0f} W against the {limit_w:.0f} W "
             f"asked for, with the sun giving {pv_w:.0f} W. Switching this import to "
@@ -8334,7 +8386,8 @@ class Plugin(indigo.PluginBase):
                            not discharge register, to cap grid flow; battery must be free to supply
                            house load + grid simultaneously)
           - import_active: mode = Charge PV First (Grid First if the import fell
-                           back), charge limit = inverter max, discharge = inverter max
+                           back), charge limit = the import's own rate (5.136.0,
+                           even with a stale overflow flag), discharge = inverter max
           - a Happy Hour import: discharge = 0 (v5.112.0 — the house runs on the free grid)
           - otherwise:     both limits = inverter max (unrestricted self-consumption)
         """
@@ -8356,13 +8409,17 @@ class Plugin(indigo.PluginBase):
         if self.store.get("cheap_window_import_active"):
             expected_discharge_w = 0
 
+        # A running import owns the charge limit: it is the rate _force_charge
+        # wrote (5.130.1: the cheap window sizes it to the site headroom).
+        # 5.136.0: checked BEFORE solar overflow. The 25-Oct-2026 free hour ran
+        # with the overflow flag still set, and this pass put its 200 W cap back
+        # a minute into the import, so the battery took 0.27 kWh of a free 4 kWh.
         # During solar overflow the charge limit is intentionally reduced.
         # Use the stored cap as the expected value so verify() doesn't fight it.
-        if self.store.get("solar_overflow_active"):
-            expected_charge_w = self.store.get("solar_overflow_charge_cap_w", inv_max_w)
-        elif self.store.get("cheap_window_import_active"):
-            # 5.130.1: the fallback charge is sized to the site headroom.
+        if self.store.get("import_active"):
             expected_charge_w = int(self.store.get("import_power_w") or inv_max_w)
+        elif self.store.get("solar_overflow_active"):
+            expected_charge_w = self.store.get("solar_overflow_charge_cap_w", inv_max_w)
         else:
             expected_charge_w = inv_max_w
 
@@ -17073,6 +17130,7 @@ class Plugin(indigo.PluginBase):
             # restart mid-window without double-counting, so it is persisted on entry.
             "happy_hour_import_active":  bool(self.store.get("happy_hour_import_active")),
             "happy_hour_anchor_kwh":     self.store.get("happy_hour_anchor_kwh"),
+            "happy_hour_battery_anchor_kwh": self.store.get("happy_hour_battery_anchor_kwh"),
             "happy_hour_target_soc":     (self.store.get("import_target_soc")
                                           if self.store.get("happy_hour_import_active")
                                           else None),
@@ -17183,6 +17241,8 @@ class Plugin(indigo.PluginBase):
             if data.get("happy_hour_import_active"):
                 self.store["happy_hour_import_active"] = True
                 self.store["happy_hour_anchor_kwh"] = data.get("happy_hour_anchor_kwh")
+                self.store["happy_hour_battery_anchor_kwh"] = data.get(
+                    "happy_hour_battery_anchor_kwh")
                 # 5.125.0: the import flag as well. With only the Happy Hour flag
                 # back, the verify pass expected Self Consumption and switched the
                 # charge off for the rest of the free window, and the Happy Hour

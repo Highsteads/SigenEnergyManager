@@ -8450,6 +8450,9 @@ class TestImportsChargePvFirst(unittest.TestCase):
         m.connected   = True
         m.set_remote_ems_mode.return_value = True
         m.force_charge.return_value        = True
+        # 5.136.0: the fallback reads the charge limit first. Here it is right,
+        # so a shortfall is the mode's, as these tests assume.
+        m.read_charge_limit.return_value   = limit
         p.latest_inverter_data = {"batterySoc": soc, "batteryPowerWatts": batt_w,
                                   "pvPowerWatts": pv_w}
         p.store = {"import_active": active, "export_active": False,

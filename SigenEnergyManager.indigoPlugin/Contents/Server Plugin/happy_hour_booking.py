@@ -437,8 +437,13 @@ def reminder_message(slots, tz):
     return title, body
 
 
-def result_message(free_kwh, slots, tz, cheap_rate_p=None):
-    """(title, body) once the day's last booked free hour has ended."""
+def result_message(free_kwh, slots, tz, cheap_rate_p=None, battery_kwh=None):
+    """(title, body) once the day's last booked free hour has ended.
+
+    battery_kwh is what the battery stored, from its own charge counter. Without
+    it the note says nothing about the battery: the 25-Oct-2026 note claimed
+    "most of it into the battery" when the battery took 0.27 of 3.97 kWh.
+    """
     span = span_words(slots, tz) if slots else ""
     if free_kwh is None:
         return ("The free hours are over",
@@ -448,11 +453,24 @@ def result_message(free_kwh, slots, tz, cheap_rate_p=None):
         return ("The free hours banked almost nothing",
                 f"The free electricity {span} is over, but the house took only "
                 f"{free_kwh:.1f} kWh from the grid in that time.".replace("  ", " "))
+    title = f"The free hours banked {_kwh(free_kwh)}"
     body = (f"The free electricity {span} is over. The house took {_kwh(free_kwh)} "
-            f"from the grid in that time, most of it into the battery, and Octopus "
-            f"should credit all of it.")
+            f"from the grid in that time, and Octopus should credit all of it.")
+    if battery_kwh is not None:
+        stored = min(float(battery_kwh), float(free_kwh))
+        rest   = float(free_kwh) - stored
+        if rest < 0.1:
+            body += " The battery stored the lot."
+        elif stored >= 0.5 * float(free_kwh):
+            body += (f" The battery stored {stored:.1f} kWh of it and the house used "
+                     f"the other {rest:.1f} kWh as it went.")
+        else:
+            title = f"The battery stored only {stored:.1f} kWh of the free {_kwh(free_kwh)}"
+            body += (f" The battery stored only {stored:.1f} kWh of it and the house "
+                     f"used the other {rest:.1f} kWh as it went, so the battery did "
+                     f"not fill as planned.")
     if cheap_rate_p:
-        pounds = free_kwh * float(cheap_rate_p) / 100.0
+        cost = free_kwh * float(cheap_rate_p) / 100.0
         body += (f" Bought at the cheap overnight rate of {float(cheap_rate_p):.1f}p "
-                 f"instead, that much would have cost about {pounds:.2f} pounds.")
-    return f"The free hours banked {_kwh(free_kwh)}", body.replace("  ", " ")
+                 f"instead, that much would have cost about £{cost:.2f}.")
+    return title, body.replace("  ", " ")

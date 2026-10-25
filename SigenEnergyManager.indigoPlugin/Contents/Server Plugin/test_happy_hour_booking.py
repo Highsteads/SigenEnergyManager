@@ -241,7 +241,8 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
 
     def _check(self, title, body):
         for text in (title, body):
-            text.encode("ascii")                        # raises on anything else
+            # ASCII apart from the pound sign, which the estate's notes carry.
+            text.replace("£", "").encode("ascii")  # raises on anything else
             self.assertNotIn("|", text)
             self.assertNotIn("=", text)
             self.assertNotIn("  ", text)
@@ -340,7 +341,7 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         title, body = hb.result_message(18.6, _slots(hours=(13, 14)), LONDON, 14.62)
         self._check(title, body)
         self.assertEqual(title, "The free hours banked 19 kWh")
-        self.assertIn("about 2.72 pounds", body)
+        self.assertIn("about £2.72", body)
 
     def test_a_result_with_nothing_banked_says_so_plainly(self):
         title, body = hb.result_message(0.2, _slots(hours=(13,)), LONDON, 14.62)

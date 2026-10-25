@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.136.0 — 25 October 2026
+
+- **A free hour charges at full rate.** On 25 October the free hour from 2pm to 3pm brought in 4 kWh, but the battery stored only 0.3 kWh of it. Solar Overflow had been holding charging to 200 W that afternoon, and the free hour did not switch it off, so the plugin's minute-by-minute check put the 200 W limit back a minute after the free hour set 10 kW. Starting any grid import now ends Solar Overflow, and while an import runs that check expects the import's own rate.
+- **The panels stay on.** When a grid import is not reaching the battery, the plugin now reads the inverter's charge limit first. If the limit is the problem it puts it back and leaves the mode alone. Before, it blamed the mode and switched to one that turns the panels off, which lost about 2 kWh of sunshine on 25 October and did not help the charging.
+- **The free-hour note says where the power went.** It used to say the free power went "most of it into the battery" without checking. It now reads the battery's own charge figure and says how much the battery stored and how much the house used, and the title says so when the battery did not fill. Money is shown with a pound sign.
+
 ## 5.135.0 — 25 October 2026
 
 - **Room for the free hour.** When a free Happy Hour is booked for later in the day, Solar Overflow now leaves the battery room for it, and aims to have that room empty when the hour starts, not to fill the battery by 4pm. Spare sunshine before the free hour is exported instead of going into the battery, and the free hour then fills that room from the grid for nothing. Before, the sun filled the room first and the free hour found the battery nearly full. The room never takes the battery below the power-cut level you set.

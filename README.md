@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.135.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.136.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.136.0** — A free Happy Hour now charges the battery at full rate even when Solar Overflow was holding charging back beforehand. On 25 October the battery stored 0.3 kWh of a free 4 kWh, because the overflow limit of 200 W stayed in force. If an import is ever short again, the plugin checks the inverter's charge limit before it changes mode, so the panels stay on. The note after a free hour now says how much the battery stored, rather than assuming most of it, and gives money as pounds and pence.
 
 **v5.135.0** — When a free Happy Hour is booked for later in the day, Solar Overflow now leaves the battery room for it. Spare sunshine before the free hour is exported instead of filling the battery, and the free hour then fills that room from the grid for nothing. The room never takes the battery below the power-cut level. During a storm warning the free hour now fills the battery to 100%, as Solar Overflow already did.
 
@@ -136,6 +138,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.136.0 | 25 October 2026 | A free hour charges at full rate even after Solar Overflow, and its note says what the battery stored |
 | 5.135.0 | 25 October 2026 | Solar Overflow leaves room for a booked free hour later the same day |
 | 5.134.1 | 24 October 2026 | No import-held alert while the first Octopus tariff read is awaited after a restart |
 | 5.134.0 | 24 October 2026 | Ordinary nights store 95% from the cheap window; warnings and announced Axle events still fill to 100% |
