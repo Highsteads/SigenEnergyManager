@@ -72,8 +72,9 @@
 #              Claude Haiku 5.5 (5.132.2 — tomorrow's cheap window judged against its own night's dawn)
 #              Claude Sonnet 5.5 (5.132.3 — a fixed-band tariff keeps its windows and last known prices when Octopus is silent)
 #              Claude Opus 5.5 (5.134.1 — no import-held alert while the first tariff read is awaited)
-# Date:        05-10-2026
-# Version:     5.134.1
+#              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
+# Date:        25-10-2026
+# Version:     5.135.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -5255,6 +5256,7 @@ class Plugin(indigo.PluginBase):
         # hourly poll leaves behind (never a network call on the manager cycle).
         _ss_window = self._saving_session_window()
         _hh_window = self._happy_hour_window()
+        _hh_next_start, _hh_next_kwh = self._next_happy_hour_today()
 
         return ManagerSnapshot(
             current_soc_pct    = soc_pct,
@@ -5264,7 +5266,9 @@ class Plugin(indigo.PluginBase):
             saving_session_points_kwh = float((_ss_window or {}).get("points", 0) or 0),
             happy_hour_active     = _hh_window is not None,
             happy_hour_hours      = float((_hh_window or {}).get("hours", 1.0)),
-            efficiency         = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
+            happy_hour_next_start = _hh_next_start,
+            happy_hour_next_kwh   = _hh_next_kwh,
+            efficiency        = _as_float(prefs.get("batteryEfficiency"), 94) / 100.0,
             dawn_target_pct    = self._dawn_target_pct(),                      # v4.0: retained for VPP/storm
             health_cutoff_pct  = _as_float(prefs.get("batteryHealthCutoff"), 1),
             # v5.114.0: the floor the house really stops at while the grid is up
@@ -7361,6 +7365,44 @@ class Plugin(indigo.PluginBase):
                 hours = max(0.0, (end - start).total_seconds() / 3600.0)
                 return dict(w, hours=hours)
         return None
+
+    def _next_happy_hour_today(self, now_utc=None):
+        """(start_utc, kWh) of the next BOOKED free hour still to come today, or (None, 0.0).
+
+        v5.135.0, so Solar Overflow can leave the battery room for it. Gated on the
+        same `happyHourImport` pref as the import itself, and sized the same way as
+        the planner's commitment (inverter rate, capped at the fair-use limit): room
+        kept for an hour the manager will not import through would only leave the
+        battery short. Pure cache read, safe on the manager cycle.
+        """
+        if not _as_bool(self.pluginPrefs.get("happyHourImport"), False):
+            return None, 0.0
+        tz = _london_tz()
+        if tz is None:
+            return None, 0.0
+        now   = now_utc or datetime.now(timezone.utc)
+        today = now.astimezone(tz).date()
+        best  = None
+        for w in self.store.get("saving_sessions_windows") or []:
+            if w.get("direction") != SAVING_SESSION_HAPPY_HOUR:
+                continue
+            try:
+                start = datetime.fromisoformat(str(w["start"]))
+                end   = datetime.fromisoformat(str(w["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue        # malformed row — skip it, never guess a window
+            if start.tzinfo is None or end.tzinfo is None:
+                continue
+            if start <= now or start.astimezone(tz).date() != today:
+                continue
+            if best is None or start < best[0]:
+                best = (start, end)
+        if best is None:
+            return None, 0.0
+        hours    = max(0.0, (best[1] - best[0]).total_seconds() / 3600.0)
+        inv_kw   = _as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0)
+        per_hour = min(inv_kw, HAPPY_HOUR_FAIR_USE_KWH)
+        return best[0], round(per_hour * hours, 3)
 
     def _happy_hour_window(self, now_utc=None):
         """A BOOKED Octopus Weekend Happy Hour live right now, or None.

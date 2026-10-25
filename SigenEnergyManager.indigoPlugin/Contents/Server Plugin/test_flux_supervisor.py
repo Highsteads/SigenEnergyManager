@@ -2972,5 +2972,58 @@ class TestFluxOwnsTheCheapWindow(_FluxCase):
                                  lambda: p._build_manager_snapshot(30.0, True, 0.0))
             self.assertIs(snap.flux_owns_cheap_window, value)
 
+
+class TestNextHappyHourToday(unittest.TestCase):
+    """v5.135.0: the next booked free hour still to come today, fed to Solar Overflow."""
+
+    def _plugin(self, windows, import_on=True, inv_kw="10"):
+        p = _mk_plugin()
+        p.pluginPrefs["happyHourImport"] = import_on
+        p.pluginPrefs["inverterMaxKw"]   = inv_kw
+        p.store["saving_sessions_windows"] = windows
+        return p
+
+    @staticmethod
+    def _w(start, hours=1.0, direction=None, wid="hh"):
+        return {"id": wid, "start": start.isoformat(),
+                "end": (start + timedelta(hours=hours)).isoformat(),
+                "direction": direction or plugin.SAVING_SESSION_HAPPY_HOUR}
+
+    NOW = datetime(2026, 10, 25, 12, 15, tzinfo=timezone.utc)
+
+    def test_the_booked_hour_later_today_is_returned_with_its_kwh(self):
+        start = datetime(2026, 10, 25, 14, 0, tzinfo=timezone.utc)
+        p = self._plugin([self._w(start)])
+        self.assertEqual(p._next_happy_hour_today(self.NOW), (start, 10.0))
+
+    def test_the_earliest_of_two_is_returned(self):
+        a = datetime(2026, 10, 25, 13, 0, tzinfo=timezone.utc)
+        b = datetime(2026, 10, 25, 15, 0, tzinfo=timezone.utc)
+        p = self._plugin([self._w(b, wid="b"), self._w(a, wid="a")])
+        self.assertEqual(p._next_happy_hour_today(self.NOW)[0], a)
+
+    def test_nothing_when_the_import_is_switched_off(self):
+        start = datetime(2026, 10, 25, 14, 0, tzinfo=timezone.utc)
+        p = self._plugin([self._w(start)], import_on=False)
+        self.assertEqual(p._next_happy_hour_today(self.NOW), (None, 0.0))
+
+    def test_past_tomorrow_and_turn_down_windows_are_ignored(self):
+        p = self._plugin([
+            self._w(datetime(2026, 10, 25, 11, 0, tzinfo=timezone.utc), wid="past"),
+            self._w(datetime(2026, 10, 26, 14, 0, tzinfo=timezone.utc), wid="tomorrow"),
+            self._w(datetime(2026, 10, 25, 17, 0, tzinfo=timezone.utc), wid="ss",
+                    direction=plugin.SAVING_SESSION_TURN_DOWN),
+            {"id": "bad", "start": "not a date", "end": "x",
+             "direction": plugin.SAVING_SESSION_HAPPY_HOUR},
+        ])
+        self.assertEqual(p._next_happy_hour_today(self.NOW), (None, 0.0))
+
+    def test_kwh_is_capped_at_the_fair_use_limit(self):
+        start = datetime(2026, 10, 25, 14, 0, tzinfo=timezone.utc)
+        p = self._plugin([self._w(start)], inv_kw="30")
+        self.assertEqual(p._next_happy_hour_today(self.NOW)[1],
+                         plugin.HAPPY_HOUR_FAIR_USE_KWH)
+
+
 if __name__ == "__main__":
     unittest.main()

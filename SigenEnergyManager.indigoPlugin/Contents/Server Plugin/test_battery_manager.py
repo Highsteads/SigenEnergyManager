@@ -2783,6 +2783,138 @@ class TestExportFeedback(unittest.TestCase):
         bal.remaining_solar_kwh = (headroom + 1.5) * 0.8
         self.assertIsNone(self.bm._check_solar_overflow(snap, bal))
 
+
+class TestSolarOverflowLeavesRoomForAFreeHour(unittest.TestCase):
+    """v5.135.0. CliveS, 25-Oct-2026: Solar Overflow paced the battery to full by
+    the 4pm peak with a free hour booked for 2pm, so the sun filled the room the
+    grid would have filled for nothing. The free hour's room is now kept empty and
+    the pacing aims at the free hour's start.
+
+    The live numbers: 12:15 GMT, 86.8% of 35.04 kWh, storm warning, 4.1 kW of sun
+    against 0.77 kW of house, a 10 kWh free hour at 14:00 and a power-cut floor of 80%.
+    """
+
+    CAP = 35.04
+    NOW = datetime(2026, 10, 25, 12, 15, tzinfo=timezone.utc)   # GMT, so local = UTC
+
+    def _snap(self, soc_pct=86.8, hh_in_hours=1.75, hh_kwh=10.0, hh_live=False,
+              storm=True, target=95.0, min_end=80.0, pv_w=4100, home_w=770):
+        return ManagerSnapshot(
+            current_soc_pct            = soc_pct,
+            capacity_kwh               = self.CAP,
+            export_enabled             = True,
+            max_export_kw              = 4.0,
+            pv_watts                   = pv_w,
+            house_load_watts           = home_w,
+            solar_overflow_target_pct  = target,
+            solar_overflow_min_end_pct = min_end,
+            storm_active               = storm,
+            now                        = self.NOW,
+            happy_hour_active          = hh_live,
+            happy_hour_next_start      = (None if hh_in_hours is None
+                                          else self.NOW + timedelta(hours=hh_in_hours)),
+            happy_hour_next_kwh        = hh_kwh,
+        )
+
+    def _bal(self, soc_pct=86.8, remaining_solar=13.0, home_to_dusk=6.4,
+             hours_to_dusk=4.8, surplus=17.4):
+        return SufficiencyBalance(
+            battery_kwh                = soc_pct / 100.0 * self.CAP,
+            remaining_solar_kwh        = remaining_solar,
+            remaining_home_to_dusk_kwh = home_to_dusk,
+            is_daytime                 = True,
+            hours_to_dusk              = hours_to_dusk,
+            surplus_kwh                = surplus,
+        )
+
+    def setUp(self):
+        self.bm = BatteryManager()
+
+    def test_the_live_case_exports_all_the_spare_sun_before_the_free_hour(self):
+        """Already above the level the free hour wants to start from, so nothing
+        is paced into the battery: all 3.33 kW of spare sun is exported."""
+        d = self.bm._check_solar_overflow(self._snap(), self._bal())
+        self.assertIsNotNone(d)
+        self.assertAlmostEqual(d.export_kw, (4100 - 770) / 1000.0, places=6)
+        self.assertIn("paced to the free hour at 2pm", d.reason)
+        self.assertIn("keeping 7.0 kWh free for the free hour", d.reason)
+        self.assertNotIn("(storm)", d.reason)
+
+    def test_without_a_free_hour_the_same_moment_still_charges(self):
+        """The baseline the live case was fixed from: paced to 100% for the storm."""
+        d = self.bm._check_solar_overflow(self._snap(hh_in_hours=None), self._bal())
+        self.assertIsNotNone(d)
+        self.assertLess(d.export_kw, (4100 - 770) / 1000.0 - 0.5)
+        self.assertNotIn("free hour", d.reason)
+
+    def test_room_is_capped_at_what_the_hour_can_fill_above_the_floor(self):
+        """95% free-hour target (no storm) minus the 80% floor is 15% of the pack,
+        so a 10 kWh hour keeps 5.26 kWh of room, not 10."""
+        room, hours = self.bm._overflow_happy_hour_room(
+            self._snap(storm=False), self._bal())
+        self.assertAlmostEqual(room, 0.15 * self.CAP, places=6)
+        self.assertAlmostEqual(hours, 1.75, places=6)
+
+    def test_room_is_capped_at_what_the_hour_can_bring_in(self):
+        room, _ = self.bm._overflow_happy_hour_room(self._snap(hh_kwh=2.0), self._bal())
+        self.assertAlmostEqual(room, 2.0, places=6)
+
+    def test_pacing_aims_below_the_free_hour_target_by_its_room(self):
+        """At 70% with a 2 kWh hour and no storm, the pacing aims at 95% less
+        2 kWh, reached by 2pm, not at 95% by 4pm."""
+        snap = self._snap(soc_pct=70.0, hh_kwh=2.0, storm=False, target=95.0,
+                          min_end=50.0, pv_w=6000, home_w=700)
+        bal  = self._bal(soc_pct=70.0, remaining_solar=25.0, home_to_dusk=5.0)
+        d = self.bm._check_solar_overflow(snap, bal)
+        aim = 95.0 - 2.0 / self.CAP * 100.0
+        expected_req = (aim - 70.0) / 100.0 * self.CAP / 1.75
+        self.assertAlmostEqual(d.export_kw, min(5.3 - expected_req, 4.0), places=6)
+        self.assertIn(f"to {aim:.0f}% target", d.reason)
+
+    def test_the_floor_is_never_paced_away(self):
+        """A large hour must not pace the battery below the power-cut level."""
+        snap = self._snap(soc_pct=70.0, hh_kwh=10.0, storm=False, target=95.0,
+                          min_end=80.0, pv_w=6000, home_w=700)
+        bal  = self._bal(soc_pct=70.0, remaining_solar=25.0, home_to_dusk=5.0)
+        d = self.bm._check_solar_overflow(snap, bal)
+        self.assertIn("to 80% target", d.reason)
+
+    def test_the_free_hour_lets_overflow_start_on_a_day_that_only_just_fits(self):
+        """Net sun 1 kWh short of filling the battery: no overflow without the free
+        hour. With 5 kWh of room kept, 4 kWh of sun is spare and is exported."""
+        bal = self._bal(soc_pct=86.8, remaining_solar=6.4 + 0.132 * self.CAP - 1.0)
+        self.assertIsNone(self.bm._check_solar_overflow(
+            self._snap(hh_in_hours=None), bal))
+        self.assertIsNotNone(self.bm._check_solar_overflow(self._snap(), bal))
+
+    def test_a_free_hour_after_dusk_keeps_no_room(self):
+        room, _ = self.bm._overflow_happy_hour_room(
+            self._snap(hh_in_hours=5.0), self._bal(hours_to_dusk=4.8))
+        self.assertEqual(room, 0.0)
+
+    def test_a_free_hour_already_started_keeps_no_room(self):
+        room, _ = self.bm._overflow_happy_hour_room(
+            self._snap(hh_in_hours=-0.1), self._bal())
+        self.assertEqual(room, 0.0)
+
+    def test_a_live_free_hour_is_the_import_branchs_business(self):
+        room, _ = self.bm._overflow_happy_hour_room(self._snap(hh_live=True), self._bal())
+        self.assertEqual(room, 0.0)
+
+    def test_a_storm_takes_the_free_hour_to_full(self):
+        self.bm._flux_clip_risk_passed = lambda snapshot: False
+        self.assertEqual(self.bm._happy_hour_target_pct(self._snap(storm=True)), 100.0)
+        self.assertEqual(self.bm._happy_hour_target_pct(self._snap(storm=False)), 95.0)
+
+    def test_clock_labels(self):
+        lbl = BatteryManager._clock_label
+        self.assertEqual(lbl(datetime(2026, 10, 25, 14, 0, tzinfo=timezone.utc)), "2pm")
+        self.assertEqual(lbl(datetime(2026, 10, 25, 14, 30, tzinfo=timezone.utc)), "2:30pm")
+        self.assertEqual(lbl(datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)), "noon")
+        self.assertEqual(lbl(datetime(2026, 10, 25, 9, 0, tzinfo=timezone.utc)), "9am")
+        # BST: 13:00 UTC on a summer Sunday is 2pm in London
+        self.assertEqual(lbl(datetime(2026, 7, 26, 13, 0, tzinfo=timezone.utc)), "2pm")
+
 if __name__ == "__main__":
     print(f"Running {globals().get('PLUGIN_NAME', 'SigenEnergyManager')} battery_manager tests")
     unittest.main(verbosity=2)

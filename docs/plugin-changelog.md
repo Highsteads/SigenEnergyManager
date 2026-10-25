@@ -21,6 +21,12 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.135.0 — 25-10-2026
+
+- **Solar Overflow keeps room for a booked free hour.** Live 25-Oct-2026: a free hour was booked for 14:00 while Solar Overflow paced the battery to 100% (storm) by the 16:00 peak, so by 14:00 the sun would have filled the room the free hour was booked to fill. New `ManagerSnapshot.happy_hour_next_start` / `happy_hour_next_kwh`, fed by `plugin._next_happy_hour_today()` (next booked window later today from `saving_sessions_windows`, gated on `happyHourImport`, sized `min(inverterMaxKw, HAPPY_HOUR_FAIR_USE_KWH) x hours` like the planner commitment). `BatteryManager._overflow_happy_hour_room()` keeps `min(next_kwh, (_happy_hour_target_pct - solar_overflow_min_end_pct) x capacity)`, only for an hour that starts before dusk and is not yet live. `_overflow_physics_surplus` adds that room (the sun cannot use it), and `_check_solar_overflow` aims at the free-hour target less the room, clamped to the min-end floor, paced to the hour's start, never unpaced while it is ahead. `_overflow_physics_surplus` is now an instance method.
+- **Storm fills a free hour to 100%.** `_happy_hour_target_pct` returns 100 while `storm_active`, matching the overflow storm target.
+- Tests: `test_battery_manager.TestSolarOverflowLeavesRoomForAFreeHour` (12, built on the live 12:15 numbers), `test_flux_supervisor.TestNextHappyHourToday` (5).
+
 ## v5.134.1 — 24-10-2026
 
 - **Import-hold alert waits for the first tariff.** `_note_import_hold` (step 6 of `_evaluate_manager_impl`) ran before the step-8a tariff guard, so the first tick after a restart, planned with no tariff, sent the once-a-day Pushover "the tariff 'unknown' is not recognised" (live 24-Oct-2026 10:11:03; Flux arrived 10:11:13). New `_tariff_pending()` holds the single `tariff_wait_since` clock (TARIFF_WAIT_S, 300 s) for both: the guard returns before acting, and `_note_import_hold` returns without stamping `import_hold_noted_date`, so a real hold later that day still reports. After the wait it reports as before. `TariffData.tariff_fetched` (default True; `_build_tariff_data` sets `bool(tariff_info)`) lets the planner's unknown branch say "the Octopus tariff has not been read yet" instead of "not recognised". Tests: `test_agile_readiness.TestHoldWaitsForTheFirstTariff` (7), mutation-checked against both halves.

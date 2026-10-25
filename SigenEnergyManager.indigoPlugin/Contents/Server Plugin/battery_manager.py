@@ -789,6 +789,11 @@ class ManagerSnapshot:
     # window is live and the feature is enabled. plugin.py owns that test.
     happy_hour_active:       bool  = False
     happy_hour_hours:        float = 1.0    # length of the live window (hours)
+    # v5.135.0: the next booked free hour still to come TODAY (UTC start), and the
+    # kWh it can put in the battery, so Solar Overflow leaves it room. None / 0.0
+    # when there is none or the import is switched off. plugin.py owns that test.
+    happy_hour_next_start:   Optional[datetime] = None
+    happy_hour_next_kwh:     float = 0.0
 
     # Solar overflow state (from plugin.py store — passed in so manager is stateless)
     solar_overflow_active:     bool = False   # charge cap currently applied
@@ -2542,9 +2547,8 @@ class BatteryManager:
                 f"skipped — no gate claimed the refusal (physics surplus {_surplus:+.1f} kWh, "
                 f"24h surplus {balance.surplus_kwh:.1f} kWh). This is a bug — please report it")
 
-    @staticmethod
     def _overflow_physics_surplus(
-        snapshot: ManagerSnapshot, balance: SufficiencyBalance
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
     ) -> float:
         """kWh of solar today that cannot fit in the battery: the physics gate's number.
 
@@ -2556,10 +2560,47 @@ class BatteryManager:
 
         Note the headroom term is to 100%, not to the pacing target: the question is
         whether the energy physically fits, which the target does not change.
+
+        v5.135.0: room kept for a booked free hour later today counts as already
+        taken. The grid fills it for nothing, so the sun cannot use it either.
         """
         headroom_kwh   = (100.0 - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh
         net_to_battery = balance.remaining_solar_kwh - balance.remaining_home_to_dusk_kwh
-        return net_to_battery - headroom_kwh
+        hh_room_kwh, _ = self._overflow_happy_hour_room(snapshot, balance)
+        return net_to_battery - headroom_kwh + hh_room_kwh
+
+    def _overflow_happy_hour_room(
+        self, snapshot: ManagerSnapshot, balance: SufficiencyBalance
+    ) -> Tuple[float, float]:
+        """(kWh, hours to its start) of battery room to keep for a booked free hour.
+
+        v5.135.0. CliveS, 25-Oct-2026: Solar Overflow was pacing the battery to full
+        by the 4pm peak with a free hour booked for 2pm, so the sun filled the room
+        the grid would have filled for nothing, and the free hour found the battery
+        nearly full. Every kWh of that room the sun takes is a kWh exported at 9.7p
+        that the free hour would have replaced at 0p.
+
+        The room is what the free hour can actually fill: from the floor the pacing
+        may go down to (`solar_overflow_min_end_pct`, the power-cut level) up to the
+        free hour's own target, and no more than the hour can bring in. Only a free
+        hour that starts before dusk counts; one that is live is the import
+        branch's business, not this one's. Any error keeps no room, which is the
+        behaviour before this existed.
+        """
+        try:
+            start = snapshot.happy_hour_next_start
+            if start is None or snapshot.happy_hour_active:
+                return 0.0, 0.0
+            hours_to_start = (start - snapshot.now).total_seconds() / 3600.0
+            if hours_to_start <= 0.0 or hours_to_start >= float(balance.hours_to_dusk):
+                return 0.0, 0.0
+            span_pct = (self._happy_hour_target_pct(snapshot)
+                        - float(snapshot.solar_overflow_min_end_pct))
+            room_kwh = min(max(0.0, float(snapshot.happy_hour_next_kwh)),
+                           max(0.0, span_pct) / 100.0 * snapshot.capacity_kwh)
+            return room_kwh, hours_to_start
+        except Exception:                                    # noqa: BLE001
+            return 0.0, 0.0
 
     def _overflow_pacing_hours(self, snapshot: ManagerSnapshot,
                                hours_to_dusk: float) -> Tuple[float, str]:
@@ -2637,8 +2678,14 @@ class BatteryManager:
         free grid power is a better reason to fill the last five points than
         9.7p sunshine is — so the same test decides it here. Another tariff, a
         forecast that is missing or doubtful, or any error keeps the target.
+
+        v5.135.0: a storm takes it to 100% as well, as it does Solar Overflow's
+        target. A storm is the one time a full battery is worth having, and free
+        grid power is the cheapest way there.
         """
         base = float(snapshot.solar_overflow_target_pct)
+        if snapshot.storm_active:
+            return max(base, 100.0)
         if self._flux_clip_risk_passed(snapshot):
             return max(base, 100.0)
         return base
@@ -2744,6 +2791,18 @@ class BatteryManager:
         # So the floor's only remaining job is to stop a mis-set pref pacing to a level
         # below what the owner wants available for a power cut. A clamp does that
         # exactly, with no unreachable branches.
+        # v5.135.0: a booked free hour still to come today. Pace to its START, and
+        # aim below the free hour's own target by the room it can fill, so the grid
+        # fills that room for nothing instead of the sun filling it and the surplus
+        # being sold at 9.7p. Never unpaced while the free hour is ahead: taking the
+        # whole surplus would fill exactly the room this keeps. The floor below
+        # still holds, so the power-cut level is never paced away.
+        hh_room_kwh, hh_hours = self._overflow_happy_hour_room(snapshot, balance)
+        if hh_room_kwh > 0.0:
+            fill_to_full = False
+            target_pct   = (self._happy_hour_target_pct(snapshot)
+                            - hh_room_kwh / snapshot.capacity_kwh * 100.0)
+
         target_pct = max(target_pct, min_end_pct)
 
         # Room up to the TARGET (not to 100%) is what sets the pacing rate. Clamped at
@@ -2757,7 +2816,10 @@ class BatteryManager:
             (target_pct - snapshot.current_soc_pct) / 100.0 * snapshot.capacity_kwh,
         )
         pace_hours, pace_label = self._overflow_pacing_hours(snapshot, hours_to_dusk)
-        pv_surplus_kw      = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
+        if hh_room_kwh > 0.0:
+            pace_hours = hh_hours
+            pace_label = f"the free hour at {self._clock_label(snapshot.happy_hour_next_start)}"
+        pv_surplus_kw     = max(0.0, (snapshot.pv_watts - snapshot.house_load_watts) / 1000.0)
 
         # v5.111.0: do not pace at all once the day cannot clip. Pacing exists for
         # exactly one reason — to stop the battery filling early and throwing away
@@ -2816,8 +2878,10 @@ class BatteryManager:
                 f"Solar overflow: {balance.surplus_kwh:.1f} kWh 24h surplus | "
                 f"{solar_surplus:.1f} kWh physics surplus\n"
                 f"Req charge {required_charge_kw:.2f} kW to {target_pct:.0f}% target"
-                f"{' (storm)' if snapshot.storm_active else ''}"
-                f"{' (Flux: no clip risk left today, banking to full)' if fill_to_full else ''}  |  "
+                + (f" (keeping {hh_room_kwh:.1f} kWh free for the free hour)"
+                   if hh_room_kwh > 0.0 else
+                   " (storm)" if snapshot.storm_active else "")
+                + f"{' (Flux: no clip risk left today, banking to full)' if fill_to_full else ''}  |  "
                 f"PV surplus {pv_surplus_kw:.2f} kW  |  "
                 f"Export {export_kw:.2f} kW  |  Cap {cap_w}W\n"
                 f"Battery {balance.battery_kwh:.1f} kWh  |  "
@@ -2895,6 +2959,17 @@ class BatteryManager:
         against local wall-clock windows — an hour out for the whole of BST.
         """
         return _to_london(dt)
+
+    @classmethod
+    def _clock_label(cls, dt: datetime) -> str:
+        """A time as a person says it: "2pm", "2:30pm", "noon". v5.135.0."""
+        local = cls._to_local(dt)
+        if local.hour == 12 and local.minute == 0:
+            return "noon"
+        hour   = local.hour % 12 or 12
+        suffix = "am" if local.hour < 12 else "pm"
+        return (f"{hour}{suffix}" if local.minute == 0
+                else f"{hour}:{local.minute:02d}{suffix}")
 
     @staticmethod
     def _flood_floor_pct(snapshot: ManagerSnapshot) -> float:

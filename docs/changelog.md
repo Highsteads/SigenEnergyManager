@@ -7,6 +7,11 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.135.0 — 25 October 2026
+
+- **Room for the free hour.** When a free Happy Hour is booked for later in the day, Solar Overflow now leaves the battery room for it, and aims to have that room empty when the hour starts, not to fill the battery by 4pm. Spare sunshine before the free hour is exported instead of going into the battery, and the free hour then fills that room from the grid for nothing. Before, the sun filled the room first and the free hour found the battery nearly full. The room never takes the battery below the power-cut level you set.
+- **A storm fills the free hour to 100%.** During a storm warning the free hour now fills the battery to 100%, as Solar Overflow already did. Before, it stopped at your daily target.
+
 ## 5.134.1 — 24 October 2026
 
 - **No false alarm after a restart.** The first plan after a restart runs a few seconds before the Octopus tariff has been read. If tomorrow needed a grid import, that plan sent "Battery import held tonight" and said the tariff was not recognised, even though Octopus answered a moment later. The alert now waits for the tariff, as the battery control already did, for up to five minutes. If Octopus has still not answered by then, the alert goes out and says the tariff has not been read yet.
