@@ -20,7 +20,7 @@ not additional contingency buffers. Preparation is for standard paired Flux.
 
 ## Behaviour
 
-- 02:00–05:00: size charging from chronological household demand, solar forecast,
+- 02:00–04:58: size charging from chronological household demand, solar forecast,
   losses, battery capacity, available charging time and announced events. Keep
   solar headroom where it is compatible with supplying the house and events.
   Add discretionary trading energy only when profitable after losses and wear,
@@ -29,13 +29,13 @@ not additional contingency buffers. Preparation is for standard paired Flux.
   push back out before 16:00 (5.113.0). The household's own charge is still sized
   on the forecast itself.
 - Before 16:00: no hold. The battery runs the house all day (5.124.0), and
-  the executor refuses mode 2 with discharge 0 outside 02:00-05:00. The only
+  the executor refuses mode 2 with discharge 0 outside 02:00-04:58. The only
   daytime purchases are free hours and Axle cover (`event_cover`, bought by
   the manager's EVENT-COVER branch, Flux standing aside while it runs). A
   14:00-16:00 hold existed until then; it stopped a 93% battery for an hour on
   27-Sep-2026 while the house imported at the day rate, and 5.123.0's sized
   version was replaced the same day by CliveS's rule that the battery is never
-  stopped outside 02:00-05:00.
+  stopped outside 02:00-04:58.
 - 16:00–19:00: export only spare energy above the reserve, remaining household
   demand to the next cheap window and committed events. Account for the fact
   that mode 5 prevents battery charging from the PV the forecast predicts.
@@ -206,3 +206,6 @@ window (all in 5.110.0).
 | 16:17 | Manager paused mid-export (manual priority) | Flux released before the pause wrote self-consumption; reserve back to 20%, cutoff 1%; re-claimed after the stand-down |
 | 16:43-16:48 | When PV alone filled the 4 kW cap, the planned battery power read 0 and the plan handed back ("nothing worth selling") | Export now allows full battery power; the inverter's grid export cap holds the meter at 4 kW |
 | 16:51 onward | Mode 5, discharge limit 10 kW, grid 3.98 kW, battery topping up whatever PV and house leave; sell floor 38% on 40046, cutoff 1% | Stable, no per-tick writes |
+
+
+From 5.138.0, the charging control deadline is 04:58 London, distinct from the actual 05:00 tariff boundary. The two-minute buffer allows the acknowledged hand-back to complete; it is not a hardware timer.

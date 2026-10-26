@@ -42,7 +42,7 @@ Flux charges its dearest price between 4pm and 7pm. When the battery will not la
 
 ### With the Flux strategy switched on
 
-On Octopus Flux you can hand the overnight charge to the Flux strategy, which sizes it from the whole of the next day, including what the battery can sell at the peak. While it is switched on and working, the ordinary plan leaves the 2am to 5am charge to it, and only steps in if the strategy cannot make a plan. [Octopus Flux](flux.md) explains it.
+On Octopus Flux you can hand the overnight charge to the Flux strategy, which sizes it from the whole of the next day, including what the battery can sell at the peak. While it is switched on and working, the ordinary plan leaves the 2am to 4:58am charge to it, and only steps in if the strategy cannot make a plan. [Octopus Flux](flux.md) explains it.
 
 ## On Agile
 

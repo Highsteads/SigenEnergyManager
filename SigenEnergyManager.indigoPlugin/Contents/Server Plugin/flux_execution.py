@@ -10,6 +10,7 @@ leave a mode active beyond its software expiry. Commissioning must resolve that
 limitation before live activation. No IO writes occur in the constructor.
 """
 from dataclasses import dataclass
+from flux_strategy import FLUX_CHEAP_START, FLUX_CHARGE_END
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -217,8 +218,10 @@ class FluxExecutor:
             raise ValueError('Unsupported Flux mode')
         local = now.astimezone(ZoneInfo('Europe/London'))
         if target.ems_mode == 3:
-            boundary = local.replace(hour=5, minute=0, second=0, microsecond=0)
-            if not 2 <= local.hour < 5 or expiry > boundary.astimezone(timezone.utc):
+            boundary = local.replace(hour=FLUX_CHARGE_END.hour, minute=FLUX_CHARGE_END.minute,
+                                     second=0, microsecond=0)
+            if (not FLUX_CHEAP_START <= local.time().replace(tzinfo=None) < FLUX_CHARGE_END
+                    or expiry > boundary.astimezone(timezone.utc)):
                 raise ValueError('Grid charging outside Flux cheap window')
         if target.ems_mode == 5:
             boundary = local.replace(hour=19, minute=0, second=0, microsecond=0)
@@ -237,8 +240,10 @@ class FluxExecutor:
         # point during the day should the battery be stopped". The planner no
         # longer asks for one in the day; this makes sure no later change can.
         if target.ems_mode == 2 and discharge == 0:
-            boundary = local.replace(hour=5, minute=0, second=0, microsecond=0)
-            if not 2 <= local.hour < 5 or expiry > boundary.astimezone(timezone.utc):
+            boundary = local.replace(hour=FLUX_CHARGE_END.hour, minute=FLUX_CHARGE_END.minute,
+                                     second=0, microsecond=0)
+            if (not FLUX_CHEAP_START <= local.time().replace(tzinfo=None) < FLUX_CHARGE_END
+                    or expiry > boundary.astimezone(timezone.utc)):
                 raise ValueError('Battery hold outside Flux cheap window')
         top, bottom = map(_number, (target.charge_cutoff_pct, target.discharge_cutoff_pct))
         if not 0 <= bottom <= top <= 100:

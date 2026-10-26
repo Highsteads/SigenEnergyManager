@@ -87,8 +87,8 @@ class FluxExecutionTests(unittest.TestCase):
         for value in [('top',80.),('bottom',20.),('charge',6000),('discharge',0)]:
             self.assertLess(self.d.writes.index(value), enable)
         self.assertGreater(self.d.writes.index(('mode',3)), enable)
-    def test_five_boundary_stops_and_restores_policy(self):
-        self.now = self.now.replace(hour=4,minute=59,second=55)
+    def test_0458_boundary_stops_and_restores_policy(self):
+        self.now = self.now.replace(hour=4,minute=57,second=55)
         t = self.target(expires_at=self.now+timedelta(seconds=5),decision_until=self.now+timedelta(seconds=5))
         self.arm(t); self.now += timedelta(seconds=5)
         self.assertEqual(self.e.step(t,self.now),'released')

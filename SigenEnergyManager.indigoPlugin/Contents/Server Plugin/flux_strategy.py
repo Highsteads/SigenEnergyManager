@@ -10,7 +10,8 @@
 #              v2.4 and v2.5 27-09-2026; v2.6 28-09-2026; v2.7 29-09-2026;
 #              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026; v2.11 02-10-2026;
 #              v2.12 02-10-2026
-# Version:     2.12
+#              2.13: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
+# Version:     2.13
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -183,6 +184,8 @@ FLUX_CHEAP_START = time(2, 0)
 # A warning stores the full ceiling instead (FluxInputs.storm_fill).
 NIGHTLY_CHARGE_PCT = 95.0
 FLUX_CHEAP_END   = time(5, 0)
+# Control stops early; tariff validation and pricing still use the full cheap band.
+FLUX_CHARGE_END  = time(4, 58)
 FLUX_PEAK_START  = time(16, 0)
 FLUX_PEAK_END    = time(19, 0)
 
@@ -876,14 +879,14 @@ def _free_hour_booked(commitments, window_end, tz):
 def cheap_window_minimum_pct(site, commitments, now, tz):
     """The agreed overnight minimum in force NOW, or 0.0 (v2.10).
 
-    CHARGE_MIN_PCT, capped by the site's charge ceiling, while the 02:00-05:00 window
+    CHARGE_MIN_PCT, capped by the site's charge ceiling, while the 02:00-04:58 charging window
     is open; 0.0 outside it and on a day with a booked free hour, which wants the
     room. ONE owner: the planner's _minimum_charge and the manager's fallback both
     read this, so the rule cannot hold in one and lapse in the other (1-Oct-2026).
     """
-    if tz is None or not in_window(now, tz, FLUX_CHEAP_START, FLUX_CHEAP_END):
+    if tz is None or not in_window(now, tz, FLUX_CHEAP_START, FLUX_CHARGE_END):
         return 0.0
-    window_end = next_local(now, tz, FLUX_CHEAP_END)
+    window_end = next_local(now, tz, FLUX_CHARGE_END)
     if _free_hour_booked(commitments, window_end, tz):
         return 0.0
     return max(0.0, min(CHARGE_MIN_PCT, float(site.max_charge_soc_pct)))
@@ -1400,7 +1403,7 @@ def _charge_plan(inputs):
     cap_pct = (float(site.max_charge_soc_pct) if (inputs.storm_fill or owes_export)
                else min(float(site.max_charge_soc_pct), NIGHTLY_CHARGE_PCT))
 
-    window_end  = next_local(inputs.now, tz, FLUX_CHEAP_END)
+    window_end  = next_local(inputs.now, tz, FLUX_CHARGE_END)
     horizon_end = next_local(window_end, tz, FLUX_CHEAP_START)
 
     # A charge buys on the strength of a forecast, so it must have one — for the
@@ -1812,8 +1815,8 @@ def _plan(inputs):
         committed   = _commitment_kwh(inputs.commitments, inputs.now, next_cheap, "export")
 
         # ── the cheap window ────────────────────────────────────────────────
-        if in_window(inputs.now, tz, FLUX_CHEAP_START, FLUX_CHEAP_END):
-            window_end = next_local(inputs.now, tz, FLUX_CHEAP_END)
+        if in_window(inputs.now, tz, FLUX_CHEAP_START, FLUX_CHARGE_END):
+            window_end = next_local(inputs.now, tz, FLUX_CHARGE_END)
             # v2.7: plan the charge on a dimmer day than forecast, so a forecast that
             # is too sunny no longer leaves the peak sale or the evening short.
             (target_pct, power_w, buy_kwh, margin_p,
@@ -1842,7 +1845,7 @@ def _plan(inputs):
             if shortfall_kwh > 0:
                 min_note += (f". The time left and the charge rate fall about "
                              f"{shortfall_kwh:.1f} kWh short of the {minimum:.0f}% "
-                             f"minimum by {FLUX_CHEAP_END:%H:%M}")
+                             f"minimum by {FLUX_CHARGE_END:%H:%M}")
             if target_pct is None:
                 return FluxDecision(
                     mode=MODE_HOLD, owns=True, decision_at=inputs.now,

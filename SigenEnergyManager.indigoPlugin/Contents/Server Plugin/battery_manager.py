@@ -7,7 +7,8 @@
 # Author:      CliveS & Claude Opus 5; 3.12-3.16 Claude Opus 5.5
 # Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026; 3.15 01-10-2026;
 #              3.16 02-10-2026
-# Version:     3.16
+#              3.17: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
+# Version:     3.17
 # 3.16 — (review 02-10-2026) THE FLOOD DRAIN STOPS AT THE FLUX MINIMUM. On Flux the
 #       overnight pre-drain went to 40% at the 9.7p export rate and the 02:00 charge
 #       (flux_strategy.CHARGE_MIN_PCT, 50%) bought it straight back at 14.6p. On Flux
@@ -175,6 +176,7 @@
 #       forecast and dumped the battery into a poor-today/sunny-day-after pair.
 
 from dataclasses import dataclass, field, replace
+from flux_strategy import FLUX_CHARGE_END
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
 
@@ -680,6 +682,14 @@ class TariffData:
     # 5.134.1: False when Octopus has not been read since the restart, so an UNKNOWN
     # key means "no tariff yet" rather than "a tariff we do not recognise".
     tariff_fetched:   bool            = True
+
+    @property
+    def charging_end(self):
+        """Control deadline, separate from the published tariff's cheap end."""
+        if (self.tariff_key == TARIFF_FLUX
+                and self.cheap_start == "02:00" and self.cheap_end == "05:00"):
+            return FLUX_CHARGE_END.strftime("%H:%M")
+        return self.cheap_end
 
 
 @dataclass
@@ -1427,11 +1437,11 @@ class BatteryManager:
                 return None
             # Buy the reserve top-up at the night rate: only inside the cheap
             # window, never the peak/day rate.
-            if not snapshot.tariff.cheap_start or not snapshot.tariff.cheap_end:
+            if not snapshot.tariff.cheap_start or not snapshot.tariff.charging_end:
                 return None
             now_hm = self._to_local(snapshot.now).strftime("%H:%M")
             if not self._time_in_window(now_hm, snapshot.tariff.cheap_start,
-                                        snapshot.tariff.cheap_end):
+                                        snapshot.tariff.charging_end):
                 return None
             # v3.13: the Flux controller's charge already holds its reserve.
             if snapshot.flux_owns_cheap_window:
@@ -1445,7 +1455,7 @@ class BatteryManager:
                          if snapshot.tariff.today_rate_p else "")
         context       = (f"flat rate {rate_str}" if is_flat
                          else f"cheap window {snapshot.tariff.cheap_start}–"
-                              f"{snapshot.tariff.cheap_end}")
+                              f"{snapshot.tariff.charging_end}")
         return Decision(
             action          = ACTION_START_IMPORT,
             reason          = (
@@ -1908,24 +1918,24 @@ class BatteryManager:
                                      balance: SufficiencyBalance) -> Optional[Decision]:
         """The Flux cheap window, run by the manager when Flux is not running it (3.15).
 
-        Flux owns 02:00-05:00 whenever it can plan. When it cannot (1-Oct-2026: no
+        Flux owns 02:00-04:58 whenever it can plan. When it cannot (1-Oct-2026: no
         October export price published) this does what Flux would have done, short of
         trading: charge to the highest of the agreed minimum, tomorrow's household
-        target and the power-cut floor, and hold the battery there until 05:00 with
+        target and the power-cut floor, and hold the battery there until 04:58 with
         the house on the cheap grid. It never buys to sell at the peak — that needs the
         export price Flux was missing.
 
         The decision is a START_IMPORT on every tick of the window, holding included,
         with import_purpose CHEAP_WINDOW_PURPOSE; plugin.py stops the charging with the
-        hardware cutoff and ends the import at 05:00, never at the target.
+        hardware cutoff and ends the import at 04:58, never at the target.
         """
         tariff = snapshot.tariff
         if tariff.tariff_key != TARIFF_FLUX or snapshot.flux_owns_cheap_window:
             return None
-        if not tariff.cheap_start or not tariff.cheap_end:
+        if not tariff.cheap_start or not tariff.charging_end:
             return None
         now_hm = self._to_local(snapshot.now).strftime("%H:%M")
-        if not self._time_in_window(now_hm, tariff.cheap_start, tariff.cheap_end):
+        if not self._time_in_window(now_hm, tariff.cheap_start, tariff.charging_end):
             return None
         soc   = snapshot.current_soc_pct
         wants = []                       # (level, why) — the highest one is bought
@@ -1943,7 +1953,7 @@ class BatteryManager:
         # not causing.
         because = [why for level, why in wants if level >= target - 0.5]
         target = min(target, 100.0)
-        until  = _spoken_hm(tariff.cheap_end)
+        until  = _spoken_hm(tariff.charging_end)
         if target > soc + 0.5:
             buy_kwh = (target - soc) / 100.0 * snapshot.capacity_kwh
             reason = (f"Flux is not running the cheap window: charging about "
@@ -2009,7 +2019,7 @@ class BatteryManager:
         tariff      = snapshot.tariff
         now         = snapshot.now
         cheap_start = tariff.cheap_start
-        cheap_end   = tariff.cheap_end
+        cheap_end   = tariff.charging_end
         short_kwh   = balance.import_kwh_grid
 
         if not cheap_start or not cheap_end:

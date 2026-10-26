@@ -75,8 +75,8 @@
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        26-10-2026 18:03 GMT
-# Version:     5.137.1
+# Date:        26-10-2026 18:15 GMT
+# Version:     5.138.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3603,6 +3603,7 @@ class Plugin(indigo.PluginBase):
         #     the supervisor's own stand-down rules; giving it up is not.
         # Costs nothing when the feature is off: one preference read and a return.
         self._flux_supervisor_tick()
+        self._stop_overnight_charge_at_cutoff()
 
         # 3. Battery manager evaluation (every 60s — matches Modbus poll frequency)
         if now - self.store["last_manager"] >= MANAGER_EVAL_INTERVAL:
@@ -8016,13 +8017,13 @@ class Plugin(indigo.PluginBase):
             self._set_import_cutoff(None)
 
     def _in_flux_cheap_window(self, now=None):
-        """True inside 02:00-05:00 London. False when Flux code is unavailable."""
+        """True inside 02:00-04:58 charging window London. False when Flux code is unavailable."""
         if _flux_strategy is None:
             return False
         try:
             return bool(_flux_strategy.in_window(
                 now or datetime.now(timezone.utc), _london_tz(),
-                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END))
+                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHARGE_END))
         except Exception as exc:                        # noqa: BLE001
             self.logger.debug(f"[Manager] cheap-window check failed: {exc!r}")
             return False
@@ -8066,7 +8067,7 @@ class Plugin(indigo.PluginBase):
         Charge PV First with the hardware cutoff at the level wanted — or at the
         battery's present level when that is already higher, which is a pure hold —
         and the discharge pinned at zero, so the house runs on the cheap grid until
-        05:00 exactly as Flux's own hold does. The level only ever rises inside the
+        04:58 exactly as Flux's own hold does. The level only ever rises inside the
         window. Ended by _end_cheap_window_import, never by reaching the target.
         """
         if not (self.modbus and self.modbus.connected):
@@ -8135,6 +8136,14 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[Manager] cheap-window headroom not worked out: {exc!r}")
         return max(0, power)
 
+    def _stop_overnight_charge_at_cutoff(self):
+        """End the fallback charge on the fast tick, not the minute-long evaluation."""
+        with self._state_lock:
+            if (self.store.get("cheap_window_import_active")
+                    and not self._in_flux_cheap_window()
+                    and not self._flux_owns_control()):
+                self._end_cheap_window_import("the overnight charging window has closed")
+
     def _end_cheap_window_import(self, why):
         """Hand the manager's cheap-window charge back to self consumption."""
         soc = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
@@ -8160,7 +8169,7 @@ class Plugin(indigo.PluginBase):
         """Drop the bookkeeping, with NO writes, when Flux has taken the window back.
 
         Flux owns the registers now and has written its own; a hand-back here would
-        put mode 2 over its charge. Clearing the cutoff record keeps Flux's 05:00
+        put mode 2 over its charge. Clearing the cutoff record keeps Flux's 04:58
         release from restoring the manager's old ceiling.
         """
         self.store["cheap_window_import_active"] = False
@@ -8170,7 +8179,7 @@ class Plugin(indigo.PluginBase):
         log(f"[Manager] Cheap-window charge handed to Flux ({why}).")
 
     def _note_cheap_window_result(self):
-        """Once a day after 05:00 on Flux: what the window ACHIEVED, against the
+        """Once a day after 04:58 on Flux: what the window ACHIEVED, against the
         minimum it was set (5.130.0). A configured target is not an achieved one, and
         the two-week review of the 50% rule needs the achieved figure for every night.
 
@@ -8204,7 +8213,7 @@ class Plugin(indigo.PluginBase):
         rec = self.store.get("cheap_window_watch") or {}
         local = now.astimezone(tz)
         if (not rec or rec.get("day") != str(local.date()) or rec.get("reported")
-                or local.time() < _flux_strategy.FLUX_CHEAP_END):
+                or local.time() < _flux_strategy.FLUX_CHARGE_END):
             return
         rec["reported"] = True
         self.store["cheap_window_watch"] = rec
@@ -8218,19 +8227,19 @@ class Plugin(indigo.PluginBase):
         # allowance recorded 49% as a success).
         short = round(max(0.0, minimum - soc), 1)
         if minimum <= 0:
-            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}% "
+            msg = (f"[Overnight] Overnight charging ended with the battery at {soc:.0f}% "
                    f"({who}; no minimum tonight — a free hour is booked)")
             level = "INFO"
         elif short < 0.05:
-            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.1f}%, "
+            msg = (f"[Overnight] Overnight charging ended with the battery at {soc:.1f}%, "
                    f"which meets the {minimum:.0f}% minimum ({who})")
             level = "INFO"
         elif short <= 1.0:
-            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.1f}%, "
+            msg = (f"[Overnight] Overnight charging ended with the battery at {soc:.1f}%, "
                    f"{short:.1f} points under the {minimum:.0f}% minimum ({who})")
             level = "WARNING"
         else:
-            msg = (f"[Overnight] The cheap window closed with the battery at {soc:.0f}%, "
+            msg = (f"[Overnight] Overnight charging ended with the battery at {soc:.0f}%, "
                    f"BELOW the {minimum:.0f}% minimum, {short:.1f} points short ({who}"
                    + (f"; Flux said: {rec.get('flux_reason')}" if rec.get("flux_reason")
                       and not rec.get("flux_ran") else "") + ")")
@@ -8729,7 +8738,7 @@ class Plugin(indigo.PluginBase):
             if not (tariff.cheap_start and tariff.cheap_end):
                 return False
             hm = now_utc.astimezone(_london_tz()).strftime("%H:%M")
-            start, end = tariff.cheap_start, tariff.cheap_end
+            start, end = tariff.cheap_start, tariff.charging_end
             inside = (start <= hm < end) if start < end else (hm >= start or hm < end)
             return not inside
         except Exception as exc:                            # noqa: BLE001
@@ -14995,7 +15004,7 @@ class Plugin(indigo.PluginBase):
         try:
             in_cheap = _flux_strategy.in_window(
                 datetime.now(timezone.utc), _london_tz(),
-                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END)
+                _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHARGE_END)
         except Exception as exc:                        # noqa: BLE001
             self.logger.debug(f"[Flux] cheap-window check failed: {exc!r}")
             return False

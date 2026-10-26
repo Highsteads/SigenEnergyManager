@@ -21,6 +21,13 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.138.0 — 26-10-2026
+
+- Separate `FLUX_CHARGE_END` (04:58 London) from `FLUX_CHEAP_END` (05:00). Charge sizing, minimum reachability and decision leases use 04:58; rate-band discovery, validation, pricing and day-rate classification retain 05:00.
+- The executor refuses charging or a battery hold past 04:58 and retains its acknowledged release/retry behaviour. The storm ownership exception still spans the full cheap tariff band, allowing the Flux release to finish before storm priority takes over at 05:00.
+- `TariffData.charging_end` gives the fallback, reserve and scheduled-import paths the same deadline without modifying published `cheap_end`. A fast-tick fallback stop avoids waiting for the next manager evaluation. Overnight results are recorded after 04:58. Other tariffs and event/free-hour control are unchanged.
+- Regression coverage includes GMT, BST, both clock-change days, 02:00 start, 04:58 end, unchanged 04:59 cheap pricing, fallback/reserve/schedule refusal and executor read-back at the boundary.
+
 ## v5.137.1 — 26-10-2026
 
 - Preserve the unknown-charge-at-restart guard even if verification successfully stops it: record the observed Grid First mode before correction, except when the preceding Flux decision is a charge made inside the cheap window less than two minutes ago. Failed corrections still reach the existing active-charge guard. A missing, old, future or daytime plan cannot claim the handover exception. This avoids weakening protection for an untracked real purchase while fixing the stale post-correction reading.

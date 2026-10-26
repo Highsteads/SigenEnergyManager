@@ -6489,7 +6489,7 @@ class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
         self.assertEqual(plugin.Plugin._flux_other_owner(self._owner_fake()), "")
 
     def _window_fake(self, key, start="02:00", end="05:00"):
-        tariff = types.SimpleNamespace(tariff_key=key, cheap_start=start, cheap_end=end)
+        tariff = plugin.TariffData(tariff_key=key, cheap_start=start, cheap_end=end)
         return types.SimpleNamespace(_build_tariff_data=lambda: tariff,
                                      logger=logging.getLogger("t"))
 
@@ -6500,7 +6500,9 @@ class TestTheDayBuysOnlyFreeHoursAndAxleCover(unittest.TestCase):
         fake = self._window_fake("flux")
         missed = plugin.Plugin._scheduled_import_missed_its_window
         self.assertFalse(missed(fake, self._at(2, 0)))
-        self.assertFalse(missed(fake, self._at(4, 59)))
+        self.assertFalse(missed(fake, self._at(4, 57)))
+        self.assertTrue(missed(fake, self._at(4, 58)))
+        self.assertTrue(missed(fake, self._at(4, 59)))
         self.assertTrue(missed(fake, self._at(5, 0)))
         self.assertTrue(missed(fake, self._at(11, 0)))
 
