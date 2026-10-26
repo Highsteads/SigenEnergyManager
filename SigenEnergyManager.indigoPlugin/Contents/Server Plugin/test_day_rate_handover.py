@@ -93,6 +93,7 @@ class TestReviewDayRateBlock(_FluxCase):
     def _blocked(self, hhmm=(16, 30)):
         p, when = self._at(hhmm, soc=95.0)
         p.pluginPrefs['dayRateImportDate'] = when.date().isoformat()
+        p.savePluginPrefs = MagicMock()
         return p, when
 
     def test_preview_changes_neither_flag_nor_inverter(self):
@@ -110,6 +111,7 @@ class TestReviewDayRateBlock(_FluxCase):
         result = self._review(p, when, previewOnly=False, confirmed=True,
                               reviewDate=when.date().isoformat())
         self.assertTrue(result['cleared'])
+        p.savePluginPrefs.assert_called_once_with()
         before['dayRateImportDate'] = ''
         self.assertEqual(p.pluginPrefs, before)
         self.assertEqual(p.modbus.writes, [])

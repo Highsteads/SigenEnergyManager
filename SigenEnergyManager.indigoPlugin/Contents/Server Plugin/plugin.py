@@ -76,7 +76,7 @@
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 # Date:        26-10-2026 18:15 GMT
-# Version:     5.138.0
+# Version:     5.138.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -15061,6 +15061,7 @@ class Plugin(indigo.PluginBase):
                       "margin_p": decision.margin_p}
             if not preview and self._day_rate_import_today():
                 self.pluginPrefs["dayRateImportDate"] = ""
+                self.savePluginPrefs()
                 self.store["remote_ems_mode_seen"] = (0x02, time.time())
                 self.store["flux_applied_key"] = None
                 log("[Flux] Today's day-rate export block was cleared after a manual review. "

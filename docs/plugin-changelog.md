@@ -21,6 +21,8 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+**5.138.1 (26 October 2026)** - A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.
+
 ## v5.138.0 — 26-10-2026
 
 - Separate `FLUX_CHARGE_END` (04:58 London) from `FLUX_CHEAP_END` (05:00). Charge sizing, minimum reachability and decision leases use 04:58; rate-band discovery, validation, pricing and day-rate classification retain 05:00.

@@ -7,6 +7,8 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+**5.138.1 (26 October 2026)** - A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.
+
 ## 5.138.0 — 26 October 2026
 
 Overnight Flux charging now runs from 2am to 4:58am, leaving two minutes to stop and confirm the hand-back before the cheap rate ends at 5am. The main planner and fallback use the earlier deadline, including their calculation of charging time. Prices still use the real 2am to 5am tariff window.
