@@ -146,7 +146,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
-| 5.138.1 | Save confirmed export-block clearance immediately so it survives restart. |
+| 5.138.1 | 26 October 2026 | Save confirmed export-block clearance immediately so it survives restart. |
 | 5.138.0 | 26 October 2026 | Overnight Flux charging ends at 4:58am, with tariff pricing unchanged |
 | 5.137.1 | 26 October 2026 | Preserve day-rate protection for an unexpected grid charge found after restart |
 | 5.137.0 | 26 October 2026 | Charging hand-back no longer leaves a false peak-export block, with a guarded review action |

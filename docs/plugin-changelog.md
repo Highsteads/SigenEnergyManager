@@ -21,7 +21,9 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
-**5.138.1 (26 October 2026)** - A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.
+## v5.138.1 - 26 October 2026
+
+A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.
 
 ## v5.138.0 — 26-10-2026
 

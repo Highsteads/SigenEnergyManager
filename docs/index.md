@@ -18,7 +18,7 @@ I run it on my own house, with 14.25 kWp of solar in four arrays, a 10 kW Sigene
 - **Keeps a reserve in the battery overnight** — 15% from April to September and 20% from October to March, as you set — so a power cut never finds it empty.
 - **Sells spare solar in the day** without letting the battery miss its target, and on a smaller day waits until the battery is nearly full before it sells anything.
 - **Makes room in the battery overnight** before a very sunny day, so the morning sun is not wasted.
-- **On Octopus Flux**, fills the battery in the cheap 2am to 5am window with what the house will need, and sells what is truly spare between 4pm and 7pm, when Octopus pays the most for it.
+- **On Octopus Flux**, charges the battery with what the house will need from 2am to 4:58am (the cheap tariff ends at 5am), and sells what is truly spare between 4pm and 7pm, when Octopus pays the most for it.
 - **Watches for power cuts and storm warnings.** It tells you by Pushover and email when the power goes and comes back, keeps more in the battery while a Met Office warning is in force, and holds off selling after a power cut until the battery has refilled.
 - **Takes part in Octopus Saving Sessions** if you want it to — it can opt you in, sell from the battery during the session, book your Weekend Happy Hours, fill the battery with the free electricity, and check that Octopus pays back what it owes.
 - **Runs Axle events** for you, if you are signed up with Axle, and keeps a record of what each one paid.
