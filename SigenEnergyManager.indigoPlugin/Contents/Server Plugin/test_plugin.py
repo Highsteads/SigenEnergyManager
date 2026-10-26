@@ -2666,6 +2666,9 @@ class TestSavingSessionPushoverWording(unittest.TestCase):
         stub = T._Stub({"has_joined": True, "token_balance": 1, "events": [ev]},
                        store=store, prefs=prefs)
         stub._saving_session_for_us = lambda e: True
+        # These tests cover wording for an eligible session. Eligibility has its
+        # own date-bound tests; the live scheme expiry must not change this case.
+        stub._session_join_verdict = lambda *args: (True, "")
         if join_result is not None:
             stub.octopus.join_saving_session_event.return_value = join_result
         plugin.Plugin._check_saving_sessions(stub)

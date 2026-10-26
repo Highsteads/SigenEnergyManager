@@ -81,4 +81,23 @@
         </ConfigUI>
     </Action>
 
+    <Action id="reviewDayRateExportBlock">
+        <Name>Review Day-rate Export Block</Name>
+        <CallbackMethod>actionReviewDayRateExportBlock</CallbackMethod>
+        <ConfigUI>
+            <Field id="reviewInfo" type="label">
+                <Label>Preview normal Flux planning without today's day-rate block. Clear it only after checking that it was raised in error. This does not force export or remove reserves.</Label>
+            </Field>
+            <Field id="previewOnly" type="checkbox" defaultValue="true">
+                <Label>Preview only:</Label>
+            </Field>
+            <Field id="reviewDate" type="textfield" defaultValue="">
+                <Label>Reviewed date (YYYY-MM-DD):</Label>
+            </Field>
+            <Field id="confirmed" type="checkbox" defaultValue="false">
+                <Label>I have checked that today's block is incorrect:</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
 </Actions>

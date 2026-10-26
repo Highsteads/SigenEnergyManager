@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.137.0 — 26 October 2026
+
+Ending an overnight charge no longer leaves an old charging reading that blocks the afternoon Flux sale. The plugin reads the inverter again after correcting its mode. A dated, confirmed review action can clear an incorrect day-rate block without forcing export or removing the reserves and 7pm stop.
+
 ## 5.136.0 — 25 October 2026
 
 - **A free hour charges at full rate.** On 25 October the free hour from 2pm to 3pm brought in 4 kWh, but the battery stored only 0.3 kWh of it. Solar Overflow had been holding charging to 200 W that afternoon, and the free hour did not switch it off, so the plugin's minute-by-minute check put the 200 W limit back a minute after the free hour set 10 kW. Starting any grid import now ends Solar Overflow, and while an import runs that check expects the import's own rate.

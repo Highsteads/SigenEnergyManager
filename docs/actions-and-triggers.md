@@ -57,3 +57,12 @@ Indigo's own **Device State Changed** trigger works with the plugin's devices to
 - **Grid Online** on the **Sigenergy Inverter** — becomes 0 when the power goes and 1 when it comes back.
 
 For example, you could have a trigger on **Current Mode** becoming **Happy Hour Import** switch on an immersion heater, so the free hour heats the water as well as filling the battery.
+
+
+## Review a day-rate export block
+
+**Review Day-rate Export Block** previews what normal Flux planning would do if today's block were removed. Its result is returned to the caller. Preview is on by default and changes nothing.
+
+Only clear a block after checking the event log and charging history. Untick **Preview only**, enter today's local date as **YYYY-MM-DD**, and tick the confirmation. An old date is refused. Flux must be armed, no other operation can own the inverter, and the inverter must be reachable and in Self Consumption.
+
+Clearing does not force a sale. Normal Flux planning still keeps energy for the house, its reserve and promised events, checks prices, and stops peak selling at 7pm. A genuine later daytime charge can set the block again. Upgrading never clears a saved block by itself.

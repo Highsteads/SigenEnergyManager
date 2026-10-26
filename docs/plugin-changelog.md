@@ -21,6 +21,14 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.137.0 — 26-10-2026
+
+- `_verify_ems_registers` clears the cached remote mode before reading and re-reads after a correction. Only measured post-correction mode reaches the unexpected-charge check. A failed write that still reads Grid First retains day-rate protection, while missing reads cannot reuse earlier evidence. Explicit manager and scheduled daytime imports still record their purchases.
+- On 26 October the storm handover left Grid First until 05:00:52. Verification corrected it, but `_act_on_decision` reused that earlier reading at 05:01:06 and blocked the 16:00 sale. History bounds the whole 04:59-05:02 grid increment at 0.18 kWh, including some cheap energy; this is not proof of zero daytime import.
+- `reviewDayRateExportBlock` previews the normal planner without the flag. Clearing requires a dated confirmation, armed Flux, no higher-priority owner, connected inverter in measured Self Consumption and fresh telemetry. It changes only the flag and invalidates the applied key; the supervisor still owns every export command and safety check. Existing blocks are never cleared automatically on upgrade.
+- Existing wiring/wording fixtures now isolate the calendar: the 48-slot day fixture uses an ordinary summer week, and the eligible-session wording fixture supplies eligibility explicitly. The original clock-change and scheme-end policy tests remain intact.
+- Regression tests cover successful and failed correction, unreadable registers, GMT/BST, preview, confirmation, unsafe states, low battery and the 7pm boundary.
+
 ## v5.136.0 — 25-10-2026
 
 - **A free hour was held to Solar Overflow's charge cap.** Live 25-Oct-2026, 14:00-15:00: Solar Overflow (pacing ahead of the hour since 5.135.0) had `HOLD_ESS_MAX_CHARGE` at 200 W. The Happy Hour import wrote 10 kW, and at 14:02 `_verify_ems_registers` logged "Charge limit mismatch: inverter=10000W expected=200W" and restored the cap: it tested `solar_overflow_active` before any import, and no import start cleared that flag (overflow start clears `import_active`, never the reverse). 3.97 kWh free import, 0.27 kWh into the battery, SOC 88.7 -> 89.4%. Fixes: `_verify_ems_registers` expects `import_power_w` whenever `import_active` (ahead of overflow; also stops an import below the inverter maximum being "corrected" up), and `_force_charge`, the one door every import uses, clears `solar_overflow_active` / `solar_overflow_charge_cap_w` on success.

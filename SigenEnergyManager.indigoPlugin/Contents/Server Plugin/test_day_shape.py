@@ -396,6 +396,17 @@ class TestPluginWiring(unittest.TestCase):
         self.p    = _mk(self.tmp)
         self.p._measured_day_uplifts = lambda: (1.06, 1.2, 1.1)
 
+        # This wiring fixture contains ordinary 48-slot days. Pin its calendar;
+        # clock-change days are tested explicitly by the pure shape tests.
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 6, 30, 12, tzinfo=LONDON)
+                return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+        patcher = unittest.mock.patch.object(plugin, "datetime", Clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def tearDown(self):
         self._tmp.cleanup()
 
@@ -413,7 +424,7 @@ class TestPluginWiring(unittest.TestCase):
         con.close()
 
     def _recent(self, weekday, n):
-        today = date.today()
+        today = plugin.datetime.now().date()
         back  = (today.weekday() - weekday) % 7 or 7
         last  = today - timedelta(days=back)
         return [last - timedelta(days=7 * k) for k in range(n)]

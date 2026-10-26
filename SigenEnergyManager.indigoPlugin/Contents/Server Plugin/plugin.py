@@ -74,8 +74,9 @@
 #              Claude Opus 5.5 (5.134.1 — no import-held alert while the first tariff read is awaited)
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
-# Date:        25-10-2026
-# Version:     5.136.0
+#              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
+# Date:        26-10-2026 17:55 GMT
+# Version:     5.137.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -8445,12 +8446,12 @@ class Plugin(indigo.PluginBase):
             else:
                 expected_mode = 0x02  # Max Self Consumption
 
+            # This evidence must describe the inverter AFTER any correction.
+            # An old Charge Grid First read survived a successful 5am hand-back
+            # and falsely blocked the whole afternoon's Flux export (26-Oct-2026).
+            # Clear first: an unreadable register must not revive an earlier read.
+            self.store["remote_ems_mode_seen"] = (None, 0.0)
             actual_mode = self.modbus.read_ems_mode()
-            if actual_mode is not None:
-                # The remote EMS mode (40031) as last read, for the day-rate check
-                # in _act (review 02-10-2026). emsWorkMode is 30003, which never
-                # holds these names, so that check could not fire.
-                self.store["remote_ems_mode_seen"] = (actual_mode, time.time())
             if actual_mode is not None and actual_mode != expected_mode:
                 log(
                     f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
@@ -8458,6 +8459,11 @@ class Plugin(indigo.PluginBase):
                     level="WARNING",
                 )
                 self.modbus.set_remote_ems_mode(expected_mode)
+                # A successful command is not a measurement. If it did not take,
+                # retain the observed charging mode so day-rate protection fires.
+                actual_mode = self.modbus.read_ems_mode()
+            if actual_mode is not None:
+                self.store["remote_ems_mode_seen"] = (actual_mode, time.time())
         elif self.store.get("export_active"):
             # v5.91.0: extracted so _log_vpp_snapshot can run the SAME checks
             # on the registers it has already read, instead of only filing them.
@@ -14984,6 +14990,54 @@ class Plugin(indigo.PluginBase):
         decision = self.store.get("flux_decision")
         return bool(decision is not None and getattr(decision, "mode", None)
                     in (_flux_strategy.MODE_CHARGE, _flux_strategy.MODE_HOLD))
+
+    def actionReviewDayRateExportBlock(self, action):
+        """Preview normal Flux without today's block, or clear a reviewed false block.
+
+        Never forces export or writes inverter registers. The ordinary supervisor
+        re-plans with all reserves, commitments, prices and window limits intact.
+        A dated confirmation prevents a saved action clearing future days blindly.
+        """
+        with self._state_lock:
+            props = action.props
+            today = _local_today_str()
+            preview = _as_bool(props.get("previewOnly", True))
+            if not preview and (not _as_bool(props.get("confirmed", False))
+                                or props.get("reviewDate", "") != today):
+                return json.dumps({"ok": False, "reason": "Confirm the review with today's local date."})
+            if not self._flux_armed():
+                return json.dumps({"ok": False, "reason": "Flux is not armed."})
+            owner = self._flux_other_owner()
+            if owner:
+                return json.dumps({"ok": False, "reason": owner})
+            if not self.modbus or not self.modbus.connected:
+                return json.dumps({"ok": False, "reason": "The inverter is not connected."})
+            if self.modbus.read_ems_mode() != 0x02:
+                return json.dumps({"ok": False, "reason": "The inverter must be confirmed in Self Consumption first."})
+            observation = self._flux_observation()
+            if observation is None:
+                return json.dumps({"ok": False, "reason": "Fresh inverter readings are unavailable."})
+            observed, observed_at = observation
+            inputs = self._flux_inputs(observed, observed_at)
+            decision = _flux_strategy.plan(_replace(inputs, day_rate_import_today=False))
+            result = {"ok": True, "preview": preview, "blocked": self._day_rate_import_today(),
+                      "mode": decision.mode, "reason": decision.reason,
+                      "soc_pct": observed["batterySoc"],
+                      "planned_kwh": decision.planned_kwh,
+                      "protect_soc_pct": decision.protect_soc_pct,
+                      "household_floor_pct": decision.household_floor_pct,
+                      "discharge_limit_w": decision.discharge_limit_w,
+                      "margin_p": decision.margin_p}
+            if not preview and self._day_rate_import_today():
+                self.pluginPrefs["dayRateImportDate"] = ""
+                self.store["remote_ems_mode_seen"] = (0x02, time.time())
+                self.store["flux_applied_key"] = None
+                log("[Flux] Today's day-rate export block was cleared after a manual review. "
+                    "Normal Flux planning will decide whether to sell, keeping its reserves and 7pm stop.")
+                result["cleared"] = True
+            else:
+                result["cleared"] = False
+            return json.dumps(result)
 
     def _day_rate_import_today(self):
         return self.pluginPrefs.get("dayRateImportDate", "") == _local_today_str()
