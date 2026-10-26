@@ -75,8 +75,8 @@
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        26-10-2026 17:55 GMT
-# Version:     5.137.0
+# Date:        26-10-2026 18:03 GMT
+# Version:     5.137.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -8452,6 +8452,14 @@ class Plugin(indigo.PluginBase):
             # Clear first: an unreadable register must not revive an earlier read.
             self.store["remote_ems_mode_seen"] = (None, 0.0)
             actual_mode = self.modbus.read_ems_mode()
+            if (actual_mode == 0x03 and expected_mode == 0x02
+                    and not self.store.get("happy_hour_import_active")
+                    and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE
+                    and not self._recent_flux_cheap_charge()):
+                # An unknown charge found after a restart may really have bought
+                # day-rate energy. Record it BEFORE stopping it. Only a known,
+                # recent cheap-window handover is exempt from this inference.
+                self._note_day_rate_import()
             if actual_mode is not None and actual_mode != expected_mode:
                 log(
                     f"[Verify] EMS mode mismatch: inverter={mode_names.get(actual_mode, actual_mode)} "
@@ -14922,6 +14930,20 @@ class Plugin(indigo.PluginBase):
         manager's day-rate peak top-up price a stored kWh with the same figure."""
         default = (_flux_strategy.DEFAULT_WEAR_P_PER_KWH if FLUX_AVAILABLE else 5.0)
         return _as_float(self.pluginPrefs.get("fluxWearPencePerKwh"), default)
+
+    def _recent_flux_cheap_charge(self):
+        """Recognise only the short handover of our own measured cheap-window plan."""
+        decision = self.store.get("flux_decision")
+        if (not FLUX_AVAILABLE or decision is None
+                or decision.mode != _flux_strategy.MODE_CHARGE
+                or decision.decision_at is None):
+            return False
+        now = datetime.now(timezone.utc)
+        age = (now - decision.decision_at).total_seconds()
+        return (0 <= age <= 120
+                and _flux_strategy.in_window(
+                    decision.decision_at, _london_tz(),
+                    _flux_strategy.FLUX_CHEAP_START, _flux_strategy.FLUX_CHEAP_END))
 
     def _note_day_rate_import(self):
         """Record that a grid import began OUTSIDE the Flux cheap window today.

@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.137.1 — 26 October 2026
+
+The charging hand-back fix also preserves the restart safeguard: an unexpected grid charge is recorded before stopping it. Only the controller's own recent cheap-window charge is recognised as a handover, and a failed correction still blocks the sale.
+
 ## 5.137.0 — 26 October 2026
 
 Ending an overnight charge no longer leaves an old charging reading that blocks the afternoon Flux sale. The plugin reads the inverter again after correcting its mode. A dated, confirmed review action can clear an incorrect day-rate block without forcing export or removing the reserves and 7pm stop.

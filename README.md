@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.137.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.137.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**v5.137.1** — The charging hand-back fix also preserves the restart safeguard: an unexpected grid charge is recorded before stopping it. Only the controller's own recent cheap-window charge is recognised as a handover, and a failed correction still blocks the sale.
 
 **v5.137.0** — Ending an overnight charge no longer leaves an old charging reading that blocks the afternoon Flux sale. The plugin reads the inverter again after correcting its mode. A dated, confirmed review action can clear an incorrect day-rate block without forcing export or removing the reserves and 7pm stop.
 
@@ -140,6 +142,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.137.1 | 26 October 2026 | Preserve day-rate protection for an unexpected grid charge found after restart |
 | 5.137.0 | 26 October 2026 | Charging hand-back no longer leaves a false peak-export block, with a guarded review action |
 | 5.136.0 | 25 October 2026 | A free hour charges at full rate even after Solar Overflow, and its note says what the battery stored |
 | 5.135.0 | 25 October 2026 | Solar Overflow leaves room for a booked free hour later the same day |

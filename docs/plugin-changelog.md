@@ -21,6 +21,11 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.137.1 — 26-10-2026
+
+- Preserve the unknown-charge-at-restart guard even if verification successfully stops it: record the observed Grid First mode before correction, except when the preceding Flux decision is a charge made inside the cheap window less than two minutes ago. Failed corrections still reach the existing active-charge guard. A missing, old, future or daytime plan cannot claim the handover exception. This avoids weakening protection for an untracked real purchase while fixing the stale post-correction reading.
+- Regression tests cover unknown charging before a successful stop and the handover evidence's age/window limits.
+
 ## v5.137.0 — 26-10-2026
 
 - `_verify_ems_registers` clears the cached remote mode before reading and re-reads after a correction. Only measured post-correction mode reaches the unexpected-charge check. A failed write that still reads Grid First retains day-rate protection, while missing reads cannot reuse earlier evidence. Explicit manager and scheduled daytime imports still record their purchases.

@@ -7,7 +7,7 @@
 # Version:     1.0
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,6 +25,9 @@ class TestDayRateHandover(_FluxCase):
         p.modbus.set_remote_ems_mode = MagicMock(return_value=write_ok)
         p.store['remote_ems_mode_seen'] = (0x03, when.timestamp() - 10)
         p._note_day_rate_import = MagicMock()
+        p.store['flux_decision'] = fs.FluxDecision(
+            mode=fs.MODE_CHARGE, owns=True, reason='cheap window',
+            decision_at=when.replace(hour=4, minute=59) + timedelta(seconds=50))
         def run():
             p._verify_ems_registers()
             p._act_on_decision(SimpleNamespace(
@@ -57,6 +60,22 @@ class TestDayRateHandover(_FluxCase):
                 p = self._verify_and_act(readings, datetime(2026, 10, 26, 5, 1, tzinfo=LONDON))
                 p._note_day_rate_import.assert_not_called()
                 self.assertEqual(p.store['remote_ems_mode_seen'], (None, 0.0))
+
+    def test_unknown_charge_at_restart_is_recorded_before_successful_stop(self):
+        p, when = self._at((12, 5), soc=60.0)
+        p.modbus.read_ems_mode = MagicMock(side_effect=[0x03, 0x02])
+        p._note_day_rate_import = MagicMock()
+        self._call_at(p, when, p._verify_ems_registers)
+        p._note_day_rate_import.assert_called_once()
+        self.assertEqual(p.store['remote_ems_mode_seen'][0], 0x02)
+
+    def test_old_or_daytime_charge_plan_is_not_a_cheap_handover(self):
+        p, when = self._at((5, 1), soc=99.3)
+        for stamp in (when - timedelta(minutes=3), when, when + timedelta(seconds=1)):
+            with self.subTest(stamp=stamp):
+                p.store['flux_decision'] = fs.FluxDecision(
+                    mode=fs.MODE_CHARGE, owns=True, reason='test', decision_at=stamp)
+                self.assertFalse(self._call_at(p, when, p._recent_flux_cheap_charge))
 
     def test_no_correction_only_needs_one_read(self):
         p = self._verify_and_act([0x02], datetime(2026, 10, 26, 5, 1, tzinfo=LONDON))
