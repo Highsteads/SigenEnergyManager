@@ -23,11 +23,12 @@ New entries go at the top, as they were kept in the file.
 
 ## v5.139.1 - 28 October 2026
 
-**Shutdown inside Indigo's stop budget.** Indigo force-kills a plugin about 22 s after asking it to stop (measured: Stopping 17:21:48.676, kill 17:22:11.177). During the Flux peak `shutdown()` ran `_flux_release()` — a confirmed restore of mode 2, both cutoffs and both limits with read-backs, about 14 s at the 1 s Modbus spacing — and then `set_self_consumption()` wrote it all again. Every SEM restart inside 16:00-19:00 from 26-10-2026 on (five of five) was killed mid-write, before `_save_accumulators()` at the end ever ran.
+**Shutdown and Indigo's stop budget.** Indigo force-kills a plugin about 22 s after asking it to stop (measured: Stopping 17:21:48.676, kill 17:22:11.177). During the Flux peak `shutdown()` ran `_flux_release()` — a confirmed restore of mode 2, both cutoffs and both limits with read-backs, about 14 s at the 1 s Modbus spacing — and then `set_self_consumption()` wrote it all again. Every SEM restart inside 16:00-19:00 from 26-10-2026 on (five of five) was killed mid-write, before `_save_accumulators()` at the end ever ran.
 
 - `_save_accumulators()` now runs first, and again at the end.
 - `set_self_consumption()` is skipped when `_flux_release()` returned `"released"`. An unconfirmed release, or no Flux claim, still gets it.
 - Tests: totals saved before any inverter write; a confirmed release is not written twice; the unconfirmed order is kept. Each fails with its fix removed.
+- **Measured live after install (17:36, Flux exporting): still killed at 22.4 s.** The confirmed release alone is ~23 ops at the 1 s spacing (neutralise 3, four set-and-read pairs at 3 each, enable 2, final `_verify` 6), ~23 s; the startup release measured 23.2 s. Every write had finished (enable ~17:36:58) before the kill at 17:37:04.6, which landed in the final read-backs. `accumulators.json` was written at 17:36:42. So the totals and the hardware are safe, and the remaining kill is the verification reads. Fitting inside the budget needs fewer reads in the executor (each register is read back by the driver and again by `_set_read`, then again by `_verify`) - not changed here.
 
 **Two Happy Hours a weekend.** Octopus's page says "You can use up to two per weekend", and Saturday slots arrive from 1 November. `plan_day()` takes `weekend_booked` (hours booked on the other day of the weekend, from `Plugin._happy_hour_weekend_booked()`, which counts ended slots too), and room is the smaller of the day cap and the weekend cap. The bright-day hold title names the day ("a duller day than Saturday") instead of always saying Sunday. `happy_hour_booking.py` 1.2.
 

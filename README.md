@@ -54,7 +54,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
-**5.139.1 (28 October 2026)** - Restarting the plugin between 4pm and 7pm no longer gets it killed part-way through. Handing the inverter back took longer than the time Indigo gives a plugin to stop, so every restart in the Flux peak since 26 October was cut off before it saved the day's energy totals. The totals are now saved first, and the inverter is no longer handed back twice. Octopus allow two Happy Hours a weekend, and Saturday slots start appearing from 1 November, so the plugin now counts Saturday's bookings against Sunday's. A held-back message names the day instead of always saying Sunday.
+**5.139.1 (28 October 2026)** - A restart between 4pm and 7pm no longer loses the day's energy totals. Handing the inverter back takes about 23 seconds and Indigo allows a plugin about 22 to stop, so every restart in the Flux peak since 26 October was cut off before the totals were saved. The totals are now saved first, and the inverter is no longer handed back twice. Indigo can still stop the plugin during the last checks of a peak-time hand-back, but by then every setting has been written. Octopus allow two Happy Hours a weekend, and Saturday slots start appearing from 1 November, so the plugin now counts Saturday's bookings against Sunday's. A held-back message names the day instead of always saying Sunday.
 
 **5.139.0 (28 October 2026)** - Octopus have extended the Weekend Happy Hour scheme to 14 February 2027, and from 1 November it is paid for with tokens: usually two tokens buy an hour, sometimes three on a dearer weekend. The plugin now uses 14 February as its end date, so the "use it by" note and the check that refuses a Power Down settling too late both follow it. Set the tokens-per-hour figure in Configure to what Octopus charge you, because their API does not report it.
 
@@ -152,7 +152,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
-| 5.139.1 | 28 October 2026 | A peak-time restart is no longer killed; two Happy Hours a weekend, Saturday included. |
+| 5.139.1 | 28 October 2026 | A peak-time restart keeps the day's totals; two Happy Hours a weekend, Saturday included. |
 | 5.139.0 | 28 October 2026 | Weekend Happy Hour scheme runs to 14 February 2027, with tokens from 1 November. |
 | 5.138.2 | 28 October 2026 | Live readings within seconds after a short drop in the inverter connection. |
 | 5.138.1 | 26 October 2026 | Save confirmed export-block clearance immediately so it survives restart. |
