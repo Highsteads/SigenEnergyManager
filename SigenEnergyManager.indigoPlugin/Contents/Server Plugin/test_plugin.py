@@ -7254,9 +7254,15 @@ class TestSessionsForOtherRegionsStaySilent(unittest.TestCase):
     def test_a_region_refusal_is_remembered_and_then_silent(self):
         """Octopus is the last word: if it refuses on region, stop announcing it."""
         stub = self._stub()
+        # The join is asked on a pinned date. On the real clock, from late
+        # October the Happy Hour token check refuses before any join is tried,
+        # so nothing is refused and this test failed of its own accord
+        # (28-10-2026). The announcement half runs on the real clock, because
+        # _check_saving_sessions drops a session whose start has passed.
         ev = self._event("EVENT_90", [6, 7])       # list says ours; Octopus says not
-        plugin.Plugin._auto_join_saving_sessions(stub, {"events": [ev]},
-                                                 datetime.now(timezone.utc))
+        pinned = dict(ev, start_at=self.NOW + timedelta(hours=5),
+                      end_at=self.NOW + timedelta(hours=6))
+        plugin.Plugin._auto_join_saving_sessions(stub, {"events": [pinned]}, self.NOW)
         self.assertIn("EVENT_90", stub.store["saving_sessions_not_our_region"])
         stub.store["saving_sessions_notified"] = []
         self._run(stub, [ev])

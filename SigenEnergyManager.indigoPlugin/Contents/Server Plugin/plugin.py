@@ -75,8 +75,8 @@
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        26-10-2026 18:15 GMT
-# Version:     5.138.1
+# Date:        28-10-2026 13:40 GMT
+# Version:     5.138.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.138.2 - 28 October 2026
+
+sigenergy_modbus.py 1.20. On 28-10-2026 the inverter reset the Modbus socket twice (13:07, 13:11). The plugin reconnected in 0.3 s, but `connect()` set `_slow_primed = False` on every connect (review 02-10-2026), so the first snapshot was a full sweep of ~29 reads at the 1 s protocol spacing: ~31 s with no readings, which the manager held through and the Zappi export guard saw as unknown.
+
+- `connect()` now re-primes only when `_slow_cache_warm()` is False: every key the last full sweep cached (`_primed_keys`) must still be cached and younger than `SLOW_CACHE_MAX_AGE_S / 2` (300 s), so the rotation reaches each one before it expires. Otherwise the 02-10 full sweep stands.
+- A warm reconnect marks `RECONNECT_RECHECK_KEYS` (`emsWorkMode`, `dischargeCutoffSoc`) due, so settings an inverter restart may have changed are read fresh on the first cycle.
+- `test_reconnect_warm_cache.py`: six tests (short drop is a short cycle and keeps every key, settings fresh, long and half-aged drops full-sweep, first connect full-sweeps), each guard sabotage-checked.
+- `test_plugin.py`: `test_a_region_refusal_is_remembered_and_then_silent` pinned to the class clock for the join; on the real clock from late October the Happy Hour token verdict refuses before any join is tried, so it failed of its own accord.
+
 ## v5.138.1 - 26 October 2026
 
 A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.

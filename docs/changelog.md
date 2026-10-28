@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.138.2 - 28 October 2026
+
+After a short drop in the inverter connection, the plugin has live readings again within seconds instead of half a minute. It used to re-read every register before giving the first reading after any reconnect; now, while its stored readings are still fresh, it reads only the power figures, a few of the slower ones and the battery settings, and keeps the full re-read for a drop of more than five minutes.
+
 ## 5.138.1 - 26 October 2026
 
 A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.

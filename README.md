@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.138.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.138.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.138.2 (28 October 2026)** - After a short drop in the inverter connection, the plugin has live readings again within seconds instead of half a minute. It used to re-read every register before giving the first reading after any reconnect; now, while its stored readings are still fresh, it reads only the power figures, a few of the slower ones and the battery settings, and keeps the full re-read for a drop of more than five minutes.
 
 **5.138.1 (26 October 2026)** - A confirmed manual clearance of a false day-rate export block now saves immediately, so restarting cannot restore the old flag. Overnight charging remains 2am to 4:58am.
 
@@ -146,6 +148,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.138.2 | 28 October 2026 | Live readings within seconds after a short drop in the inverter connection. |
 | 5.138.1 | 26 October 2026 | Save confirmed export-block clearance immediately so it survives restart. |
 | 5.138.0 | 26 October 2026 | Overnight Flux charging ends at 4:58am, with tariff pricing unchanged |
 | 5.137.1 | 26 October 2026 | Preserve day-rate protection for an unexpected grid charge found after restart |
