@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.139.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.139.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.139.2 (28 October 2026)** - A restart between 4pm and 7pm now finishes handing the inverter back before Indigo's time limit. Every setting the plugin writes during a Flux hand-back was being read back twice; it is now read back once, which takes the hand-back from about 23 seconds to about 17, inside the roughly 22 seconds Indigo allows. Each Flux change of mode during the day is about five seconds quicker as a result.
 
 **5.139.1 (28 October 2026)** - A restart between 4pm and 7pm no longer loses the day's energy totals. Handing the inverter back takes about 23 seconds and Indigo allows a plugin about 22 to stop, so every restart in the Flux peak since 26 October was cut off before the totals were saved. The totals are now saved first, and the inverter is no longer handed back twice. Indigo can still stop the plugin during the last checks of a peak-time hand-back, but by then every setting has been written. Octopus allow two Happy Hours a weekend, and Saturday slots start appearing from 1 November, so the plugin now counts Saturday's bookings against Sunday's. A held-back message names the day instead of always saying Sunday.
 
@@ -152,6 +154,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.139.2 | 28 October 2026 | A Flux hand-back reads each setting back once, so a peak-time restart finishes in time. |
 | 5.139.1 | 28 October 2026 | A peak-time restart keeps the day's totals; two Happy Hours a weekend, Saturday included. |
 | 5.139.0 | 28 October 2026 | Weekend Happy Hour scheme runs to 14 February 2027, with tokens from 1 November. |
 | 5.138.2 | 28 October 2026 | Live readings within seconds after a short drop in the inverter connection. |

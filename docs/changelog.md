@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.139.2 - 28 October 2026
+
+A restart between 4pm and 7pm now finishes handing the inverter back before Indigo's time limit. Every setting the plugin writes during a Flux hand-back was being read back twice; it is now read back once, which takes the hand-back from about 23 seconds to about 17, inside the roughly 22 seconds Indigo allows. Each Flux change of mode during the day is about five seconds quicker as a result.
+
 ## 5.139.1 - 28 October 2026
 
 A restart between 4pm and 7pm no longer loses the day's energy totals. Handing the inverter back takes about 23 seconds and Indigo allows a plugin about 22 to stop, so every restart in the Flux peak since 26 October was cut off before the totals were saved. The totals are now saved first, and the inverter is no longer handed back twice. Indigo can still stop the plugin during the last checks of a peak-time hand-back, but by then every setting has been written. Octopus allow two Happy Hours a weekend, and Saturday slots start appearing from 1 November, so the plugin now counts Saturday's bookings against Sunday's. A held-back message names the day instead of always saying Sunday.

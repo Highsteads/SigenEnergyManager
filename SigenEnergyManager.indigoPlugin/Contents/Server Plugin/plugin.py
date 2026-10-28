@@ -75,10 +75,11 @@
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Claude Haiku 5.5 (5.139.0 — Happy Hour scheme extended to 14 February 2027, token system)
-#              Claude Opus 5.5 (5.139.1 — shutdown fits Indigo's stop budget; two Happy Hours a weekend)
+#              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
+#              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 # Date:        28-10-2026 13:40 GMT
-# Version:     5.139.1
+# Version:     5.139.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1595,10 +1596,13 @@ class _FluxRawDriver:
       * `inverter_max_w` is a plugin PREFERENCE, not a register. The executor
         validates every power figure against it, so it has to come from somewhere,
         and reading it from the driver keeps the executor free of plugin state.
-      * `set_charge_limit(watts, quiet=False)` logs and read-back-verifies by
-        default. The executor does its own read-back on every write, so this
-        adapter passes quiet=True and lets the executor be the one that decides
-        what "confirmed" means. One verifier, not two.
+      * the driver's setters log and read-back-verify by default. The executor
+        does its own read-back on every write, so this adapter turns the driver's
+        read-back off (quiet=True on the charge limit, verify=False on the rest)
+        and lets the executor be the one that decides what "confirmed" means. One
+        verifier, not two. Until 5.139.2 only the charge limit did, so five
+        registers were read twice and a release took ~23 s, over Indigo's ~22 s
+        stop budget: every peak-time shutdown was killed in its final checks.
       * it is the seam the tests drive. Everything below here is a real Modbus
         transaction; everything above it can be exercised on a fake.
 
@@ -1622,10 +1626,10 @@ class _FluxRawDriver:
         return bool(self._modbus.set_charge_limit(int(watts), quiet=True))
 
     def set_discharge_limit(self, watts):
-        return bool(self._modbus.set_discharge_limit(int(watts)))
+        return bool(self._modbus.set_discharge_limit(int(watts), verify=False))
 
     def set_charge_cutoff(self, pct):
-        return bool(self._modbus.set_charge_cutoff(float(pct)))
+        return bool(self._modbus.set_charge_cutoff(float(pct), verify=False))
 
     def set_discharge_cutoff(self, pct):
         # THE FLOOR GOES ON THE BACKUP RESERVE (40046), NOT THE CUTOFF (40048).
@@ -1636,16 +1640,16 @@ class _FluxRawDriver:
         # in a power cut that followed; on 40046 the battery stays fully usable.
         # quiet: the executor reads it back itself, and in a peak sale the floor
         # moves every few minutes (5.131.1).
-        ok = bool(self._modbus.set_backup_soc(float(pct), quiet=True))
+        ok = bool(self._modbus.set_backup_soc(float(pct), quiet=True, verify=False))
         if ok and self._on_backup_written is not None:
             self._on_backup_written(float(pct))
         return ok
 
     def set_remote_ems_mode(self, mode):
-        return bool(self._modbus.set_remote_ems_mode(int(mode)))
+        return bool(self._modbus.set_remote_ems_mode(int(mode), verify=False))
 
     def enable_remote_ems(self):
-        return bool(self._modbus.enable_remote_ems())
+        return bool(self._modbus.enable_remote_ems(verify=False))
 
     # --- reads --------------------------------------------------------
     def read_ems_mode(self):

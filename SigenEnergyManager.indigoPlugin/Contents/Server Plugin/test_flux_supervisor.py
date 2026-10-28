@@ -106,6 +106,7 @@ class _FakeModbus:
         self.grid_w  = grid_w
         self.reads   = 0
         self.writes  = []
+        self.verify_flags = {}
 
     def read_power_flows(self):
         self.reads += 1
@@ -125,24 +126,28 @@ class _FakeModbus:
         self.writes.append(("charge_limit", watts, quiet))
         return True
 
-    def set_discharge_limit(self, watts):
+    def set_discharge_limit(self, watts, verify=True):
         self.writes.append(("discharge_limit", watts))
+        self.verify_flags["discharge_limit"] = verify
         return True
 
-    def set_charge_cutoff(self, pct):
+    def set_charge_cutoff(self, pct, verify=True):
         self.writes.append(("charge_cutoff", pct))
+        self.verify_flags["charge_cutoff"] = verify
         return True
 
     def set_discharge_cutoff(self, pct):
         self.writes.append(("discharge_cutoff", pct))
         return True
 
-    def set_remote_ems_mode(self, mode):
+    def set_remote_ems_mode(self, mode, verify=True):
         self.writes.append(("mode", mode))
+        self.verify_flags["mode"] = verify
         return True
 
-    def enable_remote_ems(self):
+    def enable_remote_ems(self, verify=True):
         self.writes.append("enable_remote_ems")
+        self.verify_flags["enable"] = verify
         return True
 
     def read_ems_mode(self):
@@ -163,8 +168,9 @@ class _FakeModbus:
     def read_remote_ems_enabled(self):
         return True
 
-    def set_backup_soc(self, pct, quiet=False):
+    def set_backup_soc(self, pct, quiet=False, verify=True):
         self.backup_quiet = quiet
+        self.verify_flags["backup_soc"] = verify
         self.writes.append(("backup_soc", pct))
         return True
 
@@ -2589,6 +2595,73 @@ class TestRawDriver(unittest.TestCase):
         m = _FakeModbus()
         plugin._FluxRawDriver(m, {"inverterMaxKw": "10"}).set_charge_limit(1234)
         self.assertIn(("charge_limit", 1234, True), m.writes)
+
+    def test_the_adapter_turns_off_every_driver_read_back(self):
+        """5.139.2. The executor reads every write back itself. A driver read-back
+        on top made a release ~23 s, over Indigo's ~22 s stop budget."""
+        m = _FakeModbus()
+        d = plugin._FluxRawDriver(m, {"inverterMaxKw": "10"})
+        d.set_discharge_limit(1000)
+        d.set_charge_cutoff(90.0)
+        d.set_discharge_cutoff(20.0)
+        d.set_remote_ems_mode(2)
+        d.enable_remote_ems()
+        self.assertEqual(m.verify_flags, {"discharge_limit": False, "charge_cutoff": False,
+                                          "backup_soc": False, "mode": False,
+                                          "enable": False})
+
+    def test_a_release_fits_inside_indigos_stop_budget(self):
+        """Count the Modbus transactions of a whole release on the REAL driver.
+
+        Indigo kills a plugin ~22 s after asking it to stop (measured 28-10-2026),
+        and the driver spaces requests 1 s apart, so a release must stay well under
+        that. Before 5.139.2 it was 22 transactions and measured 23.2 s live.
+        """
+        import flux_execution as fe
+        from sigenergy_modbus import SigenergyModbus
+
+        regs, calls = {}, []
+
+        def _ok(**extra):
+            r = MagicMock()
+            r.isError.return_value = False
+            for k, v in extra.items():
+                setattr(r, k, v)
+            return r
+
+        def _wr(address, value, device_id):
+            calls.append(("w", address))
+            regs[address] = value
+            return _ok()
+
+        def _wrs(address, values, device_id):
+            calls.append(("w", address))
+            for i, v in enumerate(values):
+                regs[address + i] = v
+            return _ok()
+
+        def _rd(address, count, device_id):
+            calls.append(("r", address))
+            return _ok(registers=[regs.get(address + i, 0) for i in range(count)])
+
+        client = MagicMock()
+        client.write_register.side_effect = _wr
+        client.write_registers.side_effect = _wrs
+        client.read_holding_registers.side_effect = _rd
+        m = SigenergyModbus(ip="192.0.2.1", port=502, plant_address=247,
+                            inverter_address=1, logger=MagicMock(),
+                            sleep_func=lambda s: None)
+        m.client = client
+        m._connected = True
+        driver = plugin._FluxRawDriver(m, {"inverterMaxKw": "10"})
+        with tempfile.TemporaryDirectory() as tmp:
+            ex = fe.FluxExecutor(driver, os.path.join(tmp, "journal.json"),
+                                 baseline_charge_w=10000, baseline_discharge_w=10000,
+                                 baseline_charge_cutoff_pct=100.0,
+                                 baseline_discharge_cutoff_pct=15.0)
+            result = ex.step(None, datetime.now(timezone.utc))
+        self.assertEqual(result, "released")
+        self.assertLessEqual(len(calls), 17, calls)
 
     def test_the_adapter_covers_everything_the_executor_asks_the_driver_for(self):
         """Read the EXECUTOR's source for the surface it uses, not a list of it."""

@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.139.2 - 28 October 2026
+
+**One verifier, not two, on every Flux write.** `_FluxRawDriver` already said the executor is the only verifier, but only `set_charge_limit` (quiet=True) skipped the driver's read-back. The mode, Remote EMS enable, charge cutoff, backup reserve and discharge limit were each written, read back by `_write_single_register`/`_write_uint32_registers`, and read again by the executor (`_neutralise`, `_set_read`). A release was 22 Modbus transactions at the 1 s spacing, measured 23.2 s live, against Indigo's ~22 s stop budget.
+
+- `sigenergy_modbus.py` 1.21: `verify=True` keyword on `enable_remote_ems`, `set_remote_ems_mode`, `set_discharge_limit`, `set_charge_cutoff` and `set_backup_soc`. Default unchanged, so every other caller (and SigenVPP) behaves as before. `set_backup_soc(quiet=True)` never skipped the read-back; only the log level.
+- `_FluxRawDriver` passes `verify=False` on those five. The executor still reads every register back itself, and the final `_verify` after enabling Remote EMS is unchanged.
+- Tests: the adapter turns off every driver read-back; a whole release on the REAL driver with a fake Modbus client is at most 17 transactions (it was 22, and the test fails at 22 with the adapter change reverted).
+- SigenVPP's byte-identical copy synced.
+
 ## v5.139.1 - 28 October 2026
 
 **Shutdown and Indigo's stop budget.** Indigo force-kills a plugin about 22 s after asking it to stop (measured: Stopping 17:21:48.676, kill 17:22:11.177). During the Flux peak `shutdown()` ran `_flux_release()` — a confirmed restore of mode 2, both cutoffs and both limits with read-backs, about 14 s at the 1 s Modbus spacing — and then `set_self_consumption()` wrote it all again. Every SEM restart inside 16:00-19:00 from 26-10-2026 on (five of five) was killed mid-write, before `_save_accumulators()` at the end ever ran.
