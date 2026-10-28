@@ -21,6 +21,18 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.139.1 - 28 October 2026
+
+**Shutdown inside Indigo's stop budget.** Indigo force-kills a plugin about 22 s after asking it to stop (measured: Stopping 17:21:48.676, kill 17:22:11.177). During the Flux peak `shutdown()` ran `_flux_release()` — a confirmed restore of mode 2, both cutoffs and both limits with read-backs, about 14 s at the 1 s Modbus spacing — and then `set_self_consumption()` wrote it all again. Every SEM restart inside 16:00-19:00 from 26-10-2026 on (five of five) was killed mid-write, before `_save_accumulators()` at the end ever ran.
+
+- `_save_accumulators()` now runs first, and again at the end.
+- `set_self_consumption()` is skipped when `_flux_release()` returned `"released"`. An unconfirmed release, or no Flux claim, still gets it.
+- Tests: totals saved before any inverter write; a confirmed release is not written twice; the unconfirmed order is kept. Each fails with its fix removed.
+
+**Two Happy Hours a weekend.** Octopus's page says "You can use up to two per weekend", and Saturday slots arrive from 1 November. `plan_day()` takes `weekend_booked` (hours booked on the other day of the weekend, from `Plugin._happy_hour_weekend_booked()`, which counts ended slots too), and room is the smaller of the day cap and the weekend cap. The bright-day hold title names the day ("a duller day than Saturday") instead of always saying Sunday. `happy_hour_booking.py` 1.2.
+
+**Checked, not changed:** the live Saving Sessions schema (introspected 28-10-2026) has no per-event token price. `SavingSessionsEventType` carries id, code, startAt, endAt, status, rewardPerKwhInOctoPoints, targetRegion, optInInvitationBatchId, devEvent, eventType and capacityStatus. So `happyHourTokensRequired` stays the only source.
+
 ## v5.139.0 - 28 October 2026
 
 Octopus extended the Weekend Happy Hour scheme to **14 February 2027** and makes it a token scheme from 1 November: one token per successful Power Down, usually 2 tokens per hour (3 or more on a dearer weekend), tokens expire 14 February 2027, odd Saturday slots and a raincheck. Read from Octopus's page and email, 28-10-2026.

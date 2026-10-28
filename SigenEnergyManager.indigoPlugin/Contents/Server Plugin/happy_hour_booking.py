@@ -6,7 +6,7 @@
 #              profile and the battery in; a booking plan and its messages out.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        24-09-2026
-# Version:     1.1  (SigenEnergyManager 5.112.6: a hold on a day already booked names the booking)
+# Version:     1.2  (SigenEnergyManager 5.139.1: two hours a weekend, shared by Saturday and Sunday)
 #
 # SigenEnergyManager 5.112.0. The rules, agreed with CliveS on 22-Sep-2026:
 #
@@ -43,6 +43,7 @@ import flux_strategy as fs
 
 
 MAX_HOURS_PER_DAY       = 2                      # "You can use up to two in one day"
+MAX_HOURS_PER_WEEKEND   = 2                      # "You can use up to two per weekend" (28-10-2026)
 MIN_USEFUL_KWH_PER_HOUR = 5.0                    # about half of what an hour can bring in
 BOOKING_LEAD            = timedelta(minutes=5)   # "up to 5 minutes before ... starts"
 FAIR_USE_KWH_PER_HOUR   = 16.0                   # "free up to 16kWh" an hour
@@ -173,11 +174,15 @@ def useful_free_kwh(site, house, pv, slots, day, tz, per_hour_kwh,
 
 def plan_day(*, day, slots, tokens, tokens_per_hour, now, tz, site, house, pv,
              per_hour_kwh, scheme_end, refused=(), start_kwh=None,
-             min_useful_kwh=MIN_USEFUL_KWH_PER_HOUR):
+             min_useful_kwh=MIN_USEFUL_KWH_PER_HOUR, weekend_booked=0):
     """What to book on one day's slots. Pure; nothing here touches the account.
 
+    `weekend_booked` is the hours already booked on the OTHER day of the same
+    weekend. Octopus allow two a weekend, and from 1 November 2026 a weekend can
+    have Saturday slots as well as Sunday ones, so a day's room is shared.
+
     Order of thought:
-      1. room — two hours a day at most, less any already booked;
+      1. room — two hours a day and two a weekend at most, less any already booked;
       2. tokens — whole hours only, and none at all if Octopus did not say;
       3. which slots can still be booked — not full, not refused before, and
          more than five minutes from starting;
@@ -193,7 +198,8 @@ def plan_day(*, day, slots, tokens, tokens_per_hour, now, tz, site, house, pv,
     plan   = BookingPlan(day=day, outcome="", booked=booked, tokens=tokens,
                          tokens_per_hour=int(tokens_per_hour or 0), sundays_after=after)
 
-    room = MAX_HOURS_PER_DAY - len(booked)
+    room = min(MAX_HOURS_PER_DAY - len(booked),
+               MAX_HOURS_PER_WEEKEND - len(booked) - max(0, int(weekend_booked or 0)))
     if room <= 0:
         return replace(plan, outcome=DAY_FULL)
     if not tokens_per_hour or int(tokens_per_hour) <= 0:
@@ -414,7 +420,9 @@ def hold_message(plan, tz, today, scheme_end):
                      f"look again every hour until the slots start.")
         parts.append(later)
         return title, " ".join(parts)
-    title = "Keeping your free hours for a duller Sunday"
+    # Named from the day, not "Sunday": Saturday slots arrive from 1 November 2026.
+    name  = when if when in ("today", "tomorrow") else f"{plan.day:%A}"
+    title = f"Keeping your free hours for a duller day than {name}"
     parts = [f"Octopus have opened bookings for {when}."]
     if plan.pv_day_kwh is not None:
         parts.append(f"The forecast is about {_kwh(plan.pv_day_kwh)} of sun that day, "

@@ -17,6 +17,8 @@ From octopus.energy/saving-sessions/weekend-happy-hours/ and the "how to earn" h
 - Beat your usual use in a Power Down session and you earn one token. The API's `tokenBalance`
   counts them. From 1 November an hour usually costs two tokens, sometimes three on a dearer
   weekend; Octopus do not report that price, so set it in Configure.
+- Octopus allow **two Happy Hours a weekend**. The plugin counts hours booked on Saturday against
+  Sunday's room, and the other way round.
 - Slots are announced on **Thursdays**, generally **Sunday 11am to 3pm in one-hour slots**. Every
   weekend since 16 August has been exactly that. Places per slot are **limited**, and a full slot
   greys out. You may book **up to five minutes before** a slot starts.

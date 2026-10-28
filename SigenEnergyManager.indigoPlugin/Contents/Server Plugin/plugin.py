@@ -75,9 +75,10 @@
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
 #              Claude Haiku 5.5 (5.139.0 — Happy Hour scheme extended to 14 February 2027, token system)
+#              Claude Opus 5.5 (5.139.1 — shutdown fits Indigo's stop budget; two Happy Hours a weekend)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 # Date:        28-10-2026 13:40 GMT
-# Version:     5.139.0
+# Version:     5.139.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2434,14 +2435,24 @@ class Plugin(indigo.PluginBase):
         # is at most a second, well inside Indigo's shutdown budget.
         if self.modbus is not None:
             self.modbus._sleep = time.sleep
+        # Save the day's totals FIRST (5.139.1). Indigo force-kills a plugin about
+        # 22 s after asking it to stop, and a hand-back during the Flux peak takes
+        # longer than that: every restart inside 16:00-19:00 from 26-10-2026 on was
+        # killed mid-write, before the save at the end of this method ever ran. The
+        # save is local and fast; it is repeated at the end for the last tick.
+        try:
+            self._save_accumulators()
+        except Exception as exc:
+            log(f"Accumulator save on shutdown failed: {exc!r}", level="WARNING")
         # Give the inverter up BEFORE anything else stops. The executor's journal
         # survives this process, so a claim left standing is a claim the next
         # start has to reconcile against hardware it cannot see the history of —
         # and the set_self_consumption below would otherwise be a write made over
         # the top of a live claim.
+        released = ""
         try:
             with self._state_lock:
-                self._flux_release("the plugin is shutting down")
+                released = self._flux_release("the plugin is shutting down")
         except Exception as exc:
             log(f"[Flux] Release on shutdown failed: {exc!r}", level="WARNING")
         if self.web_dashboard:
@@ -2458,11 +2469,16 @@ class Plugin(indigo.PluginBase):
                 pass
             _plugin_log_fh = None
         if self.modbus and self.modbus.connected:
-            # Return to self-consumption on shutdown
-            try:
-                self.modbus.set_self_consumption()
-            except Exception:
-                pass
+            # Return to self-consumption on shutdown — unless the Flux release has
+            # just done exactly that and read it back. Its confirmed hand-back
+            # writes mode 2, both cutoffs and both power limits to the policy
+            # baseline, so writing it all again only spent the seconds Indigo
+            # does not give us (5.139.1).
+            if released != "released":
+                try:
+                    self.modbus.set_self_consumption()
+                except Exception:
+                    pass
             self.modbus.disconnect()
         self._save_accumulators()
 
@@ -6483,6 +6499,31 @@ class Plugin(indigo.PluginBase):
                 booked=bool(e.get("joined")))))
         return out
 
+    def _happy_hour_weekend_booked(self, data, day, tz):
+        """Hours booked on the OTHER day of `day`'s weekend (5.139.1).
+
+        Octopus allow two Happy Hours a weekend, and from 1 November 2026 a
+        weekend can carry Saturday slots as well as Sunday ones. Counted from the
+        whole events list, ended slots included, so a Saturday already used still
+        counts against the Sunday after it. A weekday has no partner: 0.
+        """
+        if day.weekday() == 5:
+            partner = day + timedelta(days=1)
+        elif day.weekday() == 6:
+            partner = day - timedelta(days=1)
+        else:
+            return 0
+        n = 0
+        for e in data.get("events") or []:
+            if e.get("direction") != SAVING_SESSION_HAPPY_HOUR or not e.get("joined"):
+                continue
+            start = e.get("start_at")
+            if not start or not self._saving_session_for_us(e):
+                continue
+            if start.astimezone(tz).date() == partner:
+                n += 1
+        return n
+
     def _auto_book_happy_hours(self, data, now_utc):
         """Book Weekend Happy Hour slots, if the owner asked us to. v5.112.0.
 
@@ -6548,7 +6589,8 @@ class Plugin(indigo.PluginBase):
                     tokens_per_hour=need, now=now_utc, tz=tz, site=site,
                     house=house, pv=pv, per_hour_kwh=per_hour,
                     scheme_end=HAPPY_HOUR_SCHEME_END, refused=refused,
-                    start_kwh=start_kwh)
+                    start_kwh=start_kwh,
+                    weekend_booked=self._happy_hour_weekend_booked(data, day, tz))
             except Exception as exc:                                # noqa: BLE001
                 log(f"[HappyHour] Could not work out a booking for {day:%a %d %b}: "
                     f"{exc}", level="WARNING")

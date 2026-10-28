@@ -195,6 +195,24 @@ class TestThePlan(unittest.TestCase):
         self.assertEqual(_plan(pv_kwh=8.0, slots=_slots(booked=(13, 14))).outcome,
                          hb.DAY_FULL)
 
+    def test_two_hours_on_the_other_day_fill_the_weekend(self):
+        """5.139.1. Octopus allow two a WEEKEND, and Saturday slots arrive from
+        1 November 2026, so Saturday's two hours leave Sunday nothing."""
+        self.assertEqual(_plan(pv_kwh=8.0, weekend_booked=2).outcome, hb.DAY_FULL)
+
+    def test_one_hour_on_the_other_day_leaves_one_for_this_day(self):
+        p = _plan(pv_kwh=8.0, weekend_booked=1)
+        self.assertEqual(p.outcome, hb.BOOK)
+        self.assertEqual(len(p.book), 1)
+
+    def test_a_saturday_hold_is_not_called_a_sunday(self):
+        sat = date(2026, 9, 26)
+        p = _plan(pv_kwh=40.0, day=sat, slots=_slots(day=sat))
+        self.assertEqual(p.outcome, hb.HOLD_BRIGHT)
+        title, body = hb.hold_message(p, LONDON, date(2026, 9, 24), SCHEME_END)
+        self.assertEqual(title, "Keeping your free hours for a duller day than Saturday")
+        self.assertNotIn("duller Sunday", title)
+
     def test_no_forecast_holds_unless_the_tokens_must_go(self):
         empty = fs.HourlyPvForecast({}, LONDON)
         self.assertEqual(_plan(pv=empty).outcome, hb.HOLD_NO_FORECAST)
@@ -290,7 +308,7 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         p = _plan(pv_kwh=40.0)
         title, body = hb.hold_message(p, LONDON, self.TODAY, SCHEME_END)
         self._check(title, body)
-        self.assertEqual(title, "Keeping your free hours for a duller Sunday")
+        self.assertEqual(title, "Keeping your free hours for a duller day than Sunday")
         self.assertIn("your seven tokens, enough for three free hours,", body)
         self.assertIn("Four more Sundays are left before the offer ends on 1 November.", body)
         self.assertIn("almost no room for it.", body)
@@ -307,7 +325,7 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         self.assertIn("One free hour is already booked for Sunday 27 September, "
                       "from 2pm to 3pm, and it stays booked.", body)
         self.assertIn("A second hour is not worth a token", body)
-        self.assertNotIn("duller Sunday", title + body)
+        self.assertNotIn("Keeping your free hours", title + body)
         self.assertNotIn("fill the battery by itself", body)
 
     def test_the_waiting_for_a_forecast_message(self):

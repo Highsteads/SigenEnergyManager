@@ -2099,7 +2099,7 @@ class TestLifecycle(unittest.TestCase):
         p._flux_supervisor_tick()
         self.assertFalse(p.flux_executor.owns_control)
 
-    def test_shutdown_gives_the_inverter_up_before_its_own_write(self):
+    def _shutdown_order(self, release_ok):
         p = _mk_plugin()
         p.web_dashboard = None
         order = []
@@ -2110,6 +2110,7 @@ class TestLifecycle(unittest.TestCase):
                 return super().step(target, now, **kw)
 
         p.flux_executor = _Watching(owns=True)
+        p.flux_executor.release_ok = release_ok
 
         class _WatchingModbus(_FakeModbus):
             def set_self_consumption(self_inner):
@@ -2120,8 +2121,27 @@ class TestLifecycle(unittest.TestCase):
                 pass
 
         p.modbus = _WatchingModbus()
+        p._save_accumulators = lambda: order.append("save")
         p.shutdown()
-        self.assertEqual(order[:2], ["flux_release", "modbus_write"])
+        return order
+
+    def test_shutdown_gives_the_inverter_up_before_its_own_write(self):
+        # An unconfirmed release keeps the old belt and braces: Flux first, then
+        # the plain self-consumption write over the top.
+        order = self._shutdown_order(release_ok=False)
+        self.assertEqual([o for o in order if o != "save"][:2], ["flux_release", "modbus_write"])
+
+    def test_a_confirmed_release_is_not_written_twice(self):
+        """5.139.1. A peak-time restart wrote the baseline twice and ran past
+        Indigo's ~22 s stop budget, so Indigo killed it every time from 26-10-2026."""
+        order = self._shutdown_order(release_ok=True)
+        self.assertIn("flux_release", order)
+        self.assertNotIn("modbus_write", order)
+
+    def test_the_day_totals_are_saved_before_any_inverter_write(self):
+        order = self._shutdown_order(release_ok=False)
+        self.assertEqual(order[0], "save")
+        self.assertEqual(order[-1], "save")
 
     def test_sleep_gives_the_inverter_up(self):
         p = _mk_plugin()

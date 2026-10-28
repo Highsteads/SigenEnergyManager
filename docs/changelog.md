@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.139.1 - 28 October 2026
+
+Restarting the plugin between 4pm and 7pm no longer gets it killed part-way through. Handing the inverter back took longer than the time Indigo gives a plugin to stop, so every restart in the Flux peak since 26 October was cut off before it saved the day's energy totals. The totals are now saved first, and the inverter is no longer handed back twice. Octopus allow two Happy Hours a weekend, and Saturday slots start appearing from 1 November, so the plugin now counts Saturday's bookings against Sunday's. A held-back message names the day instead of always saying Sunday.
+
 ## 5.139.0 - 28 October 2026
 
 Octopus have extended the Weekend Happy Hour scheme to 14 February 2027. From 1 November it is paid for with tokens: one token for each successful Power Down, and usually two tokens for an hour, sometimes three on a dearer weekend. The plugin's end date, the "use it by" note and the check that refuses a session too late to earn a usable token now all use 14 February 2027. Set the tokens-per-hour figure in Configure to what Octopus charge you, because their API does not report it. Octopus may add odd Saturday slots from 1 November; the plugin still plans on Sundays only, which means it spends tokens a little early rather than risk losing them.

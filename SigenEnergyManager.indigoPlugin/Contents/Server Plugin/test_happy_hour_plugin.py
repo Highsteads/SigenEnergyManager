@@ -156,7 +156,7 @@ class TestAutoBooking(unittest.TestCase):
         p.octopus.book_happy_hour_event.assert_not_called()
         self.assertEqual(p._send_pushover.call_count, 1)
         self.assertEqual(p._send_pushover.call_args.args[0],
-                         "Keeping your free hours for a duller Sunday")
+                         "Keeping your free hours for a duller day than Sunday")
 
     def test_a_hold_after_a_booking_is_logged_but_never_pushed(self):
         """24-Sep-2026 live: 19:06 booked 2pm, 20:07 pushed 'Keeping your free hours
@@ -219,6 +219,25 @@ class TestAutoBooking(unittest.TestCase):
             e["target_regions"] = [8, 9]
         p._auto_book_happy_hours({"token_balance": 7, "events": events}, THURSDAY)
         p.octopus.book_happy_hour_event.assert_not_called()
+
+    def test_saturdays_bookings_count_against_sundays_room(self):
+        """5.139.1. Two booked on Saturday leave Sunday nothing: two a weekend."""
+        sat = SUNDAY - timedelta(days=1)
+        p = _mk(pv_kwh=8.0)
+        events = _slot_events() + [
+            dict(e, id=7000 + i, code=f"SAT_{i}")
+            for i, e in enumerate(_slot_events(day=sat, hours=(11, 12), joined=(11, 12)))]
+        p._auto_book_happy_hours({"token_balance": 7, "events": events}, THURSDAY)
+        p.octopus.book_happy_hour_event.assert_not_called()
+
+    def test_the_weekend_partner_count(self):
+        sat = SUNDAY - timedelta(days=1)
+        p = _mk(pv_kwh=8.0)
+        data = {"events": _slot_events(day=sat, hours=(11, 12, 13), joined=(11, 13))}
+        self.assertEqual(p._happy_hour_weekend_booked(data, SUNDAY, LONDON), 2)
+        self.assertEqual(p._happy_hour_weekend_booked(data, sat, LONDON), 0)
+        self.assertEqual(p._happy_hour_weekend_booked(data, SUNDAY + timedelta(days=1),
+                                                      LONDON), 0)
 
     def test_slots_after_the_scheme_are_never_booked(self):
         after = datetime(2027, 2, 14, tzinfo=LONDON).date()
