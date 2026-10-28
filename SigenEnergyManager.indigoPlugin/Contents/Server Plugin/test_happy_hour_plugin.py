@@ -204,8 +204,8 @@ class TestAutoBooking(unittest.TestCase):
         p.octopus.book_happy_hour_event.assert_not_called()
 
     def test_the_last_sunday_is_booked_whatever_the_weather(self):
-        last = datetime(2026, 10, 25, tzinfo=LONDON).date()
-        now  = datetime(2026, 10, 22, 14, 0, tzinfo=LONDON).astimezone(timezone.utc)
+        last = datetime(2027, 2, 7, tzinfo=LONDON).date()
+        now  = datetime(2027, 2, 4, 14, 0, tzinfo=LONDON).astimezone(timezone.utc)
         p = _mk(pv_kwh=40.0, day=last)
         p._auto_book_happy_hours({"token_balance": 7, "events": _slot_events(day=last)}, now)
         self.assertEqual(p.octopus.book_happy_hour_event.call_count, 2)
@@ -221,8 +221,8 @@ class TestAutoBooking(unittest.TestCase):
         p.octopus.book_happy_hour_event.assert_not_called()
 
     def test_slots_after_the_scheme_are_never_booked(self):
-        after = datetime(2026, 11, 1, tzinfo=LONDON).date()
-        now   = datetime(2026, 10, 29, 14, 0, tzinfo=LONDON).astimezone(timezone.utc)
+        after = datetime(2027, 2, 14, tzinfo=LONDON).date()
+        now   = datetime(2027, 2, 11, 14, 0, tzinfo=LONDON).astimezone(timezone.utc)
         p = _mk(pv_kwh=8.0, day=after)
         p._auto_book_happy_hours({"token_balance": 7, "events": _slot_events(day=after)}, now)
         p.octopus.book_happy_hour_event.assert_not_called()
@@ -346,7 +346,7 @@ class TestTheJoinVerdictKnowsTheFluxPeak(unittest.TestCase):
                 "end_at":   fs.local_wall(LONDON, day, fs.time(h1, 0))}
 
     def test_inside_the_peak_after_the_scheme_is_joined(self):
-        day = datetime(2026, 11, 10, tzinfo=LONDON).date()
+        day = datetime(2027, 2, 20, tzinfo=LONDON).date()
         ok, why = self._p()._session_join_verdict(self._event(day, 18, 19), day, day)
         self.assertTrue(ok)
         self.assertEqual(why, "")
@@ -354,19 +354,19 @@ class TestTheJoinVerdictKnowsTheFluxPeak(unittest.TestCase):
     def test_outside_the_peak_on_flux_is_joined_but_not_exported(self):
         # 5.126.0. CliveS: "we should still join them but do not export". Joining
         # costs nothing on Flux: nothing is exported for a session.
-        day = datetime(2026, 11, 10, tzinfo=LONDON).date()
+        day = datetime(2027, 2, 20, tzinfo=LONDON).date()
         for h0, h1 in ((19, 20), (18, 20), (10, 11)):
             ok, why = self._p()._session_join_verdict(self._event(day, h0, h1), day, day)
             self.assertTrue(ok, (h0, h1))
             self.assertEqual(why, "")
 
     def test_a_session_that_runs_past_seven_is_not_inside_the_peak(self):
-        day = datetime(2026, 11, 10, tzinfo=LONDON).date()
+        day = datetime(2027, 2, 20, tzinfo=LONDON).date()
         self.assertFalse(self._p()._session_inside_flux_peak(
             self._event(day, 18, 20)["start_at"], self._event(day, 18, 20)["end_at"]))
 
     def test_without_flux_armed_the_token_check_decides(self):
-        day = datetime(2026, 11, 10, tzinfo=LONDON).date()
+        day = datetime(2027, 2, 20, tzinfo=LONDON).date()
         ok, _ = self._p(armed=False)._session_join_verdict(self._event(day, 18, 19), day, day)
         self.assertFalse(ok)
 

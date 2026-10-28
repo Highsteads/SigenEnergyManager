@@ -74,9 +74,10 @@
 #              Claude Opus 5.5 (5.134.1 — no import-held alert while the first tariff read is awaited)
 #              Claude Opus 5.5 (5.135.0 — Solar Overflow leaves room for a booked free hour later today)
 #              Claude Opus 5.5 (5.136.0 — a free hour is no longer held to Solar Overflow's charge cap)
+#              Claude Haiku 5.5 (5.139.0 — Happy Hour scheme extended to 14 February 2027, token system)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 # Date:        28-10-2026 13:40 GMT
-# Version:     5.138.2
+# Version:     5.139.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -279,13 +280,15 @@ from octopus_api      import fixed_tou_window, carry_slots_forward_one_day
 #   octopus.energy/saving-sessions/weekend-happy-hours/
 #   octopus.energy/help-and-faqs/articles/how-to-earn-weekend-happy-hours/
 #
-# The end date is EXCLUSIVE here even though Octopus write "use them all by 1st
-# November", and 1 November 2026 is itself a Sunday. The wording is ambiguous
-# ("until 1st November" elsewhere on the same site) and the two readings fail in
-# opposite directions: assume it counts and be wrong, and a token is earned that
-# can never be spent — which is the exact thing this guard exists to prevent.
-# Assume it does not and be wrong, and the worst case is one cautious refusal.
-HAPPY_HOUR_SCHEME_END        = date(2026, 11, 1)
+# The end date is EXCLUSIVE here even though Octopus write "they expire on 14th
+# February 2027", and 14 February 2027 is a Sunday. The wording is ambiguous and
+# the two readings fail in opposite directions: assume it counts and be wrong,
+# and a token is earned that can never be spent — which is the exact thing this
+# guard exists to prevent. Assume it does not and be wrong, and the worst case
+# is one cautious refusal.
+# Extended from 1 November 2026 to 14 February 2027 on 28-10-2026, with the
+# token system that replaced the flat two-per-hour rule (Octopus email and page).
+HAPPY_HOUR_SCHEME_END        = date(2027, 2, 14)
 # "You can use up to two per weekend."
 HAPPY_HOUR_MAX_PER_WEEKEND   = 2
 # "Results from your Power Down sessions will take about three working days to
@@ -6300,15 +6303,16 @@ class Plugin(indigo.PluginBase):
 
         Dated deliberately, so it stops saying itself once the date has passed rather
         than nagging for ever about a promotion that has ended. THE DATE IS A VENDOR
-        PROMOTION AND WILL ROT: re-read the page rather than trusting this constant
-        past it, and if Octopus extend the scheme this is the one line to change.
+        PROMOTION AND WILL ROT: re-read the page rather than trusting the date, which
+        is HAPPY_HOUR_SCHEME_END. Octopus extended it to 14 February 2027 on 28-10-2026
+        (the 1 November date above is the old one).
         """
-        end = date(2026, 11, 1)
+        end = HAPPY_HOUR_SCHEME_END
         now = today or date.today()
         if now >= end:
             return ""       # the scheme has ended, or been extended and nobody looked
         days = (end - now).days
-        return ("  Use it by 1 November or it is lost"
+        return (f"  Use it by {end.day} {end:%B} or it is lost"
                 + (f" — {days} day{'' if days == 1 else 's'} left." if days <= 45 else "."))
 
     def _happy_hour_tokens_required(self):
@@ -6392,7 +6396,7 @@ class Plugin(indigo.PluginBase):
             _start = (start_at.astimezone(_tz) if _tz else start_at).date()
             # `now_utc` is the caller's clock, already passed in. Reading date.today()
             # here instead would make every test of this guard depend on the real
-            # calendar and start failing of its own accord on 1 November 2026.
+            # calendar and start failing of its own accord when the scheme ends.
             _today = (now_utc.astimezone(_tz) if _tz else now_utc).date()
             _worth, _why = self._session_join_verdict(event, _start, _today)
             if not _worth:

@@ -2549,14 +2549,15 @@ class TestCheckSavingSessions(unittest.TestCase):
         """
         from datetime import date as _d
         f = plugin.Plugin._happy_hour_expiry_note
-        self.assertIn("1 November", f(today=_d(2026, 10, 25)))
-        self.assertIn("7 days left", f(today=_d(2026, 10, 25)))
-        self.assertIn("1 day left", f(today=_d(2026, 10, 31)))   # singular
-        self.assertEqual(f(today=_d(2026, 11, 1)), "")           # the day it ends
-        self.assertEqual(f(today=_d(2027, 1, 1)), "")
+        # Extended to 14 February 2027 on 28-10-2026 (the 1 November date is history).
+        self.assertIn("14 February", f(today=_d(2027, 1, 25)))
+        self.assertIn("20 days left", f(today=_d(2027, 1, 25)))
+        self.assertIn("1 day left", f(today=_d(2027, 2, 13)))    # singular
+        self.assertEqual(f(today=_d(2027, 2, 14)), "")           # the day it ends
+        self.assertEqual(f(today=_d(2027, 3, 1)), "")
         # Far out, the deadline is named but not counted down to.
         far = f(today=_d(2026, 6, 1))
-        self.assertIn("1 November", far)
+        self.assertIn("14 February", far)
         self.assertNotIn("days left", far)
 
     def test_the_alert_does_not_contradict_a_budget_refusal(self):
@@ -7091,18 +7092,21 @@ class TestHappyHourTokenBudget(unittest.TestCase):
 
     # ── the slot count ─────────────────────────────────────────────────────
     def test_slots_counts_two_per_remaining_weekend(self):
-        # Tue 15 Sep 2026 -> weekends of 19/20, 26/27 Sep, 3/4, 10/11, 17/18,
-        # 24/25 Oct and Sat 31 Oct = 7 weekends, 2 hours each.
-        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 9, 15)), 14)
+        # Tue 15 Sep 2026 -> weekends of 19/20 Sep to 6/7 Feb = 21 weekends, then the
+        # lone Saturday 13 Feb (14 Feb itself is excluded) = 22 weekends, 2 hours each.
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 9, 15)), 44)
 
     def test_a_saturday_and_the_sunday_after_it_are_one_weekend(self):
-        # Sat 31 Oct and Sun 1 Nov must never count as two, and 1 Nov is excluded
-        # anyway. From Fri 30 Oct only that Saturday remains: one weekend, 2 hours.
-        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 10, 30)), 2)
+        # Sat 31 Oct and Sun 1 Nov are ONE weekend, so they must not count as two.
+        # From Fri 30 Oct: that weekend, then 7/8 Nov to 6/7 Feb = 14 more, then the
+        # lone Saturday 13 Feb = 16 weekends, 2 hours each.
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 10, 30)), 32)
 
     def test_the_end_date_is_exclusive(self):
-        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 11, 1)), 0)
-        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2026, 12, 1)), 0)
+        # 14 Feb 2027 is a Sunday and is excluded; Sat 13 Feb is still a usable weekend day.
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2027, 2, 13)), 2)
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2027, 2, 14)), 0)
+        self.assertEqual(plugin.Plugin.happy_hour_slots_left(self._date(2027, 3, 1)), 0)
 
     # ── the verdict ────────────────────────────────────────────────────────
     def test_a_session_is_worth_joining_with_room_to_spare(self):
@@ -7134,33 +7138,34 @@ class TestHappyHourTokenBudget(unittest.TestCase):
     def test_a_stated_budget_can_never_exceed_the_slots_that_exist(self):
         """Typing 50 does not conjure weekends.
 
-        From Tue 20 Oct only the 24/25 Oct weekend and Sat 31 Oct remain — two
-        weekends, four hours — so a stated 50 is capped at 4 and eight tokens are
-        already too many. The session itself is on the 21st, which still settles in
-        time, so this exercises the budget leg and not the deadline one.
+        From Mon 8 Feb 2027 only Sat 13 Feb remains — one weekend, two hours — so a
+        stated 50 is capped at 2 and eight tokens are already too many. The session
+        itself is on the 8th and credits on the 13th, which still settles in time,
+        so this exercises the budget leg and not the deadline one.
         """
         p = self._plugin(tokens=8, prefs={"happyHourUsableHours": "50"})
-        worth, why = p._happy_hour_token_verdict(self._date(2026, 10, 21),
-                                                 now_local=self._date(2026, 10, 20))
+        worth, why = p._happy_hour_token_verdict(self._date(2027, 2, 8),
+                                                 now_local=self._date(2027, 2, 8))
         self.assertFalse(worth)
-        self.assertIn("4 hours", why)
+        self.assertIn("2 hours", why)
         self.assertIn("already hold 8 tokens", why)
 
     def test_a_session_settling_too_late_is_refused_whatever_the_balance(self):
         """Octopus take about 3 working days, and bookings close before the weekend.
 
-        A session on 29 Oct credits around 3 Nov, after the scheme has ended.
+        A session on Thu 11 Feb 2027 credits around Tue 16 Feb, after the scheme
+        has ended on 14 February.
         """
         p = self._plugin(tokens=0)
-        worth, why = p._happy_hour_token_verdict(self._date(2026, 10, 29),
-                                                 now_local=self._date(2026, 10, 25))
+        worth, why = p._happy_hour_token_verdict(self._date(2027, 2, 11),
+                                                 now_local=self._date(2027, 2, 8))
         self.assertFalse(worth)
         self.assertIn("too late", why)
 
     def test_after_the_scheme_ends_nothing_is_worth_joining(self):
         p = self._plugin(tokens=0)
-        worth, why = p._happy_hour_token_verdict(self._date(2026, 11, 5),
-                                                 now_local=self._date(2026, 11, 2))
+        worth, why = p._happy_hour_token_verdict(self._date(2027, 2, 16),
+                                                 now_local=self._date(2027, 2, 15))
         self.assertFalse(worth)
         self.assertIn("ended", why)
 

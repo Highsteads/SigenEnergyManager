@@ -14,14 +14,16 @@ booked yourself.
 
 From octopus.energy/saving-sessions/weekend-happy-hours/ and the "how to earn" help article:
 
-- Beat your usual use in two Power Down sessions and you earn one Weekend Happy Hour. The API's
-  `tokenBalance` counts one token per successful session; two buy an hour.
+- Beat your usual use in a Power Down session and you earn one token. The API's `tokenBalance`
+  counts them. From 1 November an hour usually costs two tokens, sometimes three on a dearer
+  weekend; Octopus do not report that price, so set it in Configure.
 - Slots are announced on **Thursdays**, generally **Sunday 11am to 3pm in one-hour slots**. Every
   weekend since 16 August has been exactly that. Places per slot are **limited**, and a full slot
   greys out. You may book **up to five minutes before** a slot starts.
 - Up to **two hours in one day**. Everything the house imports in the hour is free **up to 16 kWh**;
   the standing charge is paid as normal.
-- The offer ends on **1 November 2026**, and unused hours are lost.
+- The offer runs to **14 February 2027**, and unused tokens expire then. Octopus may add odd
+  Saturday slots from 1 November, and may skip a weekend's Happy Hours as a last resort (a raincheck).
 - Results of a Power Down take about three working days, so Monday to Wednesday sessions count
   towards that weekend and Thursday to Sunday ones towards the next.
 
@@ -55,7 +57,7 @@ announced and not yet started:
 2. **Tokens**: whole hours only; nothing if Octopus did not report a balance.
 3. **Candidates**: not full, not refused before, more than five minutes from starting.
 4. **Must spend**: hours held beyond two for each Sunday still left after this one (Sundays only,
-   and 1 November itself excluded) are booked now whatever the weather.
+   and 14 February itself excluded) are booked now whatever the weather.
 5. **Worth it**: the day is simulated twice with the planner's own walk, from the charge the
    planner would arrange, with and without the candidate hours. Useful energy is the free energy
    the battery takes **less any sunshine it pushes out**. An hour is added only while it brings at
@@ -94,7 +96,7 @@ The four per-slot "Happy Hour available" pushes are not sent while automatic boo
   at the 4 kW limit through the peak anyway (meter data 17-20 Sep-2026: 2.00 kWh every half hour
   on days with no session), so joining costs nothing. The token verdict still decides sessions
   outside the peak. Without this the auto-join would have declined every session from 27 October
-  and, after 1 November, for good.
+  and, after the scheme ends, for good.
 - **The Open-Meteo fetch covers six days**, and keeps the days after tomorrow as
   `_hourly_p50_ahead` / `aheadDayKwh`, so a Thursday decision can see the Sunday.
 

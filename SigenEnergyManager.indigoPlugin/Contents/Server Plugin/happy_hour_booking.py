@@ -25,10 +25,14 @@
 #     brighter is lived with rather than undone.
 #
 # Octopus's own rules, read 22-Sep-2026 (octopus.energy/saving-sessions/
-# weekend-happy-hours/): slots are announced on Thursdays, generally Sunday
-# 11am to 3pm in one-hour slots; places per slot are limited; you may book up
-# to five minutes before a slot starts; up to two in one day; everything the
-# house imports in the hour is free up to 16 kWh; the offer ends 1 November.
+# weekend-happy-hours/, re-read 28-Oct-2026): slots are announced on Thursdays,
+# generally Sunday 11am to 3pm in one-hour slots; places per slot are limited;
+# you may book up to five minutes before a slot starts; up to two in one day;
+# everything the house imports in the hour is free up to 16 kWh. From 1 November
+# the scheme is a token scheme: one token per successful Power Down, two (or
+# three on a dearer weekend) per hour, tokens expire 14 February 2027, and the
+# odd Saturday slot and off-hours windows may appear. Saturdays are NOT counted
+# as later chances below; see sundays_after.
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
@@ -94,12 +98,13 @@ class BookingPlan:
 def sundays_after(day, scheme_end):
     """Sundays strictly after `day` and strictly before `scheme_end`.
 
-    Only SUNDAYS count as later chances to spend a token. Octopus say the slots
-    are "generally on a Sunday" and every one announced so far has been, and the
-    two readings fail in opposite directions: count a Saturday that never gets
-    slots and tokens are lost at the end; leave one out and the worst case is
-    spending an hour a week early. `scheme_end` is exclusive — 1 November 2026
-    is itself a Sunday, and "use them by 1st November" does not settle it.
+    Only SUNDAYS count as later chances to spend a token. Octopus now say they
+    will "look out for the odd Saturday session", which is occasional and not a
+    regular slot, so a Saturday is not counted. Leaving one out is the cautious
+    side: the worst case is spending an hour a week early, whereas counting a
+    Saturday that never arrives loses tokens at the end. `scheme_end` is
+    exclusive, 14 February 2027 is itself a Sunday, and "they expire on 14th
+    February" does not settle it.
     """
     n = 0
     d = day + timedelta(days=1)

@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.139.0 - 28 October 2026
+
+Octopus extended the Weekend Happy Hour scheme to **14 February 2027** and makes it a token scheme from 1 November: one token per successful Power Down, usually 2 tokens per hour (3 or more on a dearer weekend), tokens expire 14 February 2027, odd Saturday slots and a raincheck. Read from Octopus's page and email, 28-10-2026.
+
+- `HAPPY_HOUR_SCHEME_END` moves from 1 November 2026 to **14 February 2027**, still exclusive. The "use it by" note in `_happy_hour_expiry_note()` now reads that constant instead of its own hardcoded date, so there is one place to change.
+- `happyHourTokensRequired` keeps its default of 2. Its PluginConfig label now says 2 usually and 3 or more on a dearer weekend, and that the API does not report the price per weekend, so the owner sets it.
+- `happy_hour_booking.sundays_after()` still counts Sundays only. Saturdays are now "the odd Saturday session", so they are not regular chances; leaving them out spends tokens early, never loses them.
+- Tests: the scheme-end and budget tests in `test_plugin.py` and `test_happy_hour_plugin.py` move to the 2027 calendar. `test_happy_hour_booking.py` keeps its own 2026 fixture, because it passes the end date in as a parameter.
+
 ## v5.138.2 - 28 October 2026
 
 sigenergy_modbus.py 1.20. On 28-10-2026 the inverter reset the Modbus socket twice (13:07, 13:11). The plugin reconnected in 0.3 s, but `connect()` set `_slow_primed = False` on every connect (review 02-10-2026), so the first snapshot was a full sweep of ~29 reads at the 1 s protocol spacing: ~31 s with no readings, which the manager held through and the Zappi export guard saw as unknown.
