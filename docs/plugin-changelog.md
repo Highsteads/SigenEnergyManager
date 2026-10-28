@@ -29,6 +29,7 @@ New entries go at the top, as they were kept in the file.
 - `_FluxRawDriver` passes `verify=False` on those five. The executor still reads every register back itself, and the final `_verify` after enabling Remote EMS is unchanged.
 - Tests: the adapter turns off every driver read-back; a whole release on the REAL driver with a fake Modbus client is at most 17 transactions (it was 22, and the test fails at 22 with the adapter change reverted).
 - SigenVPP's byte-identical copy synced.
+- **Measured live, 28-10-2026 17:46, restart during a Flux peak export:** Stopping 17:46:40.939, "Control handed back" 17:46:58.527 (17.6 s), dashboard stopped and inverter disconnected 17:46:58.891, "Stopped plugin" 17:46:59.995 (19.1 s). No force-kill, against five of five killed from 26-10 to 28-10.
 
 ## v5.139.1 - 28 October 2026
 
