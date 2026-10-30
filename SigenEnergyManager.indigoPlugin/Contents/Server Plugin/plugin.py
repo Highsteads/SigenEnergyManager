@@ -78,11 +78,12 @@
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
+#              Claude Opus 5.5 (5.140.3 - Axle emails no longer carry a sign-in link; say so)
 #              Claude Opus 5.5 (5.140.2 - the last-tokens sentence in the Happy Hour booking message)
 #              Claude Opus 5.5 (5.140.1 - a normal night's charge may reach 100% on a dull day)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        30-10-2026 19:45 GMT
-# Version:     5.140.2
+# Date:        30-10-2026 22:15 GMT
+# Version:     5.140.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -9780,8 +9781,12 @@ class Plugin(indigo.PluginBase):
         OFF BY DEFAULT, like the mail scan and for the same reason: this is a
         published plugin and it reads the user's own Mail store to find the
         sign-in link Axle put there. Nothing is stored and nothing is typed -
-        the link expires on its own after seven days, and an event always sends
-        a fresh one on the day it finishes.
+        the link expires on its own after seven days.
+
+        Axle's emails stopped carrying that link in late October 2026: the last
+        was 13-Oct, and the five sent since 27-Oct have a bare account URL. So
+        this finds nothing unless Axle bring it back. The money does not depend
+        on it - `_scan_axle_mail` filed the 27-Oct event from its results email.
 
         THE TWO LAYERS ARE DELIBERATELY NOT ONE CALL. `events` is ordinary JSON
         from Axle's own published API and tells us WHICH events are settled;
@@ -9799,9 +9804,10 @@ class Plugin(indigo.PluginBase):
         found = _axle_account.newest_live_token()
         if not found:
             self._note_account_problem(
-                "no live Axle sign-in link was found in Apple Mail on this Mac - they "
-                "arrive with every Axle email and last a week, so opening your account "
-                "page from any of their emails will supply a fresh one")
+                "no live Axle sign-in link was found in Apple Mail on this Mac - "
+                "Axle's emails stopped carrying one in late October 2026. Each event's "
+                "earnings still arrive from their results email, so only the balance "
+                "shown can fall behind")
             return
         token, expires, site_id = found
 
@@ -9898,9 +9904,9 @@ class Plugin(indigo.PluginBase):
             except (TypeError, ValueError):
                 when = str(start)
             vpp_log(f"[VPP] Axle have settled the {when} event but no payment figure has "
-                    f"reached the ledger, so the earnings shown are short. Open your Axle "
-                    f"account page to refresh the sign-in link, or import the figures by "
-                    f"hand.", "WARNING")
+                    f"reached the ledger, so the earnings shown are short. Look for Axle's "
+                    f"results email for that event, or import the figures by hand.",
+                    "WARNING")
 
         # Drop anything that has since been paid, so a later recurrence warns again.
         for start in list(seen):
@@ -16790,7 +16796,7 @@ class Plugin(indigo.PluginBase):
             # is precisely the thing he should not have to go looking for. It is
             # NOT a warning — an armed state working as configured is not a fault.
             vpp_log("[VPP] Reading the Axle account directly is ON - the plugin borrows "
-                    "the seven-day sign-in link from Axle's own emails; nothing is stored.",
+                    "any live sign-in link from Axle's own emails; nothing is stored.",
                     event=True)
         except Exception as exc:
             self.logger.debug(f"[VPP] Axle account setting log skipped: {exc}")

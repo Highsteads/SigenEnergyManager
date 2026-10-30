@@ -104,7 +104,7 @@ Leave the four daily figures alone unless you want to override them. The plugin 
 | **Axle API token** | The token Axle give you. |
 | **Axle VPP payment rate** | What Axle pay for each kWh sold in an event, in pounds. £1.00 to start with. Only used for the earnings estimate. |
 | **Read Axle's settlement emails from Apple Mail on this Mac** | Ticked, the plugin files what each event paid from Axle's emails. Off to start with. |
-| **Read your Axle account page directly** | Ticked, the plugin reads your Axle account page using the sign-in link from Axle's latest email. Off to start with. |
+| **Read your Axle account page directly** | Ticked, the plugin reads your Axle account page using any live sign-in link in Axle's emails. Those sent since late October 2026 carry none, so for now it finds nothing. Off to start with. |
 | **Warn if the earnings figures are this many days stale** | 7 days to start with. 0 switches the warning off. |
 
 ## OCTOPUS SAVING SESSIONS

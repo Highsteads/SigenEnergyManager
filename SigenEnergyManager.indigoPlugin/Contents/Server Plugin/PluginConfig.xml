@@ -249,7 +249,7 @@
         <Label>Read your Axle account page directly:</Label>
     </Field>
     <Field id="label_axleReadAccount_info" type="label">
-        <Label>Every email Axle send carries a sign-in link that works for seven days, and an event always sends one on the day it finishes. With this on, the plugin borrows that link from Apple Mail and reads your account the same way your browser does, so earnings arrive whether or not Axle send a settlement email for them.
+        <Label>Axle's emails used to carry a sign-in link that works for seven days, but those sent since late October 2026 do not. With this on, the plugin borrows any live link it finds in Apple Mail and reads your account the same way your browser does. Until their emails carry one again this finds nothing, and earnings come from the settlement emails above.
 
 You never sign in and nothing is stored: the link is read fresh each time and expires on its own. It matters because Axle changed how they settle this site in September 2026 and simply stopped emailing the figures — two events were paid and invisible here for a week. Their account page also says plainly which events have been settled, so the plugin can now tell you money is owed even when it cannot read the amount.</Label>
     </Field>

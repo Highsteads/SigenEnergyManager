@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.140.3 - 30 October 2026
+
+Axle's emails have stopped carrying the sign-in link the plugin used to read your account page, so the warning, the Configure note and the guide now say that, rather than telling you to open your account from an email. Earnings still arrive from Axle's results emails.
+
 ## 5.140.2 - 30 October 2026
 
 The message for a Happy Hour booking that spends your last tokens now reads properly. It used to end "leaving no, not enough for another hour", and now ends "leaving none".

@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.140.3 - 30 October 2026
+
+Wording only. Axle's emails stopped carrying the `token=` account link: the last was 13-Oct-2026 and the
+five from noreply@axle.energy since 27-Oct have a bare `/app/account` URL, so `newest_live_token` finds
+nothing. The warning told the owner to open the account from an email, which no longer helps, so it, the
+unsettled-money warning, the start-up line, the Configure note and the guide now say what is true. No
+behaviour changed: a link would still be used if Axle bring it back, and the 27-Oct event (GBP 4.01)
+reached the ledger from its results email by the mail scan.
+
 ## v5.140.2 - 30 October 2026
 
 `happy_hour_booking` 1.3: `number_words(0)` is "no", which is right before a noun and wrong alone, so
