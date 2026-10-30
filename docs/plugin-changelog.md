@@ -21,6 +21,16 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.140.1 - 30 October 2026
+
+`flux_strategy` 2.14: `NIGHTLY_CHARGE_PCT` 95 to 100 (CliveS, 30-Oct-2026; 5.134.0 set 95). The
+charge is still `household_target` plus a resale amount limited by forecast headroom, so the
+limit only bites on a dull day. Simulated with October's half-hours at 2:00-5:00 targets: need-based
+to 100% against need-based to 95% was 25p better on October as it was, and £2.01 to £5.13 a month
+better with solar scaled to 0.5 and 0.3 (house load x1 and x1.25), with no clipping. Filling to
+100% every night was £9.31 worse on October, so the need-based sizing stays. Scaled October, not
+a real winter. Wear not included. A booked free hour's room is still kept.
+
 ## v5.140.0 - 30 October 2026
 
 New `forecast_blend.py` (pure sums) and `openmeteo_forecast` 1.11. The plugin sent no `models=`

@@ -11,7 +11,8 @@
 #              v2.8 and v2.9 30-09-2026; v2.9.1 and v2.10 01-10-2026; v2.11 02-10-2026;
 #              v2.12 02-10-2026
 #              2.13: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
-# Version:     2.13
+#              2.14: Claude Opus 5.5, 30-10-2026 (a normal night may store up to 100%)
+# Version:     2.14
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -180,9 +181,12 @@ from typing import Mapping, Optional, Tuple
 # --- The structural Flux clock. Also pinned in flux_execution._valid_target;
 # derive_bands refuses to plan if the published rates disagree with it. ---
 FLUX_CHEAP_START = time(2, 0)
-# 5.134.0 (CliveS, 24-Oct-2026): a normal night stores this much, counting free-hour room.
-# A warning stores the full ceiling instead (FluxInputs.storm_fill).
-NIGHTLY_CHARGE_PCT = 95.0
+# The most a normal night stores, counting free-hour room. 5.134.0 set 95; 5.140.1 lifts it
+# to 100 (CliveS, 30-Oct-2026). The charge is still sized on what the day needs and leaves
+# room for forecast solar, so this only bites on a dull day. Simulated on October with the
+# solar scaled to winter levels: £2 to £5 a month better, nothing lost to the export limit,
+# and 25p better on October as it was. A warning always fills (FluxInputs.storm_fill).
+NIGHTLY_CHARGE_PCT = 100.0
 FLUX_CHEAP_END   = time(5, 0)
 # Control stops early; tariff validation and pricing still use the full cheap band.
 FLUX_CHARGE_END  = time(4, 58)
@@ -1398,7 +1402,7 @@ def _charge_plan(inputs):
     eff    = site.one_way_efficiency
     # 5.134.0: a normal night stores NIGHTLY_CHARGE_PCT; a warning stores the full ceiling.
     # An announced export commitment (an Axle event) is energy the battery owes, so it
-    # keeps the full ceiling: capping it at 95 would quietly under-deliver the event.
+    # keeps the full ceiling: capping it lower would quietly under-deliver the event.
     owes_export = any(c.kind == "export" for c in inputs.commitments)
     cap_pct = (float(site.max_charge_soc_pct) if (inputs.storm_fill or owes_export)
                else min(float(site.max_charge_soc_pct), NIGHTLY_CHARGE_PCT))

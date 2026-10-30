@@ -1703,12 +1703,21 @@ class TestTheNightlyMinimumCharge(unittest.TestCase):
         self.assertEqual(storm.charge_cutoff_pct, 100.0)
         self.assertLess(plain.charge_cutoff_pct, 100.0)
 
-    def test_a_normal_night_stores_95_and_a_warning_stores_100(self):
-        """5.134.0 (CliveS, 24-Oct-2026): 95% stored on an ordinary night, 100% under a warning."""
-        plain = fs.plan(self._in((2, 0), 40.0))
-        storm = fs.plan(self._in((2, 0), 40.0, storm_fill=True))
-        self.assertLessEqual(plain.charge_cutoff_pct, fs.NIGHTLY_CHARGE_PCT)
-        self.assertEqual(storm.charge_cutoff_pct, 100.0)
+    def test_a_dull_day_fills_the_battery_on_a_normal_night(self):
+        """5.140.1 (CliveS, 30-Oct-2026): the 95% limit is lifted. A day the sun will not
+        fill can be charged to 100%, with no warning and nothing owed."""
+        dull = fs.plan(self._in((2, 0), 40.0, pv_kwh=3.0))
+        self.assertEqual(dull.mode, fs.MODE_CHARGE)
+        self.assertEqual(dull.charge_cutoff_pct, 100.0)
+
+    def test_a_bright_day_still_leaves_room_for_the_sun(self):
+        """Lifting the limit must not turn the charge into a fill."""
+        bright = fs.plan(self._in((2, 0), 40.0, pv_kwh=40.0))
+        self.assertLess(bright.charge_cutoff_pct, 90.0)
+
+    def test_a_booked_free_hour_still_keeps_its_room_on_a_dull_day(self):
+        kept = fs.plan(self._in((2, 0), 40.0, pv_kwh=3.0, free=((12, 13),)))
+        self.assertLess(kept.charge_cutoff_pct, 100.0)
 
     def test_a_warning_fill_is_a_no_op_when_already_full(self):
         storm = fs.plan(self._in((2, 0), 100.0, storm_fill=True))
