@@ -5,8 +5,8 @@
 #              in plain English. Pure: slots, tokens, a solar forecast, the house
 #              profile and the battery in; a booking plan and its messages out.
 # Author:      CliveS & Claude Opus 5.5
-# Date:        24-09-2026
-# Version:     1.2  (SigenEnergyManager 5.139.1: two hours a weekend, shared by Saturday and Sunday)
+# Date:        30-10-2026
+# Version:     1.3  (SigenEnergyManager 5.140.2: the sentence for spending the last tokens)
 #
 # SigenEnergyManager 5.112.0. The rules, agreed with CliveS on 22-Sep-2026:
 #
@@ -377,9 +377,11 @@ def booked_message(plan, tz, today, scheme_end):
         tail = (f"which is {_plural(hours_left, 'more free hour')}, to use by "
                 f"{_end_words(scheme_end)}" if hours_left else
                 "not enough for another hour")
+        # "no" is right before a noun and wrong alone: the last two tokens of the
+        # scheme read "leaving no, not enough for another hour" on 30-Oct-2026.
+        leaving = f"leaving {number_words(left)}, {tail}" if left else "leaving none"
         parts.append(f"That spends {number_words(spent)} of your "
-                     f"{_plural(plan.tokens, 'token')}, leaving {number_words(left)}, "
-                     f"{tail}.")
+                     f"{_plural(plan.tokens, 'token')}, {leaving}.")
     return title, " ".join(parts)
 
 

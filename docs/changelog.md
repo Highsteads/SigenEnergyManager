@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.140.2 - 30 October 2026
+
+The message for a Happy Hour booking that spends your last tokens now reads properly. It used to end "leaving no, not enough for another hour", and now ends "leaving none".
+
 ## 5.140.1 - 30 October 2026
 
 An ordinary night's charge can now reach 100%, not 95%, when the day ahead needs it. It still buys only what the day needs and leaves room for the sun, so a bright day is charged no higher than before. On a dull day the extra sells in the 4pm to 7pm peak or saves buying at the day rate.

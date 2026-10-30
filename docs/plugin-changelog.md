@@ -21,6 +21,12 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.140.2 - 30 October 2026
+
+`happy_hour_booking` 1.3: `number_words(0)` is "no", which is right before a noun and wrong alone, so
+spending the last tokens read "leaving no, not enough for another hour". It now says "leaving none".
+Seen in the live push of 30-Oct-2026 at 19:03. Pinned by a new test.
+
 ## v5.140.1 - 30 October 2026
 
 `flux_strategy` 2.14: `NIGHTLY_CHARGE_PCT` 95 to 100 (CliveS, 30-Oct-2026; 5.134.0 set 95). The

@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.140.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.140.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.140.2 (30 October 2026)** - The message for a Happy Hour booking that spends your last tokens now reads properly. It used to end "leaving no, not enough for another hour", and now ends "leaving none".
 
 **5.140.1 (30 October 2026)** - An ordinary night's charge can now reach 100%, not 95%, when the day ahead needs it. It still buys only what the day needs and leaves room for the sun, so a bright day is charged no higher than before. On a dull day the extra sells in the 4pm to 7pm peak or saves buying at the day rate.
 
@@ -158,6 +160,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.140.2 | 30 October 2026 | The Happy Hour booking message reads properly when it spends the last tokens. |
 | 5.140.1 | 30 October 2026 | An ordinary night's charge can reach 100% when the day ahead needs it. |
 | 5.140.0 | 30 October 2026 | Corrected solar figures blend three weather models, and tomorrow's forecast is now scored. |
 | 5.139.2 | 28 October 2026 | A Flux hand-back reads each setting back once, so a peak-time restart finishes in time. |

@@ -286,6 +286,13 @@ class TestTheMessagesReadAsEnglish(unittest.TestCase):
         self.assertIn("One free hour is booked", body)
         self.assertIn("leaving one, not enough for another hour.", body)
 
+    def test_spending_the_last_tokens_reads_as_a_sentence(self):
+        p = _plan(pv_kwh=8.0, tokens=2)
+        title, body = hb.booked_message(p, LONDON, self.TODAY, SCHEME_END)
+        self._check(title, body)
+        self.assertIn("spends two of your two tokens, leaving none.", body)
+        self.assertNotIn("leaving no,", body)
+
     def test_a_second_hour_added_later_counts_the_whole_day(self):
         """The span covers both hours, so the sentence must too. The first draft
         read 'One free hour is booked for Sunday, from 1pm to 3pm'."""
