@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.140.0 - 30 October 2026
+
+A cloudier or brighter day than forecast now catches the plugin out less often. The corrected solar figures now blend three weather models, the Met Office and two from ECMWF, each one scaled by how far out it has been at your house. Tested on 158 past days, the average miss fell from 5.4 kWh a day to 4.2. If the extra models cannot be read, the plugin goes back to the old correction by itself. The plugin also now scores tomorrow's forecast against the day itself, and logs how it did each midnight.
+
 ## 5.139.2 - 28 October 2026
 
 A restart between 4pm and 7pm now finishes handing the inverter back before Indigo's time limit. Every setting the plugin writes during a Flux hand-back was being read back twice; it is now read back once, which takes the hand-back from about 23 seconds to about 17, inside the roughly 22 seconds Indigo allows. Each Flux change of mode during the day is about five seconds quicker as a result.

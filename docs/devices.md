@@ -66,9 +66,9 @@ The solar forecast for your roof, fetched every 30 minutes. The device list show
 
 | Shown as | What it means |
 |---|---|
-| **Today P50 (kWh)** and **Tomorrow P50 (kWh)** | The forecast for today and tomorrow, as it comes from the weather model. |
-| **Today Corrected (kWh)** and **Tomorrow Corrected (kWh)** | The same forecasts corrected by how far out they have been at your house. The plugin plans from these. |
-| **Bias Correction Factor** | The correction it applied — below 1 means the forecast has been running high. |
+| **Today P50 (kWh)** and **Tomorrow P50 (kWh)** | The forecast for today and tomorrow, as it comes from the Met Office weather model. |
+| **Today Corrected (kWh)** and **Tomorrow Corrected (kWh)** | The Met Office and two ECMWF models blended, each scaled by how far out it has been at your house. The plugin plans from these. If the extra models cannot be read, these fall back to the Met Office figure with the correction below. |
+| **Bias Correction Factor** | The overall correction for the Met Office figure on its own — below 1 means it has been running high. The blend does not use it. |
 | **Remaining Today (kWh)** | The solar still to come today. |
 | **Current Hour (W avg)** and **Next Hour (W avg)** | The forecast for this hour and the next. |
 | **Forecast Status** | Whether the last fetch worked. |

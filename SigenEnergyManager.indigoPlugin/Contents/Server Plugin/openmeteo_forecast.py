@@ -6,9 +6,16 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Opus 4.8; v1.9, v1.10 Claude Opus 5.5
-# Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026
-# Version:     1.10 (review 02-10-2026: a failed fetch falls back to the in-memory
+# Author:      CliveS & Claude Opus 4.8; v1.9, v1.10, v1.11 Claude Opus 5.5
+# Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026; v1.11 30-10-2026
+# Version:     1.11 (the corrected figures come from a blend of three weather models,
+#              each scaled on its own record: see forecast_blend.py for why. The raw
+#              figures, the bias bands and openmeteo_accuracy_records.json carry on
+#              exactly as they were, and are what runs whenever the blend cannot.
+#              raw x biasFactorToday still equals the corrected figure, hour by hour,
+#              so nothing that reads the forecast had to change. The forecast for
+#              tomorrow as it stood that evening is now scored against the day.)
+#              prior 1.10 (review 02-10-2026: a failed fetch falls back to the in-memory
 #              forecast only inside STALE_FALLBACK_TTL and only if it is for today,
 #              else the "No data" empty forecast — an 85-hour-old forecast was being
 #              served as "OK"; a cache from yesterday is no longer served after
@@ -99,6 +106,9 @@ except ImportError:
 # zoneinfo spells that `fold=1` rather than a keyword — swapping the constant
 # without that mapping would have broken the once-a-year path. The mapping now
 # lives in `london_localise(prefer_dst=)` and is pinned by tests.
+from forecast_blend import (
+    blend_day, calibration_factors, complete_day_totals, day_ahead_summary, merge_records,
+)
 from london_time import london_localise, london_now
 
 
@@ -143,6 +153,7 @@ PERFORMANCE_RATIO = 0.90
 
 # Open-Meteo API
 OPENMETEO_URL   = "https://api.open-meteo.com/v1/forecast"
+PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 # Today plus five. The Weekend Happy Hour booking check decides on a Thursday
 # (when Octopus open the slots) about the Sunday three days on, and re-checks
 # every hour until the slot; six days lets a slot released as early as Tuesday
@@ -161,6 +172,13 @@ BASELINE_DAYS_KEPT = 4
 CACHE_TTL       = 1800  # 30 minutes — well within 10,000 call/day free tier
 RETRY_ATTEMPTS  = 2     # total attempts per array call (1 initial + 1 retry)
 RETRY_BACKOFF_S = 2     # seconds between attempts on transient network errors
+
+# The model blend (v1.11).
+BLEND_MIN_RAW_KWH    = 0.5        # below this a scale between raw and blend means nothing
+MODEL_FALLBACK_TTL   = 6 * 3600   # a failed model fetch may reuse a cache this old
+SEED_DAYS            = 60         # days of archived forecasts fetched to start a scale
+SEED_RETRY_S         = 3600       # a failed seed is tried again after this
+DAY_AHEAD_HOUR       = 18         # the first fetch from this hour is tomorrow's graded figure
 
 # Dawn detection: first hourly slot whose output exceeds this threshold (Wh).
 # 500 Wh/h ~ 500 W average sustained; below this = pre-dawn / post-dusk.
@@ -204,6 +222,10 @@ class OpenMeteoForecast:
     limit. Bias correction is retained so the system self-calibrates if PR or shade
     factors need fine-tuning (factor will converge to 1.0 if the model is accurate).
 
+    v1.11: with blend_models set, the corrected figures come from a blend of
+    calibrated models instead, and the bias bands are the fall-back. See
+    forecast_blend.py.
+
     Public interface is identical to SolcastForecast so plugin.py needs only a
     constructor swap (no API key / site ID params).
 
@@ -212,7 +234,7 @@ class OpenMeteoForecast:
     """
 
     def __init__(self, data_dir, logger=None, latitude=None, longitude=None, arrays=None,
-                 optimiser_file=None):
+                 optimiser_file=None, blend_models=()):
         """Initialise the Open-Meteo forecast client.
 
         Args:
@@ -232,6 +254,10 @@ class OpenMeteoForecast:
                        None = OPTIMISER_FORECAST_FILE (the live Python Scripts
                        folder). Tests MUST pass a temp path — v1.8, after the
                        suite clobbered the live file with zero slots.
+            blend_models: Open-Meteo model names to calibrate and blend (v1.11).
+                       Empty = the bias bands alone. The plugin passes BLEND_MODELS;
+                       the default stays empty so a test that mocks _fetch_array
+                       cannot reach the network through the extra fetch.
         """
         self.optimiser_file = optimiser_file or OPTIMISER_FORECAST_FILE
         if latitude is None or longitude is None:
@@ -261,6 +287,13 @@ class OpenMeteoForecast:
         self._morning_baselines = {}   # {"YYYY-MM-DD": forecast kWh}
         self._correction_factor    = 1.0  # overall kWh-weighted scalar (display only)
         self._correction_bands     = [(c, 1.0) for c in BIAS_BAND_CENTRES_KWH]
+
+        # Model blend state (v1.11)
+        self.blend_models    = tuple(blend_models or ())
+        self._model_records  = self._load_json_list(self._model_records_path())
+        self._day_ahead      = self._load_day_ahead()   # {"YYYY-MM-DD": captured figures}
+        self._seed_tried_at  = 0.0
+        self._blend_was_on   = None
 
         # Pre-warm in-memory cache from disk so restarts don't lose data
         self._load_combined_cache()
@@ -358,6 +391,7 @@ class OpenMeteoForecast:
         self._save_cache(combined)
         self._cached_forecast = combined
         self._cached_time     = now
+        self._capture_day_ahead(combined)
 
         # First complete fetch of each LOCAL day = that day's "morning" baseline
         # for bias calibration (paired with the day's actual PV at the following
@@ -473,6 +507,8 @@ class OpenMeteoForecast:
         """
         if date_str is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
+
+        self._record_model_day(actual_pv_kwh, date_str)
 
         # The baseline must belong to the day being recorded — none for that date
         # means the day's capture was missed (restart before the first fetch, etc.)
@@ -696,6 +732,9 @@ class OpenMeteoForecast:
                 f"[OpenMeteo] Only {arrays_ok}/{len(self.arrays)} arrays fetched"
             )
 
+        # Which days the blend covers is settled after the raw buckets exist.
+        arrays_complete = (arrays_ok == len(self.arrays))
+
         # Apply inverter cap and split into today / tomorrow buckets
         hourly_today    = {}
         hourly_tomorrow = {}
@@ -748,6 +787,18 @@ class OpenMeteoForecast:
                         continue          # a naive dawn compares wrongly later
                     dawn_times[date_str] = dt_aware
 
+        # v1.11: the blend rewrites the buckets so raw x factor gives its hourly
+        # shape, while their sum stays the raw total. Only a complete raw fetch is
+        # blended: a partial one must keep reading as degraded.
+        blend = None
+        if arrays_complete:
+            blend = self._build_blend(today.strftime("%Y-%m-%d"),
+                                      tomorrow.strftime("%Y-%m-%d"))
+        blend_today    = self._apply_blend(hourly_today, today_total,
+                                           (blend or {}).get("today"))
+        blend_tomorrow = self._apply_blend(hourly_tomorrow, tomorrow_total,
+                                           (blend or {}).get("tomorrow"))
+
         # Remaining today: bias-corrected, with the current hour pro-rated.
         # _enrich_forecast recomputes this against the current clock on every
         # serve path, but both call sites go through the one helper — keeping a
@@ -757,7 +808,7 @@ class OpenMeteoForecast:
                                            microsecond=0, tzinfo=None)
         remaining_today_kwh = self._remaining_today_kwh(
             hourly_today,
-            self._apply_band_correction(today_total),
+            blend_today or self._apply_band_correction(today_total),
             now=now_local,
         )
 
@@ -783,7 +834,279 @@ class OpenMeteoForecast:
             "_hourly_p50_ahead":    hourly_ahead,
             "aheadDayKwh":          {d: round(v, 1) for d, v in sorted(ahead_totals.items())},
             "_dawn_times":          dawn_times,
+            "blendFactorToday":     blend_today,
+            "blendFactorTomorrow":  blend_tomorrow,
+            "blendModels":          (blend or {}).get("models", []),
+            "modelDayKwh":          (blend or {}).get("model_day_kwh", {}),
         }
+
+    # ================================================================
+    # Model blend (v1.11) - the sums are in forecast_blend.py
+    # ================================================================
+
+    def _build_blend(self, today_str, tomorrow_str):
+        """Fetch the blend's models and combine them for today and tomorrow.
+
+        Returns {"today", "tomorrow", "models", "model_day_kwh"}, or None when the
+        blend cannot run, in which case the bias bands stand in as they always have.
+        """
+        if not self.blend_models:
+            return None
+        try:
+            hourly = self._fetch_model_hourly()
+            if hourly is None:
+                self._note_blend(False, "a model fetch failed")
+                return None
+            factors = calibration_factors(self._model_records, self.blend_models)
+            if len(factors) < len(self.blend_models):
+                self._seed_model_records()
+                factors = calibration_factors(self._model_records, self.blend_models)
+            today    = blend_day(hourly, today_str, factors)
+            tomorrow = blend_day(hourly, tomorrow_str, factors)
+            if not today and not tomorrow:
+                self._note_blend(False, f"only {len(factors)} model(s) calibrated")
+            else:
+                self._note_blend(True, ", ".join(
+                    f"{m} x{f:.3f}" for m, f in sorted(factors.items())))
+            return {
+                "today":         today,
+                "tomorrow":      tomorrow,
+                "models":        sorted(factors),
+                "model_day_kwh": {
+                    day: {m: round(k, 2)
+                          for m, k in complete_day_totals(hourly, day).items()}
+                    for day in (today_str, tomorrow_str)
+                },
+            }
+        except Exception as e:                              # noqa: BLE001
+            # The blend is an improvement, never a dependency.
+            self.logger.warning(f"[OpenMeteo] Blend skipped: {e}")
+            return None
+
+    def _note_blend(self, is_on, detail):
+        """Log a change of source once, not on every refresh."""
+        if is_on == self._blend_was_on:
+            return
+        self._blend_was_on = is_on
+        if is_on:
+            self.logger.info(f"[OpenMeteo] Forecast blend in use: {detail}")
+        else:
+            self.logger.warning(
+                f"[OpenMeteo] Forecast blend not in use ({detail}) - using the bias bands")
+
+    @staticmethod
+    def _apply_blend(bucket, raw_total, day):
+        """Rewrite a raw bucket to the blend's shape and return the day's factor.
+
+        After this, bucket x factor is the blended hour and the bucket's sum is
+        still raw_total, which keeps the rule in the repo notes: raw figures and
+        corrected ones are related by biasFactorToday and by nothing else.
+        None means the bucket was left alone.
+        """
+        if not day or raw_total < BLEND_MIN_RAW_KWH or day["total"] <= 0:
+            return None
+        factor = day["total"] / raw_total
+        for key, kwh in day["hourly"].items():
+            if key in bucket:
+                bucket[key] = int(round(kwh / factor * 1000))
+        return factor
+
+    @staticmethod
+    def _local_key(time_str):
+        """API time "YYYY-MM-DDTHH:MM" as the buckets' "YYYY-MM-DD HH:MM:SS"."""
+        return f"{str(time_str).replace('T', ' ')}:00"
+
+    def _add_model_rows(self, totals, array_cfg, times, values):
+        """Add one array's GTI series to a {local key: kWh or None} dict, capped."""
+        scale = array_cfg["kwp"] * PERFORMANCE_RATIO * array_cfg["shade"]
+        for time_str, gti in zip(times, values):
+            key = self._local_key(time_str)
+            if gti is None or (key in totals and totals[key] is None):
+                totals[key] = None
+                continue
+            kwh = min(max(float(gti), 0.0), GTI_MAX_WM2) / 1000.0 * scale
+            totals[key] = min(totals.get(key, 0.0) + kwh, INVERTER_CAP_KW)
+
+    def _fetch_model_hourly(self):
+        """{model: {local key: kWh or None}} across all arrays, or None on failure."""
+        hourly = {m: {} for m in self.blend_models}
+        for array_cfg in self.arrays:
+            data = self._fetch_model_array(array_cfg)
+            if data is None:
+                return None
+            for model in self.blend_models:
+                self._add_model_rows(hourly[model], array_cfg,
+                                     data.get("time", []), data.get(model, []))
+        return hourly
+
+    def _fetch_model_array(self, array_cfg):
+        """Fetch every blend model's GTI for one array in a single call.
+
+        Returns {"time": [...], model: [W/m2 or None, ...]}. None marks a gap and
+        is kept: the Met Office series stops after about two and a half days.
+        """
+        path     = os.path.join(self.data_dir, f"openmeteo_models_{array_cfg['name']}.json")
+        fallback = None
+        cached   = self._load_json_dict(path)
+        if cached:
+            age   = time.time() - float(cached.get("cached_time", 0))
+            data  = cached.get("data") or {}
+            times = data.get("time") or []
+            today = self._now_local().strftime("%Y-%m-%d")
+            if times and str(times[0])[:10] >= today:
+                if age < CACHE_TTL:
+                    return data
+                if age < MODEL_FALLBACK_TTL:
+                    fallback = data
+        if self._network_down_this_cycle:
+            return fallback
+
+        params = {
+            "latitude":      self.latitude,
+            "longitude":     self.longitude,
+            "hourly":        "global_tilted_irradiance",
+            "tilt":          array_cfg["tilt"],
+            "azimuth":       array_cfg["azimuth"],
+            "timezone":      "Europe/London",
+            "forecast_days": FORECAST_DAYS,
+            "timeformat":    "iso8601",
+            "models":        ",".join(self.blend_models),
+        }
+        try:
+            response = requests.get(OPENMETEO_URL, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                self.logger.warning(
+                    f"[OpenMeteo] {array_cfg['name']} models: HTTP {response.status_code}")
+                return fallback
+            hourly = response.json().get("hourly", {})
+        except Exception as e:                              # noqa: BLE001
+            self.logger.warning(f"[OpenMeteo] {array_cfg['name']} models: {e}")
+            return fallback
+
+        data = {"time": hourly.get("time", [])}
+        for model in self.blend_models:
+            series = hourly.get(f"global_tilted_irradiance_{model}", [])
+            if len(series) != len(data["time"]):
+                self.logger.warning(
+                    f"[OpenMeteo] {array_cfg['name']}: {model} missing from the reply")
+                return fallback
+            data[model] = series
+        if not data["time"]:
+            return fallback
+        try:
+            self._atomic_write_json(path, {"cached_time": time.time(), "data": data})
+        except Exception as e:                              # noqa: BLE001
+            self.logger.debug(f"[OpenMeteo] Cannot write model cache: {e}")
+        return data
+
+    def _seed_model_records(self):
+        """Start each model's scale from Open-Meteo's archive of past forecasts.
+
+        Without this ECMWF would sit out for MIN_CAL_DAYS after install. Actual
+        generation comes from the accuracy records, so only days already graded
+        are seeded. A live record always outranks a seeded one.
+        """
+        if time.time() - self._seed_tried_at < SEED_RETRY_S:
+            return
+        self._seed_tried_at = time.time()
+        actuals = {r.get("date"): r.get("actual_kwh")
+                   for r in self._load_accuracy_records()[-SEED_DAYS:]
+                   if float(r.get("actual_kwh") or 0.0) > 0.0}
+        if not actuals:
+            return
+        hourly = {m: {} for m in self.blend_models}
+        for array_cfg in self.arrays:
+            data = self._fetch_model_history(array_cfg, min(actuals), max(actuals))
+            if data is None:
+                self.logger.warning("[OpenMeteo] Blend seed failed - retrying in an hour")
+                return
+            for model in self.blend_models:
+                self._add_model_rows(hourly[model], array_cfg,
+                                     data.get("time", []), data.get(model, []))
+        rows = []
+        for day in sorted(actuals):
+            models = complete_day_totals(hourly, day)
+            if models:
+                rows.append({"date": day, "actual_kwh": actuals[day], "source": "seed",
+                             "models": {m: round(k, 2) for m, k in models.items()}})
+        self._model_records = merge_records(self._model_records, rows)
+        self._save_model_records()
+        self.logger.info(f"[OpenMeteo] Blend seeded from {len(rows)} archived days")
+
+    def _fetch_model_history(self, array_cfg, start, end):
+        """Day-ahead forecasts as issued, for one array between two dates."""
+        variable = "global_tilted_irradiance_previous_day1"
+        params = {
+            "latitude":   self.latitude,
+            "longitude":  self.longitude,
+            "hourly":     variable,
+            "tilt":       array_cfg["tilt"],
+            "azimuth":    array_cfg["azimuth"],
+            "timezone":   "Europe/London",
+            "start_date": start,
+            "end_date":   end,
+            "models":     ",".join(self.blend_models),
+        }
+        try:
+            response = requests.get(PREVIOUS_RUNS_URL, params=params, timeout=30)
+            if response.status_code != 200:
+                self.logger.warning(
+                    f"[OpenMeteo] Blend seed: HTTP {response.status_code}")
+                return None
+            hourly = response.json().get("hourly", {})
+        except Exception as e:                              # noqa: BLE001
+            self.logger.warning(f"[OpenMeteo] Blend seed: {e}")
+            return None
+        data = {"time": hourly.get("time", [])}
+        for model in self.blend_models:
+            data[model] = hourly.get(f"{variable}_{model}", [])
+        return data
+
+    def _capture_day_ahead(self, combined):
+        """Keep tomorrow's figures as they stand this evening, to grade at midnight.
+
+        The first fetch from DAY_AHEAD_HOUR is the forecast the evening's decisions
+        see. Until now only today's figure was ever graded, so nothing measured the
+        number that plans tomorrow.
+        """
+        if not self.blend_models:
+            return
+        now = self._now_local()
+        tomorrow = (now.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+        if now.hour < DAY_AHEAD_HOUR or tomorrow in self._day_ahead:
+            return
+        raw = float(combined.get("tomorrowKwh", 0.0) or 0.0)
+        factor = self._day_factor(combined, "blendFactorTomorrow", raw)
+        self._day_ahead[tomorrow] = {
+            "headline_kwh": round(raw * factor, 2),
+            "models":       (combined.get("modelDayKwh") or {}).get(tomorrow, {}),
+        }
+        for old in sorted(self._day_ahead)[:-BASELINE_DAYS_KEPT]:
+            del self._day_ahead[old]
+        self._save_day_ahead()
+
+    def _record_model_day(self, actual_pv_kwh, date_str):
+        """Grade the evening-before figures for a finished day."""
+        held = self._day_ahead.pop(date_str, None)
+        if held is None or float(actual_pv_kwh or 0.0) <= 0.0:
+            return
+        self._save_day_ahead()
+        self._model_records = merge_records(self._model_records, [{
+            "date":         date_str,
+            "actual_kwh":   round(float(actual_pv_kwh), 2),
+            "headline_kwh": held.get("headline_kwh"),
+            "models":       held.get("models") or {},
+            "source":       "live",
+        }])
+        self._save_model_records()
+        self.logger.info(
+            f"[OpenMeteo] Day-ahead: forecast={float(held.get('headline_kwh') or 0):.1f} kWh, "
+            f"actual={float(actual_pv_kwh):.1f} kWh"
+        )
+
+    def get_day_ahead_summary(self, window_days=7):
+        """Accuracy of the evening-before figure for tomorrow."""
+        return day_ahead_summary(self._model_records, window_days)
 
     def _fetch_array(self, array_cfg):
         """Fetch hourly GTI for one array from the Open-Meteo API.
@@ -979,8 +1302,8 @@ class OpenMeteoForecast:
         raw_today    = combined.get("todayKwh", 0.0)
         raw_tomorrow = combined.get("tomorrowKwh", 0.0)
 
-        factor_today    = self._apply_band_correction(raw_today)
-        factor_tomorrow = self._apply_band_correction(raw_tomorrow)
+        factor_today    = self._day_factor(combined, "blendFactorToday", raw_today)
+        factor_tomorrow = self._day_factor(combined, "blendFactorTomorrow", raw_tomorrow)
 
         enriched["biasFactor"]           = round(self._correction_factor, 3)
         enriched["biasFactorToday"]      = round(factor_today, 3)
@@ -1014,6 +1337,10 @@ class OpenMeteoForecast:
             enriched["currentHourWatts"]  = hourly_today.get(cur_key, 0)
             enriched["nextHourWatts"]     = hourly_today.get(nxt_key, 0)
         return enriched
+
+    def _day_factor(self, combined, blend_key, raw_kwh):
+        """The day's multiplier: the blend's where it ran, else the bias bands."""
+        return combined.get(blend_key) or self._apply_band_correction(raw_kwh)
 
     def _empty_forecast(self, reason=""):
         """Return a zeroed forecast dict when no data is available."""
@@ -1233,8 +1560,8 @@ class OpenMeteoForecast:
                     else:
                         raw_tomorrow_kwh += kwh
 
-            factor_today    = self._apply_band_correction(raw_today_kwh)
-            factor_tomorrow = self._apply_band_correction(raw_tomorrow_kwh)
+            factor_today    = self._day_factor(combined, "blendFactorToday", raw_today_kwh)
+            factor_tomorrow = self._day_factor(combined, "blendFactorTomorrow", raw_tomorrow_kwh)
 
             hourly_out = {}
             for utc_key, kwh in today_slots:
@@ -1336,6 +1663,49 @@ class OpenMeteoForecast:
 
     def _accuracy_path(self):
         return os.path.join(self.data_dir, "openmeteo_accuracy_records.json")
+
+    def _model_records_path(self):
+        return os.path.join(self.data_dir, "openmeteo_model_records.json")
+
+    def _day_ahead_path(self):
+        return os.path.join(self.data_dir, "openmeteo_day_ahead.json")
+
+    def _load_json_dict(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except FileNotFoundError:
+            return None
+        except Exception as e:                              # noqa: BLE001
+            self.logger.debug(f"[OpenMeteo] Cannot read {path}: {e}")
+            return None
+
+    def _load_json_list(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except FileNotFoundError:
+            return []
+        except Exception as e:                              # noqa: BLE001
+            self.logger.debug(f"[OpenMeteo] Cannot read {path}: {e}")
+            return []
+
+    def _load_day_ahead(self):
+        return self._load_json_dict(self._day_ahead_path()) or {}
+
+    def _save_day_ahead(self):
+        try:
+            self._atomic_write_json(self._day_ahead_path(), self._day_ahead)
+        except Exception as e:                              # noqa: BLE001
+            self.logger.debug(f"[OpenMeteo] Cannot write day-ahead figures: {e}")
+
+    def _save_model_records(self):
+        try:
+            self._atomic_write_json(self._model_records_path(), self._model_records)
+        except Exception as e:                              # noqa: BLE001
+            self.logger.warning(f"[OpenMeteo] Cannot write model records: {e}")
 
     def _load_array_cache(self, array_name):
         path = self._array_cache_path(array_name)

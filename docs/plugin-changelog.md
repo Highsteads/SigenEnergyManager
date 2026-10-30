@@ -21,6 +21,30 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.140.0 - 30 October 2026
+
+New `forecast_blend.py` (pure sums) and `openmeteo_forecast` 1.11. The plugin sent no `models=`
+to Open-Meteo, so it got `best_match`, which at this site returned exactly `ukmo_seamless`.
+Backtest over 158 days (24 Apr to 29 Oct), day-ahead from the Previous Runs API, each model
+scaled only from earlier days: plugin as it ran 5.41 kWh a day average error, AIFS alone 4.42,
+AIFS + IFS + UKMO 4.17 (gain 1.24, bootstrap 95% range 0.56 to 1.94). Raw ECMWF reads 7 to 8 kWh
+a day high, so no model enters until it has `MIN_CAL_DAYS` of record.
+
+- `corrected*Kwh` come from the blend: each model x its rolling 45-day actual/forecast ratio,
+  clamped 0.5 to 1.5, averaged hour by hour. Fewer than two usable models on a day = bias bands.
+- `todayKwh`, `tomorrowKwh`, the bias bands and `openmeteo_accuracy_records.json` are untouched
+  and stay on the raw `best_match` series, so the fall-back stays calibrated.
+- The rule raw x `biasFactorToday` = corrected still holds hour by hour: `_apply_blend` rewrites
+  the buckets to the blend's shape, summing to the raw total, and `biasFactorToday` becomes
+  blend total / raw total. Nothing reading the forecast changed. `aheadDayKwh` stays raw.
+- `openmeteo_model_records.json` holds each model's day-ahead figure and the actual, seeded from
+  Previous Runs for 60 graded days; a live record outranks a seeded one.
+- First fetch from 18:00 captures tomorrow's headline and model figures
+  (`openmeteo_day_ahead.json`), graded in `record_accuracy`, logged at midnight by
+  `get_day_ahead_summary`. Before this only today's figure was ever graded.
+- `CHARGE_PV_FACTOR` and `RESALE_PV_OPTIMISM` are unchanged: actual/forecast p90 is 1.19 against
+  1.20 today, p10 0.79 against 0.73, median 0.99 against 0.95. Not measured: a winter.
+
 ## v5.139.2 - 28 October 2026
 
 **One verifier, not two, on every Flux write.** `_FluxRawDriver` already said the executor is the only verifier, but only `set_charge_limit` (quiet=True) skipped the driver's read-back. The mode, Remote EMS enable, charge cutoff, backup reserve and discharge limit were each written, read back by `_write_single_register`/`_write_uint32_registers`, and read again by the executor (`_neutralise`, `_set_read`). A release was 22 Modbus transactions at the 1 s spacing, measured 23.2 s live, against Indigo's ~22 s stop budget.

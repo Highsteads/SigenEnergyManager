@@ -77,9 +77,10 @@
 #              Claude Haiku 5.5 (5.139.0 — Happy Hour scheme extended to 14 February 2027, token system)
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
+#              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        28-10-2026 13:40 GMT
-# Version:     5.139.2
+# Date:        30-10-2026 16:30 GMT
+# Version:     5.140.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -266,6 +267,7 @@ import day_shape as _day_shape
 from daily_energy import (DailyEnergy, readings_from_data, recovery_from_data,
                           local_midnight_epoch, KEYS as ENERGY_KEYS)
 from openmeteo_forecast import OpenMeteoForecast
+from forecast_blend import BLEND_MODELS
 from octopus_api      import (OctopusAPI, TARIFF_TRACKER, TARIFF_FLEXIBLE, TARIFF_AGILE,
                               TARIFF_FLUX, TARIFF_GO, TARIFF_IGO, TARIFF_IFLUX,
                               TARIFF_UNKNOWN, GAS_KWH_PER_M3)
@@ -11736,6 +11738,13 @@ class Plugin(indigo.PluginBase):
                     f"mean factor {summary['mean_factor']:.2f}  "
                     f"(over: {summary['over_count']}, under: {summary['under_count']})"
                 )
+            ahead = self.forecast.get_day_ahead_summary(window_days=7) if self.forecast else {"days": 0}
+            if ahead["days"] > 0:
+                log(
+                    f"[Forecast] Tomorrow's figure, last {ahead['days']} days: "
+                    f"{ahead['mean_error_kwh']:.1f} kWh out on average "
+                    f"against {ahead['mean_actual_kwh']:.1f} kWh made"
+                )
         except Exception as exc:
             self.logger.debug(f"Accuracy summary skipped: {exc}")
 
@@ -16954,6 +16963,7 @@ class Plugin(indigo.PluginBase):
                 latitude=site_lat,
                 longitude=site_lon,
                 arrays=arrays_override,
+                blend_models=BLEND_MODELS,
             )
             # The bias correction belongs to the object, so it is loaded wherever
             # the object is built (review 02-10-2026). Only startup() loaded it, so
