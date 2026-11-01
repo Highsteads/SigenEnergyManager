@@ -6,9 +6,14 @@
 #              Free tier: 10,000 calls/day. 4 arrays x ~48 calls/day = well within limit.
 #              Exposes the same public interface as SolcastForecast so plugin.py
 #              needs only a simple constructor swap.
-# Author:      CliveS & Claude Opus 4.8; v1.9, v1.10, v1.11 Claude Opus 5.5
-# Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026; v1.11 30-10-2026
-# Version:     1.11 (the corrected figures come from a blend of three weather models,
+# Author:      CliveS & Claude Opus 4.8; v1.9, v1.10, v1.11, v1.12 Claude Opus 5.5
+# Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026; v1.11 30-10-2026;
+#              v1.12 01-11-2026
+# Version:     1.12 (01-11-2026: a forecast assembled from cached arrays carries the
+#              age of its OLDEST array, not the time of the attempt, so a day-long
+#              outage can no longer pass the planner's 3-hour freshness check; when
+#              every array came from the failure fallback the status says so.)
+# Previous:    1.11 (the corrected figures come from a blend of three weather models,
 #              each scaled on its own record: see forecast_blend.py for why. The raw
 #              figures, the bias bands and openmeteo_accuracy_records.json carry on
 #              exactly as they were, and are what runs whenever the blend cannot.
@@ -387,10 +392,23 @@ class OpenMeteoForecast:
 
         combined["forecastStatus"] = "OK"
         combined["lastUpdate"]     = datetime.now().strftime("%H:%M:%S")
+        # v1.12: stamp the forecast with the age of its OLDEST array. Every array
+        # failing to download used to come back from the disk fallback (up to
+        # STALE_FALLBACK_TTL old) stamped 'OK' and `now`, which plugin.py copies
+        # into forecast_ok_at, so the Flux planner's 3-hour freshness limit never
+        # tripped during an outage.
+        data_at = getattr(self, "_cycle_data_at", None)
+        data_at = min(now, data_at) if data_at else now
+        if (getattr(self, "_cycle_fallback_count", 0) >= arrays_total
+                and arrays_total > 0):
+            combined["forecastStatus"] = "OK (cached - downloads failing)"
+            self.logger.warning(
+                f"[OpenMeteo] Every array download failed — serving the cached "
+                f"forecast from {(now - data_at) / 3600.0:.1f}h ago, dated as such")
 
-        self._save_cache(combined)
+        self._save_cache(combined, cached_time=data_at)
         self._cached_forecast = combined
-        self._cached_time     = now
+        self._cached_time     = data_at
         self._capture_day_ahead(combined)
 
         # First complete fetch of each LOCAL day = that day's "morning" baseline
@@ -702,8 +720,14 @@ class OpenMeteoForecast:
         # key format: "YYYY-MM-DD HH:00:00"
         hourly_raw = {}
         arrays_ok  = 0
+        # v1.12: the generation time of the OLDEST array used, and how many came
+        # from the failure fallback rather than a download or the fresh cache.
+        self._cycle_data_at        = None
+        self._cycle_fallback_count = 0
 
         for array_cfg in self.arrays:
+            self._last_array_data_at  = None
+            self._last_array_fallback = False
             gti_data = self._fetch_array(array_cfg)
             if gti_data is None:
                 self.logger.warning(
@@ -712,6 +736,12 @@ class OpenMeteoForecast:
                 continue
 
             arrays_ok += 1
+            data_at = getattr(self, "_last_array_data_at", None)
+            if data_at:
+                self._cycle_data_at = (data_at if self._cycle_data_at is None
+                                       else min(self._cycle_data_at, data_at))
+            if getattr(self, "_last_array_fallback", False):
+                self._cycle_fallback_count += 1
             factor = array_cfg["kwp"] * PERFORMANCE_RATIO * array_cfg["shade"]
 
             for time_str, gti_wm2 in gti_data:
@@ -1121,6 +1151,9 @@ class OpenMeteoForecast:
         """
         # Disk cache check
         fallback_data = None   # served on fetch failure if fresh enough (see below)
+        fallback_at   = None   # v1.12: when that fallback was fetched
+        self._last_array_data_at  = None    # v1.12: when the data returned was fetched
+        self._last_array_fallback = False   # v1.12: True when it is the failure fallback
         cached = self._load_array_cache(array_cfg["name"])
         if cached:
             age  = time.time() - cached.get("cached_time", 0)
@@ -1141,6 +1174,7 @@ class OpenMeteoForecast:
                 self.logger.debug(
                     f"[OpenMeteo] {array_cfg['name']}: disk cache (age {age:.0f}s)"
                 )
+                self._last_array_data_at = float(cached.get("cached_time", 0) or 0)
                 return data
             # Pre-compute what a fetch-failure fallback may serve: the same
             # fresh-day guard plus a 24h age ceiling. Previously every failure
@@ -1148,6 +1182,7 @@ class OpenMeteoForecast:
             # fabricated tomorrowKwh=0.0 stamped 'OK' (v5.43 fix).
             if age < STALE_FALLBACK_TTL and fresh_day:
                 fallback_data = data
+                fallback_at   = float(cached.get("cached_time", 0) or 0)
 
         # A blackholed network fails each array serially (attempts x timeout);
         # once one array exhausts its attempts on network errors, skip the live
@@ -1156,7 +1191,7 @@ class OpenMeteoForecast:
             self.logger.debug(
                 f"[OpenMeteo] {array_cfg['name']}: network down this cycle — "
                 f"skipping live fetch")
-            return fallback_data
+            return self._served_fallback(fallback_data, fallback_at)
 
         params = {
             "latitude":   self.latitude,
@@ -1209,7 +1244,7 @@ class OpenMeteoForecast:
 
         if response is None:
             # All attempts failed — fall back to cache if we have one
-            return fallback_data
+            return self._served_fallback(fallback_data, fallback_at)
 
         try:
             if response.status_code != 200:
@@ -1228,7 +1263,7 @@ class OpenMeteoForecast:
                         f"[OpenMeteo] HTTP {response.status_code} for "
                         f"{array_cfg['name']}: {response.text[:200]}"
                     )
-                return fallback_data
+                return self._served_fallback(fallback_data, fallback_at)
 
             try:
                 data = response.json()
@@ -1236,7 +1271,7 @@ class OpenMeteoForecast:
                 self.logger.error(
                     f"[OpenMeteo] Malformed JSON for {array_cfg['name']}: {e}"
                 )
-                return fallback_data
+                return self._served_fallback(fallback_data, fallback_at)
             hourly = data.get("hourly", {})
             times  = hourly.get("time", [])
             gti    = hourly.get("global_tilted_irradiance", [])
@@ -1246,7 +1281,7 @@ class OpenMeteoForecast:
                     f"[OpenMeteo] Unexpected response for {array_cfg['name']}: "
                     f"{len(times)} times, {len(gti)} GTI values"
                 )
-                return fallback_data
+                return self._served_fallback(fallback_data, fallback_at)
 
             result  = []
             clamped = 0
@@ -1270,17 +1305,25 @@ class OpenMeteoForecast:
             self.logger.debug(
                 f"[OpenMeteo] {array_cfg['name']}: fetched {len(result)} hours"
             )
+            self._last_array_data_at = time.time()
             return result
 
         except Exception as e:
             self.logger.error(
                 f"[OpenMeteo] Error parsing response for {array_cfg['name']}: {e}"
             )
-            return fallback_data
+            return self._served_fallback(fallback_data, fallback_at)
 
     # ================================================================
     # Enrichment & Empty Result
     # ================================================================
+
+    def _served_fallback(self, fallback_data, fallback_at):
+        """Return the failure fallback, recording that it is one and how old (v1.12)."""
+        if fallback_data is not None:
+            self._last_array_data_at  = fallback_at
+            self._last_array_fallback = True
+        return fallback_data
 
     def _enrich_forecast(self, combined):
         """Add corrected forecast totals to the combined dict.
@@ -1811,12 +1854,16 @@ class OpenMeteoForecast:
         except Exception as e:
             self.logger.warning(f"[OpenMeteo] Cannot load combined cache: {e}")
 
-    def _save_cache(self, combined):
-        """Persist combined forecast to disk (strips non-serialisable _dawn_times)."""
+    def _save_cache(self, combined, cached_time=None):
+        """Persist combined forecast to disk (strips non-serialisable _dawn_times).
+
+        cached_time (v1.12): when the data was generated, so a reload does not
+        date a forecast built from old arrays as new. Defaults to now.
+        """
         path = self._combined_cache_path()
         try:
             saveable = {k: v for k, v in combined.items() if not k.startswith("_dawn")}
-            saveable["_cached_time"] = time.time()
+            saveable["_cached_time"] = cached_time if cached_time else time.time()
             self._atomic_write_json(path, saveable, indent=2)
         except Exception as e:
             self.logger.debug(f"[OpenMeteo] Cannot write combined cache: {e}")

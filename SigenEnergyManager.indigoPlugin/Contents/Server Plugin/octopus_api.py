@@ -5,7 +5,12 @@
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
 # Date:        02-10-2026
-# Version:     1.5 (review 02-10-2026: TOU stale-on-failure, billed product for the active tariff)
+# Version:     1.6 (01-11-2026: _fetch_rate_schedule can tell a failure from an empty day)
+#
+# v1.6 (01-11-2026) — _fetch_rate_schedule(..., failed_as_none=True) returns None when the
+#   fetch FAILED (error, timeout, rate-limit guard, 404) and [] only when Octopus answered
+#   with no slots. The Flux refresh uses it so one failed day cannot replace a good
+#   schedule with one that has a gap in it. Every other caller is unchanged.
 #
 # v1.5 (02-10-2026) — review fixes: _get_tou_rates serves the last good bands and
 #   negative-caches a failed refetch; _find_product_code uses the account's billed
@@ -2522,13 +2527,18 @@ class OctopusAPI:
             self.logger.warning(f"Rate fetch error ({product_code}): {e}")
             return None
 
-    def _fetch_rate_schedule(self, product_code, tariff_code, target_date):
+    def _fetch_rate_schedule(self, product_code, tariff_code, target_date, failed_as_none=False):
         """Fetch all rate slots overlapping a given date.
 
         For Tracker: returns 1 slot.
         For Agile: returns up to 48 half-hourly slots.
         For Go/Flux: returns 2-5 time-band slots.
+
+        failed_as_none (v1.6): return None, not [], when the fetch itself failed,
+        so a caller can tell "Octopus has published nothing for this day" from
+        "we could not ask". The default keeps the old [] for every existing caller.
         """
+        failed = None if failed_as_none else []
         # Octopus rate slots align to the Europe/London day (23:00Z boundaries
         # in BST) and the endpoint returns all slots OVERLAPPING the window —
         # a UTC-midnight window in BST gains a spurious extra Tracker slot each
@@ -2556,12 +2566,12 @@ class OctopusAPI:
         try:
             data = self._api_get(url, params=params, authenticated=False)
             if not data:
-                return []
+                return failed
             results = data.get("results", [])
             return sorted(results, key=lambda r: r.get("valid_from", ""))
         except Exception as e:
             self.logger.warning(f"Rate schedule fetch error ({product_code}, {target_date}): {e}")
-            return []
+            return failed
 
     @staticmethod
     def _active_rate(rates):

@@ -3,12 +3,16 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20, 1.21)
-# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026; 1.21 28-10-2026
-# Version:     1.21 (28-10-2026: verify=False on the five setters the Flux executor
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20, 1.21, 1.22)
+# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026; 1.21 28-10-2026;
+#              1.22 01-11-2026
+# Version:     1.22 (01-11-2026: connect() takes timeout, retries and ignore_backoff, so
+#              the plugin's shutdown can make ONE quick attempt to reach an inverter
+#              marked down instead of handing back nothing. Defaults are unchanged.)
+# Previous:    1.21 (28-10-2026: verify=False on the five setters the Flux executor
 #              drives, which reads every write back itself; one read per register
 #              instead of two, so a hand-back fits Indigo's ~22 s stop budget.)
-# Previous:    1.20 (28-10-2026: a reconnect skips the full sweep while every
+#              prior 1.20 (28-10-2026: a reconnect skips the full sweep while every
 #              cached slow value is younger than half SLOW_CACHE_MAX_AGE_S, and
 #              re-reads only RECONNECT_RECHECK_KEYS on top of a normal cycle, so a
 #              blip costs ~8 s of readings rather than ~31 s.)
@@ -643,8 +647,12 @@ class SigenergyModbus:
     # ================================================================
 
     @_locked
-    def connect(self):
+    def connect(self, timeout=10, retries=3, ignore_backoff=False):
         """Connect to the Sigenergy inverter via Modbus TCP.
+
+        1.22: timeout/retries/ignore_backoff exist for the plugin's shutdown, which
+        has about 22 s before Indigo kills it and must not wait out the reconnect
+        back-off or a 40 s retry cycle. Every other caller uses the defaults.
 
         A successful TCP handshake alone is not proof of health — during an
         inverter reboot/firmware update the device accepts TCP while the Modbus
@@ -658,7 +666,7 @@ class SigenergyModbus:
             return False
 
         now = time.monotonic()   # monotonic — immune to NTP wall-clock steps
-        if now - self._last_connect_attempt < self._reconnect_delay:
+        if not ignore_backoff and now - self._last_connect_attempt < self._reconnect_delay:
             return False
 
         self._last_connect_attempt = now
@@ -670,8 +678,8 @@ class SigenergyModbus:
             self.client = ModbusTcpClient(
                 host=self.ip,
                 port=self.port,
-                timeout=10,
-                retries=3,
+                timeout=timeout,
+                retries=retries,
             )
 
             result = self.client.connect()

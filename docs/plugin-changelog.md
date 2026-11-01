@@ -21,6 +21,47 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.141.0 - 1 November 2026
+
+Fixes from the 01-Nov-2026 code review. Pinned by `test_review_2026_11_01.py` (32 tests) plus new cases in
+`test_flux_supervisor.py` and `test_flux_strategy.py`.
+
+- **Shutdown hand-back** (`_hand_back_for_stop`). Shutdown only called `set_self_consumption()` and skipped
+  everything when `modbus.connected` was False, swallowing failures with `except: pass`. It now makes one
+  quick reconnect (`connect(timeout=3, retries=0, ignore_backoff=True)`, new in `sigenergy_modbus` 1.22),
+  writes Self Consumption, then — only if that is confirmed — 40048 to the health floor, 40047 to 100% and
+  40046 to the policy floor when owned. Anything not handed back is a WARNING naming it. A confirmed Flux
+  release still writes nothing more (5.139.1). Store flags are untouched, so a restart still resumes a VPP
+  window or flood drain; since 40048 no longer survives a clean stop, startup sets `raised_floor_unconfirmed`
+  and `_verify_ems_registers` → `_reassert_raised_floor` writes the window's floor back once
+  (`_vpp_floor_pct`, split out of `_set_vpp_discharge_cutoff`, or `_absolute_cutoff_pct` for flood).
+- **Axle reschedules** (`_note_vpp_reschedule`). `store["vpp_event"]` was written only at announcement, so
+  the ACTIVE end test, the overrun backstop and Flux commitments used the old times. In ANNOUNCED and
+  PRE_CHARGING a different start or end from the API now replaces the stored event, re-arms the T-10 warning,
+  saves and logs. PRE_CHARGING moved more than 30 min later goes back to ANNOUNCED. ACTIVE is unchanged.
+- **Grid-import end time** (`_import_window_end_utc`, `_end_import_past_its_window`). A manager import ended
+  only on reaching its target SOC. An import started inside a Go/Flux/iGo/iFlux cheap window now records
+  `import_until` (the window's `charging_end`, London local to UTC), and `_act_on_decision` stops it first
+  thing once that has passed. `_force_charge` clears `import_until` so no import inherits an old one. Agile,
+  Tracker, Flexible and imports started outside the window (Axle cover at the day rate) have no end, as before.
+  Reach on Flux with the strategy armed: Flux owns 02:00-04:58 when it can plan, and when it cannot,
+  `_check_cheap_window_fallback` (which already ends at 04:58) is evaluated before `_plan_import`. So on that
+  setup this path mainly catches an Axle-cover import started inside the window; at 04:58 it is stopped and,
+  if the cover still wants energy, restarted at once at the day rate as a fresh decision. The real gain is
+  on Go/iGo/iFlux, and on Flux without the strategy armed.
+- **Flux prices** (`_refresh_flux_rates`, `octopus_api` 1.6). `_fetch_rate_schedule(..., failed_as_none=True)`
+  returns None on a failed fetch and [] only for an answered, empty day. Any failure keeps the last good
+  slots and `flux_rates_at` and logs a WARNING once per distinct problem.
+- **Zero tracking factor** (`flux_strategy` 2.15). `HourlyPvForecast` dropped a per-day factor of exactly 0,
+  which the Axle cover passes on a no-PV day, and fell back to the ~1.0 bias. `value >= 0` now.
+- **Pause/sleep flags.** `_disengage_to_safe_baseline` now ends a running Happy Hour through
+  `_end_happy_hour_import` (recording its free kWh) and clears `cheap_window_import_active` and
+  `saving_session_export_active` (resetting `vpp_export_submode`), so a resume re-drives them.
+- **Cached forecast age** (`openmeteo_forecast` 1.12). `_fetch_array` records when the data it returns was
+  fetched; the combined forecast takes the OLDEST array's time as `_cached_time` (and in the saved cache),
+  so `forecast_ok_at` no longer reads fresh during an outage. All arrays from the failure fallback gives
+  status "OK (cached - downloads failing)" (still starts with "OK" for the bank-first check).
+
 ## v5.140.3 - 30 October 2026
 
 Wording only. Axle's emails stopped carrying the `token=` account link: the last was 13-Oct-2026 and the

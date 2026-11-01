@@ -82,8 +82,9 @@
 #              Claude Opus 5.5 (5.140.2 - the last-tokens sentence in the Happy Hour booking message)
 #              Claude Opus 5.5 (5.140.1 - a normal night's charge may reach 100% on a dull day)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
-# Date:        30-10-2026 22:15 GMT
-# Version:     5.140.3
+#              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
+# Date:        01-11-2026 GMT
+# Version:     5.141.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -104,6 +105,7 @@ import time
 import copy
 from dataclasses import replace as _replace
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 # ============================================================
@@ -2121,6 +2123,9 @@ class Plugin(indigo.PluginBase):
                 if _flood_prev_val > 0:
                     self.store["flood_prev_target_soc"] = _flood_prev_val
                     self.store["export_active"]         = True
+                    # 5.141.0: shutdown now lowers 40048, so the floor is put back
+                    # by the first connected verify pass.
+                    self.store["raised_floor_unconfirmed"] = True
                     log(
                         f"[Manager] Flood prevention rehydrated from prefs: "
                         f"target {_flood_prev_val:.0f}% — pre-drain still in progress"
@@ -2477,19 +2482,98 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 pass
             _plugin_log_fh = None
-        if self.modbus and self.modbus.connected:
-            # Return to self-consumption on shutdown — unless the Flux release has
-            # just done exactly that and read it back. Its confirmed hand-back
-            # writes mode 2, both cutoffs and both power limits to the policy
-            # baseline, so writing it all again only spent the seconds Indigo
-            # does not give us (5.139.1).
-            if released != "released":
-                try:
-                    self.modbus.set_self_consumption()
-                except Exception:
-                    pass
-            self.modbus.disconnect()
+        if self.modbus is not None:
+            self._hand_back_for_stop(released)
         self._save_accumulators()
+
+    # Seconds allowed for the ONE reconnect attempt shutdown makes. Indigo kills the
+    # plugin about 22 s after asking it to stop; a TCP connect plus its probe read
+    # at this timeout costs at most about twice this.
+    SHUTDOWN_CONNECT_TIMEOUT_S = 3
+
+    def _hand_back_for_stop(self, released):
+        """Leave the inverter at the plain baseline when the plugin stops (5.141.0).
+
+        Return to self-consumption on shutdown — unless the Flux release has just
+        done exactly that and read it back. Its confirmed hand-back writes mode 2,
+        both cutoffs and both power limits to the policy baseline, so writing it
+        all again only spent the seconds Indigo does not give us (5.139.1).
+
+        Otherwise, as _disengage_to_safe_baseline does for sleep and pause: Self
+        Consumption with both power limits cleared, the discharge cutoff (40048)
+        back to the health floor, the charge cutoff (40047) back to 100%, and the
+        backup reserve (40046) back to the policy floor when the plugin owns it.
+        Before 5.141.0 only the mode and limits were reset, so stopping during a
+        grid import or a flood or Axle drain left the inverter refusing to charge
+        above the import target, or to discharge below the raised floor, until
+        the plugin next started — indefinitely, if it was disabled.
+
+        The floors are released only once Self Consumption is confirmed: lifting
+        the charge cutoff over a charge that is still running would remove its
+        only backstop. Store flags are NOT changed, so a restart mid-event still
+        resumes it, and _verify_ems_registers raises the floor again
+        (raised_floor_unconfirmed).
+
+        A link marked down gets ONE quick reconnect attempt, past the back-off.
+        Anything that could not be handed back is a WARNING naming it.
+        """
+        if released == "released":
+            try:
+                self.modbus.disconnect()
+            except Exception:
+                pass
+            return
+        if not self.modbus.connected:
+            try:
+                self.modbus.connect(timeout=self.SHUTDOWN_CONNECT_TIMEOUT_S, retries=0,
+                                    ignore_backoff=True)
+            except Exception as exc:
+                log(f"[Shutdown] Reconnect to hand the inverter back failed: {exc!r}",
+                    level="WARNING")
+        if not self.modbus.connected:
+            log("[Shutdown] Could not reach the inverter to hand it back. It may still be "
+                "in a forced charge or export, or holding a raised charge or discharge "
+                "limit — check the Sigen app.", level="WARNING")
+            return
+        not_done = []
+        try:
+            mode_ok = bool(self.modbus.set_self_consumption())
+        except Exception as exc:
+            log(f"[Shutdown] Self Consumption hand-back raised: {exc!r}", level="WARNING")
+            mode_ok = False
+        if mode_ok:
+            health = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
+            health = round(max(0.0, min(100.0, health)), 1)
+            try:
+                if not self.modbus.set_discharge_cutoff(health):
+                    not_done.append(f"the discharge floor ({health:.0f}%)")
+            except Exception as exc:
+                not_done.append(f"the discharge floor ({exc!r})")
+            try:
+                if not self.modbus.set_charge_cutoff(100.0):
+                    not_done.append("the charge limit (100%)")
+            except Exception as exc:
+                not_done.append(f"the charge limit ({exc!r})")
+            try:
+                if self._owns_backup_reserve():
+                    reserve = self._policy_discharge_floor_pct()
+                    if not self._set_backup_reserve(reserve):
+                        not_done.append(f"the backup reserve ({reserve:.0f}%)")
+            except Exception as exc:
+                not_done.append(f"the backup reserve ({exc!r})")
+        else:
+            not_done.append("Self Consumption mode and power limits (so the charge "
+                            "limit and discharge floor were left in place as backstops)")
+        if not_done:
+            log("[Shutdown] The inverter was NOT fully handed back: "
+                + "; ".join(not_done) + " — check the Sigen app.", level="WARNING")
+        else:
+            log("[Shutdown] Inverter handed back: Self Consumption, discharge floor at "
+                "the health cutoff, charge limit 100%")
+        try:
+            self.modbus.disconnect()
+        except Exception:
+            pass
 
     # ────────────────────────────────────────────────────────────────────────
     # Mac sleep / wake
@@ -7627,6 +7711,9 @@ class Plugin(indigo.PluginBase):
             return
 
         action      = decision.action
+        # 5.141.0: an import whose cheap window has closed stops before anything
+        # else is decided, so the decision below starts from a clean slate.
+        self._end_import_past_its_window()
         prev_import = self.store["import_active"]
         prev_export = self.store["export_active"]
 
@@ -7699,6 +7786,8 @@ class Plugin(indigo.PluginBase):
                 if self._force_charge(power_w, cutoff):
                     self.store["import_active"]     = True
                     self.store["import_target_soc"] = decision.target_soc_pct
+                    self.store["import_until"]      = self._import_window_end_utc(
+                        datetime.now(timezone.utc))
                     self.store["export_active"]     = False
                     self.store["had_import_today"]  = True   # daily history flag
                     self._note_day_rate_import()
@@ -8355,6 +8444,9 @@ class Plugin(indigo.PluginBase):
         """
         ok = self.modbus.force_charge(power_w, cutoff_soc=cutoff, pv_first=True)
         if ok:
+            # 5.141.0: no end time unless the caller sets one, so an end left by an
+            # earlier import can never stop this one.
+            self.store["import_until"]          = None
             self.store["import_ems_mode"]       = EMS_CHARGE_PV_FIRST
             self.store["import_power_w"]        = int(power_w)
             self.store["pv_first_short_passes"] = 0
@@ -8577,6 +8669,7 @@ class Plugin(indigo.PluginBase):
         # Skip if VPP has temporarily raised the cutoff — the VPP state machine owns it.
         # Skip if flood prevention has temporarily raised the cutoff — it owns it too.
         if not self.store.get("vpp_cutoff_raised") and not self.store.get("flood_prev_target_soc"):
+            self.store["raised_floor_unconfirmed"] = False   # nothing raised to restore
             # ONE owner for this register. This used to read batteryHealthCutoff
             # directly, so any floor another policy had raised was pulled back to
             # 1% within a minute of that policy handing over.
@@ -8590,6 +8683,8 @@ class Plugin(indigo.PluginBase):
                         level="WARNING",
                     )
                     self.modbus.set_discharge_cutoff(expected_cutoff_pct)
+        elif self.store.get("raised_floor_unconfirmed"):
+            self._reassert_raised_floor()
 
         # --- Backup reserve (the economic floor, register 40046) ---
         # Owned only while Flux is armed; see _absolute_cutoff_pct for why the
@@ -8800,6 +8895,70 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[Manager] cheap-window check failed: {exc!r}")
             return False
 
+    def _import_window_end_utc(self, now_utc):
+        """When a manager grid import started NOW must stop: the end of the
+        time-of-use cheap window it started in (5.141.0), or None.
+
+        None for Tracker, Agile and Flexible, which have no single window, and for
+        an import started outside the window (an Axle cover bought at the day rate
+        on purpose). Same tariffs and same window as
+        _scheduled_import_missed_its_window.
+        """
+        try:
+            tariff = self._build_tariff_data()
+            if tariff.tariff_key not in (TARIFF_GO, TARIFF_FLUX, TARIFF_IGO, TARIFF_IFLUX):
+                return None
+            start, end = tariff.cheap_start, tariff.charging_end
+            if not (start and end):
+                return None
+            local = now_utc.astimezone(_london_tz())
+            hm    = local.strftime("%H:%M")
+            inside = (start <= hm < end) if start < end else (hm >= start or hm < end)
+            if not inside:
+                return None
+            end_h, end_m = (int(x) for x in end.split(":"))
+            end_date = local.date() if hm < end else local.date() + timedelta(days=1)
+            end_local = _london_localise(datetime.combine(end_date, dtime(end_h, end_m)))
+            if end_local is None:
+                return None
+            return end_local.astimezone(timezone.utc)
+        except Exception as exc:                            # noqa: BLE001
+            self.logger.debug(f"[Manager] import window end unknown: {exc!r}")
+            return None
+
+    def _end_import_past_its_window(self, now_utc=None):
+        """Stop a manager grid import once its cheap window has closed (5.141.0).
+
+        An import used to end only on reaching its target SOC, so a slow charge
+        (a cold battery, the BMS tapering near full) went on buying at the day or
+        peak rate. The cheap-window charge and a free Happy Hour have their own
+        ends and are left to them. Returns True when it stopped one; the manager
+        then decides afresh, and may start a new import if it still wants one.
+        """
+        until = self.store.get("import_until")
+        if (until is None or not self.store.get("import_active")
+                or self.store.get("happy_hour_import_active")
+                or self.store.get("cheap_window_import_active")):
+            return False
+        now_utc = now_utc or datetime.now(timezone.utc)
+        if now_utc < until:
+            return False
+        soc = float(self.latest_inverter_data.get("batterySoc", 0.0) or 0.0)
+        target = float(self.store.get("import_target_soc", 0.0) or 0.0)
+        self.store["import_active"]     = False
+        self.store["import_target_soc"] = 0.0
+        self.store["import_until"]      = None
+        handed_back = bool(self.modbus and self.modbus.connected
+                           and self.modbus.set_self_consumption())
+        if not handed_back:
+            log("[Manager] Hand-back to Self Consumption at the end of the cheap window "
+                "was NOT confirmed — retrying on the next tick", level="WARNING")
+            self.store["vpp_handback_pending"] = True
+        self._restore_import_cutoff()
+        log(f"[Manager] Grid import stopped: its cheap window closed at "
+            f"{_local_time(until)} with the battery at {soc:.0f}% of a {target:.0f}% target")
+        return True
+
     def _check_scheduled_import_impl(self):
         """Check if a scheduled import time has arrived."""
         scheduled = self.store.get("import_scheduled_time")
@@ -8898,6 +9057,7 @@ class Plugin(indigo.PluginBase):
             if self.modbus and self._force_charge(power_w, cutoff):
                 self.store["import_active"]      = True
                 self.store["import_target_soc"]  = target_soc
+                self.store["import_until"]       = self._import_window_end_utc(now_utc)
                 self.store["import_scheduled_time"] = None
                 self.store["had_import_today"]   = True   # daily history flag
                 self._note_day_rate_import()
@@ -10432,6 +10592,19 @@ class Plugin(indigo.PluginBase):
         end_time       = event["end_time"]
         hours_to_start = (start_time - now).total_seconds() / 3600.0
 
+        # 5.141.0: BEFORE the window opens, Axle's latest times win. The stored
+        # event used to be written once, at announcement, so an event moved
+        # earlier exported to its OLD end time, and one moved later was ended
+        # early with a false "EVENT COMPLETE". Once ACTIVE the stored window still
+        # rules (see the ACTIVE branch below for why).
+        if current_state in (VPP_ANNOUNCED, VPP_PRE_CHARGING):
+            if self._note_vpp_reschedule(event) and current_state == VPP_PRE_CHARGING \
+                    and hours_to_start > 0.5:
+                # Moved well later: back to waiting, so pre-charge runs again at
+                # the new T-30min and nothing treats the event as imminent.
+                self._vpp_transition(VPP_ANNOUNCED)
+                current_state = VPP_ANNOUNCED
+
         if current_state == VPP_IDLE and hours_to_start > 0:
             self.store["vpp_event"] = event
             self.store["vpp_10min_warning_sent"]  = False  # latched per event
@@ -11003,6 +11176,32 @@ class Plugin(indigo.PluginBase):
                 "register held a value the plugin did not write. Check the JSONL "
                 "snapshots for when it changed.", level="WARNING")
 
+    def _note_vpp_reschedule(self, event):
+        """Adopt Axle's new times for an event that has not started (5.141.0).
+
+        Returns True when the stored event was replaced. Called only in ANNOUNCED
+        and PRE_CHARGING; an ACTIVE window is never moved by the API.
+        """
+        stored = self.store.get("vpp_event") or {}
+        old_start, old_end = stored.get("start_time"), stored.get("end_time")
+        new_start, new_end = event.get("start_time"), event.get("end_time")
+        if new_start is None or new_end is None or new_end <= new_start:
+            return False
+        if old_start == new_start and old_end == new_end:
+            return False
+        self.store["vpp_event"] = event
+        if old_start != new_start:
+            self.store["vpp_10min_warning_sent"] = False   # latched per start time
+        old_txt = (f"{_local_time(old_start)}-{_local_time(old_end)}"
+                   if old_start is not None and old_end is not None else "unknown")
+        vpp_log(f"[VPP] Event rescheduled by Axle: was {old_txt}, now "
+                f"{_local_time(new_start)}-{_local_time(new_end)}")
+        try:
+            self._save_accumulators()      # the restart-safe copy carries the new window
+        except Exception as exc:
+            vpp_log(f"[VPP] Saving the rescheduled window failed: {exc}", level="WARNING")
+        return True
+
     def _start_vpp_precharge(self, event):
         """Assess SOC 30 min before VPP event; read-only since 5.131.0, no grid import.
 
@@ -11145,6 +11344,45 @@ class Plugin(indigo.PluginBase):
         determined, NOT at announcement time.
         """
         self._flux_preempt("Axle pre-charge cutoff")
+        floor_pct, reason = self._vpp_floor_pct(is_daytime)
+
+        if self.modbus:
+            self.modbus.set_discharge_cutoff(floor_pct)
+            if self._owns_backup_reserve():
+                self._set_backup_reserve(
+                    self._policy_discharge_floor_pct(dispatch_event=event))
+            self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
+            vpp_log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
+
+    def _reassert_raised_floor(self):
+        """Put a raised 40048 floor back ONCE after a restart (5.141.0).
+
+        A VPP window or flood drain resumed after a restart keeps its flag, and
+        _verify_ems_registers leaves a flagged floor to its owner. The owner wrote
+        it once, before the restart, and shutdown now releases it, so without this
+        the resumed drain would run down to the health floor. Retried on every
+        verify pass until it is read back or written.
+        """
+        if self.store.get("vpp_cutoff_raised"):
+            raised_pct, why = self._vpp_floor_pct(
+                bool(self.store.get("vpp_is_daytime", False)))
+            why = f"Axle window, {why}"
+        elif self.store.get("flood_prev_target_soc"):
+            raised_pct, why = self._absolute_cutoff_pct(), "flood prevention"
+        else:
+            self.store["raised_floor_unconfirmed"] = False
+            return
+        actual_pct = self.modbus.read_discharge_cutoff()
+        if actual_pct is not None and abs(actual_pct - raised_pct) <= 0.5:
+            self.store["raised_floor_unconfirmed"] = False
+        elif self.modbus.set_discharge_cutoff(raised_pct):
+            self.store["raised_floor_unconfirmed"] = False
+            log(f"[Verify] Discharge cutoff restored to {raised_pct:.0f}% after the "
+                f"restart ({why})")
+
+    def _vpp_floor_pct(self, is_daytime):
+        """The 40048 floor an Axle window holds, and why (split out in 5.141.0 so
+        the restart re-assert in _verify_ems_registers writes the same figure)."""
         health_floor    = _as_float(self.pluginPrefs.get("batteryHealthCutoff"), 1.0)
         dawn_target_pct = self._dawn_target_pct()
 
@@ -11158,15 +11396,7 @@ class Plugin(indigo.PluginBase):
         # Never below the absolute cutoff. The Flux reserve and every OTHER
         # commitment go on the backup reserve instead, computed with this event
         # excluded so the dispatch can spend its own allocation.
-        floor_pct = max(floor_pct, health_floor, self._absolute_cutoff_pct())
-
-        if self.modbus:
-            self.modbus.set_discharge_cutoff(floor_pct)
-            if self._owns_backup_reserve():
-                self._set_backup_reserve(
-                    self._policy_discharge_floor_pct(dispatch_event=event))
-            self.store["vpp_cutoff_raised"] = True   # prevents verify() fighting the VPP floor
-            vpp_log(f"[VPP] Discharge cutoff set to {floor_pct:.0f}% ({reason})")
+        return max(floor_pct, health_floor, self._absolute_cutoff_pct()), reason
 
     def _event_is_daytime(self, event_start):
         """Return True if event_start falls within the solar generation window.
@@ -11288,6 +11518,13 @@ class Plugin(indigo.PluginBase):
         cleanly on wake/resume.  Best-effort; never raises (a hands-off transition
         must always complete).
         """
+        # 0. 5.141.0: a free Happy Hour records what it banked so far, through its
+        #    own end (which also hands back and restores the charge cutoff).
+        if self.store.get("happy_hour_import_active"):
+            try:
+                self._end_happy_hour_import(f"{reason.lower()} stopped it")
+            except Exception as exc:
+                log(f"[{reason}] Happy Hour stand-down failed: {exc}", level="WARNING")
         # 1. Stand down any VPP engagement first.  For an ACTIVE window _end_vpp_export
         #    already restores the cutoff + records the wrap-up; earlier states just drop
         #    back to IDLE so a later resume/wake re-detects the window if it's still open.
@@ -11331,6 +11568,18 @@ class Plugin(indigo.PluginBase):
         self.store["vpp_cutoff_raised"] = False
         self.store["import_active"]     = False
         self.store["export_active"]     = False
+        self.store["import_until"]      = None
+        # 3b. 5.141.0: and the three feature flags. Left set, a resume or wake
+        #     inside the window found its own flag and never drove again: a free
+        #     Happy Hour or the overnight cheap-window charge did not restart, and
+        #     a Saving Session "owned" the registers while exporting nothing. The
+        #     Happy Hour's free kWh so far were recorded in step 0.
+        self.store["happy_hour_import_active"]     = False
+        self.store["happy_hour_anchor_kwh"]        = None
+        self.store["cheap_window_import_active"]   = False
+        if self.store.get("saving_session_export_active"):
+            self.store["saving_session_export_active"] = False
+            self.store["vpp_export_submode"]           = None
         # 4. Cancel any QUEUED import (v5.65.0). _check_scheduled_import runs on
         #    the tick regardless of pause — it sits outside the paused gate — so a
         #    schedule armed before the pause fired anyway: a full-power grid import
@@ -11519,12 +11768,15 @@ class Plugin(indigo.PluginBase):
             return
 
         # decision == "resume" — the window is still open. Restore the state
-        # machine only; NO hardware re-issue here. The discharge-cutoff register
-        # persisted across the restart, and for an ACTIVE window the manager's
-        # ACTION_VPP_EXPORT override re-drives the export on its next tick.
-        # Keeping vpp_cutoff_raised set stops _verify_ems_registers lowering the
-        # floor before then.
+        # machine only; NO hardware re-issue here. For an ACTIVE window the
+        # manager's ACTION_VPP_EXPORT override re-drives the export on its next
+        # tick. Keeping vpp_cutoff_raised set stops _verify_ems_registers lowering
+        # the floor. 5.141.0: the register no longer survives a clean stop
+        # (shutdown releases it), so the first connected verify pass writes the
+        # window's floor again — raised_floor_unconfirmed.
         self.store["vpp_active"] = (state == VPP_ACTIVE)
+        if self.store.get("vpp_cutoff_raised"):
+            self.store["raised_floor_unconfirmed"] = True
         vpp_log(f"[VPP] Resuming persisted '{state}' window after restart — "
             f"{_local_time(event.get('start_time'))}-{_local_time(event.get('end_time'))} "
             f"(Axle API not required; cutoff-raised="
@@ -14879,11 +15131,33 @@ class Plugin(indigo.PluginBase):
             # daily history is written just after midnight for the day that has
             # just ENDED, and without its bands that write cannot be weighted —
             # it would silently fall back to a flat rate every single night.
+            #
+            # 5.141.0: ALL SIX FETCHES OR NOTHING. A single failed day (a timeout, the
+            # rate-limit guard) used to come back as [] and be stitched in with the
+            # other days, so the stored schedule had a hole where today should be,
+            # flux_rates_at was re-stamped as fresh, and Flux refused to plan until
+            # the next good refresh. A failure now keeps the last good schedule and
+            # its own timestamp. A day Octopus answers with no slots is not a
+            # failure: that is the unpublished-side case _flux_planning_spans
+            # carries forward.
             today = _london_today()
-            imp, exp = [], []
+            imp, exp, failed = [], [], []
             for day in (today - timedelta(days=1), today, today + timedelta(days=1)):
-                imp.extend(self.octopus._fetch_rate_schedule(imp_code, imp_tariff, day) or [])
-                exp.extend(self.octopus._fetch_rate_schedule(exp_code, exp_tariff, day) or [])
+                for side, code, tariff, into in (("import", imp_code, imp_tariff, imp),
+                                                 ("export", exp_code, exp_tariff, exp)):
+                    got = self.octopus._fetch_rate_schedule(code, tariff, day,
+                                                            failed_as_none=True)
+                    if got is None:
+                        failed.append(f"{side} {day.isoformat()}")
+                    else:
+                        into.extend(got)
+            if failed:
+                problem = ("the Flux rate fetch failed for " + ", ".join(failed)
+                           + "; keeping the last good schedule")
+                if self.store.get("flux_rates_problem") != problem:
+                    log(f"[Flux] {problem[0].upper()}{problem[1:]}", level="WARNING")
+                self.store["flux_rates_problem"] = problem
+                return
             if not imp or not exp:
                 self.store["flux_rates_problem"] = "the Flux rate schedules came back empty"
                 return
