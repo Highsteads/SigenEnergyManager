@@ -4,9 +4,12 @@
 # Description: The VPP earnings ledger - what Axle has actually settled, held
 #              beside what we observed ourselves, and never merged into one
 #              ambiguous number.
-# Author:      CliveS & Claude Opus 5
-# Date:        02-10-2026
-# Version:     1.3 (review 02-10-2026: an email- stand-in never evicts Axle's real row)
+# Author:      CliveS & Claude Opus 5; 1.4 Claude Opus 5.5
+# Date:        02-10-2026; 1.4 01-11-2026
+# Version:     1.4 (01-11-2026: load_ledger keeps axle.last_new_row_at, which every
+#              reload used to drop, so "when did Axle last send something new"
+#              never showed past one tick)
+# Previous:    1.3 (review 02-10-2026: an email- stand-in never evicts Axle's real row)
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -122,10 +125,11 @@ def load_ledger(path):
     base.update({k: v for k, v in data.items() if k in base or k == "load_error"})
     axle = data.get("axle") or {}
     base["axle"] = {
-        "fetched_at":   axle.get("fetched_at"),
-        "balance":      axle.get("balance"),
-        "transactions": list(axle.get("transactions") or []),
-        "events":       list(axle.get("events") or []),
+        "fetched_at":      axle.get("fetched_at"),
+        "balance":         axle.get("balance"),
+        "transactions":    list(axle.get("transactions") or []),
+        "events":          list(axle.get("events") or []),
+        "last_new_row_at": axle.get("last_new_row_at"),
     }
     base["local"] = list(data.get("local") or [])
     return base

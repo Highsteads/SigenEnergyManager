@@ -21,6 +21,56 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.142.0 - 1 November 2026
+
+The remaining items from the 01-Nov-2026 code review. Pinned by `test_review_2026_11_01_b.py` (40 tests).
+
+- **Modbus exception replies** (`sigenergy_modbus` 1.23): `_write_single_register` / `_write_uint32_registers`
+  return False but keep `_connected` when the result is a pymodbus `ExceptionResponse` (`_is_exception_reply`);
+  other error results still drop the link. `_soc_pct` decodes 30014 and returns None above 1000 raw, so
+  read_all's critical-key guard holds the last snapshot; an exact 0 is still believed.
+- **pymodbus pin**: `requirements.txt` is now `pymodbus>=3.10,<4.0`. Checked: 3.9.2's client methods take
+  `slave=`, 3.10.0's take `device_id=`, which every call here uses.
+- **Checked writes**: `_drive_vpp_export` records the sub-mode, mode and bank cap (and fires `exportStarted`)
+  only when the write returns True; on failure it clears the sub-mode so the next tick re-drives, and writes
+  nothing while disconnected. The flood floor (`set_discharge_cutoff`) is checked; on failure the export is
+  handed back and the target not recorded. The manager's hand-backs go through `_hand_back_confirmed`, which
+  sets `vpp_handback_pending` on failure. Flood export writes the inverter maximum as its discharge limit
+  (the DNO cap was "corrected" by verify a minute later). `_end_vpp_export`'s immediate retry reconnects first.
+- **Cancelled pre-charge**: no mode write and `export_active` left alone; it belonged to the manager.
+- **Sleep latch**: `prepare_to_sleep` sets `mac_asleep_at` first and runs `_disengage_to_safe_baseline` under
+  `_state_lock`; `_tick` returns at once while it is set; `wake_up` clears it; it expires after
+  `SLEEP_LATCH_MAX_S` (300 s) of ticks, in case the sleep never happened. *Uncertain*: whether Indigo keeps
+  `runConcurrentThread` running between `prepareToSleep` and the sleep; the latch is harmless either way.
+- **Dashboard** (`web_dashboard` 1.7): loopback is trusted only with a local Host (127.0.0.1, localhost, ::1
+  or none) and no Cf-Connecting-Ip / Cf-Ray / Tailscale-User-* / X-Forwarded-Host header. *Uncertain*: the
+  exact headers `tailscale serve` adds; the Host check covers it regardless. `_dashboard_url(with_token=False)`
+  for the start-up and wake lines. `closedPrefsConfigUi` → `_restart_dashboard_if_changed`.
+- **Settings save**: `_init_modules(from_prefs_save=True)` skips the "clear anything stale" writes while
+  `_inverter_in_use()`.
+- **Remote EMS**: `_verify_ems_registers` reads 40029 while `_inverter_in_use()` and re-enables it with a
+  WARNING. Not while idle, so the Return to Local EMS action stands. *Uncertain* whether an inverter reboot
+  clears 40029.
+- **Day-rate import detection**: tests `in _IMPORT_EMS_MODES`, not `== 0x03` (imports use 0x04 since 5.136.0;
+  the Flux executor never writes 0x04).
+- **Locking**: `_retry_vpp_handback` and `_check_happy_hour_overrun` run under `_state_lock` from the tick.
+- **Octopus** (`octopus_api` 1.7): `_active_rate` returns {} when no row is in force (was `rates[-1]`).
+  `get_agile_rates` asks for `failed_as_none`, does not cache a failure, and serves that day's previous slots.
+- **Export rate**: on a banded tariff `_export_rate_now_p` no longer falls back to the carried
+  `export_rate_p` (its own last output); it uses `_flux_planning_spans` for now, then the default.
+- **Forecast** (`openmeteo_forecast` 1.13): a null GTI hour is skipped, and an hour any array lacks is dropped
+  from the combined buckets. `_refresh_forecast` keeps `forecast_kwh_by_date`; the daily history's
+  `pv_forecast_kwh` and `classified_from_kwh` read `_forecast_kwh_for(date_str)`.
+- **Storm watch** 1.9: `_mo_window` picks the start year nearest now and moves an end before its start into the
+  next year.
+- **Ledger** (`vpp_ledger` 1.4): `load_ledger` keeps `axle.last_new_row_at`.
+- **Axle account** 1.1: `_http_get` strips query strings from exception text.
+- **Logs**: `_zone_name` replaces two hard-coded "BST" labels.
+
+Not changed: the Modbus timeout and retries (10 s, 3) need a pulled-cable test to tune safely; the Saving
+Session credit matching in `free_hour_credits` is deliberate per its own comments; whether Indigo text fields
+accept `secure="true"` is not confirmed, so the secret fields are unchanged.
+
 ## v5.141.0 - 1 November 2026
 
 Fixes from the 01-Nov-2026 code review. Pinned by `test_review_2026_11_01.py` (32 tests) plus new cases in

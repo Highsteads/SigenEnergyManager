@@ -6,7 +6,12 @@
 #              Started from plugin.startup(), stopped on plugin.shutdown().
 # Author:      CliveS & Claude Opus 5
 # Date:        24-08-2026
-# Version:     1.6 (page moved out to dashboard.html; Chart.js bundle and the
+# Version:     1.7 (01-11-2026: a loopback caller is trusted only when the request
+#              was addressed to this machine (Host 127.0.0.1/localhost/::1, or none)
+#              and carries no tunnel header. cloudflared and `tailscale serve` run on
+#              this Mac and connect from 127.0.0.1, so their visitors used to skip
+#              the token; a DNS-rebinding page did too.)
+# 1.6 - page moved out to dashboard.html; Chart.js bundle and the
 #              /chart.js route dropped with the charts. The seven JSON endpoints
 #              are unchanged - the Dashboards plugin proxies all of them.)
 # 1.5 - loopback bind by default + bearer/query/cookie token auth; refuses to
@@ -155,6 +160,31 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, IndexError):
             return False
 
+    # Headers a tunnel on this machine adds to what it forwards (1.7). A request
+    # carrying any of them came from outside, whatever its socket address says.
+    _TUNNEL_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "Tailscale-User-Login",
+                       "Tailscale-User-Name", "X-Forwarded-Host")
+
+    def _addressed_to_this_machine(self):
+        """True when the request names this machine as its host (1.7).
+
+        The Dashboards plugin and a local browser ask for 127.0.0.1 or localhost.
+        A tunnel forwards the public name it was reached on, and a DNS-rebinding
+        page carries the attacker's name, so neither passes. A request with no
+        Host at all (an HTTP/1.0 script) is local by construction.
+        """
+        for name in self._TUNNEL_HEADERS:
+            if self.headers.get(name, ""):
+                return False
+        host = (self.headers.get("Host", "") or "").strip().lower()
+        if not host:
+            return True
+        if host.startswith("["):                       # [::1]:8179
+            name = host[1:].split("]", 1)[0]
+        else:
+            name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        return name in ("127.0.0.1", "localhost", "::1")
+
     def _presented_token(self):
         """Return whatever token the client offered, from any of the four places.
 
@@ -189,7 +219,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         """
         if not self._auth_token:
             return True
-        if self._client_is_loopback():
+        if self._client_is_loopback() and self._addressed_to_this_machine():
             return True
         # As bytes (review 02-10-2026): compare_digest refuses str holding any
         # non-ASCII character, so ?token=%C3%A9 raised and the request got no

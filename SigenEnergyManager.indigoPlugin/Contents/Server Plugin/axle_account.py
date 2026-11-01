@@ -5,9 +5,12 @@
 #              already post through the door in their own emails. No login, no
 #              stored credential, and two layers so the fragile one cannot fail
 #              quietly.
-# Author:      CliveS & Claude Opus 5
-# Date:        12-09-2026
-# Version:     1.0
+# Author:      CliveS & Claude Opus 5; 1.1 Claude Opus 5.5
+# Date:        12-09-2026; 1.1 01-11-2026
+# Version:     1.1 (01-11-2026: a network error's text has its query string removed
+#              before it becomes a note, so the ?token= sign-in link can never reach
+#              the log. The 120-character cut happened to hide it; this does not
+#              depend on that.)
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -62,6 +65,10 @@ from datetime import datetime, timedelta, timezone
 
 
 API_HOST     = "https://api.axle.energy"
+# 1.1: a URL's query string inside an exception message, up to whitespace, a quote
+# or a closing bracket. It carries the account token.
+_QUERY_STRING_RE = re.compile(r"\?[^\s'\")]*")
+
 ACCOUNT_HOST = "https://vpp.axle.energy"
 
 MAIL_ROOT_GLOB = "~/Library/Mail/V*"
@@ -201,7 +208,8 @@ def _http_get(url, token, timeout, getter=None):
                          headers={"Authorization": f"Bearer {token}"})
         return (r.status_code, r.text)
     except Exception as exc:
-        return (0, f"{type(exc).__name__}: {exc}")
+        # 1.1: requests puts the full URL, query string and all, in the message.
+        return (0, f"{type(exc).__name__}: {_QUERY_STRING_RE.sub('?...', str(exc))}")
 
 
 def fetch_events(site_id, token, timeout=HTTP_TIMEOUT, getter=None):

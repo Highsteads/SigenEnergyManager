@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.141.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.142.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.142.0 (1 November 2026)** - The rest of the code review's fixes. Commands to the inverter are now checked: an Axle export, a flood drain's battery floor and the plugin's switches back to normal are only recorded once the inverter has accepted them, and are retried if it has not. The Mac going to sleep now stops the plugin taking control again before it sleeps. The web dashboard no longer lets visitors through a Cloudflare or Tailscale tunnel skip its password, the password is no longer written to the log at every start, and a change to the dashboard settings takes effect at once. Saving the settings during an event no longer disturbs it. Smaller fixes cover the Tracker and Agile prices, the export price after a failed download, forecast gaps, Met Office warnings over New Year, and log lines that said BST in winter.
 
 **5.141.0 (1 November 2026)** - Fixes from a full code review. Stopping or disabling the plugin now puts the battery's charge limit and discharge floor back to normal, not just the mode, and says so in the log if it cannot reach the inverter. An Axle event that is moved before it starts is now followed to its new times. An ordinary grid charge stops when its cheap window closes instead of running on at the day rate. One failed price download no longer stops the Flux plan. A day with no solar at all is no longer planned as a sunny one. Pausing or sleeping inside a free Happy Hour, the night charge or a Saving Session no longer stops it restarting afterwards. A forecast served from old saved copies during an internet outage is now dated as old.
 
@@ -164,6 +166,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.142.0 | 1 November 2026 | The rest of the code review: checked inverter commands, sleep, dashboard password, smaller price and forecast fixes. |
 | 5.141.0 | 1 November 2026 | Fixes from a full code review: shutdown hand-back, Axle reschedules, grid-charge end time, Flux prices, no-sun days. |
 | 5.140.3 | 30 October 2026 | The Axle sign-in warning and notes now match what Axle send. |
 | 5.140.2 | 30 October 2026 | The Happy Hour booking message reads properly when it spends the last tokens. |

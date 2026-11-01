@@ -3,10 +3,14 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20, 1.21, 1.22)
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16-1.23)
 # Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026; 1.21 28-10-2026;
-#              1.22 01-11-2026
-# Version:     1.22 (01-11-2026: connect() takes timeout, retries and ignore_backoff, so
+#              1.22 01-11-2026; 1.23 01-11-2026
+# Version:     1.23 (01-11-2026: a Modbus EXCEPTION REPLY to a write (the inverter answered
+#              "illegal value" or similar) returns False but keeps the link, which is
+#              demonstrably alive; only a transport failure marks it down. Battery SOC
+#              outside 0-100% decodes as absent.)
+# Previous:    1.22 (01-11-2026: connect() takes timeout, retries and ignore_backoff, so
 #              the plugin's shutdown can make ONE quick attempt to reach an inverter
 #              marked down instead of handing back nothing. Defaults are unchanged.)
 # Previous:    1.21 (28-10-2026: verify=False on the five setters the Flux executor
@@ -107,6 +111,35 @@ try:
     PYMODBUS_AVAILABLE = True
 except ImportError:
     PYMODBUS_AVAILABLE = False
+
+try:
+    from pymodbus.pdu import ExceptionResponse as _ExceptionResponse
+except ImportError:
+    _ExceptionResponse = None
+
+
+def _soc_pct(raw):
+    """Battery SOC register (gain 10) to percent, or None when impossible (1.23).
+
+    A raw value above 1000 (100.0%) — 0xFFFF is the usual "not available" fill —
+    used to decode as e.g. 6553.5% and look like a full battery, so the import
+    planner skipped a charge. Absent is safer: read_all's critical-key guard then
+    keeps the last good snapshot. An exact 0 is still believed; whether this
+    firmware ever reports a false 0 is not known.
+    """
+    if raw is None or raw < 0 or raw > 1000:
+        return None
+    return round(raw / 10.0, 1)
+
+
+def _is_exception_reply(result):
+    """True when the inverter ANSWERED with a Modbus exception code (1.23).
+
+    That is a rejected request on a live link — the reply itself proves the
+    socket works — so it must not tear the connection down. Any other error
+    result is treated as a transport failure, as before.
+    """
+    return _ExceptionResponse is not None and isinstance(result, _ExceptionResponse)
 
 
 # ============================================================
@@ -1234,9 +1267,9 @@ class SigenergyModbus:
         # ONE instant. homePowerWatts is derived from all three, so any spread
         # here lands in the house figure and nowhere else.
 
-        batt_soc = self._read_uint16(PLANT_BATTERY_SOC)
+        batt_soc = _soc_pct(self._read_uint16(PLANT_BATTERY_SOC))
         if batt_soc is not None:
-            data["batterySoc"] = round(batt_soc / 10.0, 1)
+            data["batterySoc"] = batt_soc
         else:
             plant_errors += 1
 
@@ -1385,8 +1418,11 @@ class SigenergyModbus:
                 self.logger.error(f"Failed to write reg {register}={value} (slave {slave}): {result}")
                 # Mark connection invalid so the next operation reconnects.
                 # Without this, a failed write leaves the socket in zombie state
-                # and subsequent writes silently fail.
-                self._connected = False
+                # and subsequent writes silently fail. 1.23: not for an exception
+                # REPLY, which proves the link is alive; dropping it made every
+                # later read in the same verify pass return None.
+                if not _is_exception_reply(result):
+                    self._connected = False
                 return False
         except (ModbusException, ConnectionException) as e:
             self.logger.error(f"Modbus write error reg {register} (slave {slave}): {e}")
@@ -1451,8 +1487,10 @@ class SigenergyModbus:
                 self.logger.error(
                     f"Failed to write regs {register}-{register+1}={value} (slave {slave}): {result}"
                 )
-                # Mark connection invalid so the next operation reconnects.
-                self._connected = False
+                # Mark connection invalid so the next operation reconnects —
+                # unless the inverter answered with an exception code (1.23).
+                if not _is_exception_reply(result):
+                    self._connected = False
                 return False
         except (ModbusException, ConnectionException) as e:
             self.logger.error(f"Modbus write error regs {register}-{register+1} (slave {slave}): {e}")
@@ -1791,10 +1829,7 @@ class SigenergyModbus:
         """
         if not self._connected:
             return None
-        raw = self._read_uint16(PLANT_BATTERY_SOC)
-        if raw is None:
-            return None
-        return round(raw / 10.0, 1)
+        return _soc_pct(self._read_uint16(PLANT_BATTERY_SOC))
 
     def read_power_flows(self):
         """SOC and the three live power figures in one go, or None.
@@ -1815,7 +1850,7 @@ class SigenergyModbus:
         """
         if not self._connected:
             return None
-        soc = self._read_uint16(PLANT_BATTERY_SOC)
+        soc = _soc_pct(self._read_uint16(PLANT_BATTERY_SOC))
         if soc is None:
             return None
         pair = decode_s32_pair(self._read_block_u16(PLANT_PV_POWER, 4))
@@ -1826,7 +1861,7 @@ class SigenergyModbus:
             return None
         pv, batt = max(0, pair[0]), pair[1]
         return {
-            "batterySoc":        round(soc / 10.0, 1),
+            "batterySoc":        soc,
             "pvPowerWatts":      pv,
             "batteryPowerWatts": batt,
             "gridPowerWatts":    grid,
