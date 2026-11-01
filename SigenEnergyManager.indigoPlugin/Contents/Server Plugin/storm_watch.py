@@ -14,9 +14,10 @@
 #              Met Office warnings are calibrated for real disruption/power-cut
 #              risk, avoiding false positives from ordinary windy days.
 #              Returns a severity string: "none", "yellow", "amber", or "red".
-# Author:      CliveS & Claude Fable 5; v1.7 Claude Opus 5.5
-# Date:        27-09-2026; v1.7 02-10-2026
-# Version:     1.8 (Met Office RSS as a second source, check_met_office_level; RSS times are UTC)
+# Author:      CliveS & Claude Fable 5; v1.7, v1.9 Claude Opus 5.5
+# Date:        27-09-2026; v1.7 02-10-2026; v1.9 01-11-2026
+# Version:     1.9 (01-11-2026: a Met Office window over New Year is dated correctly)
+# Previous:    1.8 (Met Office RSS as a second source, check_met_office_level; RSS times are UTC)
 #              1.7 (a non-Atom body is unknown, not all-clear; CAP "Minor" is green, not yellow)
 #              1.6 (no built-in site: lat/lon are required, the caller skips the check without them)
 #              1.5 (failure paths return None — caller holds previous level, no false all-clear)
@@ -402,13 +403,31 @@ def _mo_window(description, now_utc):
     m = _MO_VALID_RE.search(description or "")
     if not m:
         return None
-    year = now_utc.year
-    try:
-        start = datetime.strptime(f"{year} {m.group(2)} {m.group(3)} {m.group(1)}", "%Y %d %b %H%M")
-        end   = datetime.strptime(f"{year} {m.group(5)} {m.group(6)} {m.group(4)}", "%Y %d %b %H%M")
-    except ValueError:
+
+    def _at(year, day, mon, hhmm):
+        try:
+            return datetime.strptime(f"{year} {day} {mon} {hhmm}",
+                                     "%Y %d %b %H%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    # 01-11-2026: the text carries no year, and both ends used to take the current
+    # one, so a warning over New Year was lost both ways: on 31 Dec "1800 Thu 31
+    # Dec to 1200 Fri 01 Jan" ended on 1 Jan of THIS year (expired), and on 1 Jan
+    # it started on 31 Dec of this year (eleven months away). The start is now the
+    # year that puts it nearest to now, and an end before its start is next year's.
+    starts = [s for s in (_at(y, m.group(2), m.group(3), m.group(1))
+                          for y in (now_utc.year - 1, now_utc.year, now_utc.year + 1))
+              if s is not None]
+    if not starts:
         return None
-    return (start.replace(tzinfo=timezone.utc), end.replace(tzinfo=timezone.utc))
+    start = min(starts, key=lambda s: abs(s - now_utc))
+    end   = _at(start.year, m.group(5), m.group(6), m.group(4))
+    if end is not None and end < start:
+        end = _at(start.year + 1, m.group(5), m.group(6), m.group(4))
+    if end is None:
+        return None
+    return (start, end)
 
 
 def check_met_office_level(region, now_utc=None, xml_bytes=None):

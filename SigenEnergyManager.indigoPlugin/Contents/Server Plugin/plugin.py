@@ -83,8 +83,9 @@
 #              Claude Opus 5.5 (5.140.1 - a normal night's charge may reach 100% on a dull day)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
+#              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
 # Date:        01-11-2026 GMT
-# Version:     5.141.0
+# Version:     5.142.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -884,6 +885,14 @@ MET_OFFICE_REGION_DEFAULT = "North East England"
 def _storm_level_active(level):
     """True for a yellow, amber or red storm level; "none", "clear" and blank are not."""
     return str(level or "").lower() not in ("", "none", "clear")
+
+
+def _zone_name(when_utc):
+    """"GMT" or "BST" for a moment, for log lines (5.142.0: two said "BST" all year)."""
+    try:
+        return when_utc.astimezone(_london_tz()).tzname() or "UK time"
+    except Exception:                                   # noqa: BLE001
+        return "UK time"
 
 
 def _flux_cheap_window_open(now_utc=None):
@@ -2150,7 +2159,7 @@ class Plugin(indigo.PluginBase):
                 bind_host=self._resolve_dashboard_bind(),
                 auth_token=self._resolve_dashboard_token())
             self.web_dashboard.start()
-            log(f"[Web] Dashboard at {self._dashboard_url()}")
+            log(f"[Web] Dashboard at {self._dashboard_url(with_token=False)}")
         except Exception as exc:
             log(f"[Web] Dashboard failed to start: {exc}", level="ERROR")
 
@@ -2584,8 +2593,16 @@ class Plugin(indigo.PluginBase):
     # battery. Return to self-consumption (the safe baseline) on sleep, then
     # let the manager re-evaluate normally on wake. Modbus reconnects lazily
     # on next poll cycle; we only need to restart the web dashboard.
+    # How long the sleep latch holds the tick if no wake follows (5.142.0). A real
+    # sleep stops this process, so a tick still running this long after
+    # prepare_to_sleep means the sleep was cancelled.
+    SLEEP_LATCH_MAX_S = 300.0
+
     def prepare_to_sleep(self):
         log("Mac going to sleep — returning inverter to self-consumption and stopping dashboard")
+        # Latch FIRST, so no tick can start driving the inverter while we hand it
+        # back (see _tick).
+        self.store["mac_asleep_at"] = time.time()
         # Same reasoning as shutdown, and more urgent: a sleeping Mac stops
         # calling step() altogether, and nothing in the executor is a hardware
         # timer. A Flux mode left running into a four-hour sleep would run for
@@ -2604,7 +2621,10 @@ class Plugin(indigo.PluginBase):
         # discharge-cutoff floor / VPP engagement (see _disengage_to_safe_baseline),
         # so an unattended sleep can't strand the battery above a raised SOC and
         # force grid import. The manager re-evaluates and re-applies on wake.
-        self._disengage_to_safe_baseline("Sleep")
+        # 5.142.0: under the state lock, so it cannot interleave with a control
+        # stage that was already running when the sleep notice came.
+        with self._state_lock:
+            self._disengage_to_safe_baseline("Sleep")
         if self.modbus and self.modbus.connected:
             try:
                 self.modbus.disconnect()
@@ -2616,6 +2636,7 @@ class Plugin(indigo.PluginBase):
 
     def wake_up(self):
         log("Mac woke — restarting dashboard; modbus reconnects on next poll, manager re-evaluates within 60s")
+        self.store["mac_asleep_at"] = None
         super().wake_up()
         try:
             self.web_dashboard = WebDashboard(
@@ -2623,7 +2644,7 @@ class Plugin(indigo.PluginBase):
                 bind_host=self._resolve_dashboard_bind(),
                 auth_token=self._resolve_dashboard_token())
             self.web_dashboard.start()
-            log(f"[Web] Dashboard at {self._dashboard_url()}")
+            log(f"[Web] Dashboard at {self._dashboard_url(with_token=False)}")
         except Exception as exc:
             log(f"[Web] Dashboard restart on wake failed: {exc}", level="ERROR")
         # Force a fresh modbus poll on the next tick (not wait the full
@@ -3684,6 +3705,18 @@ class Plugin(indigo.PluginBase):
             only regular writer — safe without the lock.
         Contract pinned by test_concurrency.py.
         """
+        # 5.142.0: going to sleep stops the tick. prepare_to_sleep hands the
+        # inverter back, but nothing stopped this loop, and the next poll
+        # reconnects by itself, so Flux or the manager could take the inverter
+        # again in the seconds before the Mac actually slept, and hold it for the
+        # whole sleep. The latch is cleared by wake_up, and expires on its own
+        # if the ticks carry on for SLEEP_LATCH_MAX_S (the sleep never happened).
+        asleep_at = self.store.get("mac_asleep_at")
+        if asleep_at:
+            if now - asleep_at < self.SLEEP_LATCH_MAX_S:
+                return
+            self.store["mac_asleep_at"] = None
+            log("[Sleep] The Mac did not go to sleep after all — resuming control")
         # Date rotation only needs checking every ~hour (Phase 4C).  Skipping
         # the per-tick filesystem stat avoids 8,640 redundant calls/day.
         if now - self.store.get("last_log_check", 0.0) >= 3600.0:
@@ -3784,8 +3817,11 @@ class Plugin(indigo.PluginBase):
             self._write_energy_summary_variables()
             self.store["last_energy_var"] = now
 
-        # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64)
-        self._retry_vpp_handback()
+        # 12. Unconfirmed VPP hand-back — re-assert on the 10s tick (v5.64).
+        # 5.142.0: a CONTROL stage, so it runs under the lock like the others; it
+        # wrote Modbus and store flags unlocked, beside a locked action callback.
+        with self._state_lock:
+            self._retry_vpp_handback()
 
         # 12a. Axle settlement mail (v5.95.0). Runs BEFORE the freshness check
         # below, so an import found here clears the staleness warning on the same
@@ -3814,8 +3850,10 @@ class Plugin(indigo.PluginBase):
             self._check_ledger_freshness()
             self.store["last_ledger_check"] = now
 
-        # 13. Happy Hour overrun backstop — independent of the primary end path
-        self._check_happy_hour_overrun()
+        # 13. Happy Hour overrun backstop — independent of the primary end path.
+        # Under the lock for the same reason as step 12 (5.142.0).
+        with self._state_lock:
+            self._check_happy_hour_overrun()
 
     def _retry_vpp_handback(self):
         """Re-assert Self Consumption after a VPP hand-back that was never confirmed.
@@ -5778,13 +5816,44 @@ class Plugin(indigo.PluginBase):
                 level="WARNING")
         return token
 
-    def _dashboard_url(self):
-        """The URL that actually works right now, token included where needed."""
+    def _dashboard_url(self, with_token=True):
+        """The URL that actually works right now, token included where needed.
+
+        with_token=False (5.142.0) for the automatic start-up and wake lines: they
+        put the token in the event log and the daily log files every time. The
+        Plugins menu item still shows the full link when it is asked for.
+        """
         if self._resolve_dashboard_bind() == DASHBOARD_BIND_LOOPBACK:
             return f"http://127.0.0.1:{WEB_DASHBOARD_PORT}/"
         host = self._resolve_dashboard_host()
+        if not with_token:
+            return (f"http://{host}:{WEB_DASHBOARD_PORT}/ (token needed: Plugins → "
+                    f"Sigenergy Manager → Show Web Dashboard Access)")
         return (f"http://{host}:{WEB_DASHBOARD_PORT}/"
                 f"?token={self._resolve_dashboard_token()}")
+
+    def _restart_dashboard_if_changed(self):
+        """Apply a changed dashboard bind or token now, not at the next restart
+        (5.142.0). Switching back to "This machine only" used to leave the server
+        listening on every interface, with the old token, until the plugin
+        restarted, while the menu already said "this machine only"."""
+        bind  = self._resolve_dashboard_bind()
+        token = self._resolve_dashboard_token()
+        dash  = getattr(self, "web_dashboard", None)
+        if dash is not None and getattr(dash, "_bind_host", None) == bind \
+                and getattr(dash, "_token", None) == token:
+            return
+        try:
+            if dash is not None:
+                dash.stop()
+            self.web_dashboard = WebDashboard(self, port=WEB_DASHBOARD_PORT,
+                                              bind_host=bind, auth_token=token)
+            self.web_dashboard.start()
+            log(f"[Web] Dashboard settings changed — restarted at "
+                f"{self._dashboard_url(with_token=False)}")
+        except Exception as exc:
+            log(f"[Web] Dashboard restart after a settings change failed: {exc}",
+                level="ERROR")
 
     def _is_in_quiet_hours(self):
         """True if the current local time falls within the configured Pushover
@@ -7728,7 +7797,7 @@ class Plugin(indigo.PluginBase):
         # never says "Charge Grid First", so the check had never fired.
         _seen = self.store.get("remote_ems_mode_seen") or (None, 0.0)
         if (not prev_import
-                and _seen[0] == 0x03 and time.time() - _seen[1] < 120.0
+                and _seen[0] in _IMPORT_EMS_MODES and time.time() - _seen[1] < 120.0
                 and not self.store.get("happy_hour_import_active")
                 and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE):
             self._note_day_rate_import()
@@ -7828,26 +7897,41 @@ class Plugin(indigo.PluginBase):
             if not prev_import and not prev_export:
                 log(f"[Manager] Starting night export: {decision.reason}")
                 inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
-                # Flood prevention uses DNO export cap (decision.power_watts).
-                # Legacy night export falls back to full inverter capacity (inv_max_w).
-                export_w = decision.power_watts if decision.power_watts > 0 else inv_max_w
-                if self.modbus.night_export(export_w):
+                # 5.142.0: the discharge limit is the inverter maximum, as
+                # night_export's docstring says: the inverter's commissioned DNO
+                # cap limits the grid export. Flood prevention used to pass its DNO
+                # cap here (decision.power_watts), so the house load came out of
+                # the 4 kW and _verify_ems_registers, which expects inverter max
+                # whenever export_active is set, "corrected" it with a WARNING a
+                # minute later on every flood export.
+                started = bool(self.modbus.night_export(inv_max_w))
+                if started and decision.target_soc_pct > 0:
                     # Set hardware floor so battery stops automatically at target SOC.
                     # Plugin resets this cutoff on return to self-consumption.
-                    if decision.target_soc_pct > 0:
-                        # Never below the policy floor. Flood prevention drains the
-                        # battery to make room for tomorrow's sun, which is worth
-                        # money; the reserve is there for a power cut, which is
-                        # not about money. Read the floor BEFORE recording the
-                        # flood target, or the target would be compared with
-                        # itself.
-                        floor  = self._policy_discharge_floor_pct()
-                        target = max(float(decision.target_soc_pct), floor)
-                        self.modbus.set_discharge_cutoff(target)
+                    # Never below the policy floor. Flood prevention drains the
+                    # battery to make room for tomorrow's sun, which is worth
+                    # money; the reserve is there for a power cut, which is
+                    # not about money. Read the floor BEFORE recording the
+                    # flood target, or the target would be compared with
+                    # itself.
+                    floor  = self._policy_discharge_floor_pct()
+                    target = max(float(decision.target_soc_pct), floor)
+                    # 5.142.0: CHECKED. An unchecked failure here recorded the
+                    # target anyway, the verify pass then left 40048 alone for the
+                    # whole drain, and nothing stopped the battery at the target.
+                    # No floor, no drain: hand back and let the next cycle retry.
+                    if self.modbus.set_discharge_cutoff(target):
                         self._set_flood_prev_target(target)
                         log(f"[Manager] Discharge cutoff set to {target:.0f}% "
                             f"(flood prevention floor)")
                         self._trigger_event("floodPreventionStarted")
+                    else:
+                        log(f"[Manager] Flood prevention floor ({target:.0f}%) could not "
+                            f"be set — export stopped, retrying next cycle", level="WARNING")
+                        if not self.modbus.set_self_consumption():
+                            self.store["vpp_handback_pending"] = True
+                        started = False
+                if started:
                     self.store["export_active"]      = True
                     self.store["export_count_today"] = (
                         self.store.get("export_count_today", 0) + 1
@@ -7958,7 +8042,7 @@ class Plugin(indigo.PluginBase):
         elif action == ACTION_STOP_EXPORT:
             if prev_export:
                 log("[Manager] Stopping night export - returning to self-consumption")
-                self.modbus.set_self_consumption()
+                self._hand_back_confirmed("the night export stop")
                 # Clean up flood prevention cutoff if it was active
                 flood_target = self.store.get("flood_prev_target_soc")
                 if flood_target:
@@ -8058,7 +8142,7 @@ class Plugin(indigo.PluginBase):
                 target_soc  = self.store.get("import_target_soc", 0.0)
                 if current_soc >= target_soc:
                     log(f"[Manager] Import complete ({current_soc:.1f}% >= {target_soc:.0f}%) - returning to self-consumption")
-                    self.modbus.set_self_consumption()
+                    self._hand_back_confirmed("the import end")
                     self._restore_import_cutoff()
                     self.store["import_active"]     = False
                     self.store["import_target_soc"] = 0.0
@@ -8083,7 +8167,7 @@ class Plugin(indigo.PluginBase):
                 # already handed back: the retry for an unconfirmed hand-back
                 # (vpp_handback_pending) refuses to run while it is True.
                 if not session_handed_back:
-                    self.modbus.set_self_consumption()
+                    self._hand_back_confirmed("the export end")
                 if flood_target:
                     self._set_flood_prev_target(None)
                     floor = self._write_policy_floors()
@@ -8093,7 +8177,7 @@ class Plugin(indigo.PluginBase):
             elif self.store.get("solar_overflow_active"):
                 # SOC dropped below release threshold — restore full charge rate
                 log("[Manager] Solar overflow released — restoring full charge limit")
-                self.modbus.set_self_consumption()   # resets charge limit to inv_max_w
+                self._hand_back_confirmed("the solar overflow release")   # resets charge limit to inv_max_w
                 self.store["solar_overflow_active"]       = False
                 self.store["solar_overflow_charge_cap_w"] = 0
                 # Starts the manager's re-engage dwell (battery_manager v3.10).
@@ -8114,10 +8198,22 @@ class Plugin(indigo.PluginBase):
             target_soc  = self.store["import_target_soc"]
             if current_soc >= target_soc:
                 log(f"[Manager] Import target SOC {target_soc:.0f}% reached - stopping")
-                self.modbus.set_self_consumption()
+                self._hand_back_confirmed("the import end")
                 self._restore_import_cutoff()
                 self.store["import_active"]      = False
                 self.store["import_target_soc"]  = 0.0
+
+    def _hand_back_confirmed(self, what):
+        """Self Consumption, CONFIRMED; on failure a WARNING and the per-tick retry
+        (5.142.0). These hand-backs used to ignore the result and clear their
+        flags anyway, leaving the healing to the verify pass alone."""
+        ok = bool(self.modbus and self.modbus.connected
+                  and self.modbus.set_self_consumption())
+        if not ok:
+            log(f"[Manager] Hand-back to Self Consumption at {what} was NOT confirmed "
+                f"— retrying on the next tick", level="WARNING")
+            self.store["vpp_handback_pending"] = True
+        return ok
 
     def _set_flood_prev_target(self, target_soc_pct):
         """Set or clear flood-prevention target SOC, persisted to pluginPrefs.
@@ -8551,6 +8647,19 @@ class Plugin(indigo.PluginBase):
         if not self.modbus or not self.modbus.connected:
             return
 
+        # --- Remote EMS enable (register 40029), 5.142.0 ---
+        # Every mode this plugin writes needs Remote EMS on. Only the mode
+        # register (40031) was checked, so an inverter reboot or the Sigen app
+        # taking control could leave 40031 reading as expected while the import
+        # or export it described did nothing at all. Checked only while the plugin
+        # is driving something, so the Return to Local EMS action is respected.
+        if self._inverter_in_use():
+            enabled = self.modbus.read_remote_ems_enabled()
+            if enabled is False:
+                log("[Verify] Remote EMS was found switched OFF while the plugin is "
+                    "driving the inverter — switching it back on", level="WARNING")
+                self.modbus.enable_remote_ems()
+
         inv_max_w = int(_as_float(self.pluginPrefs.get("inverterMaxKw"), 10.0) * 1000)
 
         # Always expect inverter max — night_export() uses HOLD_GRID_MAX_EXPORT_LIMIT
@@ -8608,7 +8717,10 @@ class Plugin(indigo.PluginBase):
             # Clear first: an unreadable register must not revive an earlier read.
             self.store["remote_ems_mode_seen"] = (None, 0.0)
             actual_mode = self.modbus.read_ems_mode()
-            if (actual_mode == 0x03 and expected_mode == 0x02
+            # 5.142.0: either charge mode. Manager imports have used Charge PV
+            # First (0x04) since 5.136.0, so testing 0x03 alone never fired for
+            # them. The Flux executor drives 0x02/0x03/0x05 only.
+            if (actual_mode in _IMPORT_EMS_MODES and expected_mode == 0x02
                     and not self.store.get("happy_hour_import_active")
                     and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE
                     and not self._recent_flux_cheap_charge()):
@@ -9076,6 +9188,20 @@ class Plugin(indigo.PluginBase):
 
         data = self.forecast.fetch_forecast(force=force)
         self.latest_forecast_data = data
+        # 5.142.0: remember each day's own forecast total, keyed by the day it is
+        # FOR. The midnight record used to read latest_forecast_data, and a fetch
+        # landing after midnight but before the (up to 10-minute late) midnight
+        # task put the NEW day's forecast into the day that had just ended.
+        try:
+            _fc_date = str((data or {}).get("forecastDate") or "")
+            if _fc_date and "No data" not in str((data or {}).get("forecastStatus", "")):
+                _by_date = dict(self.store.get("forecast_kwh_by_date") or {})
+                _by_date[_fc_date] = float(data.get("todayKwh", 0.0) or 0.0)
+                for _old in sorted(_by_date)[:-3]:
+                    del _by_date[_old]
+                self.store["forecast_kwh_by_date"] = _by_date
+        except (TypeError, ValueError):
+            pass
 
         self._update_forecast_device(data)
 
@@ -10572,11 +10698,13 @@ class Plugin(indigo.PluginBase):
 
             elif current_state != VPP_IDLE:
                 # Event cancelled / disappeared before the window opened — stand down.
-                vpp_log("[VPP] Event cancelled/disappeared - restoring self-consumption")
+                vpp_log("[VPP] Event cancelled/disappeared before its window opened — "
+                        "standing down")
                 self._restore_discharge_cutoff()
-                if self.store.get("export_active") and self.modbus:
-                    self.modbus.set_self_consumption()
-                self.store["export_active"]      = False
+                # 5.142.0: no mode write and export_active left alone. Since
+                # 5.131.0 nothing before the window drives the inverter, so an
+                # export running now belongs to the manager (a flood pre-drain),
+                # and stopping it here left its floor flagged with no export.
                 self.store["vpp_charge_stopped"] = False
                 self._vpp_transition(VPP_IDLE)
                 self.store["vpp_active"] = False
@@ -10617,7 +10745,7 @@ class Plugin(indigo.PluginBase):
             self._trigger_event("vppAnnounced")
             vpp_log(
                 f"[VPP] Event announced: {_local_time(start_time)} - "
-                f"{_local_time(end_time)} BST ({event['duration_hrs']:.1f}h)"
+                f"{_local_time(end_time)} {_zone_name(end_time)} ({event['duration_hrs']:.1f}h)"
             )
             # Persist every field Axle's API returned to per-event JSONL file
             # under <data_dir>/vpp_events/. Read after the event with eg
@@ -10631,7 +10759,7 @@ class Plugin(indigo.PluginBase):
             mins_late = int(-hours_to_start * 60)
             vpp_log(
                 f"[VPP] Late detection: event already active {_local_time(start_time)} - "
-                f"{_local_time(end_time)} BST (Axle published {mins_late} min late) — "
+                f"{_local_time(end_time)} {_zone_name(end_time)} (Axle published {mins_late} min late) — "
                 f"entering ACTIVE, self-driving export"
             )
             self.store["vpp_event"] = event
@@ -11622,7 +11750,14 @@ class Plugin(indigo.PluginBase):
             if not released:
                 # One immediate retry: the commonest cause is a dropped socket,
                 # and the failed write already flags the connection for reconnect.
-                released = bool(self.modbus.set_self_consumption())
+                # 5.142.0: so reconnect FIRST. Writes refuse while the link is
+                # marked down, so the retry used to fail at once and the paid
+                # export ran on until the next poll had reconnected.
+                if not self.modbus.connected:
+                    self.modbus.connect(timeout=self.SHUTDOWN_CONNECT_TIMEOUT_S,
+                                        retries=0, ignore_backoff=True)
+                if self.modbus.connected:
+                    released = bool(self.modbus.set_self_consumption())
         if not released:
             vpp_log("[VPP] Hand-back to Self Consumption NOT confirmed at window end — "
                 "the inverter may still be exporting. Re-asserting every tick until "
@@ -11883,35 +12018,55 @@ class Plugin(indigo.PluginBase):
         else:
             sub = prev_sub or "discharge"   # band [target, target+HYST): hold prev
 
+        # 5.142.0: every write is CHECKED, and the sub-mode, mode and cap are
+        # recorded only once they have landed. They used to be recorded (and
+        # "export started" fired) whatever the inverter said, and the next tick
+        # then saw prev_sub == sub and wrote nothing, so a failed first write was
+        # never retried here. A failure now clears the sub-mode so the next tick
+        # re-drives from scratch.
+        if not self.modbus.connected:
+            self.store["vpp_export_submode"] = None
+            return
+        ok = True
         if sub == "bank":
             charge_cap_w = max(0, surplus_w - target_w)
             if prev_sub != "bank":
                 # Switch into Max Self Consumption (resets limits to inv_max), then
                 # apply the charge cap below. vpp_export_mode tracks 0x02 for verify.
-                self.modbus.set_self_consumption()
-                self.store["vpp_export_mode"]       = 0x02
-                self.store["vpp_bank_charge_cap_w"] = -1   # force the cap write below
-                vpp_log(f"[VPP] Bank-surplus export — PV {pv_w}W, home {home_w}W, surplus "
-                    f"{surplus_w}W >= target {target_w}W: mode 0x02, charge cap "
-                    f"{charge_cap_w}W (export {target_w}W from PV, bank the rest).")
+                ok = bool(self.modbus.set_self_consumption())
+                if ok:
+                    self.store["vpp_export_mode"]       = 0x02
+                    self.store["vpp_bank_charge_cap_w"] = -1   # force the cap write below
+                    vpp_log(f"[VPP] Bank-surplus export — PV {pv_w}W, home {home_w}W, surplus "
+                        f"{surplus_w}W >= target {target_w}W: mode 0x02, charge cap "
+                        f"{charge_cap_w}W (export {target_w}W from PV, bank the rest).")
             prev_cap = self.store.get("vpp_bank_charge_cap_w", -1)
-            if abs(prev_cap - charge_cap_w) > 300:
-                self.modbus.set_charge_limit(charge_cap_w, quiet=True)
-                self.store["vpp_bank_charge_cap_w"] = charge_cap_w
+            if ok and abs(prev_cap - charge_cap_w) > 300:
+                if self.modbus.set_charge_limit(charge_cap_w, quiet=True):
+                    self.store["vpp_bank_charge_cap_w"] = charge_cap_w
+                else:
+                    ok = False
         else:
             if prev_sub != "discharge":
                 if daytime:
-                    self.modbus.daytime_export(inv_max_w)   # mode 0x05 + charge 0
-                    self.store["vpp_export_mode"] = 0x05
+                    ok = bool(self.modbus.daytime_export(inv_max_w))   # mode 0x05 + charge 0
+                    mode = 0x05
                 else:
-                    self.modbus.night_export(inv_max_w)     # mode 0x06
-                    self.store["vpp_export_mode"] = 0x06
-                self.store["vpp_bank_charge_cap_w"] = -1
-                vpp_log(f"[VPP] Discharge export — PV {pv_w}W, home {home_w}W, surplus "
-                    f"{surplus_w}W < target {target_w}W: mode "
-                    f"{'0x05 PV-first' if daytime else '0x06 ESS-first'}, battery tops "
-                    f"the export up to {target_w}W.")
+                    ok = bool(self.modbus.night_export(inv_max_w))     # mode 0x06
+                    mode = 0x06
+                if ok:
+                    self.store["vpp_export_mode"]       = mode
+                    self.store["vpp_bank_charge_cap_w"] = -1
+                    vpp_log(f"[VPP] Discharge export — PV {pv_w}W, home {home_w}W, surplus "
+                        f"{surplus_w}W < target {target_w}W: mode "
+                        f"{'0x05 PV-first' if daytime else '0x06 ESS-first'}, battery tops "
+                        f"the export up to {target_w}W.")
 
+        if not ok:
+            self.store["vpp_export_submode"] = None
+            vpp_log(f"[VPP] The {sub} export write was NOT confirmed by the inverter — "
+                    f"retrying on the next tick", level="WARNING")
+            return
         self.store["vpp_export_submode"] = sub
         if first:
             self.store["export_active"] = True
@@ -12164,6 +12319,23 @@ class Plugin(indigo.PluginBase):
             result["agile_cost_gbp"] = round(agile_cost, 4)
         return result
 
+    def _forecast_kwh_for(self, date_str):
+        """The raw PV forecast total for one local day (5.142.0).
+
+        The live forecast when it is for that day, else the last one seen for it
+        (see _refresh_forecast), else the live figure as before.
+        """
+        fc = self.latest_forecast_data or {}
+        try:
+            if str(fc.get("forecastDate") or "") == date_str:
+                return float(fc.get("todayKwh", 0.0) or 0.0)
+            kept = (self.store.get("forecast_kwh_by_date") or {}).get(date_str)
+            if kept is not None:
+                return float(kept)
+            return float(fc.get("todayKwh", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _write_daily_history(self, date_str):
         """Append today's totals to the all-time daily history.
 
@@ -12231,7 +12403,7 @@ class Plugin(indigo.PluginBase):
             "date":                 date_str,
             "month":                date_str[:7],
             "pv_kwh":               round(totals["pv"], 2),
-            "pv_forecast_kwh":      round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
+            "pv_forecast_kwh":      round(self._forecast_kwh_for(date_str), 2),
             "grid_import_kwh":      round(totals["gridImport"], 2),
             "grid_export_kwh":      round(totals["gridExport"], 2),
             "home_kwh":             round(totals["home"], 2),
@@ -12294,7 +12466,7 @@ class Plugin(indigo.PluginBase):
                 # now. They are the last state of the latch, not the verdict that
                 # governed the day — see _record_bank_first_metrics.
                 "classified_small":          bool(self.store.get("bank_first_small_latched", False)),
-                "classified_from_kwh":       round(self.latest_forecast_data.get("todayKwh", 0.0), 2),
+                "classified_from_kwh":       round(self._forecast_kwh_for(date_str), 2),
                 # The verdict that actually governed the morning, and the forecast it
                 # was reached from. v5.106.0 — absent on rows written before it.
                 "first_classified_small":    self.store.get("bank_first_first_class_small"),
@@ -14682,6 +14854,19 @@ class Plugin(indigo.PluginBase):
             band = self._flux_export_band_p()
             if band is not None:
                 return band
+            # 5.142.0: NOT the "published" value below on a banded tariff. Only
+            # this method writes that key (the refresh carries it forward), so
+            # falling back to it re-published whatever band was in force at the
+            # last good refresh — a 16:00 peak price, say — all night. The last
+            # published day carried forward gives the right band for the hour.
+            try:
+                now = datetime.now(timezone.utc)
+                for span in self._flux_planning_spans("flux_export_slots"):
+                    if span.start <= now < span.end:
+                        return round(float(span.p), 4)
+            except Exception as exc:                        # noqa: BLE001
+                self.logger.debug(f"[Flux] carried export band unavailable: {exc!r}")
+            return DEFAULT_EXPORT_RATE_P
         try:
             published = float((self.latest_rates_data or {}).get("export_rate_p", 0.0))
             if published > 0:
@@ -17032,7 +17217,7 @@ class Plugin(indigo.PluginBase):
         # while the background tick may be mid-read on the old client. The RLock
         # means the dialog close simply waits for the current tick to finish.
         with self._state_lock:
-            self._init_modules()
+            self._init_modules(from_prefs_save=True)
             # Re-publish the shared site config so the optimiser script picks up
             # any tariff / battery / inverter changes immediately rather than
             # waiting for the next plugin restart.
@@ -17040,6 +17225,7 @@ class Plugin(indigo.PluginBase):
         self._log_bank_first_setting()
         self._log_tariff_override_setting()
         self._log_saving_session_auto_join_setting()
+        self._restart_dashboard_if_changed()
         # Force the next tick to poll Octopus rather than waiting out the remaining
         # hour. Ticking "opt in automatically" at 18:55 for a 19:00 session has to
         # act now, and a settings save is exactly when the owner expects it to.
@@ -17157,7 +17343,7 @@ class Plugin(indigo.PluginBase):
     # Initialisation Helpers
     # ================================================================
 
-    def _init_modules(self):
+    def _init_modules(self, from_prefs_save=False):
         """Initialise all module instances from current preferences."""
         prefs = self.pluginPrefs
 
@@ -17368,6 +17554,15 @@ class Plugin(indigo.PluginBase):
                     "still be running. The supervisor reconciles on the first tick.",
                     level="WARNING")
             self.modbus.connect()
+        elif from_prefs_save and self._inverter_in_use():
+            # 5.142.0: a settings save in the middle of a VPP window, a free Happy
+            # Hour, a grid import or a drain must not run the start-up "clear
+            # anything stale" pass: it dropped a bank-window charge cap, lifted an
+            # import backstop and un-pinned a free hour's zero discharge, for the
+            # minute until the verify pass put them back. Nothing is stale here.
+            log("[Init] Settings saved while the inverter is in use — the start-up "
+                "reset of its limits is skipped")
+            self.modbus.connect()
         elif self.modbus.connect():
             inverter_max_w = int(_as_float(prefs.get("inverterMaxKw"), 10.0) * 1000)
             self.modbus.set_discharge_limit(inverter_max_w)   # clear any stale discharge cap
@@ -17383,6 +17578,18 @@ class Plugin(indigo.PluginBase):
             f"Solar=Open-Meteo (4 arrays), "
             f"Axle={'OK' if axle_key else 'disabled'}"
         )
+
+    def _inverter_in_use(self):
+        """True while something this plugin started is driving or holding the
+        inverter (5.142.0), so a settings save leaves its limits alone."""
+        store = getattr(self, "store", None) or {}
+        return bool(store.get("import_active") or store.get("export_active")
+                    or store.get("happy_hour_import_active")
+                    or store.get("cheap_window_import_active")
+                    or store.get("saving_session_export_active")
+                    or store.get("solar_overflow_active")
+                    or store.get("flood_prev_target_soc")
+                    or store.get("vpp_state", VPP_IDLE) not in (VPP_IDLE, VPP_ANNOUNCED))
 
     def _get_data_dir(self):
         """Return plugin data directory path (create if needed).

@@ -9,7 +9,10 @@
 # Author:      CliveS & Claude Opus 4.8; v1.9, v1.10, v1.11, v1.12 Claude Opus 5.5
 # Date:        05-09-2026 14:00; v1.9 22-09-2026; v1.10 02-10-2026; v1.11 30-10-2026;
 #              v1.12 01-11-2026
-# Version:     1.12 (01-11-2026: a forecast assembled from cached arrays carries the
+# Version:     1.13 (01-11-2026: an hour Open-Meteo returns as null is left OUT, in
+#              every array, instead of being read as zero sun, so the planner's
+#              covers() sees it as unknown.)
+# Previous:    1.12 (01-11-2026: a forecast assembled from cached arrays carries the
 #              age of its OLDEST array, not the time of the attempt, so a day-long
 #              outage can no longer pass the planner's 3-hour freshness check; when
 #              every array came from the failure fallback the status says so.)
@@ -718,8 +721,9 @@ class OpenMeteoForecast:
 
         # Accumulate combined kWh per local-time hour key before inverter cap
         # key format: "YYYY-MM-DD HH:00:00"
-        hourly_raw = {}
-        arrays_ok  = 0
+        hourly_raw  = {}
+        hour_arrays = {}   # v1.13: how many arrays supplied each hour
+        arrays_ok   = 0
         # v1.12: the generation time of the OLDEST array used, and how many came
         # from the failure fallback rather than a download or the fresh cache.
         self._cycle_data_at        = None
@@ -753,9 +757,15 @@ class OpenMeteoForecast:
                 key = dt_naive.strftime("%Y-%m-%d %H:%M:%S")
                 kwh = (gti_wm2 / 1000.0) * factor
                 hourly_raw[key] = hourly_raw.get(key, 0.0) + kwh
+                hour_arrays[key] = hour_arrays.get(key, 0) + 1
 
         if arrays_ok == 0:
             return None
+
+        # v1.13: an hour some array left out (a null) would otherwise be the sum
+        # of the others alone — a low figure that looks real. Drop it everywhere.
+        for key in [k for k, n in hour_arrays.items() if n < arrays_ok]:
+            del hourly_raw[key]
 
         if arrays_ok < len(self.arrays):
             self.logger.warning(
@@ -1286,7 +1296,13 @@ class OpenMeteoForecast:
             result  = []
             clamped = 0
             for i in range(len(times)):
-                v = float(gti[i]) if gti[i] is not None else 0.0
+                # v1.13: a null hour is UNKNOWN, not zero sun. Read as 0.0 it
+                # counted as published darkness, so HourlyPvForecast.covers()
+                # said yes to hours nobody had forecast (the far end of the range,
+                # which the Happy Hour booking check reads).
+                if gti[i] is None:
+                    continue
+                v = float(gti[i])
                 # Plausibility clamp: negative sentinels deflate daily totals
                 # (and create negative hourly slots); garbage-large samples
                 # inflate them to physically impossible values — either way

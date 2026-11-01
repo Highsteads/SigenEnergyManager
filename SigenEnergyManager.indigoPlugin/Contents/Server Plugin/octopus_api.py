@@ -5,7 +5,15 @@
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
 # Date:        02-10-2026
-# Version:     1.6 (01-11-2026: _fetch_rate_schedule can tell a failure from an empty day)
+# Version:     1.7 (01-11-2026: no rate in force is no rate; a failed Agile day keeps
+#              that day's last good slots and is not cached)
+#
+# v1.7 (01-11-2026) — _active_rate returns {} when no row covers now. It returned the
+#   LAST row of a newest-first page, about ten days old, as today's price, and
+#   _get_tracker_rates cached it as a success. get_agile_rates no longer caches a
+#   failed fetch for 30 minutes (it looked exactly like "not published yet"), and a
+#   failure for one day serves that day's previous slots, so a failed TODAY next to a
+#   good tomorrow no longer drops tonight's remaining slots.
 #
 # v1.6 (01-11-2026) — _fetch_rate_schedule(..., failed_as_none=True) returns None when the
 #   fetch FAILED (error, timeout, rate-limit guard, 404) and [] only when Octopus answered
@@ -806,7 +814,13 @@ class OctopusAPI:
             return []
 
         tariff_code = self._build_tariff_code(product_code)
-        slots = self._fetch_rate_schedule(product_code, tariff_code, target_date)
+        slots = self._fetch_rate_schedule(product_code, tariff_code, target_date,
+                                          failed_as_none=True)
+        if slots is None:
+            # v1.7: a FAILED fetch is not cached, and serves this day's previous
+            # slots (expired or not — slots carry their own times) so the next
+            # call retries instead of waiting out RATES_CACHE_TTL on an empty list.
+            return list(cached["data"]) if cached else []
 
         result = []
         for slot in slots:
@@ -2592,7 +2606,8 @@ class OctopusAPI:
                 return rate
             except ValueError:
                 continue
-        return rates[-1] if rates else {}
+        # v1.7: nothing in force is an answer of "unknown", never the oldest row.
+        return {}
 
     # ================================================================
     # Internal: Consumption Profile

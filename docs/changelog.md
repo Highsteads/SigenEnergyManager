@@ -7,6 +7,20 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.142.0 - 1 November 2026
+
+The rest of the fixes from the code review.
+
+- **Checked commands:** the plugin now checks that the inverter accepted each command before recording it. If an Axle export, a flood drain's battery floor or a switch back to normal is not accepted, a warning goes in the log and the plugin tries again on the next cycle. A flood drain whose floor cannot be set is not started, so the battery cannot drain past its target.
+- **Axle hand-back:** at the end of an Axle event, if the first switch back to normal fails because the connection dropped, the plugin reconnects before trying again instead of waiting for the next reading.
+- **Rejected values:** if the inverter answers "I won't accept that value", the plugin no longer treats the connection as broken.
+- **Sleep:** when the Mac starts going to sleep, the plugin stops controlling the battery until it wakes, so nothing can take charge again in the last few seconds.
+- **Dashboard:** visitors who come in through a Cloudflare Tunnel or Tailscale on the same Mac must now give the dashboard password; before, they were let in as if they were on the Mac itself. The password is no longer written to the log at every start and wake (the Plugins menu still shows it). Changing the dashboard settings takes effect straight away.
+- **Settings saved mid-event:** saving the plugin settings during an Axle event, a free hour, a grid charge or a drain no longer resets the inverter's limits for a minute.
+- **Remote control:** while the plugin is running a charge or export, it now checks every minute that the inverter's remote control is still switched on, and switches it back on if not.
+- **Prices:** the Tracker price is no longer an old one when today's is missing, a failed Agile download keeps that day's last good prices, and the export price shown on Flux no longer sticks at the 4pm to 7pm peak price when a download fails.
+- **Smaller fixes:** an impossible battery reading (above 100%) is ignored. A gap in the solar forecast is treated as unknown rather than as darkness. Met Office warnings that run over New Year are dated correctly. The daily record no longer picks up the next day's forecast. "When Axle last sent something new" is now remembered. Log lines say GMT in winter.
+
 ## 5.141.0 - 1 November 2026
 
 Fixes from a full code review of the plugin.
