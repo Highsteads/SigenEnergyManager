@@ -7,6 +7,18 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.141.0 - 1 November 2026
+
+Fixes from a full code review of the plugin.
+
+- **Stopping the plugin:** stopping or disabling the plugin now puts the battery fully back to normal: Self Consumption, the charge limit back to 100%, and the discharge floor back to your health cutoff. Before, only the mode was reset, so a charge limit or a raised floor could stay on the inverter until the plugin started again. If the inverter cannot be reached, the plugin now tries once more and writes a warning to the log instead of saying nothing. A restart in the middle of an Axle event or a flood drain still carries on with it, and puts its floor back within a minute.
+- **Axle events:** if Axle move an event before it starts, the plugin now follows the new times. An event moved earlier used to export to its old end time, and one moved later was ended early.
+- **Grid charges:** an ordinary grid charge on Go, Flux, iGo or iFlux now stops when its cheap window closes, even if the battery has not reached its target, so it never runs on at the day rate.
+- **Flux prices:** if one of the six Flux price downloads fails, the plugin keeps the last full set of prices and logs a warning. Before, one failure left a gap that stopped the Flux plan until the next refresh.
+- **Dark days:** a day when the panels have produced nothing at all is now planned as a day with no sun. Before, it was planned as a normal sunny day, so the Axle cover charge bought too little.
+- **Pause and sleep:** pausing the plugin, or the Mac sleeping, inside a free Happy Hour, the overnight charge or a Saving Session no longer stops it restarting afterwards.
+- **Forecast outages:** when every forecast download fails, the forecast served from saved copies is now dated by how old it really is, so the Flux plan stops trusting it after three hours.
+
 ## 5.140.3 - 30 October 2026
 
 Axle's emails have stopped carrying the sign-in link the plugin used to read your account page, so the warning, the Configure note and the guide now say that, rather than telling you to open your account from an email. Earnings still arrive from Axle's results emails.

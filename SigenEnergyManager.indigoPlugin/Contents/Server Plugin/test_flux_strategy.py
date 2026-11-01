@@ -727,6 +727,26 @@ class TestPerDayBias(unittest.TestCase):
         self.assertAlmostEqual(pv.kwh_between(noon, noon + timedelta(hours=1)),
                                1.1, places=6)
 
+    def test_a_measured_zero_factor_is_kept_not_replaced_by_the_bias(self):
+        # 01-11-2026 review: a day with no PV at all gave the Axle cover a factor
+        # of 0, which was dropped for the ~1.0 bias, planning the day as full sun.
+        day = datetime(2026, 9, 16, tzinfo=LONDON).date()
+        buckets = {f"{day:%Y-%m-%d} 12:00:00": 10000.0}
+        pv = fs.HourlyPvForecast(buckets, LONDON, bias=1.0,
+                                 bias_by_date={day: 0.0})
+        noon = fs._wall(LONDON, day, fs.time(12, 0))
+        self.assertAlmostEqual(pv.kwh_between(noon, noon + timedelta(hours=1)),
+                               0.0, places=6)
+
+    def test_a_negative_per_day_factor_still_falls_back(self):
+        day = datetime(2026, 9, 16, tzinfo=LONDON).date()
+        buckets = {f"{day:%Y-%m-%d} 12:00:00": 1000.0}
+        pv = fs.HourlyPvForecast(buckets, LONDON, bias=1.1,
+                                 bias_by_date={day: -0.5})
+        noon = fs._wall(LONDON, day, fs.time(12, 0))
+        self.assertAlmostEqual(pv.kwh_between(noon, noon + timedelta(hours=1)),
+                               1.1, places=6)
+
     def test_a_single_bias_still_applies_when_no_day_is_named(self):
         day = datetime(2026, 9, 16, tzinfo=LONDON).date()
         buckets = {f"{day:%Y-%m-%d} 12:00:00": 1000.0}

@@ -12,7 +12,8 @@
 #              v2.12 02-10-2026
 #              2.13: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
 #              2.14: Claude Opus 5.5, 30-10-2026 (a normal night may store up to 100%)
-# Version:     2.14
+#              2.15: Claude Opus 5.5, 01-11-2026 (a measured 0 tracking factor is kept)
+# Version:     2.15
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -625,7 +626,12 @@ class HourlyPvForecast:
                 value = float(factor)
             except (TypeError, ValueError):
                 continue
-            if math.isfinite(value) and value > 0:
+            # 2.15: zero is a real answer. The Axle cover passes today's measured
+            # tracking with no lower limit, and on a day with no PV at all (snow,
+            # isolator off) that is 0. Dropping it fell back to `bias` (about 1.0),
+            # so the darkest day was planned as a full-sun one. Only negative or
+            # non-finite factors fall back.
+            if math.isfinite(value) and value >= 0:
                 self.bias_by_date[day] = value
         parsed = {}
         for key, wh in (buckets or {}).items():

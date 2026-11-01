@@ -17,7 +17,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 _ind = types.ModuleType("indigo")
@@ -550,6 +550,61 @@ class TestAccountEvidencePlumbing(unittest.TestCase):
         self.assertGreater(stored.get("fetched_at", 0), 0)
         self.assertTrue(p._flux_tariff_verified()[0])
 
+
+    # ---- 5.141.0: all six schedule fetches, or keep the last good set ----
+
+    def test_one_failed_day_keeps_the_last_good_schedule_and_its_stamp(self):
+        """01-11-2026 review: a single failed fetch came back as [] and was
+        stitched in with the other days, leaving a hole where today should be,
+        re-stamping flux_rates_at, and stopping Flux planning until the next
+        good refresh."""
+        p = self._plugin_with_octopus(_evidence())
+        good_imp = p.store["flux_import_slots"] = [{"kept": "import"}]
+        good_exp = p.store["flux_export_slots"] = [{"kept": "export"}]
+        stamp    = p.store["flux_rates_at"]     = time.time() - 900
+        slot = [{"valid_from": "2026-09-16T01:00:00Z",
+                 "valid_to": "2026-09-16T04:00:00Z", "value_inc_vat": 16.8}]
+        # Six calls: (yesterday imp, exp), (today imp, exp), (tomorrow imp, exp).
+        # Today's export fetch fails.
+        p.octopus._fetch_rate_schedule.side_effect = [slot, slot, slot, None, slot, slot]
+        with patch.object(plugin, "log") as logged:
+            p._refresh_flux_rates()
+        self.assertIs(p.store["flux_import_slots"], good_imp)
+        self.assertIs(p.store["flux_export_slots"], good_exp)
+        self.assertEqual(p.store["flux_rates_at"], stamp,
+                         "a partial fetch was stamped as fresh prices")
+        self.assertIn("keeping the last good schedule", p.store["flux_rates_problem"])
+        self.assertTrue(any(c.kwargs.get("level") == "WARNING"
+                            for c in logged.call_args_list),
+                        "a failed Flux price fetch should be logged as a WARNING")
+
+    def test_the_refresh_asks_the_fetch_to_report_failure_as_none(self):
+        p = self._plugin_with_octopus(_evidence())
+        p._refresh_flux_rates()
+        for call in p.octopus._fetch_rate_schedule.call_args_list:
+            self.assertTrue(call.kwargs.get("failed_as_none"))
+
+    def test_an_empty_but_answered_day_is_not_a_failure(self):
+        """Octopus not yet publishing a side is the carry-forward case, not an
+        error: the other days are still stored."""
+        p = self._plugin_with_octopus(_evidence())
+        slot = [{"valid_from": "2026-09-16T01:00:00Z",
+                 "valid_to": "2026-09-16T04:00:00Z", "value_inc_vat": 16.8}]
+        p.octopus._fetch_rate_schedule.side_effect = [slot, slot, slot, slot, slot, []]
+        p._refresh_flux_rates()
+        self.assertEqual(len(p.store["flux_export_slots"]), 2)
+        self.assertEqual(p.store["flux_rates_problem"], "")
+
+    def test_the_schedule_fetch_returns_none_only_when_asked(self):
+        import octopus_api
+        api = octopus_api.OctopusAPI.__new__(octopus_api.OctopusAPI)
+        api.logger = MagicMock()
+        api._api_get = MagicMock(side_effect=octopus_api.OctopusApiError("timed out"))
+        day = datetime(2026, 11, 1).date()
+        self.assertEqual(api._fetch_rate_schedule("P", "T", day), [])
+        self.assertIsNone(api._fetch_rate_schedule("P", "T", day, failed_as_none=True))
+        api._api_get = MagicMock(return_value={"results": []})
+        self.assertEqual(api._fetch_rate_schedule("P", "T", day, failed_as_none=True), [])
 
 # ================================================================
 # The ONE owner of the hardware discharge floor (review 4)

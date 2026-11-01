@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.140.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.141.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.141.0 (1 November 2026)** - Fixes from a full code review. Stopping or disabling the plugin now puts the battery's charge limit and discharge floor back to normal, not just the mode, and says so in the log if it cannot reach the inverter. An Axle event that is moved before it starts is now followed to its new times. An ordinary grid charge stops when its cheap window closes instead of running on at the day rate. One failed price download no longer stops the Flux plan. A day with no solar at all is no longer planned as a sunny one. Pausing or sleeping inside a free Happy Hour, the night charge or a Saving Session no longer stops it restarting afterwards. A forecast served from old saved copies during an internet outage is now dated as old.
 
 **5.140.3 (30 October 2026)** - Axle's emails have stopped carrying the sign-in link the plugin used to read your account page, so the warning, the Configure note and the guide now say that, rather than telling you to open your account from an email. Earnings still arrive from Axle's results emails.
 
@@ -162,6 +164,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.141.0 | 1 November 2026 | Fixes from a full code review: shutdown hand-back, Axle reschedules, grid-charge end time, Flux prices, no-sun days. |
 | 5.140.3 | 30 October 2026 | The Axle sign-in warning and notes now match what Axle send. |
 | 5.140.2 | 30 October 2026 | The Happy Hour booking message reads properly when it spends the last tokens. |
 | 5.140.1 | 30 October 2026 | An ordinary night's charge can reach 100% when the day ahead needs it. |
