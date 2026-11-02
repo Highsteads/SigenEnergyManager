@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.140.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.140.4 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.140.4 (2 November 2026)** - The free-hour record now agrees with what Octopus actually paid. Sundays that had been paid could come back weeks later as unpaid, at the wrong price, a payment could land on the wrong Sunday, and you could be told to chase Octopus for nothing. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.
 
 **5.140.3 (30 October 2026)** - Axle's emails have stopped carrying the sign-in link the plugin used to read your account page, so the warning, the Configure note and the guide now say that, rather than telling you to open your account from an email. Earnings still arrive from Axle's results emails.
 
@@ -162,6 +164,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.140.4 | 2 November 2026 | The free-hour record on the Energy page no longer says Octopus owes you for Sundays it has already paid. |
 | 5.140.3 | 30 October 2026 | The Axle sign-in warning and notes now match what Axle send. |
 | 5.140.2 | 30 October 2026 | The Happy Hour booking message reads properly when it spends the last tokens. |
 | 5.140.1 | 30 October 2026 | An ordinary night's charge can reach 100% when the day ahead needs it. |

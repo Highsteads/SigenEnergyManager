@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.140.4 - 2 November 2026
+
+The free-hour record now agrees with what Octopus actually paid. I checked every payment on the account against the meter, and Octopus had paid every hour to the penny, but the Energy page said otherwise. A Sunday that had been paid could come back weeks later as unpaid and at the wrong price, a payment could land on the wrong Sunday, and Octopus changing a payment's reference when it billed could have counted that payment twice. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.
+
 ## 5.140.3 - 30 October 2026
 
 Axle's emails have stopped carrying the sign-in link the plugin used to read your account page, so the warning, the Configure note and the guide now say that, rather than telling you to open your account from an email. Earnings still arrive from Axle's results emails.

@@ -123,7 +123,7 @@ class TestDailyCheck(unittest.TestCase):
         p._send_pushover.assert_not_called()
         row = p.store["free_hour_credits"][0]
         self.assertEqual(row["state"], "awaiting")
-        self.assertEqual(row["owed_p"], round(32 * 24.35))
+        self.assertEqual(row["owed_p"], 780)         # each hour rounds up to the penny
         self.assertEqual(row["kwh_source"], "meter")
 
     def test_news_is_held_through_quiet_hours_not_lost(self):

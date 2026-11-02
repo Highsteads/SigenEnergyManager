@@ -6,7 +6,7 @@
 #              credits in, a verdict and the plain-English words out.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        02-10-2026
-# Version:     1.2 (05-10-2026: ledger version 2 re-reads meter figures that counted an extra half hour)
+# Version:     1.3 (02-11-2026: settled hours stay settled, credits match their own hour, ledger version 3)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -16,19 +16,15 @@
 # worth up to about GBP 7.80 across two hours. CliveS asked for the credit to be
 # checked every day and shown until Octopus pays it.
 #
-# WHAT IS NOT KNOWN YET, AND HOW THIS COPES
-# -----------------------------------------
-# No free hour on this account has yet been paid in a form anyone has seen. The
-# only earlier one (16-Aug-2026) used almost no grid power (2.3 kWh imported in
-# the whole month) and left no credit line. Older Octopus free-electricity
-# sessions were paid as a Credit with reasonCode FREE_ELECTRICITY_REWARD (Sept and
-# Oct 2025 on this account), so that is the first thing looked for, with looser
-# title and reason matches beside it. Every other credit posted since the free
-# hour is carried through for display, so a payment that arrives under a name
-# this module does not recognise is still in front of a person rather than
-# silently ignored. If Octopus turns out to pay by not charging the units on the
-# bill instead, no credit will ever appear and the claim will go LATE after two
-# weeks, which is the signal to change the matcher.
+# HOW OCTOPUS PAYS (measured 02-11-2026, every credit from 27-Sep to 1-Nov-2026)
+# -----------------------------------------------------------------------------
+# One Credit per hour, reasonCode WEEKEND_HAPPY_HOUR, 7 to 10 days later. Each is
+# the metered kWh times the published price for that hour, VAT included as it stood,
+# rounded UP to the whole penny: nine of nine exact. Octopus re-issues a credit's id
+# when it bills the account (3710781562 became 3744767156), so the id cannot say
+# whether a credit has been counted; its date, amount and reason can. Every other
+# credit posted since the free hour is carried through for display, so a payment
+# that arrives under a new name is still in front of a person.
 #
 # THE RULES
 # ---------
@@ -37,10 +33,13 @@
 # * kWh comes from Octopus's own meter reading for the hour (what they bill on)
 #   once it has settled, and from the inverter's grid counter until then, labelled
 #   as an estimate. Capped at 16 kWh an hour, the free allowance.
-# * Credits are matched only to a claim dated on or before the credit whose amount
-#   is known: a claim whose outstanding sum matches the credit within 5p first,
-#   else the oldest. A credit is never counted twice. A credit with no such claim
-#   yet waits for the next run rather than landing on a MEASURING claim.
+# * Credits are matched only to a claim dated on or before the credit. First to the
+#   oldest unpaid HOUR worth that sum within 1p, then to a claim whose outstanding sum
+#   matches within 5p, else to the oldest claim with a known sum outstanding. A credit
+#   is never counted twice, and one with no such claim waits for the next run rather
+#   than landing on a MEASURING claim.
+# * An hour whose claim has been dropped is remembered in settled_hours until it is
+#   past the look-back, so a settled Sunday cannot come back as unpaid.
 # * A claim still MEASURING 30 days after its last hour (CLAIM_LOOKBACK_DAYS — the
 #   same horizon after which an hour is no longer recorded) is closed, and dropped
 #   7 days later like a nothing-due one.
@@ -50,10 +49,13 @@
 # * An absent reading is never zero (the estate's absent-state rule): no kWh at
 #   all is MEASURING, not "nothing owed".
 
+import math
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 FREE_KWH_CAP_PER_HOUR = 16.0
 MATCH_TOLERANCE_P     = 5
+HOUR_TOLERANCE_P      = 1
 LATE_AFTER_DAYS       = 14
 KEEP_PAID_DAYS        = 14
 KEEP_NOTHING_DUE_DAYS = 7
@@ -75,11 +77,17 @@ STATE_PAID        = "paid"
 _OPEN = (STATE_AWAITING, STATE_LATE, STATE_SHORT)
 
 
-LEDGER_VERSION = 2
+LEDGER_VERSION = 3
 
 
 def new_ledger():
-    return {"version": LEDGER_VERSION, "claims": {}, "assigned_credit_ids": []}
+    return {"version": LEDGER_VERSION, "claims": {}, "assigned_credit_keys": [],
+            "settled_hours": {}}
+
+
+def credit_key(credit):
+    """What identifies a credit: Octopus changes its id when it bills the account."""
+    return f"{credit.get('posted')}|{int(round(_num(credit.get('amount_p')) or 0))}|{credit.get('reason') or ''}"
 
 
 def upgrade(ledger):
@@ -91,6 +99,9 @@ def upgrade(ledger):
     25.2 and reported a 93p shortfall on a credit that was right to the penny.
     Every open claim's readings are dropped so they are read again correctly;
     the inverter estimate stands in until then, as it always does.
+
+    Version 3 (02-11-2026): counted credits are remembered by credit_key, because
+    Octopus re-issues ids at billing, and dropped hours in settled_hours.
     """
     if not isinstance(ledger, dict):
         return False
@@ -100,11 +111,17 @@ def upgrade(ledger):
         version = 1
     if version >= LEDGER_VERSION:
         return False
-    for claim in (ledger.get("claims") or {}).values():
-        if claim.get("closed_at"):
-            continue
-        for hour in (claim.get("hours") or {}).values():
-            hour["meter_kwh"] = None
+    if version < 2:
+        for claim in (ledger.get("claims") or {}).values():
+            if claim.get("closed_at"):
+                continue
+            for hour in (claim.get("hours") or {}).values():
+                hour["meter_kwh"] = None
+    ledger["assigned_credit_keys"] = [credit_key(c)
+                                      for claim in (ledger.get("claims") or {}).values()
+                                      for c in claim.get("credits", [])]
+    ledger.setdefault("settled_hours", {})
+    ledger.pop("assigned_credit_ids", None)
     ledger["version"] = LEDGER_VERSION
     return True
 
@@ -140,13 +157,17 @@ def record_hours(ledger, hours, now, local_date_of):
     hours: [{"id", "start": datetime, "end": datetime, "rate_p": float|None}]
     local_date_of: callable(datetime) -> "YYYY-MM-DD" in Europe/London.
     An hour already recorded keeps its rate, so a price looked up on the day is
-    never replaced by a later day's price.
+    never replaced by a later day's price. A settled hour is never recorded again:
+    the event stays listed long after its claim has been dropped.
     """
+    settled = ledger.get("settled_hours") or {}
     for h in hours:
         start, end = h.get("start"), h.get("end")
         if start is None or end is None or end > now:
             continue
         if end < now - timedelta(days=CLAIM_LOOKBACK_DAYS):
+            continue
+        if str(h.get("id")) in settled:
             continue
         day = local_date_of(start)
         claim = _claim(ledger, day)
@@ -157,6 +178,19 @@ def record_hours(ledger, hours, now, local_date_of):
             continue
         claim["hours"][key] = {"start": _iso(start), "end": _iso(end),
                                "rate_p": _num(h.get("rate_p")), "meter_kwh": None}
+
+
+def hour_wanted(ledger, hour_id, end, now):
+    """True when record_hours has a use for this hour: it is new, or it has no price."""
+    key = str(hour_id)
+    if key in (ledger.get("settled_hours") or {}):
+        return False
+    if end is None or end < now - timedelta(days=CLAIM_LOOKBACK_DAYS):
+        return False
+    for claim in ledger.get("claims", {}).values():
+        if key in claim["hours"]:
+            return claim["hours"][key].get("rate_p") is None
+    return True
 
 
 def _claim(ledger, day):
@@ -214,6 +248,15 @@ def claim_energy(claim):
     return None, None
 
 
+def hour_worth_p(hour):
+    """What Octopus pays for one hour, in pence, or None without a reading and a
+    price. Rounded up to the penny, as every one of its credits has been."""
+    kwh, rate = _num(hour.get("meter_kwh")), _num(hour.get("rate_p"))
+    if kwh is None or rate is None:
+        return None
+    return int(math.ceil(round(min(kwh, FREE_KWH_CAP_PER_HOUR) * rate, 6)))
+
+
 def expected_pence(claim):
     """What Octopus should credit, in pence, or None when it cannot be worked out.
 
@@ -227,8 +270,7 @@ def expected_pence(claim):
     if all(h.get("meter_kwh") is not None for h in hours):
         if any(h.get("rate_p") is None for h in hours):
             return None
-        return int(round(sum(min(h["meter_kwh"], FREE_KWH_CAP_PER_HOUR) * h["rate_p"]
-                             for h in hours)))
+        return sum(hour_worth_p(h) for h in hours)
     kwh, _src = claim_energy(claim)
     if kwh is None:
         return None
@@ -252,13 +294,24 @@ def assign_credits(ledger, credits):
                "reversed": bool}]
     Returns the credits that were assigned on this call.
     """
-    seen = set(ledger.setdefault("assigned_credit_ids", []))
-    fresh = sorted((c for c in credits if str(c.get("id")) not in seen
-                    and is_free_hour_credit(c) and _num(c.get("amount_p")) is not None),
-                   key=lambda c: (str(c.get("posted")), str(c.get("id"))))
+    seen = Counter(ledger.setdefault("assigned_credit_keys", []))
+    fresh = []
+    for c in sorted((c for c in credits if is_free_hour_credit(c)
+                     and _num(c.get("amount_p")) is not None),
+                    key=lambda c: (str(c.get("posted")), str(c.get("id")))):
+        key = credit_key(c)
+        if seen[key] > 0:
+            seen[key] -= 1                     # counted already, whatever its id is now
+        else:
+            fresh.append(c)
     assigned = []
     for c in fresh:
         amount = int(round(_num(c["amount_p"])))
+        found = _hour_paid_by(ledger, amount, str(c.get("posted")))
+        if found is not None:
+            _attach(ledger, found[0], c, amount, found[1])
+            assigned.append(c)
+            continue
         # review 02-10-2026: a claim whose expected value is None (MEASURING) used to
         # be eligible, and since "paid in full" could never be true of it, it took
         # every later credit and left the Sunday Octopus actually paid going LATE.
@@ -282,13 +335,34 @@ def assign_credits(ledger, credits):
             continue
         exact = [cl for cl, owed in candidates if abs(owed - amount) <= MATCH_TOLERANCE_P]
         claim = exact[0] if exact else candidates[0][0]
-        claim["credits"].append({"id": str(c.get("id")), "posted": str(c.get("posted")),
-                                 "amount_p": amount,
-                                 "title": c.get("title") or "",
-                                 "reason": c.get("reason") or ""})
-        ledger["assigned_credit_ids"].append(str(c.get("id")))
+        _attach(ledger, claim, c, amount, None)
         assigned.append(c)
     return assigned
+
+
+def _hour_paid_by(ledger, amount, posted):
+    """(claim, hour id) for the oldest unpaid hour worth this credit, or None."""
+    for day in sorted(ledger.get("claims", {})):
+        claim = ledger["claims"][day]
+        if claim.get("closed_at") or day > posted:
+            continue
+        taken = {x.get("hour") for x in claim["credits"]}
+        for hid in sorted(claim["hours"], key=lambda k: claim["hours"][k].get("start") or ""):
+            worth = hour_worth_p(claim["hours"][hid])
+            if hid not in taken and worth is not None \
+                    and abs(worth - amount) <= HOUR_TOLERANCE_P:
+                return claim, hid
+    return None
+
+
+def _attach(ledger, claim, credit, amount, hour_id):
+    entry = {"id": str(credit.get("id")), "posted": str(credit.get("posted")),
+             "amount_p": amount, "title": credit.get("title") or "",
+             "reason": credit.get("reason") or ""}
+    if hour_id is not None:
+        entry["hour"] = hour_id
+    claim["credits"].append(entry)
+    ledger["assigned_credit_keys"].append(credit_key(credit))
 
 
 def status(claim, now):
@@ -336,7 +410,15 @@ def prune(ledger, now):
         closed = _parse(claim.get("closed_at"))
         keep = KEEP_PAID_DAYS if st["state"] == STATE_PAID else KEEP_NOTHING_DUE_DAYS
         if closed and st["state"] not in _OPEN and now - closed > timedelta(days=keep):
+            settled = ledger.setdefault("settled_hours", {})
+            for hid in claim.get("hours", {}):
+                settled[hid] = day
             del ledger["claims"][day]
+    # An hour past the look-back cannot be recorded again, so it needs no remembering.
+    forget = (now - timedelta(days=CLAIM_LOOKBACK_DAYS + 1)).strftime("%Y-%m-%d")
+    settled = ledger.get("settled_hours") or {}
+    for hid in [h for h, day in settled.items() if day < forget]:
+        del settled[hid]
 
 
 # ================================================================
@@ -409,6 +491,18 @@ def notifications(ledger, now):
     return out
 
 
+def _windows(claim):
+    """The claim's hours as (start, end) datetimes, adjacent hours joined."""
+    spans = sorted((_parse(h["start"]), _parse(h["end"])) for h in claim["hours"].values())
+    out = []
+    for start, end in spans:
+        if out and out[-1][1] == start:
+            out[-1] = (out[-1][0], end)
+        else:
+            out.append((start, end))
+    return out
+
+
 def for_display(ledger, now, other_credits=()):
     """What the dashboard shows: one row per Sunday, newest first."""
     rows = []
@@ -425,6 +519,7 @@ def for_display(ledger, now, other_credits=()):
             "date": day, "state": st["state"],
             "start": _iso(starts[0]) if starts else None,
             "end": _iso(ends[-1]) if ends else None,
+            "windows": [{"start": _iso(a), "end": _iso(b)} for a, b in _windows(claim)],
             "hours": st["hours"], "kwh": st["kwh"], "kwh_source": st["kwh_source"],
             "rate_p": sorted({h["rate_p"] for h in claim["hours"].values()
                               if h.get("rate_p") is not None}),

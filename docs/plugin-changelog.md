@@ -21,6 +21,26 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.140.4 - 2 November 2026
+
+Free-hour ledger, ledger version 3, free_hour_credits 1.3, octopus_api 1.6. Audited against the live
+account: all nine credits from 4-Oct to 1-Nov equal ceil(metered kWh x published rate inc VAT) for one
+hour, to the penny, so 15.01 GBP shown as owed was false.
+
+- A dropped claim is remembered in `settled_hours` until past `CLAIM_LOOKBACK_DAYS`. `record_hours` had
+  re-created paid Sundays empty 14 days after closing (27 Sep on 19-Oct, 4 Oct on 29-Oct).
+- `_import_rate_at` no longer gives an old hour today's price: the store's band, then the new
+  `get_import_rate_at`, and today's rate only within `FREE_HOUR_NOW_RATE_HOURS`. Otherwise None and
+  the poll tries again. 4 Oct had taken the 35.8p peak of the evening it was re-created.
+- `_record_free_hour_claims` filters on `hour_wanted` before pricing, so a settled or priced hour
+  costs no network call.
+- `hour_worth_p` rounds each hour up. `assign_credits` tries the oldest unpaid hour worth the credit
+  within 1p first, then the day within 5p, then the oldest claim.
+- Credits are remembered by `credit_key` (date, amount, reason), counted, not by id. Octopus re-issued
+  3710781562 and 3711402793 as 3744767157 and 3744767156 when it billed.
+- `for_display` adds `windows`, adjacent hours joined, for Dashboards 3.68.1.
+- The stored ledger was corrected by hand once, from the account.
+
 ## v5.140.3 - 30 October 2026
 
 Wording only. Axle's emails stopped carrying the `token=` account link: the last was 13-Oct-2026 and the
