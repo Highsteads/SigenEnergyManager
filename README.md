@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.142.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.142.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.142.1 (2 November 2026)** - The free-hour record now agrees with what Octopus actually paid. Sundays that had been paid could come back weeks later as unpaid, at the wrong price, a payment could land on the wrong Sunday, and you could be told to chase Octopus for nothing. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.
 
 **5.142.0 (1 November 2026)** - The rest of the code review's fixes. Commands to the inverter are now checked: an Axle export, a flood drain's battery floor and the plugin's switches back to normal are only recorded once the inverter has accepted them, and are retried if it has not. The Mac going to sleep now stops the plugin taking control again before it sleeps. The web dashboard no longer lets visitors through a Cloudflare or Tailscale tunnel skip its password, the password is no longer written to the log at every start, and a change to the dashboard settings takes effect at once. Saving the settings during an event no longer disturbs it. Smaller fixes cover the Tracker and Agile prices, the export price after a failed download, forecast gaps, Met Office warnings over New Year, and log lines that said BST in winter.
 
@@ -166,6 +168,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.142.1 | 2 November 2026 | The free-hour record on the Energy page no longer says Octopus owes you for Sundays it has already paid. |
 | 5.142.0 | 1 November 2026 | The rest of the code review: checked inverter commands, sleep, dashboard password, smaller price and forecast fixes. |
 | 5.141.0 | 1 November 2026 | Fixes from a full code review: shutdown hand-back, Axle reschedules, grid-charge end time, Flux prices, no-sun days. |
 | 5.140.3 | 30 October 2026 | The Axle sign-in warning and notes now match what Axle send. |

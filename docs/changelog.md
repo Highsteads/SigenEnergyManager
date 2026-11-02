@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.142.1 - 2 November 2026
+
+The free-hour record now agrees with what Octopus actually paid. I checked every payment on the account against the meter, and Octopus had paid every hour to the penny, but the Energy page said otherwise. A Sunday that had been paid could come back weeks later as unpaid and at the wrong price, a payment could land on the wrong Sunday, and Octopus changing a payment's reference when it billed could have counted that payment twice. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.
+
 ## 5.142.0 - 1 November 2026
 
 The rest of the fixes from the code review.

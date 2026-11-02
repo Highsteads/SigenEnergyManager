@@ -261,7 +261,7 @@ class TestMeasuringClaimDoesNotSinkCredits(unittest.TestCase):
         c = {"id": "c1", "posted": "2026-10-01", "amount_p": 244,
              "title": "Free electricity", "reason": "FREE_ELECTRICITY_REWARD"}
         self.assertEqual(fh.assign_credits(led, [c]), [])
-        self.assertNotIn("c1", led["assigned_credit_ids"])     # tried again next time
+        self.assertEqual(led["assigned_credit_keys"], [])      # tried again next time
         fh.set_meter_kwh(led, "E1", 10.0)
         self.assertEqual(len(fh.assign_credits(led, [c])), 1)
 

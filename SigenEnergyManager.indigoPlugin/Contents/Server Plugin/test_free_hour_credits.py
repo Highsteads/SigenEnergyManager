@@ -18,6 +18,7 @@ UTC = timezone.utc
 H1 = (datetime(2026, 9, 27, 12, 0, tzinfo=UTC), datetime(2026, 9, 27, 13, 0, tzinfo=UTC))
 H2 = (datetime(2026, 9, 27, 13, 0, tzinfo=UTC), datetime(2026, 9, 27, 14, 0, tzinfo=UTC))
 RATE = 24.35
+TWO_FULL_HOURS_P = 780         # 16 kWh at 24.35p is 389.6p, rounded up, twice
 
 
 def local_day(dt):
@@ -102,7 +103,7 @@ class TestMoney(unittest.TestCase):
         fh.set_meter_kwh(led, 6541, 12.0)
         c = led["claims"]["2026-09-27"]
         self.assertEqual(fh.claim_energy(c), (28.0, "meter"))
-        self.assertEqual(fh.expected_pence(c), round(16 * RATE + 12 * RATE))
+        self.assertEqual(fh.expected_pence(c), 390 + 293)    # each hour rounds up to the penny
 
     def test_no_rate_means_the_amount_is_unknown_not_zero(self):
         led = ledger_with_hours(rate=None)
@@ -186,7 +187,7 @@ class TestStates(unittest.TestCase):
         self.assertEqual(fh.status(c, day_after(14))["state"], fh.STATE_LATE)
 
     def test_paid_within_five_pence(self):
-        led = paid_claim([round(32 * RATE) - 5])
+        led = paid_claim([TWO_FULL_HOURS_P - 5])
         self.assertEqual(fh.status(led["claims"]["2026-09-27"], day_after(3))["state"],
                          fh.STATE_PAID)
 
@@ -195,8 +196,8 @@ class TestStates(unittest.TestCase):
         c = led["claims"]["2026-09-27"]
         st = fh.status(c, day_after(3))
         self.assertEqual(st["state"], fh.STATE_SHORT)
-        self.assertEqual(st["owed_p"], round(32 * RATE) - 700)
-        fh.assign_credits(led, [credit("rest", "2026-10-03", 79)])
+        self.assertEqual(st["owed_p"], TWO_FULL_HOURS_P - 700)
+        fh.assign_credits(led, [credit("rest", "2026-10-03", 80)])
         self.assertEqual(fh.status(c, day_after(6))["state"], fh.STATE_PAID)
 
     def test_nothing_used_means_nothing_owed(self):

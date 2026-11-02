@@ -58,7 +58,7 @@ You get one message saying what it booked and why, a reminder on the morning of 
 
 ## Checking the free hour is paid
 
-Octopus pay for a free hour by putting a credit on your account afterwards. Four times a day the plugin works out what each Sunday's free hours are owed — from Octopus's own meter reading once it has arrived, and the inverter's reading until then — up to the 16 kWh a free hour covers, at the price in force at the time. It then looks for the matching credit on your Octopus account.
+Octopus pay for a free hour by putting a credit on your account afterwards. Four times a day the plugin works out what each Sunday's free hours are owed — from Octopus's own meter reading once it has arrived, and the inverter's reading until then — up to the 16 kWh a free hour covers, at the price Octopus published for that hour. It then looks for the matching credit on your Octopus account. Octopus post one credit for each hour, usually a week or so later, and each one is the hour's value rounded up to the penny, so the plugin can tell which hour every payment belongs to.
 
 You get one Pushover message when it is paid, one if it arrives more than 5p short, and one if nothing has come two weeks after the free hour.
 

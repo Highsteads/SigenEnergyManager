@@ -78,14 +78,15 @@
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
+#              Claude Opus 5.5 (5.142.1 - free-hour record: paid Sundays stay paid, each credit finds its own hour)
 #              Claude Opus 5.5 (5.140.3 - Axle emails no longer carry a sign-in link; say so)
 #              Claude Opus 5.5 (5.140.2 - the last-tokens sentence in the Happy Hour booking message)
 #              Claude Opus 5.5 (5.140.1 - a normal night's charge may reach 100% on a dull day)
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        01-11-2026 GMT
-# Version:     5.142.0
+# Date:        02-11-2026 12:52 GMT
+# Version:     5.142.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -645,6 +646,7 @@ SAVING_SESSIONS_SOON_HOURS    = 2.0   # how far ahead counts as imminent
 # day"; four times a day costs two small requests each and means a credit posted
 # in the morning shows the same day.
 FREE_HOUR_CHECK_INTERVAL      = 6 * 3600
+FREE_HOUR_NOW_RATE_HOURS      = 3     # the rate in force now may price an hour this recent
 SESSION_HISTORY_DAYS          = 45    # how far back the Energy page lists results
 
 
@@ -6987,11 +6989,11 @@ class Plugin(indigo.PluginBase):
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, dict) and isinstance(data.get("claims"), dict):
-                data.setdefault("assigned_credit_ids", [])
                 if _fh_credits.upgrade(data):
-                    log("[FreeHour] Reading the free-hour meter figures again: the "
-                        "earlier ones counted an extra half hour in each hour")
+                    log("[FreeHour] Brought the free-hour record up to date")
                     self._save_free_hour_ledger(data)
+                data.setdefault("assigned_credit_keys", [])
+                data.setdefault("settled_hours", {})
                 return data
         except FileNotFoundError:
             pass
@@ -7009,9 +7011,10 @@ class Plugin(indigo.PluginBase):
     def _import_rate_at(self, when_utc):
         """The import unit price in force at a moment, pence inc VAT, or None.
 
-        Flux: the published band for that half hour. Anything else: the rate in
-        force now, which is the same thing for a flat tariff and for a free hour
-        recorded within the hour after it ends.
+        Flux: the published band, which the store holds for today and tomorrow only.
+        Older than that: what Octopus published for that moment. The rate in force
+        now answers only for an hour that has just ended: on 29-10-2026 it priced
+        4 October's day-rate hours at the 35.8p peak of the evening they were recorded.
         """
         if FLUX_AVAILABLE:
             try:
@@ -7020,6 +7023,15 @@ class Plugin(indigo.PluginBase):
                     return p
             except Exception as exc:                    # noqa: BLE001
                 self.logger.debug(f"[FreeHour] Flux band lookup failed: {exc!r}")
+        if self.octopus:
+            try:
+                p = self.octopus.get_import_rate_at(when_utc)
+                if p is not None:
+                    return p
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[FreeHour] published rate lookup failed: {exc!r}")
+        if datetime.now(timezone.utc) - when_utc > timedelta(hours=FREE_HOUR_NOW_RATE_HOURS):
+            return None
         try:
             return self._build_tariff_data().today_rate_p
         except Exception:                               # noqa: BLE001
@@ -7042,11 +7054,17 @@ class Plugin(indigo.PluginBase):
         if _fh_credits is None:
             return
         now = datetime.now(timezone.utc)
-        hours = [{"id": e.get("id"), "start": e.get("start_at"), "end": e.get("end_at"),
-                  "rate_p": self._import_rate_at(e.get("start_at"))}
-                 for e in events
+        ended = [e for e in events
                  if e.get("joined") and e.get("direction") == "WEEKEND_HAPPY_HOUR"
                  and e.get("end_at") is not None and e["end_at"] <= now]
+        if not ended:
+            return
+        with self._free_hour_lock:
+            known = self._load_free_hour_ledger()
+        # Filtered first: an old hour's price is a network call, on every poll otherwise.
+        hours = [{"id": e.get("id"), "start": e.get("start_at"), "end": e.get("end_at"),
+                  "rate_p": self._import_rate_at(e.get("start_at"))} for e in ended
+                 if _fh_credits.hour_wanted(known, e.get("id"), e["end_at"], now)]
         if not hours:
             return
         with self._free_hour_lock:

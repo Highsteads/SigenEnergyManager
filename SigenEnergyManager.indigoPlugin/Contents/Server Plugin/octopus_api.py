@@ -5,8 +5,10 @@
 #              and historical consumption profile for overnight drain prediction
 # Author:      CliveS & Claude Opus 4.8
 # Date:        02-10-2026
-# Version:     1.7 (01-11-2026: no rate in force is no rate; a failed Agile day keeps
-#              that day's last good slots and is not cached)
+# Version:     1.8 (02-11-2026: get_import_rate_at, the published price for a past moment)
+#
+# v1.8 (02-11-2026) — get_import_rate_at reads the price Octopus published for a past
+#   moment, for a free hour older than the plugin's own two-day band list.
 #
 # v1.7 (01-11-2026) — _active_rate returns {} when no row covers now. It returned the
 #   LAST row of a newest-first page, about ten days old, as today's price, and
@@ -1478,6 +1480,31 @@ class OctopusAPI:
                         "reason": n.get("reasonCode") or "", "note": n.get("note") or "",
                         "reversed": bool(n.get("isReversed"))})
         return out
+
+    def get_import_rate_at(self, when_utc):
+        """The import price Octopus published for a moment, pence inc VAT as it stood
+        then, or None. For an hour already past: the plugin's own band list only holds
+        today and tomorrow."""
+        tariff = self.get_current_tariff() or {}
+        product_code, tariff_code = tariff.get("product_code"), tariff.get("tariff_code")
+        if not product_code or not tariff_code or when_utc is None:
+            return None
+        tz = london_tz()
+        if tz is None:
+            self._warn_no_tz()
+            return None
+        day = when_utc.astimezone(tz).date()
+        for slot in self._fetch_rate_schedule(product_code, tariff_code, day) or []:
+            try:
+                start = datetime.fromisoformat(str(slot["valid_from"]).replace("Z", "+00:00"))
+                raw_end = slot.get("valid_to")
+                end = (datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
+                       if raw_end else None)
+                if start <= when_utc and (end is None or when_utc < end):
+                    return float(slot["value_inc_vat"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
 
     def get_import_kwh_between(self, start_utc, end_utc):
         """Metered grid import between two instants, from Octopus's own half-hourly
