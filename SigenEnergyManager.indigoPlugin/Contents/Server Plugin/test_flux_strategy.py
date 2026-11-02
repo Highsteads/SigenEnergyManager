@@ -11,6 +11,7 @@
 import math
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import flux_strategy as fs
@@ -259,6 +260,10 @@ class TestChronologicalBudget(unittest.TestCase):
         pv = fs.HourlyPvForecast(buckets, LONDON)
         lean = _bands(d, fs._wall(LONDON, d, fs.time(2, 30)),
                       exp={**EXPORT_P, "peak": 18.0})
+        # v2.16: nor the margin on top of the sized charge, for the same reason.
+        margin = mock.patch.object(fs, "CHARGE_MARGIN_KWH", 0.0)
+        margin.start()
+        self.addCleanup(margin.stop)
         # v2.9: this test is about how the HOUSEHOLD charge is sized, so the nightly
         # minimum (which would add 10 kWh from 20%) is switched off for it.
         saved, fs.CHARGE_MIN_PCT = fs.CHARGE_MIN_PCT, 0.0
@@ -392,8 +397,10 @@ class TestResaleBuyingLeavesRoomForABrighterDay(unittest.TestCase):
         bought = d.planned_kwh if d.mode == fs.MODE_CHARGE else 0.0
         # v2.2 bought under 5 kWh here. v2.7 plans on 80% of the forecast, which
         # CliveS chose knowing a bright surprise like this one costs a little, so
-        # it buys more — but still well short of the old 11.6.
-        self.assertLess(bought, 8.0)
+        # it buys more — but still well short of the old 11.6. v2.16 adds up to
+        # CHARGE_MARGIN_KWH, which the forecast has room for here.
+        self.assertLess(bought, 8.0 + fs.CHARGE_MARGIN_KWH)
+        self.assertLess(bought, 11.6)
 
     def test_the_peak_only_buys_what_the_sun_does_not_already_leave_there(self):
         """With the brighter-day check out of the way, the purchase is still no
@@ -1517,8 +1524,9 @@ class TestAxleEventCover(unittest.TestCase):
         self.assertIsNone(fs.event_cover(self._in((14, 30), None)))
 
     def test_the_2am_charge_already_buys_for_an_announced_event(self):
-        plain = fs.plan(self._in((2, 30), 25.0, commitments=()))
-        event = fs.plan(self._in((2, 30), 25.0))
+        with mock.patch.object(fs, "CHARGE_MARGIN_KWH", 0.0):   # v2.16: sizing only
+            plain = fs.plan(self._in((2, 30), 25.0, commitments=()))
+            event = fs.plan(self._in((2, 30), 25.0))
         self.assertEqual(event.mode, fs.MODE_CHARGE)
         self.assertGreater(event.charge_cutoff_pct, plain.charge_cutoff_pct)
 

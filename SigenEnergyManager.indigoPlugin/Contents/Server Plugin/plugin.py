@@ -78,6 +78,7 @@
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
+#              Claude Opus 5.5 (5.143.0 - the 2am charge keeps a 4 kWh margin where the sun leaves room)
 #              Claude Opus 5.5 (5.142.1 - free-hour record: paid Sundays stay paid, each credit finds its own hour)
 #              Claude Opus 5.5 (5.140.3 - Axle emails no longer carry a sign-in link; say so)
 #              Claude Opus 5.5 (5.140.2 - the last-tokens sentence in the Happy Hour booking message)
@@ -85,8 +86,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        02-11-2026 12:52 GMT
-# Version:     5.142.1
+# Date:        02-11-2026 16:43 GMT
+# Version:     5.143.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -11791,6 +11792,8 @@ class Plugin(indigo.PluginBase):
         self.store["had_vpp_today"] = True
         self._vpp_transition(VPP_IDLE)
         self.store["vpp_event"]     = None
+        if released:
+            self._flux_window_ended()
         self._trigger_event("vppEnded")
 
         # Wrap-up record in the per-event JSONL file (best-effort)
@@ -15913,6 +15916,17 @@ class Plugin(indigo.PluginBase):
     def _flux_clear_preempt(self):
         if self.store.get("flux_manual_preempt"):
             self.store["flux_manual_preempt"] = ""
+
+    def _flux_window_ended(self):
+        """A paid window has finished on its own clock and the inverter is back.
+
+        Like solar overflow at 4pm, this is scheduled, not a pre-emption, so it owes
+        no stand-down. 2-Nov-2026: the driver re-stamped both timers until 18:02:39,
+        the flag took five minutes to lapse and the stand-down five more, so the sale
+        was off for about ten minutes of the peak. The clear ticks still apply.
+        """
+        self._flux_clear_preempt()
+        self.store["flux_preempted_at"] = 0.0
 
     def _flux_may_claim(self):
         """True when the stand-down has expired and the coast has been clear for

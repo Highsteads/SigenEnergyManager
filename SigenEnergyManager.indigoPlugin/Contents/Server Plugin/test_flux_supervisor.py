@@ -1655,6 +1655,39 @@ class TestPeakClaimedAtFourNotFive(_FluxCase):
         self.assertEqual(p.store["flux_clear_ticks"], 0)
 
 
+class TestThePeakSaleResumesAfterAnAxleWindow(_FluxCase):
+    """2-Nov-2026 live: the 5pm-6pm window ended at 18:02:39 and the sale stayed off
+    for ten minutes, five for the manual flag to lapse and five more of stand-down."""
+
+    def _window_just_ended(self, released=True):
+        p, when = self._at((18, 2), soc=52.0)
+        now = when.timestamp()
+        p.modbus.set_self_consumption = lambda: released
+        p.modbus.connected = True
+        p.store.update(vpp_state=plugin.VPP_ACTIVE, export_active=True, vpp_active=True,
+                       flux_manual_preempt="a driven export window",
+                       flux_manual_preempt_at=now, flux_preempted_at=now,
+                       flux_clear_ticks=0, grid_export_daily_kwh=5.0,
+                       vpp_export_start_kwh=1.0)
+        p._end_vpp_export(when, {"start_time": when, "end_time": when})
+        return p, when
+
+    def test_the_sale_is_claimed_after_the_clear_ticks(self):
+        p, when = self._window_just_ended()
+        for tick in range(plugin.FLUX_RECLAIM_TICKS - 1):
+            self._run(p, when, at=when + timedelta(seconds=10 * (tick + 1)))
+            self.assertEqual(p.flux_executor.targets(), [])
+        self._run(p, when, at=when + timedelta(seconds=30))
+        self.assertEqual(p.store["flux_owner_reason"], "")
+        self.assertEqual(len(p.flux_executor.targets()), 1)
+        self.assertEqual(p.store["flux_decision"].mode, plugin._flux_strategy.MODE_EXPORT)
+
+    def test_an_unconfirmed_hand_back_keeps_the_stand_down(self):
+        p, when = self._window_just_ended(released=False)
+        self.assertEqual(p.store["flux_manual_preempt"], "a driven export window")
+        self.assertGreater(p.store["flux_preempted_at"], 0.0)
+
+
 class TestPendingClaim(_FluxCase):
     """review 4: no arbitrary timeout may pretend somebody else took over."""
 

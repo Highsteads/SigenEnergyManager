@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.143.0 - 2 November 2026
+
+The 2am charge now keeps 4 kWh in the battery on top of what the day needs and what the peak can sell. Before this, a night could finish the next evening only a kilowatt-hour or so above the reserve, which left very little if the sun fell short or the house used more than usual. The margin is only bought where the day's sun would still have room, so a bright day keeps its space and a booked free hour keeps its room. The log says how much of each charge is the margin. The false "about 0.0 kWh will not fit" line at the end of a charge has also gone.
+
+The peak sale now picks up again within about half a minute of an Axle event ending. It used to stay off for about ten minutes, which lost that much of the 4pm to 7pm sale whenever an event finished before 7pm.
+
 ## 5.142.1 - 2 November 2026
 
 The free-hour record now agrees with what Octopus actually paid. I checked every payment on the account against the meter, and Octopus had paid every hour to the penny, but the Energy page said otherwise. A Sunday that had been paid could come back weeks later as unpaid and at the wrong price, a payment could land on the wrong Sunday, and Octopus changing a payment's reference when it billed could have counted that payment twice. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.

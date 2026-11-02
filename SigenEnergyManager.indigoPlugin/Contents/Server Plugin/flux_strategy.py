@@ -13,7 +13,8 @@
 #              2.13: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
 #              2.14: Claude Opus 5.5, 30-10-2026 (a normal night may store up to 100%)
 #              2.15: Claude Opus 5.5, 01-11-2026 (a measured 0 tracking factor is kept)
-# Version:     2.15
+#              2.16: Claude Opus 5.5, 02-11-2026 (the night charge keeps a 4 kWh margin)
+# Version:     2.16
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -234,6 +235,13 @@ MIN_TRADE_KWH            = 0.5
 CHARGE_PV_FACTOR         = 0.8
 # v2.9: and never leaves the cheap window below this level (see header).
 CHARGE_MIN_PCT           = 50.0
+# v2.16: kept in the battery on top of the sized charge, where the sun leaves room.
+# CliveS, 02-Nov-2026: 2 November's charge stopped at 81% and left about 1.5 kWh above
+# the reserve at the next 2am, "which is too little". A fill to 100% every night was
+# £9.31 worse on October, so the charge stays sized and this is the buffer.
+CHARGE_MARGIN_KWH        = 4.0
+# Below this a shortfall rounds to "0.0 kWh" in the log, so it is not reported.
+MIN_REPORTED_KWH         = 0.05
 # Kept above the reserve at 2am by an Axle cover (5.125.4). CliveS, 28-Sep-2026:
 # Axle pays about £1/kWh and the dearest import is about 30p, so buying a little
 # too much to support an event is fine; running out before 2am should not happen.
@@ -1401,7 +1409,11 @@ def _decision_until(inputs, hard_end=None):
 # ================================================================
 
 def _charge_plan(inputs):
-    """(target_pct, power_w, buy_kwh, margin_p, household_kwh, infeasible_kwh)."""
+    """(target_pct, power_w, buy_kwh, margin_p, household_kwh, infeasible_kwh, buffer_kwh).
+
+    `buffer_kwh` is the part of CHARGE_MARGIN_KWH this charge makes room for. The sum
+    is the same either side of it: the house, then the peak sale, then the buffer.
+    """
     site   = inputs.site
     tz     = inputs.local_tz
     bands  = inputs.bands
@@ -1452,13 +1464,18 @@ def _charge_plan(inputs):
                            min(ceiling_kwh, site.capacity_kwh - solar_gain_kwh))
 
     profitable, margin_p = _export_is_profitable(bands, site)
-    arb_kwh = 0.0
+    room_kwh = 0.0
     if profitable:
         room_kwh = min(max(0.0, headroom_ceiling - household_target_kwh),
                        _resale_room_kwh(inputs, household_target_kwh, window_end,
                                         horizon_end, ceiling_kwh))
-        arb_kwh = max(0.0, household_target_kwh + room_kwh
-                      - max(have_kwh, household_target_kwh))
+    # v2.16: the buffer takes only the room the sale left, and only what a brighter
+    # day would not push back out, so a sunny day still has space for its own sun.
+    sized_kwh  = household_target_kwh + room_kwh
+    buffer_kwh = _sun_room_kwh(
+        inputs, sized_kwh, min(CHARGE_MARGIN_KWH, max(0.0, headroom_ceiling - sized_kwh)),
+        window_end, next_local(window_end, tz, FLUX_PEAK_START))
+    arb_kwh = max(0.0, sized_kwh + buffer_kwh - max(have_kwh, household_target_kwh))
 
     buy_kwh = household_buy_kwh + arb_kwh
     # Review 02-10-2026: MIN_TRADE_KWH was also the STOP test, so every night the
@@ -1474,7 +1491,7 @@ def _charge_plan(inputs):
     if inputs.storm_fill:
         buy_kwh = max(buy_kwh, ceiling_kwh - have_kwh)
     if buy_kwh <= 0:
-        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible
+        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh
 
     # The charge cutoff is a ceiling on SOC, so it is the target the battery
     # should reach — never above the configured maximum charge SOC, arbitrage
@@ -1488,7 +1505,7 @@ def _charge_plan(inputs):
     # Done once the SOC is at the cutoff (the same 0.05% slack _minimum_charge
     # uses, so a reading of 83.96% against an 84% cutoff is not a new charge).
     if target_pct <= float(inputs.soc_pct) + 0.05:
-        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible
+        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh
 
     hours_left = max(1.0 / 60.0, (window_end - inputs.now).total_seconds() / 3600.0)
     # max(1, ...): a tail of a few Wh must not round to 0 W and read as "no
@@ -1504,7 +1521,7 @@ def _charge_plan(inputs):
     # should carry rather than something the target quietly rounds away.
     deliverable = available / 1000.0 * hours_left * eff
     infeasible += max(0.0, buy_kwh - deliverable)
-    return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible
+    return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible, buffer_kwh
 
 
 # v2.10: the shortest time left the minimum's power is sized on. Below a minute the
@@ -1587,9 +1604,22 @@ def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
         return 0.0
 
     # 2. What a sunnier day would not push out before the peak.
+    return _sun_room_kwh(inputs, base_kwh, min(top, by_peak), window_end, peak_at)
+
+
+def _sun_room_kwh(inputs, base_kwh, want_kwh, window_end, peak_at):
+    """How much of `want_kwh` above `base_kwh` a brighter day leaves in the battery.
+
+    The day to the peak is re-walked with the forecast raised by RESALE_PV_OPTIMISM.
+    Energy that would make that day spill, or crowd out a free Happy Hour, is bought
+    at the cheap rate and pushed out at the day rate, so it is not worth buying.
+    """
+    site = inputs.site
+    if want_kwh <= 0:
+        return 0.0
     scale = getattr(inputs.pv, "scaled", None)
     if scale is None:
-        return min(top, by_peak)
+        return want_kwh
     bright = SimInputs(site=site, house=inputs.house, pv=scale(RESALE_PV_OPTIMISM),
                        commitments=inputs.commitments)
     steps  = build_steps(bright, window_end, peak_at)
@@ -1599,7 +1629,7 @@ def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
         return r.spill_kwh - r.free_in_kwh
 
     base = displaced(0.0)
-    hi   = min(top, by_peak)
+    hi   = want_kwh
     if displaced(hi) - base <= RESALE_SPILL_TOLERANCE:
         return hi
     lo = 0.0
@@ -1830,7 +1860,7 @@ def _plan(inputs):
             # v2.7: plan the charge on a dimmer day than forecast, so a forecast that
             # is too sunny no longer leaves the peak sale or the evening short.
             (target_pct, power_w, buy_kwh, margin_p,
-             household_kwh, infeasible) = _charge_plan(
+             household_kwh, infeasible, buffer_kwh) = _charge_plan(
                  replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR)))
             # Say so when a booked free hour shaped the charge. An armed state has
             # to be visible BEFORE it fires, or the first anyone learns of a
@@ -1871,7 +1901,8 @@ def _plan(inputs):
                     reason=("the cheap window is open and the battery already holds "
                             "everything the day ahead is forecast to need"
                             + min_note + free_note))
-            arb_kwh = max(0.0, buy_kwh - household_kwh)
+            kept_kwh = min(buffer_kwh, max(0.0, buy_kwh - household_kwh))
+            arb_kwh  = max(0.0, buy_kwh - household_kwh - kept_kwh)
             reason  = (f"cheap window — buying about {buy_kwh:.1f} kWh at "
                        f"{bands.import_cheap_p:.1f}p to {target_pct:.0f}%, of which "
                        f"{household_kwh:.1f} kWh is what the house and its "
@@ -1879,8 +1910,10 @@ def _plan(inputs):
             if arb_kwh >= MIN_TRADE_KWH and raised_kwh <= 0:
                 reason += (f", and {arb_kwh:.1f} kWh is for the peak window at a "
                            f"{margin_p:.1f}p margin")
+            if kept_kwh >= MIN_TRADE_KWH:
+                reason += f", and {kept_kwh:.1f} kWh is kept back as a margin"
             reason += min_note + free_note
-            if infeasible > 0:
+            if infeasible >= MIN_REPORTED_KWH:
                 reason += (f". About {infeasible:.1f} kWh of what is needed will not "
                            f"fit in the battery, so the house will import some of it "
                            f"at the day rate")

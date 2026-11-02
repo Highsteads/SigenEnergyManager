@@ -21,6 +21,30 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.143.0 - 2 November 2026
+
+`flux_strategy` 2.16. CliveS, 02-Nov-2026: the charge stopped at 81% and left about 1.5 kWh above the
+reserve at the next 2am. New `CHARGE_MARGIN_KWH` = 4.0, bought on top of `household_target` plus the
+resale room, limited by the forecast headroom and by `_sun_room_kwh` (the brighter-day half of
+`_resale_room_kwh`, split out), so a sunny day and a booked free hour keep their room. It does not
+stack on the 50% minimum and is not held at the peak: the sale can use it, and the 4 kW cap is what
+keeps it in the battery on a normal day. `_charge_plan` returns `buffer_kwh` as a seventh value and
+the reason names the margin. The shortfall sentence needs `MIN_REPORTED_KWH` (0.05), so a tail of a
+charge no longer logs "about 0.0 kWh".
+
+The sale now resumes after an Axle window inside the peak. Live 2-Nov: the window ended at 18:02:39 and
+the sale stayed off for about ten minutes, because `_drive_vpp_export` had re-stamped
+`flux_manual_preempt_at` and `flux_preempted_at` to the end, so the flag took 300 s to lapse and the
+stand-down 300 s more. `_end_vpp_export` calls the new `_flux_window_ended` once the hand-back is
+confirmed, the same treatment the 4pm overflow hand-over has. `FLUX_RECLAIM_TICKS` still applies.
+
+Simulated through tools/scenario_sim.py chained day to day over 3 Oct to 1 Nov 2026, real forecast and
+actual solar, today's prices, 15% reserve, stock valued at the cheap rate, wear included: £1.15 better
+on October as it was, 86p and 77p better with solar at 0.5 and 0.3, 32p and 6p better with a 26 kWh house.
+Average battery at 2am 24% to 30%, nights under 19% 13 to 3. A scaled October, not a real winter, and
+the house load is the tool's flat 21 kWh shape. With a heavy house and little sun the 100% ceiling
+already binds, so the margin adds nothing there. All 29 scenarios keep their rules.
+
 ## v5.142.1 - 2 November 2026
 
 Free-hour ledger, ledger version 3, free_hour_credits 1.3, octopus_api 1.8. Audited against the live

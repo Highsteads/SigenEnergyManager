@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.142.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.143.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.143.0 (2 November 2026)** - The 2am charge now keeps 4 kWh in the battery on top of what the day needs, as long as the day's sun would still have room. A night could otherwise finish the next evening only a kilowatt-hour or so above the reserve, which left very little if the sun fell short or the house used more than usual. The peak sale also picks up again straight after an Axle event, rather than about ten minutes later.
 
 **5.142.1 (2 November 2026)** - The free-hour record now agrees with what Octopus actually paid. Sundays that had been paid could come back weeks later as unpaid, at the wrong price, a payment could land on the wrong Sunday, and you could be told to chase Octopus for nothing. Each payment now finds its own hour, using the price Octopus published for that hour, and a settled Sunday stays settled.
 
@@ -168,6 +170,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.143.0 | 2 November 2026 | The 2am charge keeps a 4 kWh margin where the sun leaves room. |
 | 5.142.1 | 2 November 2026 | The free-hour record on the Energy page no longer says Octopus owes you for Sundays it has already paid. |
 | 5.142.0 | 1 November 2026 | The rest of the code review: checked inverter commands, sleep, dashboard password, smaller price and forecast fixes. |
 | 5.141.0 | 1 November 2026 | Fixes from a full code review: shutdown hand-back, Axle reschedules, grid-charge end time, Flux prices, no-sun days. |

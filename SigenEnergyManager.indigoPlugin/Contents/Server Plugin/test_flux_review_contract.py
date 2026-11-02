@@ -2,6 +2,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import flux_strategy as fs
@@ -97,7 +98,8 @@ class FluxIndependentReviewTests(unittest.TestCase):
     def test_grid_supplies_cheap_window_house_without_double_battery_purchase(self):
         i=scenario(hour=2,soc_pct=20.,house=fs.HalfHourProfile([.5]*48,TZ))
         i=replace(i,bands=replace(i.bands,export_peak_p=15.))  # no optional trade
-        decision=fs.plan(i)
+        with mock.patch.object(fs,"CHARGE_MARGIN_KWH",0.):  # the sizing alone
+            decision=fs.plan(i)
         # From 05:00 to 02:00: 21 kWh house + 7 kWh reserve = 28 kWh / 35.
         self.assertEqual(decision.charge_cutoff_pct,80.)
         self.assertAlmostEqual(decision.planned_kwh,21.,places=1)
