@@ -8,10 +8,14 @@
 # Date:        16-09-2026
 # Version:     2.0
 
+import ast
+import collections
+import inspect
 import os
 import sqlite3
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -1686,6 +1690,267 @@ class TestThePeakSaleResumesAfterAnAxleWindow(_FluxCase):
         p, when = self._window_just_ended(released=False)
         self.assertEqual(p.store["flux_manual_preempt"], "a driven export window")
         self.assertGreater(p.store["flux_preempted_at"], 0.0)
+
+
+class TestTheSaleCarriesAnAxleWindow(_FluxCase):
+    """CliveS, 2-Nov-2026: an Axle event wholly inside 4pm-7pm should not start and
+    stop anything, because the sale is already exporting at the cap. Live that day
+    the handover cost 30 s at 16:58 and, on the way out, 10 minutes 45 seconds."""
+
+    @staticmethod
+    def _event(start, minutes=60):
+        begin = datetime(2026, 9, 16, start[0], start[1], tzinfo=LONDON).astimezone(timezone.utc)
+        return {"id": "axle-1", "start_time": begin,
+                "end_time": begin + timedelta(minutes=minutes),
+                "import_export": "export", "duration_hrs": minutes / 60.0}
+
+    def _ready(self, hhmm=(16, 58), event=None, grid_w=-4000, owns=True, mode="export"):
+        p, when = self._at(hhmm, soc=70.0)
+        p.flux_executor = _FakeExecutor(owns=owns)
+        p.store.update(flux_decision=types.SimpleNamespace(mode=mode),
+                       flux_last_result="applied", vpp_state=plugin.VPP_PRE_CHARGING,
+                       vpp_floor_deferred=True, grid_export_daily_kwh=5.0,
+                       vpp_event=event or self._event((17, 0)))
+        p.latest_inverter_data["gridPowerWatts"] = grid_w
+        p._event_is_daytime = MagicMock(return_value=True)
+        p._drive_vpp_export = MagicMock()
+        p._set_vpp_discharge_cutoff = MagicMock()
+        p._write_vpp_event_header = MagicMock()
+        p._update_vpp_device = MagicMock()
+        return p, when
+
+    def _pinned(self, at, call):
+        real_dt, real_time = plugin.datetime, plugin.time
+
+        class _Clock(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return at.astimezone(tz or timezone.utc)
+
+        class _Time:
+            def __getattr__(self_inner, name):
+                return getattr(real_time, name)
+
+            @staticmethod
+            def time():
+                return at.timestamp()
+
+        plugin.datetime = _Clock
+        plugin.time     = _Time()
+        try:
+            return call()
+        finally:
+            plugin.datetime = real_dt
+            plugin.time     = real_time
+
+    def _reach_t_minus_2(self, p, when):
+        self._pinned(when, lambda: p._apply_vpp_event(p.store["vpp_event"]))
+
+    def _carried(self, hhmm=(16, 58), **kw):
+        p, when = self._ready(hhmm, **kw)
+        self._reach_t_minus_2(p, when)
+        self.assertTrue(p.store["vpp_flux_carries"])
+        return p, when
+
+    def test_a_window_inside_the_peak_touches_nothing(self):
+        p, _ = self._carried()
+        self.assertEqual(p.store["vpp_state"], plugin.VPP_ACTIVE)
+        self.assertTrue(p.store["vpp_active"])
+        self.assertTrue(p.flux_executor.owns_control)
+        self.assertEqual(p.store.get("flux_manual_preempt", ""), "")
+        p._drive_vpp_export.assert_not_called()
+        p._set_vpp_discharge_cutoff.assert_not_called()
+
+    def test_a_window_ending_as_the_peak_ends_counts_as_inside(self):
+        self._carried((17, 58), event=self._event((18, 0)))
+
+    def test_a_window_running_past_seven_is_driven_as_before(self):
+        p, when = self._ready((18, 28), event=self._event((18, 30)))
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._drive_vpp_export.assert_called_once()
+        self.assertFalse(p.flux_executor.owns_control)
+
+    def test_an_evening_window_is_driven_as_before(self):
+        p, when = self._ready((18, 58), event=self._event((19, 0)))
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._drive_vpp_export.assert_called_once()
+
+    def test_no_claim_means_the_driver_runs(self):
+        p, when = self._ready(owns=False)
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._drive_vpp_export.assert_called_once()
+        p._set_vpp_discharge_cutoff.assert_called_once()
+
+    def test_a_claim_that_is_not_a_sale_means_the_driver_runs(self):
+        p, when = self._ready(mode="supply_house")
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._drive_vpp_export.assert_called_once()
+
+    def test_a_command_not_yet_acknowledged_means_the_driver_runs(self):
+        p, when = self._ready()
+        p.store["flux_last_result"] = "pending"
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+
+    def test_a_sale_below_the_cap_means_the_driver_runs(self):
+        p, when = self._ready(grid_w=-1500)
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._drive_vpp_export.assert_called_once()
+
+    def test_an_unknown_meter_reading_means_the_driver_runs(self):
+        p, when = self._ready()
+        del p.latest_inverter_data["gridPowerWatts"]
+        self._reach_t_minus_2(p, when)
+        self.assertFalse(p.store["vpp_flux_carries"])
+
+    def test_a_late_notice_inside_a_running_sale_is_carried_too(self):
+        p, when = self._ready((17, 10))
+        p.store.update(vpp_state=plugin.VPP_IDLE, vpp_floor_deferred=False, vpp_event=None)
+        self._pinned(when, lambda: p._apply_vpp_event(self._event((17, 0))))
+        self.assertEqual(p.store["vpp_state"], plugin.VPP_ACTIVE)
+        self.assertTrue(p.store["vpp_flux_carries"])
+        self.assertTrue(p.flux_executor.owns_control)
+        p._set_vpp_discharge_cutoff.assert_not_called()
+        p._drive_vpp_export.assert_not_called()
+
+    def test_the_sale_is_not_stood_aside_for_a_carried_window(self):
+        p, when = self._carried()
+        self.assertEqual(p._flux_other_owner(), "")
+        self.assertEqual(p._flux_dispatch_event_ids(), set())
+        self.assertFalse(p._driven_export_owns_registers())
+        self._run(p, when, at=when + timedelta(minutes=20))
+        self.assertEqual(p.store["flux_owner_reason"], "")
+        self.assertEqual(p.store["flux_decision"].mode, plugin._flux_strategy.MODE_EXPORT)
+        self.assertEqual(len(p.flux_executor.targets()), 1)
+
+    def test_the_floor_still_holds_what_the_event_has_left_to_sell(self):
+        p, when = self._carried()
+        at = when + timedelta(minutes=32)      # 17:30, half the window to go
+        commitments = self._pinned(at, p._flux_commitments)
+        self.assertEqual(len(commitments), 1)
+        self.assertAlmostEqual(
+            plugin._flux_strategy.commitment_energy_kwh(
+                commitments, at, at + timedelta(hours=2)), 2.0, places=2)
+
+    def test_the_manager_does_not_drive_a_carried_window(self):
+        p, when = self._carried()
+        p.store["solar_overflow_charge_cap_w"] = 0
+        snapshot = lambda: p._build_manager_snapshot(70.0, True, 0.0)   # noqa: E731
+        self.assertFalse(self._pinned(when, snapshot).vpp_active)
+        p.store["vpp_flux_carries"] = False
+        self.assertTrue(self._pinned(when, snapshot).vpp_active)
+
+    def test_the_tail_writes_nothing_and_the_sale_runs_on(self):
+        p, when = self._carried()
+        p.modbus.set_self_consumption = MagicMock(return_value=True)
+        p._restore_discharge_cutoff = MagicMock()
+        p.store["flux_manual_preempt"] = "a Set Self-Consumption action"
+        p.store["grid_export_daily_kwh"] = 9.5
+        end = p.store["vpp_event"]["end_time"]
+        self._pinned(end + timedelta(minutes=2, seconds=1),
+                     lambda: p._apply_vpp_event(None))
+        p.modbus.set_self_consumption.assert_not_called()
+        p._restore_discharge_cutoff.assert_not_called()
+        self.assertEqual(p.store["vpp_state"], plugin.VPP_IDLE)
+        self.assertFalse(p.store["vpp_active"])
+        self.assertFalse(p.store["vpp_flux_carries"])
+        self.assertAlmostEqual(p.store["vpp_last_export_kwh"], 4.5)
+        self.assertTrue(p.flux_executor.owns_control)
+        # Somebody else's pre-emption is not this window's to clear.
+        self.assertEqual(p.store["flux_manual_preempt"], "a Set Self-Consumption action")
+
+    def _watch(self, p, at):
+        self._pinned(at, p._vpp_watch_carried_window)
+
+    def test_a_sale_that_keeps_going_is_left_alone(self):
+        p, when = self._carried()
+        for seconds in (10, 40, 70, 100):
+            self._watch(p, when + timedelta(seconds=seconds))
+        self.assertTrue(p.store["vpp_flux_carries"])
+        p._set_vpp_discharge_cutoff.assert_not_called()
+
+    def test_a_sale_that_stops_is_given_the_grace_then_the_driver_takes_it(self):
+        p, when = self._carried()
+        p.store["last_manager"] = when.timestamp()
+        p.store["solar_overflow_active"] = True   # the manager had the roof meanwhile
+        at = when + timedelta(minutes=10)
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, at)
+        self._watch(p, at + timedelta(seconds=plugin.VPP_CARRY_GRACE_S - 1))
+        self.assertTrue(p.store["vpp_flux_carries"])
+        p._set_vpp_discharge_cutoff.assert_not_called()
+        self._watch(p, at + timedelta(seconds=plugin.VPP_CARRY_GRACE_S))
+        self.assertFalse(p.store["vpp_flux_carries"])
+        p._set_vpp_discharge_cutoff.assert_called_once()
+        self.assertEqual(p.store["last_manager"], 0.0)   # the manager decides this tick
+        self.assertFalse(p.store["solar_overflow_active"])
+        self.assertNotEqual(p._flux_other_owner(), "")
+
+    def test_a_short_dip_does_not_add_up_across_recoveries(self):
+        p, when = self._carried()
+        at = when + timedelta(minutes=10)
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, at)
+        p.latest_inverter_data["gridPowerWatts"] = -4000
+        self._watch(p, at + timedelta(seconds=10))
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, at + timedelta(seconds=plugin.VPP_CARRY_GRACE_S))
+        self.assertTrue(p.store["vpp_flux_carries"])
+
+    def test_a_lost_inverter_link_is_not_a_stopped_sale(self):
+        p, when = self._carried()
+        p.modbus.connected = False
+        at = when + timedelta(minutes=10)
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, at)
+        self._watch(p, at + timedelta(seconds=plugin.VPP_CARRY_GRACE_S + 60))
+        self.assertTrue(p.store["vpp_flux_carries"])
+        p._set_vpp_discharge_cutoff.assert_not_called()
+
+    def test_nothing_is_taken_over_once_the_paid_window_has_closed(self):
+        p, when = self._carried()
+        end = p.store["vpp_event"]["end_time"]
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, end)
+        self._watch(p, end + timedelta(seconds=plugin.VPP_CARRY_GRACE_S + 30))
+        self.assertTrue(p.store["vpp_flux_carries"])
+        p._set_vpp_discharge_cutoff.assert_not_called()
+
+    def test_a_taken_over_window_ends_the_way_a_driven_one_does(self):
+        p, when = self._carried()
+        at = when + timedelta(minutes=10)
+        p.latest_inverter_data["gridPowerWatts"] = 100
+        self._watch(p, at)
+        self._watch(p, at + timedelta(seconds=plugin.VPP_CARRY_GRACE_S))
+        p.modbus.set_self_consumption = MagicMock(return_value=True)
+        p._restore_discharge_cutoff = MagicMock()
+        end = p.store["vpp_event"]["end_time"]
+        self._pinned(end + timedelta(minutes=2, seconds=1),
+                     lambda: p._apply_vpp_event(None))
+        p.modbus.set_self_consumption.assert_called_once()
+        p._restore_discharge_cutoff.assert_called_once()
+
+    def test_the_watch_runs_on_every_tick(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(plugin.Plugin._tick)))
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        self.assertIn("_vpp_watch_carried_window", called)
+
+    def test_a_carried_window_survives_a_restart(self):
+        p, _ = self._carried()
+        p._get_data_dir = lambda: p.data_dir
+        p.store = collections.defaultdict(float, p.store)   # the daily totals it also saves
+        plugin.Plugin._save_accumulators(p)
+        q = _mk_plugin(soc=70.0)
+        q._get_data_dir = lambda: p.data_dir
+        q._load_accumulators()
+        self.assertTrue(q.store["vpp_flux_carries"])
+        self.assertEqual(q.store["vpp_state"], plugin.VPP_ACTIVE)
 
 
 class TestPendingClaim(_FluxCase):

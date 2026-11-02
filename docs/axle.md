@@ -24,6 +24,8 @@ The plugin checks Axle for new events every ten minutes, and every minute when o
 
 From two minutes before the start to two minutes after the end, the plugin sells from the battery itself, at the full rate your export limit allows. The **Battery Manager** shows **VPP Export Active**, and the **VPP Event Started** trigger runs. Because Axle settle on your meter readings, a sale the plugin runs counts in exactly the same way as one Axle would start, and the same units earn your ordinary Octopus export price as well.
 
+**An event wholly inside 4pm to 7pm on Octopus Flux** is the exception. If the [peak sale](flux.md) is already running at your export limit two minutes before the start, the plugin leaves it alone and the sale carries the event, because the meter is already where Axle want it. Nothing changes on the inverter at the start or the end, and the **Battery Manager** goes on showing the peak sale rather than **VPP Export Active**. The **VPP Event Started** and **VPP Event Ended** triggers still run, and the event is counted and recorded as usual. If the sale stops or falls short for 30 seconds during the event, the plugin takes the event over and sells as described above. The Event Log says which of these happened.
+
 The plugin keeps time by the event's own start and end, so a short break in Axle's service during an event does not cut it short. An event Axle cancel before it starts is stood down.
 
 An event comes before everything else the plugin does, except a storm warning or the hold-off after a power cut, which stop it selling.

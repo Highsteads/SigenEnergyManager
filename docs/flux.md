@@ -28,7 +28,7 @@ On a day the ordinary plan has had to buy at the standard rate to get through th
 
 ## What comes first
 
-The strategy steps aside, straight away, for anything more important: an Axle event, a Weekend Happy Hour, a storm warning, a power cut, an action you run by hand, or pausing the plugin. An event that is only announced keeps its energy set aside without the strategy giving up the inverter, and a 4pm to 7pm sale carries on until two minutes before an Axle event starts. A Saving Session needs neither: inside 4pm to 7pm the peak sale runs through it, and outside it the battery simply runs the house (see [Saving Sessions](saving-sessions.md)). The Event Log says when it steps aside and when it takes the inverter back.
+The strategy steps aside, straight away, for anything more important: an Axle event, a Weekend Happy Hour, a storm warning, a power cut, an action you run by hand, or pausing the plugin. An event that is only announced keeps its energy set aside without the strategy giving up the inverter, and a 4pm to 7pm sale carries on until two minutes before an Axle event starts, unless the event sits wholly inside those hours and the sale is already at your export limit, when the sale simply carries the event (see [Axle events](axle.md)). A Saving Session needs neither: inside 4pm to 7pm the peak sale runs through it, and outside it the battery simply runs the house (see [Saving Sessions](saving-sessions.md)). The Event Log says when it steps aside and when it takes the inverter back.
 
 ## Switching it on
 

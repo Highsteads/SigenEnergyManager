@@ -21,6 +21,14 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.144.0 - 2 November 2026
+
+CliveS, 02-Nov-2026: an Axle event wholly inside the peak should not start and stop anything. At T-2min `_flux_sale_can_carry` asks whether the event starts and ends inside one peak (`_vpp_event_inside_peak`) and whether `_flux_sale_at_the_cap`: the executor holds the claim, `flux_decision.mode` is export, the last step was `applied`, and the meter shows at least `VPP_CARRY_MIN_EXPORT_FRACTION` (0.9) of `maxExportKw`. If so `vpp_flux_carries` is set, persisted in accumulators, and the window goes ACTIVE with no `_flux_preempt`, no floor and no drive. `_vpp_shares_flux` replaces `_vpp_precharge_shares_flux` at its three call sites, so a carried window is not an owner, stays in the sale's floor and does not own the registers. The manager snapshot reads `vpp_active` False for it. `_end_vpp_export` writes nothing for a carried window and leaves `_flux_window_ended` alone. The late-notice path asks the same question.
+
+`_vpp_watch_carried_window` runs every tick: `VPP_CARRY_GRACE_S` (30) short of the cap, with the link up and the paid window still open, and it sets the VPP floors and resets `last_manager`, so the manager decides on that tick and its own gates (a lockout, say) keep the last word. An unknown meter reading counts as short, a lost link does not. The event's JSONL `event_ended` record gains `carried_by_flux`, and `_vpp_driver` reports `flux sale`.
+
+Saving Sessions were never on this path: `_saving_session_window` returns None while Flux is armed (5.126.0). Unproven on a real event at release. 22 new tests, 27 mutants all caught.
+
 ## v5.143.0 - 2 November 2026
 
 `flux_strategy` 2.16. CliveS, 02-Nov-2026: the charge stopped at 81% and left about 1.5 kWh above the

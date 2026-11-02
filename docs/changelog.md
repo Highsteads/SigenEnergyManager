@@ -7,6 +7,12 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.144.0 - 2 November 2026
+
+An Axle event that sits wholly inside 4pm to 7pm no longer touches the inverter when the peak sale is already running at your export limit. Axle pay on the meter, and the meter is already at the limit, so the sale carries the event and nothing stops or starts. On 2 November stopping the sale for a 5pm to 6pm event cost half a minute going in and nearly eleven minutes coming out, about 0.7 kWh of the peak.
+
+The plugin still treats it as a paid event, and it counts and records the export in the same way. If the sale stops or falls short during the event, the plugin gives it 30 seconds and then takes the event over itself, setting the event's lowest battery level and selling as it always has, so a paid event never depends on the sale going on. An event that runs past 7pm, starts outside the peak, or finds no sale at the limit two minutes before its start runs exactly as before. That includes an event starting at 4pm sharp, because the sale has not begun two minutes earlier.
+
 ## 5.143.0 - 2 November 2026
 
 The 2am charge now keeps 4 kWh in the battery on top of what the day needs and what the peak can sell. Before this, a night could finish the next evening only a kilowatt-hour or so above the reserve, which left very little if the sun fell short or the house used more than usual. The margin is only bought where the day's sun would still have room, so a bright day keeps its space and a booked free hour keeps its room. The log says how much of each charge is the margin. The false "about 0.0 kWh will not fit" line at the end of a charge has also gone.
