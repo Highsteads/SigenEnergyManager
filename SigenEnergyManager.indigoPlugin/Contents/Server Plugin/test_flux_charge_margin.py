@@ -116,8 +116,9 @@ class TestTheMarginLeavesRoom(unittest.TestCase):
 class TestAShortfallTheLogCanShow(unittest.TestCase):
     PLAN = (81.0, 1000, 0.5, 10.6, 0.0)
 
-    def _reason(self, infeasible):
-        with mock.patch.object(fs, "_charge_plan", lambda i: self.PLAN + (infeasible, 0.0)):
+    def _reason(self, infeasible, late=0.0):
+        with mock.patch.object(fs, "_charge_plan",
+                               lambda i: self.PLAN + (infeasible, 0.0, late)):
             return fs.plan(_inputs((3, 0), soc_pct=50.0, day=DAY)).reason
 
     def test_nothing_is_said_about_a_shortfall_that_rounds_to_nothing(self):
@@ -125,6 +126,33 @@ class TestAShortfallTheLogCanShow(unittest.TestCase):
 
     def test_a_real_shortfall_is_still_reported(self):
         self.assertIn("About 0.4 kWh of what is needed will not fit", self._reason(0.4))
+
+    def test_a_small_late_shortfall_is_not_called_a_full_battery(self):
+        # 3-Nov-2026 04:49-04:52: 0.1 kWh short on time, logged as "will not fit".
+        reason = self._reason(0.1, late=0.1)
+        self.assertNotIn("will not fit", reason)
+        self.assertNotIn("time left", reason)
+
+    def test_a_large_late_shortfall_names_the_time_left(self):
+        reason = self._reason(3.0, late=3.0)
+        self.assertIn(f"About 3.0 kWh of it cannot be bought in the time left before "
+                      f"{fs.FLUX_CHARGE_END:%H:%M}", reason)
+        self.assertNotIn("will not fit", reason)
+
+    def test_both_shortfalls_are_told_apart(self):
+        reason = self._reason(2.0, late=1.2)
+        self.assertIn("About 0.8 kWh of what is needed will not fit", reason)
+        self.assertIn("About 1.2 kWh of it cannot be bought", reason)
+
+
+class TestTheLateShareOfTheShortfall(unittest.TestCase):
+    def test_a_charge_started_late_reports_its_time_shortfall(self):
+        # 04:50 with a near-empty battery: the room is there, the minutes are not.
+        out = fs._charge_plan(_inputs((4, 50), soc_pct=20.0, day=DAY))
+        self.assertEqual(len(out), 8)
+        infeasible, late = out[5], out[7]
+        self.assertGreater(late, fs.MIN_TRADE_KWH)
+        self.assertLessEqual(late, infeasible + 1e-9)
 
 
 if __name__ == "__main__":

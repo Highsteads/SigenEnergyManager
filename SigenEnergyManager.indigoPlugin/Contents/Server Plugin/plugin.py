@@ -78,6 +78,7 @@
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
+#              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
 #              Claude Opus 5.5 (5.143.0 - the 2am charge keeps a 4 kWh margin where the sun leaves room)
 #              Claude Opus 5.5 (5.142.1 - free-hour record: paid Sundays stay paid, each credit finds its own hour)
@@ -87,8 +88,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        02-11-2026 21:26 GMT
-# Version:     5.144.0
+# Date:        03-11-2026 05:10 GMT
+# Version:     5.144.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -582,6 +583,7 @@ ACCUMULATOR_SAVE_INTERVAL = 300   # 5 minutes
 ENERGY_BALANCE_ABS_KWH    = 0.5
 ENERGY_BALANCE_FRACTION   = 0.03
 ENERGY_HOUSE_FRACTION     = 0.05
+ENERGY_REARM_FRACTION     = 0.5    # a tripped check clears below half its bound
 # How long the midnight task waits for a post-midnight lifetime read to replace
 # the provisional anchor before recording the day anyway.
 MIDNIGHT_ANCHOR_WAIT_S    = 600
@@ -4261,29 +4263,34 @@ class Plugin(indigo.PluginBase):
         if residual is not None:
             through = v["pv"] + v["gridImport"] + v["batteryDischarge"]
             checks.append((
-                "balance",
-                abs(residual) > max(ENERGY_BALANCE_ABS_KWH, ENERGY_BALANCE_FRACTION * through),
+                "balance", abs(residual),
+                max(ENERGY_BALANCE_ABS_KWH, ENERGY_BALANCE_FRACTION * through),
                 f"energy balance off by {residual:+.2f} kWh so far today (pv {v['pv']:.2f} "
                 f"+ import {v['gridImport']:.2f} + discharge {v['batteryDischarge']:.2f} "
                 f"- export {v['gridExport']:.2f} - charge {v['batteryCharge']:.2f} - house "
-                f"{v['home']:.2f}) — a midnight anchor is wrong; the figures come right "
-                f"again at the next midnight"))
+                f"{v['home']:.2f}). Either a midnight anchor is wrong, and the figures come "
+                f"right again at the next midnight, or one of the inverter's counters is "
+                f"running behind the others and will catch up by itself"))
         device_home = (data or {}).get("homeDailyDirectKwh")
         derived     = self.store.get("home_daily_kwh")
         if device_home is not None and derived is not None and v["home"] is not None:
             gap = float(derived) - float(device_home)
             checks.append((
-                "house",
-                abs(gap) > max(ENERGY_BALANCE_ABS_KWH, ENERGY_HOUSE_FRACTION * float(device_home)),
+                "house", abs(gap),
+                max(ENERGY_BALANCE_ABS_KWH, ENERGY_HOUSE_FRACTION * float(device_home)),
                 f"derived house use {float(derived):.2f} kWh disagrees with the inverter's "
                 f"own daily counter {float(device_home):.2f} kWh by {gap:+.2f} kWh — the "
                 f"house anchor is wrong"))
-        for name, bad, message in checks:
+        # 5.144.1: a check re-arms only once the gap is well inside its bound. On
+        # 3-Nov-2026 the battery-charge counter ran about 0.5 kWh ahead of the import
+        # counter for 76 minutes of the 2am charge, against a 0.5 kWh bound, and the
+        # warning and its all-clear went into the log nine times each.
+        for name, gap, bound, message in checks:
             flag = f"{today}:{name}"
-            if bad and flag not in flags:
+            if gap > bound and flag not in flags:
                 log(f"[Energy] {message}", level="WARNING")
                 flags.add(flag)
-            elif not bad and flag in flags:
+            elif gap <= bound * ENERGY_REARM_FRACTION and flag in flags:
                 log(f"[Energy] {name} check back within bounds")
                 flags.discard(flag)
         self.store["energy_reconcile_warned"] = ",".join(sorted(flags))

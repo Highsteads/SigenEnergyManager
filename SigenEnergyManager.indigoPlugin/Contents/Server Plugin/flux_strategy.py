@@ -14,7 +14,8 @@
 #              2.14: Claude Opus 5.5, 30-10-2026 (a normal night may store up to 100%)
 #              2.15: Claude Opus 5.5, 01-11-2026 (a measured 0 tracking factor is kept)
 #              2.16: Claude Opus 5.5, 02-11-2026 (the night charge keeps a 4 kWh margin)
-# Version:     2.16
+#              2.17: Claude Opus 5.5, 03-11-2026 (a late charge is not one that will not fit)
+# Version:     2.17
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -1409,10 +1410,13 @@ def _decision_until(inputs, hard_end=None):
 # ================================================================
 
 def _charge_plan(inputs):
-    """(target_pct, power_w, buy_kwh, margin_p, household_kwh, infeasible_kwh, buffer_kwh).
+    """(target_pct, power_w, buy_kwh, margin_p, household_kwh, infeasible_kwh, buffer_kwh,
+    late_kwh).
 
     `buffer_kwh` is the part of CHARGE_MARGIN_KWH this charge makes room for. The sum
     is the same either side of it: the house, then the peak sale, then the buffer.
+    `late_kwh` is the part of `infeasible_kwh` that the battery has room for but the
+    time left in the window cannot deliver (v2.17); the rest will not fit at all.
     """
     site   = inputs.site
     tz     = inputs.local_tz
@@ -1491,7 +1495,7 @@ def _charge_plan(inputs):
     if inputs.storm_fill:
         buy_kwh = max(buy_kwh, ceiling_kwh - have_kwh)
     if buy_kwh <= 0:
-        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh
+        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh, 0.0
 
     # The charge cutoff is a ceiling on SOC, so it is the target the battery
     # should reach — never above the configured maximum charge SOC, arbitrage
@@ -1505,7 +1509,7 @@ def _charge_plan(inputs):
     # Done once the SOC is at the cutoff (the same 0.05% slack _minimum_charge
     # uses, so a reading of 83.96% against an 84% cutoff is not a new charge).
     if target_pct <= float(inputs.soc_pct) + 0.05:
-        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh
+        return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh, 0.0
 
     hours_left = max(1.0 / 60.0, (window_end - inputs.now).total_seconds() / 3600.0)
     # max(1, ...): a tail of a few Wh must not round to 0 W and read as "no
@@ -1520,8 +1524,10 @@ def _charge_plan(inputs):
     # and started too late is still short, and the shortfall is a fact the log
     # should carry rather than something the target quietly rounds away.
     deliverable = available / 1000.0 * hours_left * eff
-    infeasible += max(0.0, buy_kwh - deliverable)
-    return target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible, buffer_kwh
+    late_kwh    = max(0.0, buy_kwh - deliverable)
+    infeasible += late_kwh
+    return (target_pct, power_w, buy_kwh, margin_p, household_buy_kwh, infeasible,
+            buffer_kwh, late_kwh)
 
 
 # v2.10: the shortest time left the minimum's power is sized on. Below a minute the
@@ -1860,7 +1866,7 @@ def _plan(inputs):
             # v2.7: plan the charge on a dimmer day than forecast, so a forecast that
             # is too sunny no longer leaves the peak sale or the evening short.
             (target_pct, power_w, buy_kwh, margin_p,
-             household_kwh, infeasible, buffer_kwh) = _charge_plan(
+             household_kwh, infeasible, buffer_kwh, late_kwh) = _charge_plan(
                  replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR)))
             # Say so when a booked free hour shaped the charge. An armed state has
             # to be visible BEFORE it fires, or the first anyone learns of a
@@ -1913,10 +1919,18 @@ def _plan(inputs):
             if kept_kwh >= MIN_TRADE_KWH:
                 reason += f", and {kept_kwh:.1f} kWh is kept back as a margin"
             reason += min_note + free_note
-            if infeasible >= MIN_REPORTED_KWH:
-                reason += (f". About {infeasible:.1f} kWh of what is needed will not "
+            # v2.17: room the battery has but the time left cannot fill is a different
+            # fact from energy that will not fit, and is said only at a trading size.
+            # On 3-Nov-2026 the last minutes of the window put a 0.1 kWh "will not fit"
+            # on and off the plan every tick, and each flip logged the plan again.
+            no_room_kwh = infeasible - late_kwh
+            if no_room_kwh >= MIN_REPORTED_KWH:
+                reason += (f". About {no_room_kwh:.1f} kWh of what is needed will not "
                            f"fit in the battery, so the house will import some of it "
                            f"at the day rate")
+            if late_kwh >= MIN_TRADE_KWH:
+                reason += (f". About {late_kwh:.1f} kWh of it cannot be bought in the "
+                           f"time left before {FLUX_CHARGE_END:%H:%M}")
             return FluxDecision(
                 mode=MODE_CHARGE, owns=True, decision_at=inputs.now,
                 ems_mode=EMS_CHARGE_GRID,

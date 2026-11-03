@@ -21,6 +21,12 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.144.1 - 3 November 2026
+
+`_reconcile_daily_energy` re-arms a tripped check only when the gap falls to `ENERGY_REARM_FRACTION` (0.5) of its bound. On 3-Nov the lifetime battery-charge counter ran about 0.52 kWh ahead of the import counter from 02:12 to 03:29, against the 0.5 kWh floor of the bound, so the balance check warned and cleared nine times each. By 05:06 the day closed to 0.00 kWh with the same midnight anchors, so it was counter lag, not an anchor. The warning text now names both causes.
+
+`flux_strategy` 2.17: `_charge_plan` returns an eighth value, `late_kwh`, the part of `infeasible` that the battery has room for but the time left cannot deliver. The plan says "will not fit in the battery" only for `infeasible - late_kwh` (at `MIN_REPORTED_KWH`), and names a time shortfall separately, only at `MIN_TRADE_KWH`. On 3-Nov 04:49-04:52 a 0.1 kWh time shortfall flipped the suffix on and off, and `note_key` logged each flip. `FluxDecision.infeasible_kwh` still carries the total. 6 new tests, 5 of 5 mutants caught.
+
 ## v5.144.0 - 2 November 2026
 
 CliveS, 02-Nov-2026: an Axle event wholly inside the peak should not start and stop anything. At T-2min `_flux_sale_can_carry` asks whether the event starts and ends inside one peak (`_vpp_event_inside_peak`) and whether `_flux_sale_at_the_cap`: the executor holds the claim, `flux_decision.mode` is export, the last step was `applied`, and the meter shows at least `VPP_CARRY_MIN_EXPORT_FRACTION` (0.9) of `maxExportKw`. If so `vpp_flux_carries` is set, persisted in accumulators, and the window goes ACTIVE with no `_flux_preempt`, no floor and no drive. `_vpp_shares_flux` replaces `_vpp_precharge_shares_flux` at its three call sites, so a carried window is not an owner, stays in the sale's floor and does not own the registers. The manager snapshot reads `vpp_active` False for it. `_end_vpp_export` writes nothing for a carried window and leaves `_flux_window_ended` alone. The late-notice path asks the same question.

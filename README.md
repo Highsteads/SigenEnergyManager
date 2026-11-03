@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.144.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.144.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.144.1 (3 November 2026)** - Two noisy log lines from the first night with the charge margin are quieter. The energy balance check warned and cleared nine times in an hour when one of the inverter's counters ran about half a kWh behind the others during the 2am charge. It now warns once and clears only when the gap is well inside its limit. And a charge running a few minutes short of time at the end of the night no longer says energy "will not fit in the battery". A shortfall of time is now named as one, and only when it is half a kWh or more.
 
 **5.144.0 (2 November 2026)** - An Axle event that sits wholly inside 4pm to 7pm no longer touches the inverter when the peak sale is already running at your export limit. The sale carries the event and nothing stops or starts, so the minutes lost either side of it have gone (11 of them on 2 November, about 0.7 kWh). If the sale stops during the event the plugin takes the event over itself, usually within a minute, so a paid event never depends on it. Events outside those hours, and an event starting at 4pm sharp, run as before.
 
@@ -172,6 +174,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.144.1 | 3 November 2026 | Quieter overnight log: the energy check warns once, and a late charge is not called a full battery. |
 | 5.144.0 | 2 November 2026 | An Axle event wholly inside 4pm to 7pm stays with a sale already at the export limit. |
 | 5.143.0 | 2 November 2026 | The 2am charge keeps a 4 kWh margin where the sun leaves room. |
 | 5.142.1 | 2 November 2026 | The free-hour record on the Energy page no longer says Octopus owes you for Sundays it has already paid. |

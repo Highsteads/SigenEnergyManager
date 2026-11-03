@@ -7,6 +7,14 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.144.1 - 3 November 2026
+
+The first night with the 4 kWh margin charged the battery to 94%, against 81% the night before. It also put two kinds of noise in the Event Log, and both are gone.
+
+The daily energy check, which makes sure everything coming in matches everything going out, warned nine times between 2am and 3:30am and cleared itself nine times. One of the inverter's counters was running about half a kWh behind the others during the charge, right on the check's limit, and by 5am the books balanced to the hundredth. The check now warns once and stays quiet until the gap is well inside its limit. Its warning also says that a counter running behind is one possible cause, not only a wrong midnight reading.
+
+In the last minutes of the charge the plan kept adding and dropping "about 0.1 kWh of what is needed will not fit in the battery", and each change logged the plan again. The battery had plenty of room, but there were not enough minutes left to buy that last tenth. A shortfall of time is now told apart from a full battery, and it is only mentioned when it is half a kWh or more.
+
 ## 5.144.0 - 2 November 2026
 
 An Axle event that sits wholly inside 4pm to 7pm no longer touches the inverter when the peak sale is already running at your export limit. Axle pay on the meter, and the meter is already at the limit, so the sale carries the event and nothing stops or starts. On 2 November stopping the sale for a 5pm to 6pm event cost half a minute going in and nearly eleven minutes coming out, about 0.7 kWh of the peak.

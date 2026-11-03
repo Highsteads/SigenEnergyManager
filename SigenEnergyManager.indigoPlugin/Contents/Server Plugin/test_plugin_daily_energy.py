@@ -393,6 +393,26 @@ class TestReconciliationTripwire(_Tmp):
             self.assertTrue(any("back within bounds" in str(c) for c in lg.call_args_list))
         self.assertEqual(p.store["energy_reconcile_warned"], "")
 
+    def test_a_gap_hovering_at_the_bound_warns_once(self):
+        # 3-Nov-2026: a counter ran 0.49 to 0.53 kWh behind the others during the
+        # 2am charge, against a 0.5 kWh bound, and the warning flapped nine times.
+        p = _mk(self.tmp)
+        with patch.object(plugin, "_local_today_str", return_value=D1), \
+             patch.object(plugin, "log") as lg:
+            p._observe_energy_counters(_data(read_at=MID_D1 + 20))
+            for i, (pv, home) in enumerate(((7610.0, 4010.52), (7610.03, 4010.52),
+                                            (7610.03, 4010.56), (7610.05, 4010.56))):
+                p._observe_energy_counters(_data(pv=pv, home=home,
+                                                 read_at=MID_D1 + 3600 + 60 * i))
+            warnings = [c for c in lg.call_args_list if c.kwargs.get("level") == "WARNING"]
+            self.assertEqual(len(warnings), 1)
+            self.assertFalse(any("back within bounds" in str(c) for c in lg.call_args_list))
+            p._observe_energy_counters(_data(pv=7610.56, home=4010.56,
+                                             read_at=MID_D1 + 4000))
+            self.assertEqual(sum("back within bounds" in str(c)
+                                 for c in lg.call_args_list), 1)
+        self.assertEqual(p.store["energy_reconcile_warned"], "")
+
     def test_derived_house_is_checked_against_the_inverters_daily_counter(self):
         p = _mk(self.tmp)
         with patch.object(plugin, "_local_today_str", return_value=D1), \
