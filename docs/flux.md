@@ -20,7 +20,7 @@ The tariff itself stays cheap until 5am. Charging ends two minutes earlier to al
 
 **Through the day** the battery always runs the house. The plugin never stops it to save charge for the peak. The house only draws from the grid during free-electricity hours, when the battery reaches its lowest allowed charge, or when an [Axle event](axle.md) needs more than the battery holds, and then only enough to run the event and carry the house to 2am.
 
-**From 4pm to 7pm** it sells what the battery can spare, at the full rate your export limit allows. It keeps back your reserve, what the house will need until the cheap hours come round again, and anything promised to an event that is still to come.
+**From 4pm to 7pm** it sells what the battery can spare, at the full rate your export limit allows. It keeps back your reserve plus about 1.2 kWh, what the house will need until the cheap hours come round again, and anything promised to an event that is still to come.
 
 **The rest of the time** it hands the inverter back to the ordinary plan, which runs the house from the battery and handles the solar as described in [Selling to the grid](selling.md).
 

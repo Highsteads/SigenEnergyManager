@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.144.3 - 3 November 2026
+
+The 4pm to 7pm sale now stops a little earlier, keeping about 1.2 kWh above your reserve for the night. It used to stop at exactly the level it worked out would reach the reserve at 2am, and the night usually came in a little short: eight of the ten nights to 3 November fell to between 15% and 19% before the cheap charge began, against a 20% reserve. The house never had to buy from the grid, because the inverter itself only stops at 15%, but a plan that aims for the reserve should reach it. Keeping the margin costs the sale's profit on that 1.2 kWh, about 13p a night. The house can still use the margin, so a busier evening than usual runs on it rather than on the grid.
+
 ## 5.144.2 - 3 November 2026
 
 If the plugin started within 30 seconds of the Mac starting, it turned away its own first connection to the inverter and waited half a minute before trying again. The wait between tries is measured on a clock that starts when the Mac starts, and "never tried" was stored as nought on that clock, so it looked like a try a moment ago. "Never tried" now means exactly that. A test machine on GitHub, started seconds before the tests ran, found it.

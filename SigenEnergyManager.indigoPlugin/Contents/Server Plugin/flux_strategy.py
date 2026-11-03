@@ -15,7 +15,8 @@
 #              2.15: Claude Opus 5.5, 01-11-2026 (a measured 0 tracking factor is kept)
 #              2.16: Claude Opus 5.5, 02-11-2026 (the night charge keeps a 4 kWh margin)
 #              2.17: Claude Opus 5.5, 03-11-2026 (a late charge is not one that will not fit)
-# Version:     2.17
+#              2.18: Claude Opus 5.5, 03-11-2026 (the peak sale keeps a margin for the night)
+# Version:     2.18
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -247,6 +248,13 @@ MIN_REPORTED_KWH         = 0.05
 # Axle pays about £1/kWh and the dearest import is about 30p, so buying a little
 # too much to support an event is fine; running out before 2am should not happen.
 COVER_MARGIN_KWH         = 1.0
+# Kept above the reserve at 2am by the PEAK SALE (v2.18). The sale stopped exactly at
+# "reserve at 2am", and the night ran under it: 8 of the 10 nights to 3-Nov-2026 fell
+# to 15-19% before the cheap window, worst ordinary night 16.5% (31-Oct), 3.5 points
+# or 1.2 kWh short, from a 7pm-2am draw a little over the profile plus the sale
+# ending a point under its floor. Costs the trade margin on 1.2 kWh, about 13p a
+# night. The house floor does not carry it: the house may still use this energy.
+PEAK_SALE_MARGIN_KWH     = 1.2
 COVER_LEAD_MINUTES       = 60        # finish an event-cover charge this long before its deadline (the VPP pre-charge starts 30 min before an event)
 SIM_STEP_MINUTES         = 30
 SEARCH_TOLERANCE_KWH     = 1e-6      # the binary search's own convergence error
@@ -1265,17 +1273,27 @@ def household_floor_pct(inputs, until):
     return min(100.0, float(math.ceil(floor + _pct(need, site.capacity_kwh))))
 
 
+def _sale_floor_kwh(site):
+    """The low-water mark at 2am a discretionary sale must leave (v2.18).
+
+    The reserve plus PEAK_SALE_MARGIN_KWH. Shared by the sell floor and the
+    resale sizing, so the night charge buys for the same stop level the sale
+    keeps rather than for one it no longer sells down to.
+    """
+    reserve = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
+    return min(site.capacity_kwh, reserve + PEAK_SALE_MARGIN_KWH)
+
+
 def export_floor_pct(inputs, until, no_charge_until=None):
     """The floor DISCRETIONARY export may not sell through.
 
     Everything the house is forecast to need between now and `until`, plus every
-    committed kWh, plus the reserve — worked out chronologically, so a sunny
+    committed kWh, plus the reserve and PEAK_SALE_MARGIN_KWH — worked out chronologically, so a sunny
     tomorrow afternoon cannot pay for tonight, and worked out under the regime
     the export itself creates (see `no_charge_until`).
     """
     site      = inputs.site
-    floor_pct = _reserve_floor_pct(site)
-    floor_kwh = site.capacity_kwh * floor_pct / 100.0
+    floor_kwh = _sale_floor_kwh(site)
     need_kwh, _infeasible = required_start_kwh(inputs, inputs.now, until, floor_kwh,
                                                no_charge_until=no_charge_until)
     return min(100.0, float(math.ceil(_pct(need_kwh, site.capacity_kwh))))
@@ -1601,7 +1619,7 @@ def _resale_room_kwh(inputs, base_kwh, window_end, horizon_end, ceiling_kwh):
     peak_hours  = (peak_end - peak_at).total_seconds() / 3600.0
     sellable    = min(site.discharge_power_w, site.export_limit_w) / 1000.0 * peak_hours
     at_peak, _low, _unmet, _high = simulate(inputs, base_kwh, window_end, peak_at)
-    floor_kwh   = site.capacity_kwh * _reserve_floor_pct(site) / 100.0
+    floor_kwh   = _sale_floor_kwh(site)
     keep, _inf  = required_start_kwh(inputs, peak_at, horizon_end, floor_kwh,
                                      no_charge_until=peak_end)
     solar_spare = max(0.0, at_peak - keep)

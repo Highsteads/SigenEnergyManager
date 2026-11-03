@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.144.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.144.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.144.3 (3 November 2026)** - The 4pm to 7pm sale now stops a little earlier, keeping about 1.2 kWh above your reserve for the night. It used to stop at exactly the level that would reach the reserve at 2am, and eight of the last ten nights ran a few points under it before the cheap charge began.
 
 **5.144.2 (3 November 2026)** - The plugin no longer turns away its own first connection to the inverter when the Mac has been up for less than 30 seconds. It then waited half a minute for no reason. A test machine on GitHub found it.
 
@@ -176,6 +178,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.144.3 | 3 November 2026 | The peak sale keeps about 1.2 kWh above the reserve for the night. |
 | 5.144.2 | 3 November 2026 | The first inverter connection is not refused in the 30 seconds after the Mac starts. |
 | 5.144.1 | 3 November 2026 | Quieter overnight log: the energy check warns once, and a late charge is not called a full battery. |
 | 5.144.0 | 2 November 2026 | An Axle event wholly inside 4pm to 7pm stays with a sale already at the export limit. |

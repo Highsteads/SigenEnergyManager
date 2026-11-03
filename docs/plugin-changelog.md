@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.144.3 - 3 November 2026
+
+`flux_strategy` 2.18: `PEAK_SALE_MARGIN_KWH` = 1.2, added to the 2am low-water mark of the discretionary sell floor through `_sale_floor_kwh(site)`, which `export_floor_pct` and `_resale_room_kwh` now share (so the night charge sizes its resale against the same stop level). `household_floor_pct` is unchanged: the house may consume the margin. Measured from `energy_timeseries.db`: 8 of the 10 nights to 3-Nov fell under 20% before 02:00 (lows 15.0-18.1%, worst ordinary night 16.5% on 31-Oct, 1.2 kWh short), with 19:00-02:00 house draw steady at 6.5-6.7 kWh and the sale ending about a point under its last logged floor. New test `test_the_sale_leaves_a_margin_above_the_reserve_at_2am` (fails with the margin removed); `test_the_peak_only_buys_what_the_sun_does_not_already_leave_there` re-derives keep from `_sale_floor_kwh`.
+
 ## v5.144.2 - 3 November 2026
 
 `sigenergy_modbus` 1.24: `_last_connect_attempt` starts as None, and `connect()` applies the reconnect delay only once there has been an attempt. It was 0 on `time.monotonic()`, which counts from boot, so a first connect within `_reconnect_delay_base` (30 s) of boot returned False. CI hit it on 5c96d8c (`test_the_first_connect_is_always_a_full_sweep`, no-third-party job); the same code passed on 355a6a7 on an older runner. New test pins `monotonic` at 5.0 and fails on 1.23.

@@ -419,7 +419,7 @@ class TestResaleBuyingLeavesRoomForABrighterDay(unittest.TestCase):
         at_peak, *_ = fs.simulate(inp, 20.0, a, peak)
         keep, _ = fs.required_start_kwh(
             inp, peak, fs._wall(LONDON, self.DAY + timedelta(days=1), fs.time(2, 0)),
-            site.capacity_kwh * 0.20, no_charge_until=fs._wall(LONDON, self.DAY, fs.time(19, 0)))
+            fs._sale_floor_kwh(site), no_charge_until=fs._wall(LONDON, self.DAY, fs.time(19, 0)))
         sellable = 4.0 * 3 / site.one_way_efficiency
         self.assertAlmostEqual(room, max(0.0, sellable - max(0.0, at_peak - keep)), places=6)
         self.assertLess(room, sellable)
@@ -486,6 +486,26 @@ class TestTwoFloors(unittest.TestCase):
                                         f"reserve breached at {soc}% / {hhmm}")
                 if d.owns:
                     self.assertGreaterEqual(d.discharge_cutoff_pct, 20.0)
+
+    def test_the_sale_leaves_a_margin_above_the_reserve_at_2am(self):
+        """v2.18: the sale must stop where the night lands above the reserve.
+
+        Stopping exactly at "reserve at 2am" ran 8 of 10 nights to 15-19%
+        (3-Nov-2026). The sell floor now carries PEAK_SALE_MARGIN_KWH; the
+        house floor does not, so the house may still use that energy.
+        """
+        d = fs.plan(_inputs((16, 30), soc_pct=95.0))
+        saved = fs.PEAK_SALE_MARGIN_KWH
+        try:
+            fs.PEAK_SALE_MARGIN_KWH = 0.0
+            bare = fs.plan(_inputs((16, 30), soc_pct=95.0))
+        finally:
+            fs.PEAK_SALE_MARGIN_KWH = saved
+        self.assertGreaterEqual(saved, 1.0)   # the worst measured night was 1.2 kWh short
+        cap = _site().capacity_kwh
+        self.assertGreaterEqual(d.protect_soc_pct - bare.protect_soc_pct,
+                                100.0 * saved / cap - 1.0)
+        self.assertEqual(d.household_floor_pct, bare.household_floor_pct)
 
     def test_a_raised_policy_floor_outranks_the_flat_reserve(self):
         d = fs.plan(_inputs((16, 30), soc_pct=95.0, site=_site(policy_floor_pct=70.0)))
