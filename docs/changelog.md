@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.144.2 - 3 November 2026
+
+If the plugin started within 30 seconds of the Mac starting, it turned away its own first connection to the inverter and waited half a minute before trying again. The wait between tries is measured on a clock that starts when the Mac starts, and "never tried" was stored as nought on that clock, so it looked like a try a moment ago. "Never tried" now means exactly that. A test machine on GitHub, started seconds before the tests ran, found it.
+
 ## 5.144.1 - 3 November 2026
 
 The first night with the 4 kWh margin charged the battery to 94%, against 81% the night before. It also put two kinds of noise in the Event Log, and both are gone.

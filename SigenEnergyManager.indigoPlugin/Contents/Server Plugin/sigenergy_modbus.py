@@ -3,10 +3,13 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16-1.23)
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16-1.24)
 # Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026; 1.21 28-10-2026;
-#              1.22 01-11-2026; 1.23 01-11-2026
-# Version:     1.23 (01-11-2026: a Modbus EXCEPTION REPLY to a write (the inverter answered
+#              1.22 01-11-2026; 1.23 01-11-2026; 1.24 03-11-2026
+# Version:     1.24 (03-11-2026: the first connect is never refused by the reconnect delay.
+#              "No attempt yet" was 0 on time.monotonic(), which counts from boot, so a
+#              connect within 30 s of boot was turned away; a CI runner hit it.)
+# Previous:    1.23 (01-11-2026: a Modbus EXCEPTION REPLY to a write (the inverter answered
 #              "illegal value" or similar) returns False but keeps the link, which is
 #              demonstrably alive; only a transport failure marks it down. Battery SOC
 #              outside 0-100% decodes as absent.)
@@ -617,7 +620,7 @@ class SigenergyModbus:
         self._connected       = False
         self._closed_on_purpose = False   # set by disconnect(), cleared by connect()
         self._lock            = threading.RLock()   # serialises primitives (see _locked)
-        self._last_connect_attempt = 0
+        self._last_connect_attempt = None   # None = never tried; monotonic() counts from boot
         # Reconnect delay escalates 30s -> 60s -> 120s (capped) while the
         # inverter stays unreachable, resetting to 30s on a healthy connect —
         # stops a hard outage re-running a burst every 30s indefinitely.
@@ -699,7 +702,8 @@ class SigenergyModbus:
             return False
 
         now = time.monotonic()   # monotonic — immune to NTP wall-clock steps
-        if not ignore_backoff and now - self._last_connect_attempt < self._reconnect_delay:
+        if (not ignore_backoff and self._last_connect_attempt is not None
+                and now - self._last_connect_attempt < self._reconnect_delay):
             return False
 
         self._last_connect_attempt = now

@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.144.2 - 3 November 2026
+
+`sigenergy_modbus` 1.24: `_last_connect_attempt` starts as None, and `connect()` applies the reconnect delay only once there has been an attempt. It was 0 on `time.monotonic()`, which counts from boot, so a first connect within `_reconnect_delay_base` (30 s) of boot returned False. CI hit it on 5c96d8c (`test_the_first_connect_is_always_a_full_sweep`, no-third-party job); the same code passed on 355a6a7 on an older runner. New test pins `monotonic` at 5.0 and fails on 1.23. SigenVPP's byte-identical copy synced in the same change.
+
 ## v5.144.1 - 3 November 2026
 
 `_reconcile_daily_energy` re-arms a tripped check only when the gap falls to `ENERGY_REARM_FRACTION` (0.5) of its bound. On 3-Nov the lifetime battery-charge counter ran about 0.52 kWh ahead of the import counter from 02:12 to 03:29, against the 0.5 kWh floor of the bound, so the balance check warned and cleared nine times each. By 05:06 the day closed to 0.00 kWh with the same midnight anchors, so it was counter lag, not an anchor. The warning text now names both causes.

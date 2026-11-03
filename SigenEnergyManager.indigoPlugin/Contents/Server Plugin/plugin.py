@@ -78,6 +78,7 @@
 #              Claude Opus 5.5 (5.139.1 — totals saved first at shutdown; two Happy Hours a weekend)
 #              Claude Opus 5.5 (5.139.2 — one read-back per Flux write, so a hand-back fits Indigo's stop time)
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
+#              Claude Opus 5.5 (5.144.2 - the first Modbus connect is not refused within 30 s of boot)
 #              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
 #              Claude Opus 5.5 (5.143.0 - the 2am charge keeps a 4 kWh margin where the sun leaves room)
@@ -88,8 +89,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        03-11-2026 05:10 GMT
-# Version:     5.144.1
+# Date:        03-11-2026 05:13 GMT
+# Version:     5.144.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

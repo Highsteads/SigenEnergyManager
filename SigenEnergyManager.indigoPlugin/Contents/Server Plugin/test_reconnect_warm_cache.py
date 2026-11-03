@@ -126,5 +126,18 @@ class TestReconnectWithAWarmCache(unittest.TestCase):
             self.assertIn(key, d)
 
 
+    def test_the_first_connect_works_seconds_after_boot(self):
+        # 3-Nov-2026: a CI runner 20-odd seconds from boot had its first connect
+        # refused, because "never tried" was 0 on a clock that counts from boot.
+        fc = _CountingClient()
+        _set_counters(fc)
+        with mock.patch.object(sm, "ModbusTcpClient", lambda **kw: fc), \
+             mock.patch.object(sm, "PYMODBUS_AVAILABLE", True), \
+             mock.patch.object(sm.time, "monotonic", return_value=5.0):
+            m = sm.SigenergyModbus("192.0.2.10", sleep_func=lambda s: None)
+            m.logger = MagicMock()
+            self.assertTrue(m.connect())
+
+
 if __name__ == "__main__":
     unittest.main()
