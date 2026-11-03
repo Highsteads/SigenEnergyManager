@@ -23,7 +23,7 @@ New entries go at the top, as they were kept in the file.
 
 ## v5.144.2 - 3 November 2026
 
-`sigenergy_modbus` 1.24: `_last_connect_attempt` starts as None, and `connect()` applies the reconnect delay only once there has been an attempt. It was 0 on `time.monotonic()`, which counts from boot, so a first connect within `_reconnect_delay_base` (30 s) of boot returned False. CI hit it on 5c96d8c (`test_the_first_connect_is_always_a_full_sweep`, no-third-party job); the same code passed on 355a6a7 on an older runner. New test pins `monotonic` at 5.0 and fails on 1.23. SigenVPP's byte-identical copy synced in the same change.
+`sigenergy_modbus` 1.24: `_last_connect_attempt` starts as None, and `connect()` applies the reconnect delay only once there has been an attempt. It was 0 on `time.monotonic()`, which counts from boot, so a first connect within `_reconnect_delay_base` (30 s) of boot returned False. CI hit it on 5c96d8c (`test_the_first_connect_is_always_a_full_sweep`, no-third-party job); the same code passed on 355a6a7 on an older runner. New test pins `monotonic` at 5.0 and fails on 1.23.
 
 ## v5.144.1 - 3 November 2026
 
@@ -227,10 +227,9 @@ a day high, so no model enters until it has `MIN_CAL_DAYS` of record.
 
 **One verifier, not two, on every Flux write.** `_FluxRawDriver` already said the executor is the only verifier, but only `set_charge_limit` (quiet=True) skipped the driver's read-back. The mode, Remote EMS enable, charge cutoff, backup reserve and discharge limit were each written, read back by `_write_single_register`/`_write_uint32_registers`, and read again by the executor (`_neutralise`, `_set_read`). A release was 22 Modbus transactions at the 1 s spacing, measured 23.2 s live, against Indigo's ~22 s stop budget.
 
-- `sigenergy_modbus.py` 1.21: `verify=True` keyword on `enable_remote_ems`, `set_remote_ems_mode`, `set_discharge_limit`, `set_charge_cutoff` and `set_backup_soc`. Default unchanged, so every other caller (and SigenVPP) behaves as before. `set_backup_soc(quiet=True)` never skipped the read-back; only the log level.
+- `sigenergy_modbus.py` 1.21: `verify=True` keyword on `enable_remote_ems`, `set_remote_ems_mode`, `set_discharge_limit`, `set_charge_cutoff` and `set_backup_soc`. Default unchanged, so every other caller behaves as before. `set_backup_soc(quiet=True)` never skipped the read-back; only the log level.
 - `_FluxRawDriver` passes `verify=False` on those five. The executor still reads every register back itself, and the final `_verify` after enabling Remote EMS is unchanged.
 - Tests: the adapter turns off every driver read-back; a whole release on the REAL driver with a fake Modbus client is at most 17 transactions (it was 22, and the test fails at 22 with the adapter change reverted).
-- SigenVPP's byte-identical copy synced.
 - **Measured live, 28-10-2026 17:46, restart during a Flux peak export:** Stopping 17:46:40.939, "Control handed back" 17:46:58.527 (17.6 s), dashboard stopped and inverter disconnected 17:46:58.891, "Stopped plugin" 17:46:59.995 (19.1 s). No force-kill, against five of five killed from 26-10 to 28-10.
 
 ## v5.139.1 - 28 October 2026
@@ -395,7 +394,7 @@ watched failing first: `test_review_2026_10_02.py` (plugin) and `_core` / `_exec
   reward parse tolerant. **economics 1.1**: settle needs the local day's slots less 2 (44/46, 46/48,
   48/50). **free_hour_credits 1.1**: measuring claims skipped and aged out after 30 days.
   **vpp_ledger 1.3**: an email stand-in never evicts Axle's real row.
-- **sigenergy_modbus 1.19** (SigenVPP re-synced): exact-zero lifetimes are absent; `_slow_primed`
+- **sigenergy_modbus 1.19**: exact-zero lifetimes are absent; `_slow_primed`
   reset on connect; `_energyFreshKeys`; U32 sentinel rejected; `_write_uint32_registers` validates.
   **daily_energy 1.1**: a reset needs two consecutive low reads; yesterday's anchor never popped;
   per-key provisional anchors; implausible recovery rejected.
@@ -433,7 +432,7 @@ to see these logs every minute or two". 16:00-18:00 had 16 plan notes and 17 mod
 - **flux_strategy 2.10.2 `note_control_key`**: the discharge floor is out of the key (the charge
   target stays: it is the overnight plan and moves a few times a night).
 - **sigenergy_modbus 1.18 `set_backup_soc(quiet=False)`**: DEBUG when quiet; `_FluxRawDriver`
-  passes quiet=True (the executor reads every write back). SigenVPP's copy synced.
+  passes quiet=True (the executor reads every write back).
 - Tests: executor floor-in-place, mode change still neutralises, only moved values written,
   failed in-place write falls back; peak note one line however the floor moves; quiet floor
   write; set_backup_soc quiet/default. Mutations: floor forcing full apply, unchanged values
@@ -766,7 +765,7 @@ battery ~10) and held PV at **0 W** for the whole window, the string voltages ri
 and 1784 W at 15:00. Grid First lets PV fill only what the site import cap (16 kW) cannot.
 
 - **sigenergy_modbus 1.17:** `force_charge(..., pv_first=False)`; True writes 0x04 (Command
-  Charging, PV first). Default unchanged, so SigenVPP (shared copy) is unaffected.
+  Charging, PV first). Default unchanged.
 - **plugin:** `EMS_CHARGE_GRID_FIRST` / `EMS_CHARGE_PV_FIRST`; every manager import (START_IMPORT,
   HAPPY_HOUR_IMPORT, scheduled import, Force Grid Import action) goes through `_force_charge`,
   which asks for PV first and records `import_ems_mode` + `import_power_w`. AST test: no other
@@ -1182,8 +1181,6 @@ at the same Sunday total, 10am-1pm about 0.2 kWh an hour lighter.
   `connect()`), and the quality check logs that case at DEBUG instead of ERROR. `_poll_modbus`
   keeps a reference to the driver it read from and discards a `None` from a driver that has since
   been replaced — good data from it is still used.
-- **Shared module:** sigenergy_modbus.py is mirrored byte-identically into SigenVPP in the same
-  round, or its shared-module CI check goes red.
 - **Tests:** 3 in `test_sigenergy_modbus.py`, 3 in `test_concurrency.py`. Four mutations (no
   discard, no quiet branch, latch never cleared, discard good data too) each turned one red.
 
@@ -1314,7 +1311,6 @@ Axle event (18:30-19:30) and a Saving Session (18:00-19:00) together.**
   plugin's own last value, and the WARNING only when it holds something else. Nothing written
   since start counts as NOT ours, so a restart cannot quieten real drift. The correction itself is
   unchanged.
-- `sigenergy_modbus.py` is untouched, so the SigenVPP copy stays byte-identical.
 
 Tests: `TestPreChargeNeverStopsARunningExport` (4) and `TestBackupReserveMoveIsNotDrift` (5);
 5/5 mutations killed.
@@ -3756,8 +3752,7 @@ keeps the Dashboards proxy working.
 New menu item: Show Web Dashboard Access.
 Also adds sigenergy_modbus read_export_limit() (reads back the
 commissioned grid export cap 40038; the write side already
-existed) so the standalone SigenVPP daemon can share this file
-byte for byte instead of carrying a local edit.
+existed).
 Tests 696 -> 734.
 
 ## v5.74.0 — 20-08-2026

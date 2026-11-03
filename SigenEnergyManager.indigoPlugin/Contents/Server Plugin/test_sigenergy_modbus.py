@@ -912,7 +912,7 @@ class TestForceChargeCutoffBackstop(unittest.TestCase):
         self.assertIn((HOLD_ESS_CHARGE_CUTOFF, 520), writes)   # gain 10
 
     def test_force_charge_defaults_to_grid_first(self):
-        """SigenVPP shares this file and relies on the old default."""
+        """A caller that does not ask for PV first keeps Grid First."""
         modbus, mock_client = _make_modbus()
         self.assertTrue(modbus.force_charge(10000))
         self.assertEqual(_decode_single_register_calls(mock_client, HOLD_REMOTE_EMS_MODE),

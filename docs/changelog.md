@@ -742,7 +742,7 @@ The plugin can now book your Weekend Happy Hours, and the battery is made ready 
 - **The web dashboard is no longer open to the whole network by default.** It had served battery, tariff, Axle and power-cut data to any device on the network with no password. It now answers only the Indigo Mac itself, which changes nothing you see, because the Dashboards plugin reaches it from the same machine.
 - A new **Dashboard access** setting opens it to the network, and then a token is required — the server will not start without one. The token comes from your secrets file, the Configure dialog, or one the plugin makes and keeps private. A browser needs it only once.
 - New menu item **Show Web Dashboard Access**.
-- The plugin can read back the export limit set on the inverter, so the standalone SigenVPP program can share the same code.
+- The plugin can read back the export limit set on the inverter.
 
 ## 5.74.0 — 20 August 2026
 

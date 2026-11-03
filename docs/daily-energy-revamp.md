@@ -167,7 +167,7 @@ and a SOC. Nothing measured about today enters.
 4. Reason line names the tracking factor and the measured need.
 
 ## Verification (each stage)
-- Suite green twice (bare and with deps), ruff clean, `check_shared_modules.py` for SigenVPP.
+- Suite green twice (bare and with deps), ruff clean.
 - Live: derived `homeDailyKwh` within 0.1 kWh of 30092; residual within 0.1 kWh; half-hourly
   rows carry `home_kwh > 0`; the 20:00 evening message and the dashboard show the right
   figures; the reason line shows the tracking factor.

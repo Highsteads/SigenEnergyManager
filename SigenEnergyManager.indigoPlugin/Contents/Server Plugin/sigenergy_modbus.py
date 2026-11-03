@@ -33,14 +33,14 @@
 #              32-bit write is refused with an ERROR instead of raising.)
 #              prior 1.18 (set_backup_soc(quiet=True) logs at DEBUG: the Flux executor
 #              moves the floor every few minutes through a peak sale and does its
-#              own read-back. Default unchanged, so SigenVPP is unaffected.)
+#              own read-back. Default unchanged.)
 #              1.17 (force_charge(pv_first=True) selects Command Charging PV
 #              First (0x04) instead of Grid First (0x03). Measured live on
 #              27-09-2026: in 0x03 the inverter drew the whole 10 kW charge
 #              from the grid and held the panels at 0 W for two hours, string
 #              voltages rising to near open circuit, because Grid First only
 #              lets PV fill what the grid import cap cannot. The default stays
-#              0x03 so SigenVPP, which shares this file, is unchanged.)
+#              0x03.)
 #              prior 1.16 (a read cycle cut short by the OWNER'S OWN disconnect() is
 #              not a Modbus fault. A prefs save rebuilds the client while a
 #              poll is mid-cycle on the old one; every remaining read then
