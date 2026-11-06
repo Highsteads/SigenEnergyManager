@@ -19,7 +19,7 @@ These are under **Plugins → Sigenergy Manager**. Most of them write their answ
 | **Show VPP Status** | Whether an Axle event is due, and when. |
 | **Show VPP Export Summary** | Today's Axle event, if there was one, and what it sold. |
 | **Show VPP Earnings Ledger** | What Axle have paid you — in total, what you can draw now, and each event, with the energy Axle counted beside the energy the plugin measured. |
-| **Import Axle Account Data...** | For filing Axle's figures by hand. Save the data from your Axle account page as a file named `vpp_axle_import.json` in the plugin's data folder, then choose this. If the file is not there, the Event Log says where to put it. |
+| **Import Axle Account Data...** | For filing Axle's figures by hand. Save the data from your Axle account page as a file named `vpp_axle_import.json` in the plugin's data folder, then choose this. If the file is not there, the Event Log says where to put it. Keep each payment's `transaction_id`: a payment without one is left out, and the Event Log says how many. |
 | **Show Today's Energy Summary** | Today's solar, buying, selling and use, the battery's highest and lowest, and what the plugin is doing now. |
 | **Toggle Debug Logging** | Turns detailed logging on or off, without opening the settings. |
 | **Toggle Timestamps in Log (on/off)** | Every line the plugin writes to the log starts with the time to the thousandth of a second, which helps when lining events up. This turns that on or off. It stays as you leave it. |

@@ -5913,6 +5913,30 @@ class TestMergeAxlePayloadSeam(unittest.TestCase):
             self.assertEqual(after["events_total"], 1,
                              "served a pre-merge summary because the mtime had not moved")
 
+    def test_payments_without_an_id_are_reported_not_dropped_quietly(self):
+        """06-Nov-2026: an import without the ids reported success and left
+        four email stand-ins in place."""
+        bare = {k: v for k, v in self.PAYLOAD["transactions"][0].items()
+                if k != "transaction_id"}
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            with patch.object(plugin, "vpp_log") as vlog:
+                self.assertEqual(p._merge_axle_payload({"transactions": [bare, bare]}), 0)
+            warned = [c for c in vlog.call_args_list
+                      if len(c.args) > 1 and c.args[1] == "WARNING"
+                      and "no transaction ID" in c.args[0]]
+            self.assertEqual(len(warned), 1)
+            self.assertIn("2 payments", warned[0].args[0])
+            self.assertIn("they were left out", warned[0].args[0])
+
+    def test_a_payload_with_ids_raises_no_such_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            p, _ = self._p(td)
+            with patch.object(plugin, "vpp_log") as vlog:
+                p._merge_axle_payload(self.PAYLOAD)
+            self.assertFalse([c for c in vlog.call_args_list
+                              if "no transaction ID" in str(c)])
+
     def test_a_successful_merge_clears_a_standing_staleness_warning(self):
         """Waiting up to six hours for the next tick would leave the log
         contradicting the screen."""

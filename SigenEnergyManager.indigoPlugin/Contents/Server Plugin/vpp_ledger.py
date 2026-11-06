@@ -5,11 +5,13 @@
 #              beside what we observed ourselves, and never merged into one
 #              ambiguous number.
 # Author:      CliveS & Claude Opus 5; 1.4 Claude Opus 5.5
-# Date:        02-10-2026; 1.4 01-11-2026
-# Version:     1.4 (01-11-2026: load_ledger keeps axle.last_new_row_at, which every
+# Date:        02-10-2026; 1.4 01-11-2026; 1.5 06-11-2026
+# Version:     1.5 (06-11-2026: unidentified_transactions, so a caller can say when
+#              the import left rows out for want of a transaction_id)
+# Previous:    1.4 (01-11-2026: load_ledger keeps axle.last_new_row_at, which every
 #              reload used to drop, so "when did Axle last send something new"
 #              never showed past one tick)
-# Previous:    1.3 (review 02-10-2026: an email- stand-in never evicts Axle's real row)
+#              1.3 (review 02-10-2026: an email- stand-in never evicts Axle's real row)
 #
 # WHY THIS MODULE EXISTS
 # ----------------------
@@ -168,6 +170,24 @@ def save_ledger(path, ledger):
 # ======================================================================
 # Importing Axle's own numbers
 # ======================================================================
+
+def unidentified_transactions(payload):
+    """How many transaction rows in `payload` carry no `transaction_id`.
+
+    import_axle_payload keys every row on that id and skips a row without one,
+    because a row it cannot identify cannot be told apart from the same payment
+    imported twice. The skip is right; keeping quiet about it is not. On
+    06-Nov-2026 an import file built without the ids brought in the balance and
+    events, reported success, and left four email stand-ins in place. Callers
+    use this to say how many rows were left out.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    rows = payload.get("transactions") or []
+    if not isinstance(rows, list):
+        return 0
+    return sum(1 for tx in rows if isinstance(tx, dict) and not tx.get("transaction_id"))
+
 
 def _is_email_stand_in(transaction_id):
     """True for a row made from Axle's settlement EMAIL (`email-<start>`, the id

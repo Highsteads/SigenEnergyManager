@@ -135,6 +135,22 @@ class TestImport(unittest.TestCase):
         with self.assertRaises(ValueError):
             VL.import_axle_payload(VL.empty_ledger(), [1, 2, 3])
 
+    def test_rows_without_an_id_are_counted(self):
+        """The importer skips them; this is how a caller learns it did."""
+        bare = {k: v for k, v in AXLE_PAYLOAD["transactions"][0].items()
+                if k != "transaction_id"}
+        payload = {"transactions": [bare, dict(bare, transaction_id=""),
+                                    AXLE_PAYLOAD["transactions"][1], "not a row"]}
+        self.assertEqual(VL.unidentified_transactions(payload), 2)
+        led, added = VL.import_axle_payload(VL.empty_ledger(), payload)
+        self.assertEqual(added, 1)
+        self.assertEqual(len(led["axle"]["transactions"]), 1)
+
+    def test_a_payload_with_every_id_counts_none(self):
+        self.assertEqual(VL.unidentified_transactions(AXLE_PAYLOAD), 0)
+        self.assertEqual(VL.unidentified_transactions({"balance": {}}), 0)
+        self.assertEqual(VL.unidentified_transactions([1, 2]), 0)
+
 
 class TestLocalRows(unittest.TestCase):
 

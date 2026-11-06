@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.144.4 - 6 November 2026
+
+`vpp_ledger` 1.5: `unidentified_transactions(payload)` counts transaction rows with no `transaction_id`, which `import_axle_payload` skips (it keys on the id). `_merge_axle_payload` now logs one WARNING naming the count and the remedy, so every caller (menu import, account read, mail scan) hears it. Found 06-Nov-2026: a hand-built import file without the ids merged the balance and events, logged "0 new transaction(s)" and left the four `email-` stand-ins in place. New tests `test_rows_without_an_id_are_counted`, `test_a_payload_with_every_id_counts_none`, `test_payments_without_an_id_are_reported_not_dropped_quietly` (fails with the warning disabled) and `test_a_payload_with_ids_raises_no_such_warning`.
+
 ## v5.144.3 - 3 November 2026
 
 `flux_strategy` 2.18: `PEAK_SALE_MARGIN_KWH` = 1.2, added to the 2am low-water mark of the discretionary sell floor through `_sale_floor_kwh(site)`, which `export_floor_pct` and `_resale_room_kwh` now share (so the night charge sizes its resale against the same stop level). `household_floor_pct` is unchanged: the house may consume the margin. Measured from `energy_timeseries.db`: 8 of the 10 nights to 3-Nov fell under 20% before 02:00 (lows 15.0-18.1%, worst ordinary night 16.5% on 31-Oct, 1.2 kWh short), with 19:00-02:00 house draw steady at 6.5-6.7 kWh and the sale ending about a point under its last logged floor. New test `test_the_sale_leaves_a_margin_above_the_reserve_at_2am` (fails with the margin removed); `test_the_peak_only_buys_what_the_sun_does_not_already_leave_there` re-derives keep from `_sale_floor_kwh`.

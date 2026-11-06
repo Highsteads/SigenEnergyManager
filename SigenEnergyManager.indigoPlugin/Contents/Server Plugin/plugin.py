@@ -80,6 +80,7 @@
 #              Claude Opus 5.5 (5.140.0 - corrected solar figures come from a calibrated blend of three weather models)
 #              Claude Opus 5.5 (5.144.2 - the first Modbus connect is not refused within 30 s of boot)
 #              Claude Opus 5.5 (5.144.3 - the peak sale keeps 1.2 kWh above the reserve for the night)
+#              Claude Opus 5.5 (5.144.4 - the Axle import says when it leaves payments out)
 #              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
 #              Claude Opus 5.5 (5.143.0 - the 2am charge keeps a 4 kWh margin where the sun leaves room)
@@ -90,8 +91,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        03-11-2026 05:13 GMT
-# Version:     5.144.3
+# Date:        06-11-2026 14:40 GMT
+# Version:     5.144.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -10085,9 +10086,20 @@ class Plugin(indigo.PluginBase):
             raise RuntimeError(
                 f"refusing to merge over a ledger that did not parse "
                 f"({ledger['load_error']}) - fix or move {path} first")
+        skipped = _vpp_ledger.unidentified_transactions(payload)
         ledger, added = _vpp_ledger.import_axle_payload(ledger, payload)
         _vpp_ledger.save_ledger(path, ledger)
         self._vpp_ledger_cache = None
+        # The importer cannot file a payment with no id (it could not tell it
+        # from the same payment twice), and on 06-Nov-2026 it skipped four and
+        # still reported success. Say so, with the remedy.
+        if skipped:
+            rows = "payment" if skipped == 1 else "payments"
+            verb = "it was" if skipped == 1 else "they were"
+            vpp_log(f"[VPP] {skipped} {rows} in that Axle data had no transaction ID, so "
+                    f"{verb} left out of the ledger. Copy each payment from the account "
+                    f"page whole, including its transaction_id, and import again.",
+                    "WARNING")
         # A successful merge is exactly what clears a staleness warning, and
         # waiting up to six hours for the next tick to notice would leave the
         # log contradicting the screen.
