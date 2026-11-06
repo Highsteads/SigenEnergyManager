@@ -81,6 +81,7 @@
 #              Claude Opus 5.5 (5.144.2 - the first Modbus connect is not refused within 30 s of boot)
 #              Claude Opus 5.5 (5.144.3 - the peak sale keeps 1.2 kWh above the reserve for the night)
 #              Claude Opus 5.5 (5.144.4 - the Axle import says when it leaves payments out)
+#              Claude Opus 5.5 (5.145.0 - a dull day fills the battery overnight)
 #              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
 #              Claude Opus 5.5 (5.143.0 - the 2am charge keeps a 4 kWh margin where the sun leaves room)
@@ -91,8 +92,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        06-11-2026 14:40 GMT
-# Version:     5.144.4
+# Date:        06-11-2026 17:00 GMT
+# Version:     5.145.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of

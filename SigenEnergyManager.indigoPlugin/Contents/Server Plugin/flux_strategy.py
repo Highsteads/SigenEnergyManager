@@ -16,7 +16,16 @@
 #              2.16: Claude Opus 5.5, 02-11-2026 (the night charge keeps a 4 kWh margin)
 #              2.17: Claude Opus 5.5, 03-11-2026 (a late charge is not one that will not fit)
 #              2.18: Claude Opus 5.5, 03-11-2026 (the peak sale keeps a margin for the night)
-# Version:     2.18
+# Version:     2.19
+#
+# v2.19 (SigenEnergyManager 5.145.0, CliveS 06-11-2026): A DULL DAY FILLS THE BATTERY.
+# "if the solar for the day is less than 10kw fill the battery full between 2-5am".
+# On a day forecast under DULL_DAY_FILL_PV_KWH the sun cannot fill the battery, and
+# the house draws on it until 9-10am, so the 02:00-05:00 charge now buys to the
+# ceiling rather than to the sized need. The test uses the forecast as published
+# (bias-corrected), not the CHARGE_PV_FACTOR-scaled one. A booked free hour still
+# keeps its room. 3 to 5 Nov 2026 closed at 94-98% on 5-8 kWh forecasts; 15 Oct
+# (8.1 kWh) closed at 84%, 20 Oct (5.7 kWh) at 89% and 1 Nov (4.9 kWh) at 79%.
 #
 # v2.12 (review 02-10-2026), four faults found by replaying the planner:
 #   * event_cover took "the peak" as the NEXT 4pm after now, which is tomorrow's once
@@ -255,6 +264,11 @@ COVER_MARGIN_KWH         = 1.0
 # ending a point under its floor. Costs the trade margin on 1.2 kWh, about 13p a
 # night. The house floor does not carry it: the house may still use this energy.
 PEAK_SALE_MARGIN_KWH     = 1.2
+# v2.19: a day whose solar forecast is under this fills the battery overnight
+# (CliveS, 06-Nov-2026). Under about 10 kWh the sun cannot fill it, so nothing
+# bought is pushed out to the grid, and every kWh bought at the cheap rate either
+# runs the house or reaches the peak sale.
+DULL_DAY_FILL_PV_KWH     = 10.0
 COVER_LEAD_MINUTES       = 60        # finish an event-cover charge this long before its deadline (the VPP pre-charge starts 30 min before an event)
 SIM_STEP_MINUTES         = 30
 SEARCH_TOLERANCE_KWH     = 1e-6      # the binary search's own convergence error
@@ -1427,9 +1441,12 @@ def _decision_until(inputs, hard_end=None):
 # The window plans
 # ================================================================
 
-def _charge_plan(inputs):
+def _charge_plan(inputs, fill=False):
     """(target_pct, power_w, buy_kwh, margin_p, household_kwh, infeasible_kwh, buffer_kwh,
     late_kwh).
+
+    `fill` (v2.19) buys to the ceiling whatever the day needs, as a warning does; the
+    caller decides when (dull_day_fill).
 
     `buffer_kwh` is the part of CHARGE_MARGIN_KWH this charge makes room for. The sum
     is the same either side of it: the house, then the peak sale, then the buffer.
@@ -1510,7 +1527,7 @@ def _charge_plan(inputs):
     # A warning fills the battery to the ceiling in this window, whatever the day
     # needs (CliveS, 24-Oct-2026: battery health is not the priority). A booked
     # free-import hour's room is not kept back in that case.
-    if inputs.storm_fill:
+    if inputs.storm_fill or fill:
         buy_kwh = max(buy_kwh, ceiling_kwh - have_kwh)
     if buy_kwh <= 0:
         return None, 0, 0.0, margin_p, household_buy_kwh, infeasible, buffer_kwh, 0.0
@@ -1552,6 +1569,30 @@ def _charge_plan(inputs):
 # sum asks for absurd power that the charge rate caps anyway; the floor only keeps the
 # division finite, it is not a planning horizon (v2.9 used 15 minutes, see header).
 MIN_HOURS_LEFT = 1.0 / 60.0
+
+
+def day_pv_kwh(inputs, window_end):
+    """The solar forecast for the day this cheap window serves, in kWh (v2.19).
+
+    From the end of the window to the next 02:00, as published (bias-corrected),
+    not the CHARGE_PV_FACTOR-scaled forecast the charge is sized on.
+    """
+    return inputs.pv.kwh_between(window_end,
+                                 next_local(window_end, inputs.local_tz, FLUX_CHEAP_START))
+
+
+def dull_day_fill(inputs, window_end):
+    """True when the 02:00-05:00 charge should fill the battery (v2.19).
+
+    The day is forecast under DULL_DAY_FILL_PV_KWH and no free-import hour is booked
+    (that one needs empty battery, so its room is kept). A warning fills anyway
+    through storm_fill.
+    """
+    if inputs.storm_fill:
+        return False
+    if _free_hour_booked(inputs.commitments, window_end, inputs.local_tz):
+        return False
+    return day_pv_kwh(inputs, window_end) < DULL_DAY_FILL_PV_KWH
 
 
 def _minimum_charge(inputs, window_end, target_pct, power_w, buy_kwh, minimum):
@@ -1883,9 +1924,17 @@ def _plan(inputs):
             window_end = next_local(inputs.now, tz, FLUX_CHARGE_END)
             # v2.7: plan the charge on a dimmer day than forecast, so a forecast that
             # is too sunny no longer leaves the peak sale or the evening short.
+            sized_inputs = replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR))
+            # v2.19: a dull day fills the battery. What the fill adds over the sized
+            # charge is worked out so the reason can say which kWh are for what.
+            fill = dull_day_fill(inputs, window_end)
             (target_pct, power_w, buy_kwh, margin_p,
              household_kwh, infeasible, buffer_kwh, late_kwh) = _charge_plan(
-                 replace(inputs, pv=inputs.pv.scaled(CHARGE_PV_FACTOR)))
+                 sized_inputs, fill=fill)
+            fill_kwh = 0.0
+            if fill and target_pct is not None:
+                sized = _charge_plan(sized_inputs)
+                fill_kwh = max(0.0, buy_kwh - (sized[2] if sized[0] is not None else 0.0))
             # Say so when a booked free hour shaped the charge. An armed state has
             # to be visible BEFORE it fires, or the first anyone learns of a
             # smaller overnight charge is a battery that looks under-filled.
@@ -1925,8 +1974,8 @@ def _plan(inputs):
                     reason=("the cheap window is open and the battery already holds "
                             "everything the day ahead is forecast to need"
                             + min_note + free_note))
-            kept_kwh = min(buffer_kwh, max(0.0, buy_kwh - household_kwh))
-            arb_kwh  = max(0.0, buy_kwh - household_kwh - kept_kwh)
+            kept_kwh = min(buffer_kwh, max(0.0, buy_kwh - household_kwh - fill_kwh))
+            arb_kwh  = max(0.0, buy_kwh - household_kwh - kept_kwh - fill_kwh)
             reason  = (f"cheap window — buying about {buy_kwh:.1f} kWh at "
                        f"{bands.import_cheap_p:.1f}p to {target_pct:.0f}%, of which "
                        f"{household_kwh:.1f} kWh is what the house and its "
@@ -1936,6 +1985,10 @@ def _plan(inputs):
                            f"{margin_p:.1f}p margin")
             if kept_kwh >= MIN_TRADE_KWH:
                 reason += f", and {kept_kwh:.1f} kWh is kept back as a margin"
+            if fill_kwh >= MIN_TRADE_KWH:
+                reason += (f", and {fill_kwh:.1f} kWh fills the battery because only "
+                           f"about {day_pv_kwh(inputs, window_end):.0f} kWh of sun is "
+                           f"forecast for the day")
             reason += min_note + free_note
             # v2.17: room the battery has but the time left cannot fill is a different
             # fact from energy that will not fit, and is said only at a trading size.

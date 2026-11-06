@@ -1544,7 +1544,8 @@ class TestAxleEventCover(unittest.TestCase):
         self.assertIsNone(fs.event_cover(self._in((14, 30), None)))
 
     def test_the_2am_charge_already_buys_for_an_announced_event(self):
-        with mock.patch.object(fs, "CHARGE_MARGIN_KWH", 0.0):   # v2.16: sizing only
+        with mock.patch.object(fs, "CHARGE_MARGIN_KWH", 0.0), \
+             mock.patch.object(fs, "DULL_DAY_FILL_PV_KWH", 0.0):   # sizing only (v2.16, v2.19)
             plain = fs.plan(self._in((2, 30), 25.0, commitments=()))
             event = fs.plan(self._in((2, 30), 25.0))
         self.assertEqual(event.mode, fs.MODE_CHARGE)
@@ -1785,6 +1786,77 @@ class TestTheNightlyMinimumCharge(unittest.TestCase):
     def test_once_there_the_charge_stops_asking(self):
         inputs = self._in((3, 30), 50.2)
         self.assertEqual(fs.plan(inputs).control_key(), self._minimum_off(inputs).control_key())
+
+
+class TestADullDayFillsTheBattery(unittest.TestCase):
+    """v2.19 (SigenEnergyManager 5.145.0). CliveS, 06-Nov-2026: "if the solar for the
+    day is less than 10kw fill the battery full between 2-5am"."""
+
+    DAY = datetime(2026, 11, 5, tzinfo=LONDON).date()
+
+    def _in(self, hhmm, soc, pv_kwh, free=(), **over):
+        commitments = tuple(_free(self.DAY, a, b) for a, b in free)
+        kw = dict(pv=_pv(self.DAY, pv_kwh, first_hour=8, last_hour=16),
+                  house=_profile(10.0), commitments=commitments)
+        kw.update(over)
+        return _inputs(hhmm, soc_pct=soc, day=(2026, 11, 5), **kw)
+
+    def _rule_off(self, inputs):
+        saved, fs.DULL_DAY_FILL_PV_KWH = fs.DULL_DAY_FILL_PV_KWH, 0.0
+        try:
+            return fs.plan(inputs)
+        finally:
+            fs.DULL_DAY_FILL_PV_KWH = saved
+
+    def test_the_threshold_is_ten_kwh(self):
+        self.assertEqual(fs.DULL_DAY_FILL_PV_KWH, 10.0)
+
+    def test_a_dull_day_charges_to_full(self):
+        inputs = self._in((2, 0), 25.0, 6.0)
+        sized = self._rule_off(inputs)
+        filled = fs.plan(inputs)
+        self.assertEqual(sized.mode, fs.MODE_CHARGE)
+        self.assertLess(sized.charge_cutoff_pct, 100.0)     # the sized need stops short
+        self.assertEqual(filled.mode, fs.MODE_CHARGE)
+        self.assertEqual(filled.charge_cutoff_pct, 100.0)
+        self.assertGreater(filled.planned_kwh, sized.planned_kwh)
+        self.assertIn("fills the battery because only about 6 kWh of sun", filled.reason)
+
+    def test_the_reason_still_adds_up(self):
+        d = fs.plan(self._in((2, 0), 25.0, 6.0))
+        self.assertIn(f"buying about {d.planned_kwh:.1f} kWh", d.reason)
+
+    def test_ten_kwh_or_more_is_left_to_the_sized_charge(self):
+        for pv in (10.5, 14.0, 30.0):
+            inputs = self._in((2, 0), 25.0, pv)
+            self.assertEqual(fs.plan(inputs).control_key(),
+                             self._rule_off(inputs).control_key(), pv)
+
+    def test_it_reads_the_forecast_as_published_not_the_dimmed_one(self):
+        # 11 kWh published is 8.8 kWh after CHARGE_PV_FACTOR; that is not a dull day.
+        inputs = self._in((2, 0), 25.0, 11.0)
+        self.assertFalse(fs.dull_day_fill(inputs, fs.next_local(inputs.now, LONDON,
+                                                                fs.FLUX_CHARGE_END)))
+        self.assertEqual(fs.plan(inputs).control_key(), self._rule_off(inputs).control_key())
+
+    def test_a_booked_free_hour_keeps_its_room(self):
+        inputs = self._in((2, 0), 25.0, 6.0, free=((12, 13),))
+        d = fs.plan(inputs)
+        self.assertLess(d.charge_cutoff_pct, 100.0)
+        self.assertNotIn("fills the battery because", d.reason)
+
+    def test_a_full_battery_buys_nothing(self):
+        self.assertNotEqual(fs.plan(self._in((2, 0), 100.0, 6.0)).mode, fs.MODE_CHARGE)
+
+    def test_it_never_exceeds_the_site_ceiling(self):
+        d = fs.plan(self._in((2, 0), 25.0, 6.0, site=_site(max_charge_soc_pct=90.0)))
+        self.assertLessEqual(d.charge_cutoff_pct, 90.0)
+
+    def test_outside_the_cheap_window_nothing_changes(self):
+        for hhmm, soc in (((11, 0), 60.0), ((16, 30), 80.0), ((20, 0), 40.0)):
+            inputs = self._in(hhmm, soc, 6.0)
+            self.assertEqual(fs.plan(inputs).control_key(),
+                             self._rule_off(inputs).control_key(), hhmm)
 
 
 class TestTheChargePlansOnADimmerDay(unittest.TestCase):

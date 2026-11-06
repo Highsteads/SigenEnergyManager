@@ -98,7 +98,8 @@ class FluxIndependentReviewTests(unittest.TestCase):
     def test_grid_supplies_cheap_window_house_without_double_battery_purchase(self):
         i=scenario(hour=2,soc_pct=20.,house=fs.HalfHourProfile([.5]*48,TZ))
         i=replace(i,bands=replace(i.bands,export_peak_p=15.))  # no optional trade
-        with mock.patch.object(fs,"CHARGE_MARGIN_KWH",0.):  # the sizing alone
+        with mock.patch.object(fs,"CHARGE_MARGIN_KWH",0.), \
+             mock.patch.object(fs,"DULL_DAY_FILL_PV_KWH",0.):  # the sizing alone (v2.19: no dull-day fill)
             decision=fs.plan(i)
         # From 05:00 to 02:00: 21 kWh house + 7 kWh reserve = 28 kWh / 35.
         self.assertEqual(decision.charge_cutoff_pct,80.)

@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.145.0 - 6 November 2026
+
+`flux_strategy` 2.19: `DULL_DAY_FILL_PV_KWH` = 10.0. `dull_day_fill(inputs, window_end)` is True when the published (bias-corrected, not `CHARGE_PV_FACTOR`-scaled) forecast from 04:58 to the next 02:00 (`day_pv_kwh`) is under it, no free-import hour is booked and no warning is filling already. `_charge_plan(inputs, fill=False)` then buys to the ceiling as `storm_fill` does; `plan()` runs it again unfilled to say how much of the buy is the fill ("N kWh fills the battery because only about X kWh of sun is forecast for the day"). CliveS, 06-Nov-2026: the house runs on the battery until 9-10am on such a day, so a sized charge only moves cheap kWh into a later day-rate gap. Record: 3-5 Nov closed at 94-98% on 5-8 kWh forecasts; 15 Oct (8.1 kWh) 84%, 20 Oct (5.7) 89%, 1 Nov (4.9) 79%. New `TestADullDayFillsTheBattery` (9 tests, 4 of 4 mutants caught: fill ignored, free-hour exception dropped, scaled forecast used, threshold moved). Four sizing tests on dull fixtures now pin `DULL_DAY_FILL_PV_KWH` to 0, as they already pin `CHARGE_MARGIN_KWH`; the shortfall tests' `_charge_plan` stub takes `**kw`.
+
 ## v5.144.4 - 6 November 2026
 
 `vpp_ledger` 1.5: `unidentified_transactions(payload)` counts transaction rows with no `transaction_id`, which `import_axle_payload` skips (it keys on the id). `_merge_axle_payload` now logs one WARNING naming the count and the remedy, so every caller (menu import, account read, mail scan) hears it. Found 06-Nov-2026: a hand-built import file without the ids merged the balance and events, logged "0 new transaction(s)" and left the four `email-` stand-ins in place. New tests `test_rows_without_an_id_are_counted`, `test_a_payload_with_every_id_counts_none`, `test_payments_without_an_id_are_reported_not_dropped_quietly` (fails with the warning disabled) and `test_a_payload_with_ids_raises_no_such_warning`.

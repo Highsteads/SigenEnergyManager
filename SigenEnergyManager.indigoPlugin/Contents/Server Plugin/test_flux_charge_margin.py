@@ -55,7 +55,9 @@ class TestTheMarginIsKept(unittest.TestCase):
         lean = _bands(d, now, exp={**EXPORT_P, "peak": 12.0})
         # A big enough house that the 50% minimum does not already cover the margin.
         inputs = _night(bands=lean, forecast=6.0, house=26.0)
-        before, after = _plain(inputs), fs.plan(inputs)
+        # 6 kWh is a dull day, which fills the battery since v2.19; this is about sizing.
+        with mock.patch.object(fs, "DULL_DAY_FILL_PV_KWH", 0.0):
+            before, after = _plain(inputs), fs.plan(inputs)
         self.assertAlmostEqual(after.planned_kwh - before.planned_kwh,
                                fs.CHARGE_MARGIN_KWH, delta=0.05)
         self.assertNotIn("is for the peak window", after.reason)
@@ -118,7 +120,7 @@ class TestAShortfallTheLogCanShow(unittest.TestCase):
 
     def _reason(self, infeasible, late=0.0):
         with mock.patch.object(fs, "_charge_plan",
-                               lambda i: self.PLAN + (infeasible, 0.0, late)):
+                               lambda i, **kw: self.PLAN + (infeasible, 0.0, late)):
             return fs.plan(_inputs((3, 0), soc_pct=50.0, day=DAY)).reason
 
     def test_nothing_is_said_about_a_shortfall_that_rounds_to_nothing(self):

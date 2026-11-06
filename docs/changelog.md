@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.145.0 - 6 November 2026
+
+On a dull day the 2am to 5am charge now fills the battery. When the solar forecast for the day is under 10 kWh, the sun cannot fill the battery and the house runs on it until the middle of the morning, so the charge buys all the way to full instead of only what the day was worked out to need. Every unit bought at the cheap rate then either runs the house or goes into the 4pm to 7pm sale. A day with a booked free hour still keeps its room for the free electricity.
+
 ## 5.144.4 - 6 November 2026
 
 When you import data from your Axle account, the plugin now tells you if it had to leave any payments out. It can only file a payment that carries Axle's own ID, and before this a file without the IDs was imported without a word, with the balance updated but the payments left as they were. The warning says how many were left out and how to put it right.
