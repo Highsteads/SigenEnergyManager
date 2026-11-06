@@ -56,7 +56,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 **5.144.4 (6 November 2026)** - When you import data from your Axle account, the plugin now tells you if it had to leave any payments out. It can only file a payment that carries Axle's own ID, and before this a file without the IDs was imported without a word, with the balance updated but the payments left as they were. The warning says how many were left out and how to put it right.
 
-**5.144.3 (3 November 2026)** - The 4pm to 7pm sale now stops a little earlier, keeping about 1.2 kWh above your reserve for the night. It used to stop at exactly the level that would reach the reserve at 2am, and eight of the last ten nights ran a few points under it before the cheap charge began.
+**5.144.3 (3 November 2026)** - The 4pm to 7pm sale now stops a little earlier, keeping about 1.2 kWh above your reserve for the night. It used to stop at exactly the level that would reach the reserve at 2am, so an evening a little busier than the forecast took the battery right down to the reserve before the cheap charge began.
 
 **5.144.2 (3 November 2026)** - The plugin no longer turns away its own first connection to the inverter when the Mac has been up for less than 30 seconds. It then waited half a minute for no reason. A test machine on GitHub found it.
 
