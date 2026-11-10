@@ -31,7 +31,9 @@ New entries go at the top, as they were kept in the file.
 - `dashboard.html` tests `=== true` and `=== false` and draws a dash with no colour for anything else. `d.decision.dawn_viable ? 'Yes' : 'No'` would have drawn null as a red "No".
 - Print Status and Today's Summary say the state through `_dawn_viable_words`: yes, no, "not worked out just now", or an unrecognised value in quotes.
 - Readers checked before choosing blank: no trigger, schedule, action group or control page references the Battery Manager device; `Morning_Brief.py` and `Evening_Report.py` name the state only in comments; Dashboards reads `/api/status` and needed 3.70.2 for the Energy page's Dawn viable row.
-- Tests: `test_dawn_viable_blank.py` (11), watched failing first.
+- Second reader, same day: the two holds that return before `evaluate` (manager paused; inverter data older than three polls + 60 s) kept the last `dawnViable` and `socAtDawn` for as long as they lasted. `_hold_dawn_forecast(dev)` blanks both, once, when the hold starts, and sets `store["dawn_forecast_held"]`; the next evaluation clears it. `/api/status` reads its dawn figures through `_dawn_decision(dec, store)`, which is None while held, so the page does not show the old decision's verdict either. The two status dumps read an absent state as blank, not `"?"`.
+- Measured from SQL Logger history, 09-Nov-2026 16:00 to 19:00: `socAtDawn` carried a moving forecast all through the Flux peak sale (18.65 down to 6.36 kWh), so the manager does forecast then and `dawnViable` says True or False during a peak sale. It does not go blank.
+- Tests: `test_dawn_viable_blank.py` (17), watched failing first.
 
 ## v5.145.1 - 10 November 2026
 

@@ -432,7 +432,7 @@ class TestDawnForecastIsBlankWhenThereIsNone(unittest.TestCase):
         self.assertEqual(plugin._finite_or_none(0.0, 1), 0.0)
         import inspect
         src = inspect.getsource(plugin)
-        self.assertIn('"soc_at_dawn_kwh": (_finite_or_none(dec.soc_at_dawn_kwh, 1)', src)
+        self.assertIn('"soc_at_dawn_kwh": (_finite_or_none(dawn_dec.soc_at_dawn_kwh, 1)', src)
 
     def _published(self, decision):
         p = MagicMock()

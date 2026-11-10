@@ -1662,6 +1662,20 @@ def _dawn_viable_or_none(decision):
     return bool(decision.dawn_viable)
 
 
+def _dawn_decision(decision, store):
+    """The decision the dawn figures may be read from, or None while held.
+
+    A paused manager, and one holding because the inverter has stopped
+    answering, do not evaluate, so latest_decision is then an old answer and
+    not a current one (see _hold_dawn_forecast).
+    """
+    if decision is None or store is None:
+        return None
+    if store.get("dawn_forecast_held"):
+        return None
+    return decision
+
+
 def _dawn_viable_state_value(decision):
     """The dawnViable state: "True", "False", or blank when there is no answer."""
     verdict = _dawn_viable_or_none(decision)
@@ -2838,6 +2852,9 @@ class Plugin(indigo.PluginBase):
                 finally:
                     self._state_lock.release()
             store, inv, fcast, rates, dec = snap
+            # None while the manager is paused or holding on a silent inverter:
+            # the last decision's dawn figures are then an old answer.
+            dawn_dec = _dawn_decision(dec, store)
             snapshot_age_s = round(max(0.0, time.time() - snap_ts), 1)
 
             tariff_info = rates.get("tariff_info", {})
@@ -3099,10 +3116,10 @@ class Plugin(indigo.PluginBase):
                     "reason":        dec.reason         if dec else "",
                     # None (JSON null) when there is no dawn forecast to judge.
                     # A page must not read that as yes or as no.
-                    "dawn_viable":   _dawn_viable_or_none(dec),
+                    "dawn_viable":   _dawn_viable_or_none(dawn_dec),
                     # None (JSON null) when there is no forecast; the page shows a dash.
-                    "soc_at_dawn_kwh": (_finite_or_none(dec.soc_at_dawn_kwh, 1)
-                                        if dec else None),
+                    "soc_at_dawn_kwh": (_finite_or_none(dawn_dec.soc_at_dawn_kwh, 1)
+                                        if dawn_dec else None),
                 },
                 "tariff": {
                     "name":         tariff_info.get("display_name", "Unknown"),
@@ -4460,6 +4477,26 @@ class Plugin(indigo.PluginBase):
         with self._state_lock:
             return self._evaluate_manager_impl()
 
+    def _hold_dawn_forecast(self, dev):
+        """Blank dawnViable and socAtDawn while the manager is not evaluating.
+
+        5.145.2. Paused, or holding because the inverter has stopped answering,
+        the manager returns before it makes a decision, so both states kept the
+        last answer for as long as the hold lasted (CliveS, 10-Nov-2026: blank
+        rather than keep the last answer). Written once, when the hold starts,
+        not every tick. The flag makes /api/status forget the old decision's
+        dawn figures too; the next evaluation clears it.
+        """
+        self.store["dawn_forecast_held"] = True
+        if not dev:
+            return
+        if (str(dev.states.get("dawnViable", "") or "").strip()
+                or str(dev.states.get("socAtDawn", "") or "").strip()):
+            dev.updateStatesOnServer([
+                {"key": "dawnViable", "value": ""},
+                {"key": "socAtDawn",  "value": ""},
+            ])
+
     def _evaluate_manager_impl(self):
         """Run the battery manager decision engine and act on the result.
 
@@ -4494,6 +4531,7 @@ class Plugin(indigo.PluginBase):
                         f"evaluation until Modbus recovers", level="WARNING")
                     dev.updateStateOnServer("managerStatus",
                                             value="Modbus offline — holding")
+                self._hold_dawn_forecast(dev)
                 return
 
         # Manager paused (Pause action or sigen_manager_paused variable): stay
@@ -4506,6 +4544,7 @@ class Plugin(indigo.PluginBase):
             dev = self._find_device("batteryManager")
             if dev and dev.states.get("managerStatus") != "Paused":
                 dev.updateStateOnServer("managerStatus", value="Paused")
+            self._hold_dawn_forecast(dev)
             return
 
         # 0. VPP OVER-RUN BACKSTOP (v5.62.0). An active window is ended by exactly
@@ -4569,6 +4608,7 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[Manager] need_today_kwh not recorded: {exc}")
         self.latest_decision = decision
+        self.store["dawn_forecast_held"] = False
         self._record_solar_overflow_shadow(snapshot, decision)
         self._record_bank_first_metrics(snapshot, decision, soc_pct)
 
@@ -16873,7 +16913,7 @@ class Plugin(indigo.PluginBase):
         if mgr:
             action   = mgr.states.get("currentAction", "unknown")
             reason   = mgr.states.get("currentReason", "")
-            viable   = mgr.states.get("dawnViable", "?")
+            viable   = mgr.states.get("dawnViable", "")
             soc_dawn = mgr.states.get("socAtDawn", "?")
             sched    = mgr.states.get("importScheduledTime", "")
             log(f"[Status] Manager:  {action}  |  {reason}")
@@ -17283,7 +17323,7 @@ class Plugin(indigo.PluginBase):
         mgr      = self._find_device("batteryManager")
         action   = mgr.states.get("currentAction", "Unknown") if mgr else "Unknown"
         reason   = mgr.states.get("currentReason", "") if mgr else ""
-        viable   = mgr.states.get("dawnViable", "?") if mgr else "?"
+        viable   = mgr.states.get("dawnViable", "") if mgr else ""
         soc_dawn = mgr.states.get("socAtDawn", "?") if mgr else "?"
 
         fcast         = self._find_device("solarForecast")

@@ -54,7 +54,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 ## What's new
 
-**5.145.2 (10 November 2026)** - The **Dawn SOC Viable** state is now blank while the plugin cannot work out whether the battery will last until the sun comes up, which is the case while it is driving an export or filling in a free hour. It used to say True at those times, beside a blank forecast. The plugin's own page shows a dash there, where it would have shown a red No.
+**5.145.2 (10 November 2026)** - The **Dawn SOC Viable** state is now blank while the plugin cannot work out whether the battery will last until the sun comes up, which is the case while it is driving an export or filling in a free hour, while the manager is paused, and while the inverter is not answering. It used to say True at those times, beside a blank forecast. The plugin's own page shows a dash there, where it would have shown a red No.
 
 **5.145.1 (10 November 2026)** - A tidy-up of the plugin's messages. Money is written with the pound sign everywhere. The message after an Axle event is plainer and leaves the solar line out when there was no sun to have. The note after a free hour gives one value, what Octopus should credit, which is the figure the credit check uses. The **Projected SOC at Dawn** state is blank, not 0, while the plugin is driving an export and has no forecast. One missed Axle poll is a warning, and three in a row is an error.
 

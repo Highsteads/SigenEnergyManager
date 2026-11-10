@@ -11,6 +11,7 @@
 import os
 import re
 import sys
+import time
 import types
 import unittest
 from collections import defaultdict
@@ -127,7 +128,7 @@ class TestTheStatusApiAndThePage(unittest.TestCase):
     def test_the_api_sends_null_and_never_defaults_to_true(self):
         with open(os.path.join(HERE, "plugin.py"), encoding="utf-8") as f:
             src = f.read()
-        self.assertTrue('"dawn_viable":   _dawn_viable_or_none(dec),' in src)
+        self.assertTrue('"dawn_viable":   _dawn_viable_or_none(dawn_dec),' in src)
         self.assertFalse("dec.dawn_viable     if dec else True" in src)
 
     def test_the_page_draws_a_dash_for_null(self):
@@ -158,6 +159,81 @@ class TestTheStatusLogLines(unittest.TestCase):
         self.assertFalse("Viable={viable}" in src)
         self.assertFalse("Dawn viability:      {viable}" in src)
         self.assertEqual(src.count("_dawn_viable_words(viable)"), 2)
+
+
+class TestAHeldManagerHasNoAnswer(unittest.TestCase):
+    """Second reader, 10-11-2026. A paused manager, and one holding because the
+    inverter has stopped answering, return before they evaluate. Both left the
+    last verdict and the last forecast on the device for as long as the hold
+    lasted, which is exactly "keep its last answer"."""
+
+    def _held(self, store, read_at, states):
+        p = MagicMock()
+        p.store = dict(store)
+        p.modbus_poll_s = 30
+        p.latest_inverter_data = {"_read_at": read_at, "batterySoc": 50.0}
+        dev = MagicMock()
+        dev.states = dict(states)
+        p._find_device.return_value = dev
+        p._hold_dawn_forecast = lambda d: plugin.Plugin._hold_dawn_forecast(p, d)
+        plugin.Plugin._evaluate_manager_impl(p)
+        # Neither hold may reach the engine.
+        p.manager.evaluate.assert_not_called()
+        return p, dev
+
+    def _blanked(self, dev):
+        out = {}
+        for call in dev.updateStatesOnServer.call_args_list:
+            out.update({s["key"]: s["value"] for s in call.args[0]})
+        return out
+
+    def test_a_paused_manager_blanks_both_dawn_states(self):
+        p, dev = self._held({"manager_paused": True}, time.time(),
+                            {"managerStatus": "Paused", "dawnViable": "True",
+                             "socAtDawn": "18.1"})
+        self.assertEqual(self._blanked(dev), {"dawnViable": "", "socAtDawn": ""})
+        self.assertTrue(p.store["dawn_forecast_held"])
+
+    def test_a_silent_inverter_blanks_both_dawn_states(self):
+        for status in ("Running", "Modbus offline \u2014 holding"):
+            p, dev = self._held({}, time.time() - 3600,
+                                {"managerStatus": status, "dawnViable": "False",
+                                 "socAtDawn": "2.0"})
+            self.assertEqual(self._blanked(dev),
+                             {"dawnViable": "", "socAtDawn": ""}, status)
+            self.assertTrue(p.store["dawn_forecast_held"], status)
+
+    def test_already_blank_is_not_written_again(self):
+        # One write when the hold starts, not one a minute into SQL history.
+        p, dev = self._held({"manager_paused": True}, time.time(),
+                            {"managerStatus": "Paused", "dawnViable": "",
+                             "socAtDawn": ""})
+        dev.updateStatesOnServer.assert_not_called()
+        self.assertTrue(p.store["dawn_forecast_held"])
+
+    def test_the_next_evaluation_lets_go_of_the_hold(self):
+        with open(os.path.join(HERE, "plugin.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('self.latest_decision = decision\n'
+                      '        self.store["dawn_forecast_held"] = False', src)
+
+    def test_the_status_api_forgets_the_last_decision_while_held(self):
+        last = bm.Decision(soc_at_dawn_kwh=18.1)
+        self.assertIs(plugin._dawn_decision(last, {}), last)
+        self.assertIs(plugin._dawn_decision(last, {"dawn_forecast_held": False}), last)
+        self.assertIsNone(plugin._dawn_decision(last, {"dawn_forecast_held": True}))
+        self.assertIsNone(plugin._dawn_decision(None, {}))
+        self.assertIsNone(plugin._dawn_decision(last, None))
+        with open(os.path.join(HERE, "plugin.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(src.count("dawn_dec = _dawn_decision(dec, store)"), 1)
+        self.assertIn('_dawn_viable_or_none(dawn_dec)', src)
+        self.assertIn('_finite_or_none(dawn_dec.soc_at_dawn_kwh, 1)', src)
+
+    def test_an_absent_state_is_not_shown_as_a_question_mark(self):
+        with open(os.path.join(HERE, "plugin.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn('states.get("dawnViable", "?")', src)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ The **Dawn SOC Viable** state is now blank while the plugin cannot work out whet
 
 When there is a forecast, the state says True or False as before.
 
+The same goes for the two times the plugin stops planning altogether: while the manager is paused, and while the inverter has stopped answering. Both **Dawn SOC Viable** and **Projected SOC at Dawn** go blank then, and fill in again at the next plan. They used to keep whatever they last said for as long as the pause or the silence lasted.
+
 The plugin's own page shows a dash for Dawn viable at those times. The status the page reads now sends no answer, where it used to send yes, and a page that took no answer to mean no would have shown a red No. The two status reports in the Event Log say "yes", "no" or "not worked out just now".
 
 If you have a trigger or a script that reads this state, treat blank as "not known", neither yes nor no.
