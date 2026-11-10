@@ -52,7 +52,7 @@ import happy_hour_booking as hb    # noqa: E402
 import test_plugin as tp           # noqa: E402
 
 LONDON = ZoneInfo("Europe/London")
-POUND  = "£"
+POUND  = "\u00a3"
 
 
 def _slots(hours, day=(2026, 11, 1)):
@@ -107,18 +107,25 @@ class TestVppSummaryWording(unittest.TestCase):
 
     H = tp.TestVppSummaryHeadlinesThePaidHour
 
-    def _run(self, daytime=False, pv_w=0, forecast_w=None):
+    def _run(self, daytime=False, pv_w=0, forecast_w=None, external=False):
         h = self.H("test_the_body_fits_pushovers_cap")
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "ev.jsonl")
+            # The real file path is about 160 characters and is part of the body, so
+            # a short temp path understates the body by about 90 (10-Nov-2026).
+            folder = os.path.join(td, "p" * max(1, 150 - len(td)))
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "ev.jsonl")
+            self.assertGreaterEqual(len(path), 155)
             h._write_log(path)
-            if pv_w:
+            if pv_w or external:
                 import json
                 with open(path, encoding="utf-8") as fh:
                     rows = [json.loads(line) for line in fh]
-                for r in rows:
+                for i, r in enumerate(rows):
                     if "pv_w" in r:
                         r["pv_w"] = pv_w
+                        if external and i == 30:
+                            r["driver"] = "external"
                 with open(path, "w", encoding="utf-8") as fh:
                     for r in rows:
                         fh.write(json.dumps(r) + "\n")
@@ -179,6 +186,36 @@ class TestVppSummaryWording(unittest.TestCase):
         _t, _b, prose = self._run()
         self.assertIn('the inverter ran in "Remote EMS", driven by the plugin.', prose)
 
+    def test_held_back_panels_are_never_shed(self):
+        """The reworded sentence sat with the lines shed to fit, and with a
+        real-length path it was shed: the push said nothing about the one fault
+        the solar check exists for."""
+        for forecast_w in (4000, None):
+            _t, body, prose = self._run(daytime=True, forecast_w=forecast_w)
+            self.assertIn("The panels made only 0 kWh in daylight and may have "
+                          "been held back.", prose, forecast_w)
+            self.assertNotIn("forecast", prose)
+            self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+            self.assertIn("-- Ask Claude --", body)
+            self.assertIn("_verify_ems_registers", body)
+
+    def test_both_warnings_fit_without_the_last_resort_cut(self):
+        _t, body, prose = self._run(daytime=True, forecast_w=4000, external=True)
+        self.assertIn("held back", prose)
+        self.assertIn("Warning: something outside the plugin", prose)
+        self.assertIn("either side of the window", prose)
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        self.assertNotIn("The rest is in the saved file.", body)
+        self.assertIn("_verify_ems_registers", body)
+
+    def test_the_last_resort_cut_keeps_only_the_essentials(self):
+        body = plugin._fit_pushover_body(["Essential sentence. " * 30] * 3,
+                                         ["A detail."], ["", "-- Ask Claude --", "x"])
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        self.assertTrue(body.endswith("The rest is in the saved file."))
+        self.assertNotIn("Ask Claude", body)
+        self.assertNotIn("in the file below", body)
+
     def test_plain_number(self):
         self.assertEqual(plugin._plain_number(4.0), "4")
         self.assertEqual(plugin._plain_number(3.87), "3.87")
@@ -193,7 +230,8 @@ class TestFreeHourResultHasOneValuation(unittest.TestCase):
 
     def test_the_note_prices_the_hour_as_the_ledger_does(self):
         title, body = hb.result_message(11.22, _slots((14,)), LONDON, 25.6271)
-        self.assertIn(f"Octopus should credit all of it, about {POUND}2.88 at the "
+        self.assertIn(f"The house took 11.2 kWh from the grid in that time, and "
+                      f"Octopus should credit all of it, about {POUND}2.88 at the "
                       f"25.6p a unit it would have cost at that time of day.", body)
         self.assertNotIn("overnight", body)
         self.assertNotIn("GBP", body)
@@ -201,6 +239,34 @@ class TestFreeHourResultHasOneValuation(unittest.TestCase):
                                                        "meter_kwh": None}},
                                        "inverter_kwh": 11.22})
         self.assertEqual(f"{ledger_p / 100:.2f}", "2.88")
+
+    def test_the_readers_own_sum_comes_out_at_the_money_shown(self):
+        """"11 kWh ... about 2.90 at 25.6p": 11 x 25.6p is 2.82. The units beside
+        money go to one decimal, and the shown figures multiplied land within
+        2p of the money, which is worked unrounded as the ledger works it."""
+        import re
+        for kwh, rate in ((11.3, 25.6271), (11.22, 25.6271), (7.96, 35.8779),
+                          (15.04, 25.0), (3.5, 14.6)):
+            _t, body = hb.result_message(kwh, _slots((14,)), LONDON, rate)
+            m = re.search(r"took ([\d.]+) kWh .* about \u00a3([\d.]+) at the "
+                          r"([\d.]+)p a unit", body)
+            self.assertIsNotNone(m, body)
+            shown_kwh, shown_gbp, shown_p = (float(g) for g in m.groups())
+            self.assertLessEqual(abs(shown_kwh * shown_p / 100 - shown_gbp), 0.02, body)
+            self.assertEqual(m.group(2), f"{kwh * rate / 100:.2f}")
+        _t, body = hb.result_message(11.3, _slots((14,)), LONDON, 25.6271)
+        self.assertIn("The house took 11.3 kWh", body)
+        self.assertIn(f"{POUND}2.90", body)
+
+    def test_a_round_price_and_round_units_drop_the_nought(self):
+        _t, body = hb.result_message(12.0, _slots((14,)), LONDON, 25.0, battery_kwh=3.0)
+        self.assertIn("at the 25p a unit", body)
+        self.assertIn("The house took 12 kWh", body)
+        self.assertNotRegex(body, r"\d\.0(?!\d)")
+        title, body = hb.result_message(12.0, _slots((14,)), LONDON, None,
+                                        battery_kwh=3.0)
+        self.assertEqual(title, "The battery stored only 3 kWh of the free 12 kWh")
+        self.assertNotRegex(body, r"\d\.0(?!\d)")
 
     def test_without_a_price_the_money_is_left_out(self):
         _t, body = hb.result_message(11.22, _slots((14,)), LONDON, None)
@@ -312,6 +378,22 @@ class TestAxlePollSeverity(unittest.TestCase):
         self.assertEqual([lv for lv, _m in out], ["WARNING", "INFO", "WARNING"])
         self.assertEqual(p.store["vpp_api_fails"], 1)
 
+    def _recovery_event_flag(self, fails):
+        p = self._p()
+        with patch.object(plugin, "vpp_log") as vl:
+            for e in ["timed out"] * fails + [""]:
+                p._record_vpp_api_status(e)
+        last = vl.call_args_list[-1]
+        self.assertIn("recovered", last.args[0])
+        return bool(last.kwargs.get("event"))
+
+    def test_a_recovery_after_an_error_reaches_the_event_log(self):
+        """The Error went to the event log, so the all-clear must follow it."""
+        self.assertTrue(self._recovery_event_flag(3))
+        self.assertTrue(self._recovery_event_flag(5))
+        self.assertFalse(self._recovery_event_flag(1))
+        self.assertFalse(self._recovery_event_flag(2))
+
     def test_a_dead_feed_is_never_silent(self):
         """The reason the check exists: a revoked token polled for six weeks."""
         out = self._levels(self._p(), ["HTTP 401"] * 3)
@@ -339,6 +421,18 @@ class TestDawnForecastIsBlankWhenThereIsNone(unittest.TestCase):
         self.assertEqual(plugin._dawn_state_value(29.364), "29.36")
         self.assertEqual(plugin._dawn_state_value(0.0), "0.0")   # a real forecast of empty
         self.assertEqual(plugin._dawn_state_value("junk"), "")
+        for bad in (float("nan"), float("inf"), float("-inf"), "nan"):
+            self.assertEqual(plugin._dawn_state_value(bad), "", bad)
+
+    def test_the_status_api_sends_null_for_no_reading(self):
+        self.assertIsNone(plugin._finite_or_none(None, 1))
+        self.assertIsNone(plugin._finite_or_none(float("nan"), 1))
+        self.assertIsNone(plugin._finite_or_none(float("inf"), 1))
+        self.assertEqual(plugin._finite_or_none(29.364, 1), 29.4)
+        self.assertEqual(plugin._finite_or_none(0.0, 1), 0.0)
+        import inspect
+        src = inspect.getsource(plugin)
+        self.assertIn('"soc_at_dawn_kwh": (_finite_or_none(dec.soc_at_dawn_kwh, 1)', src)
 
     def _published(self, decision):
         p = MagicMock()

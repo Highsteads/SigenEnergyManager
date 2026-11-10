@@ -723,8 +723,16 @@ def _fit_pushover_body(essential, optional, tail, cap=PUSHOVER_BODY_CAP):
         body = build(keep, n - keep)
         if len(body) <= cap:
             return body
+    # The sentence saying details were shed can itself be what does not fit
+    # (both warnings in one window, 10-Nov-2026). The essentials and the Ask
+    # Claude block matter more than it does, and the file holds every detail.
+    body = "\n".join(list(essential) + list(tail))
+    if len(body) <= cap:
+        return body
+    # Even the essentials do not fit: cut those alone. The shed marker points at
+    # a file path that would be cut off, and a bare Ask Claude heading is no use.
     closing = "The rest is in the saved file."
-    kept = build(0, n)[:cap - len(closing) - 1]
+    kept = "\n".join(essential)[:cap - len(closing) - 1]
     if "\n" in kept:
         kept = kept[:kept.rindex("\n")]
     return kept.rstrip() + "\n" + closing
@@ -1633,12 +1641,21 @@ def _ascii_plain(text):
 
 def _dawn_state_value(kwh):
     """The socAtDawn state: the forecast in kWh, or blank when there is none."""
-    if kwh is None:
-        return ""
+    value = _finite_or_none(kwh, 2)
+    return "" if value is None else str(value)
+
+
+def _finite_or_none(value, places):
+    """A real, finite number rounded to `places`, or None.
+
+    NaN and infinity are no reading at all. Published as the text "nan" they
+    pass a "is it above zero" test and get repeated as a forecast.
+    """
     try:
-        return str(round(float(kwh), 2))
+        number = float(value)
     except (TypeError, ValueError):
-        return ""
+        return None
+    return round(number, places) if math.isfinite(number) else None
 
 
 def _join_and(items):
@@ -3045,9 +3062,8 @@ class Plugin(indigo.PluginBase):
                     "reason":        dec.reason         if dec else "",
                     "dawn_viable":   dec.dawn_viable     if dec else True,
                     # None (JSON null) when there is no forecast; the page shows a dash.
-                    "soc_at_dawn_kwh": (round(dec.soc_at_dawn_kwh, 1)
-                                        if dec and dec.soc_at_dawn_kwh is not None
-                                        else None),
+                    "soc_at_dawn_kwh": (_finite_or_none(dec.soc_at_dawn_kwh, 1)
+                                        if dec else None),
                 },
                 "tariff": {
                     "name":         tariff_info.get("display_name", "Unknown"),
@@ -10084,8 +10100,11 @@ class Plugin(indigo.PluginBase):
         else:
             if prev:
                 _n = self.store.get("vpp_api_fails", 0)
+                # The Error half went to the event log, so the all-clear must
+                # too, or the log's last word on the subject stays an error.
                 vpp_log(f"[VPP] Axle poll recovered after {_n} failed "
-                        f"poll{'' if _n == 1 else 's'} - API reachable again")
+                        f"poll{'' if _n == 1 else 's'} - API reachable again",
+                        event=_n >= VPP_API_ERROR_AFTER_FAILS)
             self.store["vpp_api_fails"]  = 0
             self.store["vpp_api_logged"] = 0.0
             self.store["vpp_api_last_ok"] = time.time()
@@ -11419,7 +11438,7 @@ class Plugin(indigo.PluginBase):
                 essential.append(
                     f"We sent out {run_str} altogether. The extra "
                     f"{_plain_number(outside_kwh)} kWh went either side of the "
-                    f"window, so it earns the ordinary export rate rather than the "
+                    f"window, so it earns the ordinary export rate, not the "
                     f"event rate."
                 )
         else:
@@ -11436,6 +11455,13 @@ class Plugin(indigo.PluginBase):
         if external_seen:
             essential.append("Warning: something outside the plugin moved the "
                              "inverter mode during the window.")
+        # Panels held back in daylight is the 15-Jun-2026 fault this check
+        # exists for, so it is essential too. As an optional line it was shed
+        # whenever the real file path (about 160 characters) was in the body.
+        # Short, and no claim about the forecast, which may be unknown.
+        if pv_status == "curtailed":
+            essential.append(f"The panels made only {_plain_number(pv_kwh, 1)} kWh "
+                             f"in daylight and may have been held back.")
 
         # Diagnostics. Every one of these is in the JSONL as well, which is what
         # makes them the right lines to drop when the body will not fit.
@@ -11446,11 +11472,6 @@ class Plugin(indigo.PluginBase):
         if pv_status == "ran":
             optional.append(f"The panels made about {_plain_number(pv_kwh, 1)} kWh "
                             f"in the window, peaking at {max_pv_w} W.")
-        elif pv_status == "curtailed":
-            optional.append(f"The panels look to have been held back: they made "
-                            f"about {_plain_number(pv_kwh, 1)} kWh in the window "
-                            f"and peaked at {max_pv_w} W, where the forecast "
-                            f"expected more.")
         optional += [
             f"The battery peaked at {max_bat_dis_w} W going out and the grid at "
             f"{peak_grid_export_w} W.",

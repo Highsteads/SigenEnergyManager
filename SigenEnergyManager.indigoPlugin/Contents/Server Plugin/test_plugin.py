@@ -5515,7 +5515,11 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
                 fh.write(json.dumps(r) + "\n")
 
     def _run(self, tmpdir, export_kwh=4.24, n=61):
-        path = os.path.join(tmpdir, "ev.jsonl")
+        # The real file path is about 160 characters and is part of the body, so
+        # a short temp path understates the body by about 90 (10-Nov-2026).
+        folder = os.path.join(tmpdir, "p" * max(1, 150 - len(tmpdir)))
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "ev.jsonl")
         self._write_log(path, export_kwh=export_kwh, n=n)
         p = plugin.Plugin.__new__(plugin.Plugin)
         p.logger      = MagicMock()

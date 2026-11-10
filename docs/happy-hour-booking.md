@@ -89,7 +89,8 @@ feed that lags the booking cannot drop the hour from the plan or invite a second
   tumble dryer and dishwasher. Skipped if the booking itself was made that day.
 - **Result** — after the day's last booked hour: the kWh the house took free and what Octopus
   should credit for it, at the price the electricity would have cost at that time of day (the
-  same figure the credit check expects; 5.145.1).
+  same figure the credit check expects; 5.145.1). Beside the money the kWh are given to one
+  decimal place, so the sum can be checked.
 
 The four per-slot "Happy Hour available" pushes are not sent while automatic booking is on.
 

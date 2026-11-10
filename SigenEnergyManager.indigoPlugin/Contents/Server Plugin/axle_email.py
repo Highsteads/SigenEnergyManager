@@ -5,7 +5,7 @@
 #              email into the payload shape vpp_ledger.import_axle_payload takes.
 # Author:      CliveS & Claude Opus 5
 # Date:        05-09-2026 23:40
-# Version:     1.0
+# Version:     1.1  (5.145.1: the out-of-range refusal writes the pound sign)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -234,7 +234,7 @@ def parse_settlement_email(sender, subject, body, received_at, window_lookup=Non
     if not (0.0 <= kwh <= MAX_EVENT_KWH):
         return _refuse(f"exported figure {kwh} kWh is outside the plausible range")
     if not (0.0 <= gbp <= MAX_EVENT_GBP):
-        return _refuse(f"earned figure GBP {gbp} is outside the plausible range")
+        return _refuse(f"earned figure \u00a3{gbp} is outside the plausible range")
 
 
     # Cross-check the two independent figures. They come from different parts of

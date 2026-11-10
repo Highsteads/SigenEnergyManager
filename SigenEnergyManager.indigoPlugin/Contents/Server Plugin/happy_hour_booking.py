@@ -348,6 +348,14 @@ def _kwh(x):
     return f"{x:.0f} kWh"
 
 
+def _plain(x, places=1):
+    """A figure as a person writes it: "25p" not "25.0p", "11.3" kept."""
+    text = f"{float(x):.{places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
 def booked_message(plan, tz, today, scheme_end):
     """(title, body) for slots the plugin has just booked."""
     slots   = tuple(plan.booked) + tuple(plan.book)
@@ -482,11 +490,17 @@ def result_message(free_kwh, slots, tz, credit_rate_p=None, battery_kwh=None):
                 f"The free electricity {span} is over, but the house took only "
                 f"{free_kwh:.1f} kWh from the grid in that time.".replace("  ", " "))
     title = f"The {hour} banked {_kwh(free_kwh)}"
-    body = (f"The free electricity {span} is over. The house took {_kwh(free_kwh)} "
+    # Beside money the units go to one decimal, so the reader's own sum comes
+    # out at the figure shown: "11 kWh ... about 2.90 at 25.6p" did not (11 x
+    # 25.6p is 2.82; the hour took 11.3). The money is worked from the unrounded
+    # reading and price, as the ledger works it, so it can sit a penny or two
+    # from the shown figures multiplied, never more.
+    took = f"{_plain(free_kwh)} kWh" if credit_rate_p else _kwh(free_kwh)
+    body = (f"The free electricity {span} is over. The house took {took} "
             f"from the grid in that time, and Octopus should credit all of it")
     if credit_rate_p:
         worth = free_kwh * float(credit_rate_p) / 100.0
-        body += (f", about {POUND}{worth:.2f} at the {float(credit_rate_p):.1f}p a "
+        body += (f", about {POUND}{worth:.2f} at the {_plain(credit_rate_p)}p a "
                  f"unit it would have cost at that time of day")
     body += "."
     if battery_kwh is not None:
@@ -495,11 +509,11 @@ def result_message(free_kwh, slots, tz, credit_rate_p=None, battery_kwh=None):
         if rest < 0.1:
             body += " The battery stored the lot."
         elif stored >= 0.5 * float(free_kwh):
-            body += (f" The battery stored {stored:.1f} kWh of it and the house used "
-                     f"the other {rest:.1f} kWh as it went.")
+            body += (f" The battery stored {_plain(stored)} kWh of it and the house used "
+                     f"the other {_plain(rest)} kWh as it went.")
         else:
-            title = f"The battery stored only {stored:.1f} kWh of the free {_kwh(free_kwh)}"
-            body += (f" The battery stored only {stored:.1f} kWh of it and the house "
-                     f"used the other {rest:.1f} kWh as it went, so the battery did "
+            title = f"The battery stored only {_plain(stored)} kWh of the free {_kwh(free_kwh)}"
+            body += (f" The battery stored only {_plain(stored)} kWh of it and the house "
+                     f"used the other {_plain(rest)} kWh as it went, so the battery did "
                      f"not fill as planned.")
     return title, body.replace("  ", " ")
