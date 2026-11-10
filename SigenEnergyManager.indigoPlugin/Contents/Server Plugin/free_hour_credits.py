@@ -6,7 +6,8 @@
 #              credits in, a verdict and the plain-English words out.
 # Author:      CliveS & Claude Opus 5.5
 # Date:        02-10-2026
-# Version:     1.3 (02-11-2026: settled hours stay settled, credits match their own hour, ledger version 3)
+# Version:     1.4 (10-11-2026, Claude Fable 5.2: the notes say "free hour" for a day with one hour)
+#              1.3 (02-11-2026: settled hours stay settled, credits match their own hour, ledger version 3)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -425,7 +426,7 @@ def prune(ledger, now):
 # Words — plain UK English, ASCII except the pound sign
 # ================================================================
 
-POUND = "£"
+POUND = "\u00a3"
 
 
 def money(pence):
@@ -456,6 +457,11 @@ def _rate_words(claim):
     return "the rates at the time"
 
 
+def _hours_words(claim):
+    """"free hour" for a day with one booked hour, "free hours" otherwise."""
+    return "free hour" if len(claim.get("hours") or {}) == 1 else "free hours"
+
+
 def notifications(ledger, now):
     """[(title, body)] still to send, marking each as sent. Deduped on the claim's
     date and the kind of news — never on the wording, which carries figures."""
@@ -465,19 +471,20 @@ def notifications(ledger, now):
         st = status(claim, now)
         sent = claim.setdefault("notified", {})
         when = day_words(day)
+        hrs  = _hours_words(claim)
         if st["state"] == STATE_PAID and not sent.get("paid"):
             sent["paid"] = True
             out.append((
-                "Octopus has paid for the free hours",
+                f"Octopus has paid for the {hrs}",
                 f"Octopus has credited {money(st['paid_p'])} to the account for the free "
-                f"electricity on {when}. The free hours used {kwh_words(st['kwh'])} at "
+                f"electricity on {when}. The {hrs} used {kwh_words(st['kwh'])} at "
                 f"{_rate_words(claim)}, so that is the amount we expected."))
         elif st["state"] == STATE_SHORT and sent.get("short_p") != st["paid_p"]:
             sent["short_p"] = st["paid_p"]
             out.append((
-                f"Octopus paid {money(st['owed_p'])} short for the free hours",
+                f"Octopus paid {money(st['owed_p'])} short for the {hrs}",
                 f"Octopus has credited {money(st['paid_p'])} for the free electricity on "
-                f"{when}, but the free hours used {kwh_words(st['kwh'])} at "
+                f"{when}, but the {hrs} used {kwh_words(st['kwh'])} at "
                 f"{_rate_words(claim)}, which comes to {money(st['expected_p'])}. That leaves "
                 f"{money(st['owed_p'])} unpaid, and the Energy page will keep showing it "
                 f"until the rest arrives."))
@@ -485,7 +492,7 @@ def notifications(ledger, now):
             sent["late"] = True
             out.append((
                 "Still waiting for the free-hour credit",
-                f"It is {st['days_waiting']} days since the free hours on {when} and Octopus "
+                f"It is {st['days_waiting']} days since the {hrs} on {when} and Octopus "
                 f"has not credited the {money(st['expected_p'])} it owes for "
                 f"{kwh_words(st['kwh'])} of electricity. It may be worth asking them."))
     return out

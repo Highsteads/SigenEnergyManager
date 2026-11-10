@@ -7,6 +7,22 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.145.1 - 10 November 2026
+
+A tidy-up of the plugin's messages, from a check of every notification the house sends.
+
+Money is now written with the pound sign everywhere. The free-hour and booking messages said "GBP 1.74" because a clean-up step swapped the sign out, and the Axle summary wrote "GBP" itself.
+
+The message after an Axle event is plainer. It says "We sold 4 kWh inside the paid hour, worth about £4.00 at 100p a unit", leaves the solar line out when the window was in the dark or no sun was forecast, and no longer carries figures in nested brackets. If a detail has to be dropped to fit, it says so in a sentence. The "Ask Claude" block at the end is unchanged.
+
+The note after a free hour now gives one value for it: what Octopus should credit, at the price the electricity would have cost at that time of day. That is the same figure the credit check uses. Before, the note priced the same units at the cheap overnight rate, so on 1 November it said £1.74 where the credit due was about £2.90. The title also says "The free hour" when only one hour was booked, and so do the messages about the credit.
+
+The **Projected SOC at Dawn** state is now blank when the plugin has made no forecast, which is the case while it is driving an Axle or Saving Session export or filling in a free hour. It used to show 0, and on 1 November the morning brief repeated that as a battery "about 0% full" by late morning, when it was 55%.
+
+One missed Axle poll is now a warning in the Event Log, not an error. On 9 November a single poll failed while the router restarted and was reported an hour later as a new error. Three misses in a row is still an error, repeated hourly, so a feed that has really stopped is never quiet.
+
+The Saving Session message gives the token count in words ("Octopus report no tokens and an hour costs two"). The sums behind it were checked against two months of messages and are right: each session won earns one token and a free hour costs two.
+
 ## 5.145.0 - 6 November 2026
 
 On a dull day the 2am to 5am charge now fills the battery. When the solar forecast for the day is under 10 kWh, the sun cannot fill the battery and the house runs on it until the middle of the morning, so the charge buys all the way to full instead of only what the day was worked out to need. Every unit bought at the cheap rate then either runs the house or goes into the 4pm to 7pm sale. A day with a booked free hour still keeps its room for the free electricity.

@@ -21,6 +21,18 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.145.1 - 10 November 2026
+
+Message faults from the 10-Nov-2026 audit of every email and Pushover. No control logic changed.
+
+- `_ascii_plain` keeps `\u00a3` (module constant `POUND`); it had swapped it for "GBP ". Ellipsis becomes "...". `happy_hour_booking` 1.4 and `free_hour_credits` 1.4 write the sign as the escape. The VPP status report and the settlement-email log line use `POUND` too.
+- `_summarise_vpp_event`: figures through `_plain_number` ("4 kWh"), money with `POUND`, the solar line only for `pv_status` "ran" or "curtailed" (no line for a dark window or one with no PV expected), the mode line through `_modes_words` and `_driver_words`. `_fit_pushover_body` says "One more detail is in the file below." / "Two more details are in the file below." and its last-resort cut ends "The rest is in the saved file." on a line boundary. The Ask Claude tail is unchanged (decision D6).
+- `result_message(free_kwh, slots, tz, credit_rate_p, battery_kwh)`: the money sentence is the expected credit at the hour's own published price, from `_happy_hour_credit_rate_p(slots)` (`_import_rate_at(slot.start)`, the ledger's `rate_p`; None when unpriced or the hours differ). `_happy_hour_cheap_rate_p` is gone. Titles are singular for one slot; `free_hour_credits._hours_words` does the same for the paid, short and late notes.
+- `Decision.soc_at_dawn_kwh` defaults to None (`battery_manager` 3.18). `_dawn_state_value` publishes "" for None; `/api/status` sends null, which `dashboard.html` and Dashboards' energy page already show as a dash. The Show Status and Today log lines say "not forecast just now".
+- `_record_vpp_api_status`: WARNING below `VPP_API_ERROR_AFTER_FAILS` (3), logged when the failure first appears or changes; ERROR at the third in a row, on a change, and hourly.
+- Saving Session notice: token counts through `_count_words`. One win is one token and an hour costs two: balances in the messages 15-Sep to 9-Nov-2026 went 4 (15-Oct), 0 after booking two hours, 2 by 23-Oct after the 15 and 19-Oct sessions, 0 after booking, 2 by 30-Oct after the 26 and 27-Oct sessions, 0, then 1 by 9-Nov after the 3-Nov session. Tokens arrive a day or more after the session, which is why both the 26 and 27-Oct notices said 0. Every one of those sessions fell inside the Flux peak with no extra export, so "nothing extra is needed" is borne out and the notice's other wording stays.
+- Tests: `test_notifications_2026_11_10.py` (34; 27 fail on 5.145.0). Nine tests in `test_plugin.py` that pinned the old wording were updated.
+
 ## v5.145.0 - 6 November 2026
 
 `flux_strategy` 2.19: `DULL_DAY_FILL_PV_KWH` = 10.0. `dull_day_fill(inputs, window_end)` is True when the published (bias-corrected, not `CHARGE_PV_FACTOR`-scaled) forecast from 04:58 to the next 02:00 (`day_pv_kwh`) is under it, no free-import hour is booked and no warning is filling already. `_charge_plan(inputs, fill=False)` then buys to the ceiling as `storm_fill` does; `plan()` runs it again unfilled to say how much of the buy is the fill ("N kWh fills the battery because only about X kWh of sun is forecast for the day"). CliveS, 06-Nov-2026: the house runs on the battery until 9-10am on such a day, so a sized charge only moves cheap kWh into a later day-rate gap. Record: 3-5 Nov closed at 94-98% on 5-8 kWh forecasts; 15 Oct (8.1 kWh) 84%, 20 Oct (5.7) 89%, 1 Nov (4.9) 79%. New `TestADullDayFillsTheBattery` (9 tests, 4 of 4 mutants caught: fill ignored, free-hour exception dropped, scaled forecast used, threshold moved). Four sizing tests on dull fixtures now pin `DULL_DAY_FILL_PV_KWH` to 0, as they already pin `CHARGE_MARGIN_KWH`; the shortfall tests' `_charge_plan` stub takes `**kw`.

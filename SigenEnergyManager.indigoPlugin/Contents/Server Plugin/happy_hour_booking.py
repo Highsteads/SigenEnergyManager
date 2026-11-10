@@ -5,8 +5,9 @@
 #              in plain English. Pure: slots, tokens, a solar forecast, the house
 #              profile and the battery in; a booking plan and its messages out.
 # Author:      CliveS & Claude Opus 5.5
-# Date:        30-10-2026
-# Version:     1.3  (SigenEnergyManager 5.140.2: the sentence for spending the last tokens)
+# Date:        10-11-2026 (1.4, Claude Fable 5.2)
+# Version:     1.4  (SigenEnergyManager 5.145.1: the result note prices the free hour as the credit
+#              ledger does, and its title is singular for one hour)
 #
 # SigenEnergyManager 5.112.0. The rules, agreed with CliveS on 22-Sep-2026:
 #
@@ -279,6 +280,9 @@ def plan_day(*, day, slots, tokens, tokens_per_hour, now, tz, site, house, pv,
 # Plain English — ASCII only, sentences, every number with its meaning
 # ================================================================
 
+POUND = "\u00a3"
+
+
 def number_words(n):
     """Small counts as a person says them: 'four tokens', not '4 tokens'."""
     n = int(n)
@@ -452,25 +456,39 @@ def reminder_message(slots, tz):
     return title, body
 
 
-def result_message(free_kwh, slots, tz, cheap_rate_p=None, battery_kwh=None):
+def result_message(free_kwh, slots, tz, credit_rate_p=None, battery_kwh=None):
     """(title, body) once the day's last booked free hour has ended.
 
     battery_kwh is what the battery stored, from its own charge counter. Without
     it the note says nothing about the battery: the 25-Oct-2026 note claimed
     "most of it into the battery" when the battery took 0.27 of 3.97 kWh.
+
+    credit_rate_p is the price published for the free hour itself, the one the
+    credit ledger (free_hour_credits, rate_p) prices the claim at, so this note
+    and the ledger give one figure for one event. Until 5.145.1 the note priced
+    the same units at the cheap overnight rate: on 1-Nov-2026 it said 11 kWh
+    "would have cost about 1.74" while the ledger expected a credit of 2.90.
+    None leaves the money out.
     """
     span = span_words(slots, tz) if slots else ""
+    one  = len(slots) == 1
+    hour = "free hour" if one else "free hours"
     if free_kwh is None:
-        return ("The free hours are over",
+        return (f"The {hour} {'is' if one else 'are'} over",
                 f"The free electricity {span} is over. The plugin could not measure "
                 f"how much the house took, so check the Octopus app for the credit.".replace("  ", " "))
     if free_kwh < 0.5:
-        return ("The free hours banked almost nothing",
+        return (f"The {hour} banked almost nothing",
                 f"The free electricity {span} is over, but the house took only "
                 f"{free_kwh:.1f} kWh from the grid in that time.".replace("  ", " "))
-    title = f"The free hours banked {_kwh(free_kwh)}"
+    title = f"The {hour} banked {_kwh(free_kwh)}"
     body = (f"The free electricity {span} is over. The house took {_kwh(free_kwh)} "
-            f"from the grid in that time, and Octopus should credit all of it.")
+            f"from the grid in that time, and Octopus should credit all of it")
+    if credit_rate_p:
+        worth = free_kwh * float(credit_rate_p) / 100.0
+        body += (f", about {POUND}{worth:.2f} at the {float(credit_rate_p):.1f}p a "
+                 f"unit it would have cost at that time of day")
+    body += "."
     if battery_kwh is not None:
         stored = min(float(battery_kwh), float(free_kwh))
         rest   = float(free_kwh) - stored
@@ -484,8 +502,4 @@ def result_message(free_kwh, slots, tz, cheap_rate_p=None, battery_kwh=None):
             body += (f" The battery stored only {stored:.1f} kWh of it and the house "
                      f"used the other {rest:.1f} kWh as it went, so the battery did "
                      f"not fill as planned.")
-    if cheap_rate_p:
-        cost = free_kwh * float(cheap_rate_p) / 100.0
-        body += (f" Bought at the cheap overnight rate of {float(cheap_rate_p):.1f}p "
-                 f"instead, that much would have cost about £{cost:.2f}.")
     return title, body.replace("  ", " ")

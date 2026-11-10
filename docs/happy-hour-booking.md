@@ -87,8 +87,9 @@ feed that lags the booking cannot drop the hour from the plan or invite a second
   push read as a cancellation).
 - **Morning** — from 8am on a booked day: the free hours and a nudge to run the washing machine,
   tumble dryer and dishwasher. Skipped if the booking itself was made that day.
-- **Result** — after the day's last booked hour: the kWh the house took free and what that much
-  would have cost at the cheap overnight rate.
+- **Result** — after the day's last booked hour: the kWh the house took free and what Octopus
+  should credit for it, at the price the electricity would have cost at that time of day (the
+  same figure the credit check expects; 5.145.1).
 
 The four per-slot "Happy Hour available" pushes are not sent while automatic booking is on.
 

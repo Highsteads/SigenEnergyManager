@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.145.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.145.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.145.1 (10 November 2026)** - A tidy-up of the plugin's messages. Money is written with the pound sign everywhere. The message after an Axle event is plainer and leaves the solar line out when there was no sun to have. The note after a free hour gives one value, what Octopus should credit, which is the figure the credit check uses. The **Projected SOC at Dawn** state is blank, not 0, while the plugin is driving an export and has no forecast. One missed Axle poll is a warning, and three in a row is an error.
 
 **5.145.0 (6 November 2026)** - On a dull day the 2am to 5am charge now fills the battery. When the solar forecast for the day is under 10 kWh, the sun cannot fill the battery and the house runs on it until the middle of the morning, so the charge buys all the way to full instead of only what the day was worked out to need. Every unit bought at the cheap rate then either runs the house or goes into the 4pm to 7pm sale. A day with a booked free hour still keeps its room for the free electricity.
 
@@ -182,6 +184,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.145.1 | 10 November 2026 | Plainer messages with the pound sign; a blank dawn forecast, not 0, during a driven export. |
 | 5.145.0 | 6 November 2026 | A dull day (under 10 kWh of sun forecast) fills the battery overnight. |
 | 5.144.4 | 6 November 2026 | The Axle import says when it leaves payments out. |
 | 5.144.3 | 3 November 2026 | The peak sale keeps about 1.2 kWh above the reserve for the night. |

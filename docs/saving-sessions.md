@@ -54,7 +54,7 @@ Octopus open the Sunday slots on a Thursday — usually four one-hour slots betw
 - It never cancels a booking, because it is not known whether Octopus give the tokens back.
 - **Tokens needed to book a Happy Hour** is 2 to start with. Octopus do not publish this in a way the plugin can read, so if they change it, change it here.
 
-You get one message saying what it booked and why, a reminder on the morning of a booked Sunday — a good day to run the washing machine, tumble dryer and dishwasher — and a note afterwards of how much the house took free and what that would have cost. **Happy Hour Tokens** on the **Battery Manager** shows how many tokens you hold.
+You get one message saying what it booked and why, a reminder on the morning of a booked Sunday — a good day to run the washing machine, tumble dryer and dishwasher — and a note afterwards of how much the house took free and what Octopus should credit for it. **Happy Hour Tokens** on the **Battery Manager** shows how many tokens you hold.
 
 ## Checking the free hour is paid
 

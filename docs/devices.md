@@ -47,7 +47,7 @@ What the plugin has decided and why. The device list shows **Running**, or **Pau
 | **Manager Status** | Running, Paused, or holding because the inverter cannot be reached. |
 | **Current Mode** | What the battery is doing, as one of a fixed list, which makes it the best state for a trigger: **Self Consumption** (running the house as normal), **Solar Overflow Export** (selling spare solar in the day), **Grid Import Active**, **Import Scheduled**, **Import Stopping**, **Night Export Active** (making room overnight before a sunny day), **Export Stopping**, **VPP Export Active** (an Axle event), **Saving Session Export** and **Happy Hour Import**. |
 | **Current Action** and **Decision Reason** | The same decision in words, with the reason and the figures behind it. |
-| **Projected SOC at Dawn (kWh)** and **Dawn SOC Viable** | How much the plugin expects to be in the battery when the sun comes up, and whether that is enough. |
+| **Projected SOC at Dawn (kWh)** and **Dawn SOC Viable** | How much the plugin expects to be in the battery when the sun comes up, and whether that is enough. The first is blank while the plugin has no forecast to give, for instance during an Axle export or a free hour. |
 | **Grid Import Active**, **Import Scheduled**, **Import Scheduled Time**, **Import Quantity (kWh)** | Whether the battery is charging from the grid, or will be, when, and how much. |
 | **Grid Export Active** and **Export Power (kW)** | Whether the battery is selling to the grid, and how fast. |
 | **Flood Prevention Active** and **Flood Prevention Target SOC (%)** | Whether it is making room overnight before a sunny day, and how low it will go. |

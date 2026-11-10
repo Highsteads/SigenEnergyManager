@@ -81,6 +81,7 @@
 #              Claude Opus 5.5 (5.144.2 - the first Modbus connect is not refused within 30 s of boot)
 #              Claude Opus 5.5 (5.144.3 - the peak sale keeps 1.2 kWh above the reserve for the night)
 #              Claude Opus 5.5 (5.144.4 - the Axle import says when it leaves payments out)
+#              Claude Fable 5.2 (5.145.1 - message wording from the 10-11-2026 audit: pound sign, VPP summary, one free-hour valuation, blank dawn forecast)
 #              Claude Opus 5.5 (5.145.0 - a dull day fills the battery overnight)
 #              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
@@ -92,8 +93,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        06-11-2026 17:00 GMT
-# Version:     5.145.0
+# Date:        10-11-2026 09:50 GMT
+# Version:     5.145.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -685,6 +686,10 @@ def _away_seed_profile(daily_kwh):
 
 PUSHOVER_BODY_CAP = 1024
 
+# How many Axle polls must fail in a row before it is logged as an Error rather
+# than a Warning (5.145.1).
+VPP_API_ERROR_AFTER_FAILS = 3
+
 
 def _fit_pushover_body(essential, optional, tail, cap=PUSHOVER_BODY_CAP):
     """Join three groups of lines into a Pushover body that fits the 1024 cap.
@@ -701,14 +706,16 @@ def _fit_pushover_body(essential, optional, tail, cap=PUSHOVER_BODY_CAP):
       tail       the Ask Claude block, which is what makes the file actionable.
     Only OPTIONAL lines are shed, from the bottom up, and the message SAYS how
     many went rather than going quietly shorter. Shedding to nothing and still
-    not fitting is possible in principle, so the result is truncated as a last
-    resort with an explicit marker -- never a silent cut.
+    not fitting is possible in principle, so the result is then cut at the end
+    of a line and says so in a sentence -- never a silent cut.
     """
     def build(keep, dropped):
         lines = list(essential) + list(optional[:keep])
         if dropped:
-            lines.append(f"({dropped} more detail line"
-                         f"{'' if dropped == 1 else 's'} left out to fit.)")
+            # A sentence, not a bracketed marker (5.145.1).
+            lines.append("One more detail is in the file below." if dropped == 1 else
+                         f"{_count_words(dropped).capitalize()} more details are "
+                         f"in the file below.")
         return "\n".join(lines + list(tail))
 
     n = len(optional)
@@ -716,8 +723,11 @@ def _fit_pushover_body(essential, optional, tail, cap=PUSHOVER_BODY_CAP):
         body = build(keep, n - keep)
         if len(body) <= cap:
             return body
-    body = build(0, n)
-    return body[:cap - 12].rstrip() + "\n[truncated]"
+    closing = "The rest is in the saved file."
+    kept = build(0, n)[:cap - len(closing) - 1]
+    if "\n" in kept:
+        kept = kept[:kept.rindex("\n")]
+    return kept.rstrip() + "\n" + closing
 
 
 def _as_float(value, fallback):
@@ -1603,13 +1613,76 @@ def _session_span_words(start_local, end_local):
     return f"from {_clock_words(start_local)} to {_clock_words(end_local)}"
 
 
+POUND = "\u00a3"
+
+
 def _ascii_plain(text):
-    """Pushover bodies are ASCII (standing rule): swap the usual offenders."""
+    """Messages are ASCII except the pound sign (standing rule): swap the usual
+    offenders and drop anything else.
+
+    5.145.1: the pound sign is KEPT. Until then it was swapped for "GBP ", so
+    every message that came through here read "GBP 1.74" while Pushover, Email+
+    and the event log all carry the sign itself.
+    """
     for bad, good in (("\u2014", ", "), ("\u2013", " to "), ("\u2019", "'"),
                       ("\u2018", "'"), ("\u201c", '"'), ("\u201d", '"'),
-                      ("\u00a3", "GBP "), ("\u00b0", " degrees")):
+                      ("\u2026", "..."), ("\u00b0", " degrees")):
         text = text.replace(bad, good)
-    return text.encode("ascii", "ignore").decode("ascii")
+    return "".join(ch for ch in text if ord(ch) < 128 or ch == POUND)
+
+
+def _dawn_state_value(kwh):
+    """The socAtDawn state: the forecast in kWh, or blank when there is none."""
+    if kwh is None:
+        return ""
+    try:
+        return str(round(float(kwh), 2))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _join_and(items):
+    """a, b and c."""
+    items = [str(i) for i in items]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _modes_words(modes):
+    """The inverter's own mode names, quoted so they read as its words."""
+    modes = [m for m in modes if m]
+    if not modes:
+        return "a mode it did not report"
+    return _join_and([f'"{m}"' for m in modes])
+
+
+def _driver_words(drivers):
+    """Who held the inverter through a VPP window, in words."""
+    names = {"self": "the plugin", "external": "something outside the plugin"}
+    seen = sorted(str(d) for d in drivers if d)
+    if not seen:
+        return "a controller it did not report"
+    return _join_and([names.get(d, f'"{d}"') for d in seen])
+
+
+def _plain_number(value, places=2):
+    """A figure as a person writes it: "4" not "4.00", "3.87" not "3.870"."""
+    text = f"{float(value):.{places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _count_words(n):
+    """Small counts as a person says them: "two more details", not "2 more"."""
+    words = ("no", "one", "two", "three", "four", "five", "six", "seven", "eight",
+             "nine", "ten", "eleven", "twelve")
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    return words[n] if 0 <= n < len(words) else str(n)
 
 
 # How long the manager waits after startup for the first tariff before acting on
@@ -2971,7 +3044,10 @@ class Plugin(indigo.PluginBase):
                     "action":        dec.action         if dec else "unknown",
                     "reason":        dec.reason         if dec else "",
                     "dawn_viable":   dec.dawn_viable     if dec else True,
-                    "soc_at_dawn_kwh": round(dec.soc_at_dawn_kwh if dec else 0.0, 1),
+                    # None (JSON null) when there is no forecast; the page shows a dash.
+                    "soc_at_dawn_kwh": (round(dec.soc_at_dawn_kwh, 1)
+                                        if dec and dec.soc_at_dawn_kwh is not None
+                                        else None),
                 },
                 "tariff": {
                     "name":         tariff_info.get("display_name", "Unknown"),
@@ -6913,14 +6989,25 @@ class Plugin(indigo.PluginBase):
         title, body = _hh_booking.reminder_message(slots, tz)
         self._send_happy_hour_note(f"morning:{today}", title, body)
 
-    def _happy_hour_cheap_rate_p(self):
-        """The cheapest import price published for today, for the result note.
-        None when the tariff is not banded, and the note then leaves money out."""
-        try:
-            tiers = self._band_tiers("import")
-            return float(tiers[0]["p"]) if tiers else None
-        except Exception:                                           # noqa: BLE001
-            return None
+    def _happy_hour_credit_rate_p(self, slots):
+        """The import price published for the day's free hours, for the result
+        note: the same price the credit ledger records as rate_p (5.145.1).
+
+        None when any hour has no price, or the hours were priced differently,
+        and the note then leaves the money out rather than guess. Until 5.145.1
+        the note used the cheapest band of the day instead, so the 3pm message
+        and the ledger valued one free hour two ways.
+        """
+        rates = set()
+        for slot in slots or []:
+            try:
+                p = self._import_rate_at(slot.start)
+            except Exception:                                       # noqa: BLE001
+                p = None
+            if p is None:
+                return None
+            rates.add(round(float(p), 2))
+        return rates.pop() if len(rates) == 1 else None
 
     def _happy_hour_result_note(self, banked_kwh, now_utc=None, battery_kwh=None):
         """Say what the day's free hours banked, once the last of them has ended.
@@ -6971,7 +7058,7 @@ class Plugin(indigo.PluginBase):
                 continue
         title, body = _hh_booking.result_message(
             used.get("kwh") if banked_kwh is not None else None,
-            slots, tz, self._happy_hour_cheap_rate_p(),
+            slots, tz, self._happy_hour_credit_rate_p(slots),
             battery_kwh=used.get("battery_kwh") if banked_kwh is not None else None)
         self._send_happy_hour_note(f"result:{today}", title, body)
 
@@ -7386,15 +7473,20 @@ class Plugin(indigo.PluginBase):
                                  "of electricity at the weekend, so winning it matters more "
                                  "than how much goes out.")
                     # Only say where he stands if the API actually told us.
+                    # One win is one token and an hour costs `need` (two here).
+                    # Checked against the messages of 15-Sep to 9-Nov-2026: the
+                    # balance rose by one after each session and fell by two for
+                    # each hour booked, with the token arriving a day or two late.
                     if tokens is not None and need > 0:
                         plural = "" if tokens == 1 else "s"
+                        held   = f"{_count_words(tokens)} token{plural}"
                         if tokens + 1 >= need:
-                            parts.append(f"Octopus report {tokens} token{plural}, so "
+                            parts.append(f"Octopus report {held}, so "
                                          "winning this one should unlock a free hour.")
                         else:
-                            parts.append(f"Octopus report {tokens} token{plural} and an "
-                                         f"hour costs {need}, so this one is a step "
-                                         "towards the next.")
+                            parts.append(f"Octopus report {held} and an "
+                                         f"hour costs {_count_words(need)}, so this "
+                                         "one is a step towards the next.")
                     parts.append(f"The Octopoints are change on top, about {bonus_p:.0f}p "
                                  "a unit added to what the export itself earns.")
                 body = _ascii_plain(" ".join(parts))
@@ -9964,23 +10056,36 @@ class Plugin(indigo.PluginBase):
         polled a dead endpoint for six weeks in complete silence — the VPP page
         simply read "Standby" throughout. This is what makes that state visible.
 
-        Logs on the first occurrence of a given failure and hourly thereafter, so
-        a sustained outage costs one line an hour rather than one every 10 min.
+        A first failure is a Warning. The third in a row is an Error, repeated
+        hourly (or when the failure changes), so a sustained outage costs one
+        line an hour rather than one every 10 min.
         """
         prev = self.store.get("vpp_api_error")
         self.store["vpp_api_error"] = error
 
         if error:
             self.store["vpp_api_fails"] = self.store.get("vpp_api_fails", 0) + 1
-            now = time.time()
-            if error != prev or now - self.store.get("vpp_api_logged", 0.0) >= 3600.0:
+            now   = time.time()
+            fails = self.store["vpp_api_fails"]
+            # 5.145.1: one missed poll is a Warning. On 09-Nov-2026 a single poll
+            # failed while the router rebooted and was paged an hour later as an
+            # error. It is an Error from the third failure in a row, said once
+            # there and then hourly, so a dead feed is still never silent.
+            if fails < VPP_API_ERROR_AFTER_FAILS:
+                if error != prev:
+                    vpp_log(f"[VPP] Axle poll missed - {error}. This is failure "
+                            f"{fails} in a row; it becomes an error at "
+                            f"{VPP_API_ERROR_AFTER_FAILS}.", "WARNING")
+            elif (fails == VPP_API_ERROR_AFTER_FAILS or error != prev
+                    or now - self.store.get("vpp_api_logged", 0.0) >= 3600.0):
                 self.store["vpp_api_logged"] = now
-                vpp_log(f"[VPP] Axle poll failing - {error} "
-                    f"(consecutive failures: {self.store['vpp_api_fails']})", "ERROR")
+                vpp_log(f"[VPP] Axle poll failing - {error}. That is {fails} "
+                        f"failures in a row.", "ERROR")
         else:
             if prev:
-                vpp_log(f"[VPP] Axle poll recovered after {self.store.get('vpp_api_fails', 0)} "
-                    f"failure(s) - API reachable again")
+                _n = self.store.get("vpp_api_fails", 0)
+                vpp_log(f"[VPP] Axle poll recovered after {_n} failed "
+                        f"poll{'' if _n == 1 else 's'} - API reachable again")
             self.store["vpp_api_fails"]  = 0
             self.store["vpp_api_logged"] = 0.0
             self.store["vpp_api_last_ok"] = time.time()
@@ -10584,7 +10689,7 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             when = str(tx["start_time"])[:16]
         vpp_log(f"[VPP] Settlement email imported - Axle settled "
-            f"{abs(tx['flex_kwh']):.2f} kWh at {when} for GBP "
+            f"{abs(tx['flex_kwh']):.2f} kWh at {when} for {POUND}"
             f"{tx['credit_pence'] / 100:.2f}"
             + ("." if added else ", which we already held."))
         return ""
@@ -11294,11 +11399,17 @@ class Plugin(indigo.PluginBase):
         rate_per_kwh = _as_float(self.pluginPrefs.get("axleVppRatePerKwh"), 1.00)
         outside_kwh  = (export_kwh - window_kwh) if window_kwh is not None else None
 
+        # 5.145.1: figures as a person writes them ("4 kWh", not "4.00 kWh"),
+        # the money with the pound sign, and no brackets used as markers.
+        sold_str = (f"{_plain_number(window_kwh)} kWh"
+                    if window_kwh is not None else "")
+        run_str  = f"{_plain_number(export_kwh)} kWh"
         if window_kwh is not None:
-            title = f"VPP window done - {window_kwh:.2f} kWh sold"
+            title = f"VPP window done - {sold_str} sold"
             essential = [
-                f"Sold inside the paid hour: {window_kwh:.2f} kWh, worth about "
-                f"GBP {window_kwh * rate_per_kwh:.2f} at {rate_per_kwh * 100:.0f}p a unit.",
+                f"We sold {sold_str} inside the paid hour, worth about "
+                f"{POUND}{window_kwh * rate_per_kwh:.2f} at "
+                f"{_plain_number(rate_per_kwh * 100, 1)}p a unit.",
             ]
             # Only worth a sentence when there is something to explain. Below a
             # tenth of a unit the tails are rounding, and saying so every time
@@ -11306,15 +11417,16 @@ class Plugin(indigo.PluginBase):
             # genuinely over-runs.
             if outside_kwh is not None and outside_kwh >= 0.1:
                 essential.append(
-                    f"We sent out {export_kwh:.2f} kWh altogether. The extra "
-                    f"{outside_kwh:.2f} kWh went either side of the window, so it "
-                    f"earns the ordinary export rate rather than the event rate."
+                    f"We sent out {run_str} altogether. The extra "
+                    f"{_plain_number(outside_kwh)} kWh went either side of the "
+                    f"window, so it earns the ordinary export rate rather than the "
+                    f"event rate."
                 )
         else:
             # Never present the run total as though it were the settled figure.
-            title = f"VPP window done - {export_kwh:.2f} kWh exported"
+            title = f"VPP window done - {run_str} exported"
             essential = [
-                f"We sent out {export_kwh:.2f} kWh while driving the export. The "
+                f"We sent out {run_str} while driving the export. The "
                 f"paid-hour figure could not be measured this time, so treat that "
                 f"as the whole run and not as what Axle will settle.",
             ]
@@ -11322,17 +11434,28 @@ class Plugin(indigo.PluginBase):
         # A window that something else was driving is not a detail -- it is the
         # headline. Essential, so it can never be one of the lines shed to fit.
         if external_seen:
-            essential.append("WARNING: something outside the plugin moved the "
+            essential.append("Warning: something outside the plugin moved the "
                              "inverter mode during the window.")
 
         # Diagnostics. Every one of these is in the JSONL as well, which is what
         # makes them the right lines to drop when the body will not fit.
-        optional = [
-            f"Solar: {pv_kwh:.2f} kWh ({pv_status}), peaking at {max_pv_w} W.",
+        optional = []
+        # The solar line is only news when there was sun to have. A dark window,
+        # or one where none was forecast, used to print "Solar: 0.00 kWh (n/a
+        # (dark window)), peaking at 0 W." (5.145.1).
+        if pv_status == "ran":
+            optional.append(f"The panels made about {_plain_number(pv_kwh, 1)} kWh "
+                            f"in the window, peaking at {max_pv_w} W.")
+        elif pv_status == "curtailed":
+            optional.append(f"The panels look to have been held back: they made "
+                            f"about {_plain_number(pv_kwh, 1)} kWh in the window "
+                            f"and peaked at {max_pv_w} W, where the forecast "
+                            f"expected more.")
+        optional += [
             f"The battery peaked at {max_bat_dis_w} W going out and the grid at "
             f"{peak_grid_export_w} W.",
-            f"Inverter mode through the {window_str} window: {ems_modes_str} "
-            f"(driven by {driver_str}).",
+            f"Through the {window_str} window the inverter ran in "
+            f"{_modes_words(ems_modes_seen)}, driven by {_driver_words(drivers_seen)}.",
         ]
         tail = [
             "",
@@ -13113,7 +13236,11 @@ class Plugin(indigo.PluginBase):
             # the updateStatesOnServer call.
             {"key": "currentReason",       "value": _reason_display[:255]},
             {"key": "dawnViable",          "value": str(decision.dawn_viable)},
-            {"key": "socAtDawn",           "value": str(round(decision.soc_at_dawn_kwh, 2))},
+            # 5.145.1: blank when this decision made no dawn forecast (a VPP or
+            # Saving Session export, a free hour, a stand-down). It used to be
+            # published as 0, and on 01-Nov-2026 the morning brief repeated that
+            # as "about 0% full by the time the panels get going".
+            {"key": "socAtDawn",           "value": _dawn_state_value(decision.soc_at_dawn_kwh)},
             {"key": "importActive",        "value": str(self.store["import_active"])},
             {"key": "importScheduled",     "value": str(bool(self.store["import_scheduled_time"]))},
             {"key": "importScheduledTime", "value": scheduled_str},
@@ -16688,7 +16815,8 @@ class Plugin(indigo.PluginBase):
             soc_dawn = mgr.states.get("socAtDawn", "?")
             sched    = mgr.states.get("importScheduledTime", "")
             log(f"[Status] Manager:  {action}  |  {reason}")
-            log(f"[Status] Dawn:     Viable={viable}  |  SOC at dawn {soc_dawn} kWh"
+            _dawn_txt = f"{soc_dawn} kWh" if str(soc_dawn).strip() else "not forecast just now"
+            log(f"[Status] Dawn:     Viable={viable}  |  SOC at dawn {_dawn_txt}"
                 + (f"  |  Import scheduled {sched}" if sched else ""))
 
         # --- Tomorrow ---
@@ -16992,7 +17120,7 @@ class Plugin(indigo.PluginBase):
             chg   = dev.states.get("preChargeRequired", "0")
             if start:
                 vpp_log(f"[VPP] Event window:        {start} - {end}")
-                vpp_log(f"[VPP] Est. earnings:       GBP {earn}")
+                vpp_log(f"[VPP] Est. earnings:       {POUND}{earn}")
                 if float(chg) > 0:
                     vpp_log(f"[VPP] Pre-charge target:   {chg}% SOC")
                 else:
@@ -17017,7 +17145,7 @@ class Plugin(indigo.PluginBase):
             return True
 
         def money(v, unknown="unknown"):
-            return unknown if v is None else f"GBP {v:.2f}"
+            return unknown if v is None else f"{POUND}{v:.2f}"
 
         by_kind = s.get("by_kind") or {}
         vpp_log("[VPP] ============ EARNINGS LEDGER ============")
@@ -17026,9 +17154,9 @@ class Plugin(indigo.PluginBase):
             f"{'  (withdrawable now)' if s.get('can_withdraw') else ''}")
         vpp_log(f"[VPP] This month:          {money(s.get('month_to_date_gbp'), 'nothing settled yet')}")
         vpp_log("[VPP] ---- where the money came from ----")
-        vpp_log(f"[VPP]   Grid events:       GBP {by_kind.get('events_gbp', 0.0):.2f}")
-        vpp_log(f"[VPP]   Monthly top-ups:   GBP {by_kind.get('top_ups_gbp', 0.0):.2f}")
-        vpp_log(f"[VPP]   Bonuses/referrals: GBP {by_kind.get('other_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP]   Grid events:       {POUND}{by_kind.get('events_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP]   Monthly top-ups:   {POUND}{by_kind.get('top_ups_gbp', 0.0):.2f}")
+        vpp_log(f"[VPP]   Bonuses/referrals: {POUND}{by_kind.get('other_gbp', 0.0):.2f}")
         vpp_log(f"[VPP] Events: {s.get('events_settled', 0)} settled, "
             f"{s.get('events_pending', 0)} awaiting settlement")
 
@@ -17037,9 +17165,9 @@ class Plugin(indigo.PluginBase):
         behind = s.get("balance_behind_gbp")
         if behind:
             vpp_log(f"[VPP] NB the balance above is Axle's last reported figure and is "
-                f"GBP {abs(behind):.2f} {'behind' if behind > 0 else 'ahead of'} the "
+                f"{POUND}{abs(behind):.2f} {'behind' if behind > 0 else 'ahead of'} the "
                 f"transactions listed here (they total "
-                f"GBP {s.get('rows_total_gbp', 0.0):.2f}). Import the account page "
+                f"{POUND}{s.get('rows_total_gbp', 0.0):.2f}). Import the account page "
                 f"to refresh it.", level="WARNING")
 
         age = s.get("axle_age_days")
@@ -17052,7 +17180,7 @@ class Plugin(indigo.PluginBase):
         vpp_log("[VPP] ---- recent events (paid / ours) ----")
         for e in s.get("events", []):
             if e["settled"]:
-                paid = f"GBP {e['paid_gbp']:.2f} / {e['paid_kwh']:.3f} kWh"
+                paid = f"{POUND}{e['paid_gbp']:.2f} / {e['paid_kwh']:.3f} kWh"
             else:
                 # Never "GBP 0.00" — settlement runs days behind the event.
                 paid = "awaiting settlement"
@@ -17136,7 +17264,8 @@ class Plugin(indigo.PluginBase):
         log(f"[Today] Manager action:      {action}")
         if reason:
             log(f"[Today] Reason:              {reason}")
-        log(f"[Today] Dawn viability:      {viable}  |  SOC at dawn: {soc_dawn} kWh")
+        _dawn_txt = f"{soc_dawn} kWh" if str(soc_dawn).strip() else "not forecast just now"
+        log(f"[Today] Dawn viability:      {viable}  |  SOC at dawn: {_dawn_txt}")
         log(f"[Today] Tariff:              {t_name}{rate_str}{tmrw_str}")
         log(f"[Today] Tomorrow forecast:   {fcst_tmrw} kWh solar expected")
         log(f"[Today] Live:                PV {pv_now} W  |  Grid {grid_now} W")

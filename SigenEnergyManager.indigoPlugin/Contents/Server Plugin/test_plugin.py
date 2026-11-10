@@ -2638,7 +2638,7 @@ class TestCheckSavingSessions(unittest.TestCase):
         known = self._Stub({"has_joined": True, "events": ev, "token_balance": 1},
                            store={"saving_sessions_notified": []})
         self._check(known)
-        self.assertIn("1 token", known.sent[0][1])
+        self.assertIn("one token", known.sent[0][1])
         self.assertIn("unlock a free hour", known.sent[0][1])   # 1 + this one >= 2
 
     def test_token_progress_says_step_when_the_pair_is_not_yet_complete(self):
@@ -2647,8 +2647,9 @@ class TestCheckSavingSessions(unittest.TestCase):
                            store={"saving_sessions_notified": []})
         self._check(known)
         body = known.sent[0][1]
-        self.assertIn("0 tokens", body)
+        self.assertIn("Octopus report no tokens and an hour costs two", body)
         self.assertIn("step towards the next", body)
+        self.assertNotIn("0 tokens", body)
 
 
 class TestSavingSessionPushoverWording(unittest.TestCase):
@@ -5290,7 +5291,7 @@ class TestFitPushoverBody(unittest.TestCase):
     def test_a_short_body_is_left_exactly_alone(self):
         body = plugin._fit_pushover_body(["money"], ["detail"], self.TAIL)
         self.assertEqual(body, "money\ndetail\n\n-- Ask Claude --\nread the file")
-        self.assertNotIn("left out", body)
+        self.assertNotIn("in the file below", body)
 
     def test_an_oversized_body_sheds_optional_lines_from_the_bottom(self):
         essential = ["E" * 200]
@@ -5302,12 +5303,13 @@ class TestFitPushoverBody(unittest.TestCase):
 
     def test_shedding_says_so_rather_than_going_quietly_shorter(self):
         body = plugin._fit_pushover_body(["E" * 900], ["x" * 300, "y" * 300], self.TAIL)
-        self.assertIn("2 more detail lines left out to fit.", body)
+        self.assertIn("Two more details are in the file below.", body)
+        self.assertNotIn("(", body.split("-- Ask Claude --")[0])
 
     def test_the_note_is_singular_for_one_line(self):
         body = plugin._fit_pushover_body(["E" * 900], ["x" * 300], self.TAIL)
-        self.assertIn("1 more detail line left out to fit.", body)
-        self.assertNotIn("lines left out", body)
+        self.assertIn("One more detail is in the file below.", body)
+        self.assertNotIn("details are", body)
 
     def test_the_money_and_the_prompt_always_survive(self):
         essential = ["PAID 4.00 kWh"]
@@ -5322,11 +5324,12 @@ class TestFitPushoverBody(unittest.TestCase):
         still must not be handed to Pushover to cut invisibly."""
         body = plugin._fit_pushover_body(["E" * 2000], [], self.TAIL)
         self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
-        self.assertIn("[truncated]", body)
+        self.assertTrue(body.endswith("The rest is in the saved file."), body[-80:])
+        self.assertNotIn("[", body)
 
     def test_no_optional_lines_at_all_is_fine(self):
         body = plugin._fit_pushover_body(["money"], [], self.TAIL)
-        self.assertNotIn("left out", body)
+        self.assertNotIn("in the file below", body)
         self.assertIn("money", body)
 
 
@@ -5531,15 +5534,16 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
     def test_the_title_leads_with_the_paid_hour(self):
         with tempfile.TemporaryDirectory() as td:
             _, title, _ = self._run(td)
-            self.assertIn("4.00", title)
+            self.assertEqual(title, "VPP window done - 4 kWh sold")
             self.assertNotIn("4.24", title)
 
     def test_the_body_opens_with_the_paid_hour_and_its_worth(self):
         with tempfile.TemporaryDirectory() as td:
             _, _, body = self._run(td)
             first = body.splitlines()[0]
-            self.assertIn("4.00 kWh", first)
-            self.assertIn("GBP 4.00", first)
+            self.assertIn("We sold 4 kWh inside the paid hour", first)
+            self.assertIn("\u00a34.00 at 100p a unit", first)
+            self.assertNotIn("GBP", body)
 
     def test_the_run_total_is_still_there_and_explained(self):
         """Not hidden — a reader who knows the tails exist must still be able to
@@ -5565,7 +5569,7 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             _, title, body = self._run(td)
             for s, name in ((title, "title"), (body, "body")):
-                bad = [c for c in s if ord(c) > 127]
+                bad = [c for c in s if ord(c) > 127 and c != "\u00a3"]
                 self.assertEqual(bad, [], f"non-ASCII in {name}: {bad!r}")
 
     def test_the_body_fits_pushovers_cap(self):
@@ -5639,9 +5643,9 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
             self.assertGreater(len(body), 900, "fixture no longer near the cap")
             self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
             # It only fits because a diagnostic line was shed, and it says so.
-            self.assertIn("left out to fit.", body)
+            self.assertIn("more details are in the file below.", body)
             # And what was shed is never the money or the prompt.
-            self.assertIn("Sold inside the paid hour", body)
+            self.assertIn("inside the paid hour", body)
             self.assertIn("_verify_ems_registers", body)
 
     def test_a_trivial_tail_is_not_worth_a_sentence(self):

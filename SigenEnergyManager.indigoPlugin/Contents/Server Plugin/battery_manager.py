@@ -8,7 +8,11 @@
 # Date:        05-08-2026; 3.12-3.13 26-09-2026; 3.14 27-09-2026; 3.15 01-10-2026;
 #              3.16 02-10-2026
 #              3.17: Codex GPT-6, 26-10-2026 (4:58am charging deadline)
-# Version:     3.17
+#              3.18: Claude Fable 5.2, 10-11-2026
+# Version:     3.18
+# 3.18 - Decision.soc_at_dawn_kwh defaults to None, not 0.0. Fifteen decisions (VPP and
+#       Saving Session exports, free hours, stand-downs) are made without a dawn forecast,
+#       and the plugin published their 0.0 as a forecast of an empty battery.
 # 3.16 — (review 02-10-2026) THE FLOOD DRAIN STOPS AT THE FLUX MINIMUM. On Flux the
 #       overnight pre-drain went to 40% at the 9.7p export rate and the 02:00 charge
 #       (flux_strategy.CHARGE_MIN_PCT, 50%) bought it straight back at 14.6p. On Flux
@@ -940,7 +944,10 @@ class Decision:
     target_soc_pct:  float = 0.0
     scheduled_time:  Optional[datetime] = None   # for deferred imports
     dawn_viable:     bool  = True
-    soc_at_dawn_kwh: float = 0.0
+    # None = this decision made no dawn forecast (a VPP or Saving Session export,
+    # a free hour, a stand-down). It defaulted to 0.0 until 5.145.1, and the plugin
+    # published that as a forecast of an empty battery.
+    soc_at_dawn_kwh: Optional[float] = None
     import_kwh:      float = 0.0
     export_kw:       float = 0.0    # kW being exported (solar overflow)
     # v5.100.0 — the import planner found a genuine tomorrow deficit and no price to
