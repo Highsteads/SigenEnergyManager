@@ -21,6 +21,18 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.145.2 - 10 November 2026
+
+`dawnViable` blank when there is no dawn forecast to judge (CliveS, 10-Nov-2026: blank rather than keep the last answer). No control logic changed.
+
+- `_dawn_viable_or_none(decision)`: None when the decision is None or its `soc_at_dawn_kwh` is None or not finite, else `bool(decision.dawn_viable)`. The verdict is read off the forecast, so no forecast means no verdict. `Decision.dawn_viable` keeps its default of True (thirty sites set it); nothing outside the helper should read the field.
+- `_update_manager_device` writes `_dawn_viable_state_value(decision)`: "True", "False" or "". The state is declared String in Devices.xml, so blank needs no type change.
+- `/api/status` `decision.dawn_viable` is the helper's value, so JSON null for no forecast. It was `dec.dawn_viable if dec else True`, which also claimed yes before the first decision.
+- `dashboard.html` tests `=== true` and `=== false` and draws a dash with no colour for anything else. `d.decision.dawn_viable ? 'Yes' : 'No'` would have drawn null as a red "No".
+- Print Status and Today's Summary say the state through `_dawn_viable_words`: yes, no, "not worked out just now", or an unrecognised value in quotes.
+- Readers checked before choosing blank: no trigger, schedule, action group or control page references the Battery Manager device; `Morning_Brief.py` and `Evening_Report.py` name the state only in comments; Dashboards reads `/api/status` and needed 3.70.2 for the Energy page's Dawn viable row.
+- Tests: `test_dawn_viable_blank.py` (11), watched failing first.
+
 ## v5.145.1 - 10 November 2026
 
 Message faults from the 10-Nov-2026 audit of every email and Pushover. No control logic changed.

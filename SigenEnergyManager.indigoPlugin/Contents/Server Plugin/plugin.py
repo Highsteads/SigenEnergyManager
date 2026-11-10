@@ -82,6 +82,7 @@
 #              Claude Opus 5.5 (5.144.3 - the peak sale keeps 1.2 kWh above the reserve for the night)
 #              Claude Opus 5.5 (5.144.4 - the Axle import says when it leaves payments out)
 #              Claude Fable 5.2 (5.145.1 - message wording from the 10-11-2026 audit: pound sign, VPP summary, one free-hour valuation, blank dawn forecast)
+#              Claude Fable 5.2 (5.145.2 - dawnViable is blank, not True, when there is no dawn forecast to judge)
 #              Claude Opus 5.5 (5.145.0 - a dull day fills the battery overnight)
 #              Claude Opus 5.5 (5.144.1 - quieter overnight log: energy check hysteresis, late charge worded apart)
 #              Claude Opus 5.5 (5.144.0 - an Axle window inside the peak stays with a sale already at the cap)
@@ -93,8 +94,8 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        10-11-2026 09:50 GMT
-# Version:     5.145.1
+# Date:        10-11-2026 12:10 GMT
+# Version:     5.145.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1645,6 +1646,42 @@ def _dawn_state_value(kwh):
     return "" if value is None else str(value)
 
 
+def _dawn_viable_or_none(decision):
+    """Whether the battery lasts until dawn: True, False, or None for no answer.
+
+    5.145.2. The verdict is read off the dawn forecast, so a decision that made
+    no forecast (a VPP or Saving Session export, a free hour, a stand-down)
+    has no verdict either. Decision.dawn_viable defaults to True, and
+    until now that default was published beside a blank socAtDawn as if it had
+    been worked out.
+    """
+    if decision is None:
+        return None
+    if _finite_or_none(getattr(decision, "soc_at_dawn_kwh", None), 2) is None:
+        return None
+    return bool(decision.dawn_viable)
+
+
+def _dawn_viable_state_value(decision):
+    """The dawnViable state: "True", "False", or blank when there is no answer."""
+    verdict = _dawn_viable_or_none(decision)
+    return "" if verdict is None else str(verdict)
+
+
+def _dawn_viable_words(value):
+    """The dawnViable state as the status dumps say it: yes, no, or not worked out."""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return "not worked out just now"
+    if text.lower() == "true":
+        return "yes"
+    if text.lower() == "false":
+        return "no"
+    return f'"{text}"'
+
+
 def _finite_or_none(value, places):
     """A real, finite number rounded to `places`, or None.
 
@@ -3060,7 +3097,9 @@ class Plugin(indigo.PluginBase):
                 "decision": {
                     "action":        dec.action         if dec else "unknown",
                     "reason":        dec.reason         if dec else "",
-                    "dawn_viable":   dec.dawn_viable     if dec else True,
+                    # None (JSON null) when there is no dawn forecast to judge.
+                    # A page must not read that as yes or as no.
+                    "dawn_viable":   _dawn_viable_or_none(dec),
                     # None (JSON null) when there is no forecast; the page shows a dash.
                     "soc_at_dawn_kwh": (_finite_or_none(dec.soc_at_dawn_kwh, 1)
                                         if dec else None),
@@ -13256,7 +13295,9 @@ class Plugin(indigo.PluginBase):
             # currentMode (List enum) appended below, guarded — see note before
             # the updateStatesOnServer call.
             {"key": "currentReason",       "value": _reason_display[:255]},
-            {"key": "dawnViable",          "value": str(decision.dawn_viable)},
+            # 5.145.2: blank with socAtDawn, never the default True (CliveS,
+            # 10-Nov-2026: blank rather than keep the last answer).
+            {"key": "dawnViable",          "value": _dawn_viable_state_value(decision)},
             # 5.145.1: blank when this decision made no dawn forecast (a VPP or
             # Saving Session export, a free hour, a stand-down). It used to be
             # published as 0, and on 01-Nov-2026 the morning brief repeated that
@@ -16837,7 +16878,7 @@ class Plugin(indigo.PluginBase):
             sched    = mgr.states.get("importScheduledTime", "")
             log(f"[Status] Manager:  {action}  |  {reason}")
             _dawn_txt = f"{soc_dawn} kWh" if str(soc_dawn).strip() else "not forecast just now"
-            log(f"[Status] Dawn:     Viable={viable}  |  SOC at dawn {_dawn_txt}"
+            log(f"[Status] Dawn:     Viable {_dawn_viable_words(viable)}  |  SOC at dawn {_dawn_txt}"
                 + (f"  |  Import scheduled {sched}" if sched else ""))
 
         # --- Tomorrow ---
@@ -17286,7 +17327,7 @@ class Plugin(indigo.PluginBase):
         if reason:
             log(f"[Today] Reason:              {reason}")
         _dawn_txt = f"{soc_dawn} kWh" if str(soc_dawn).strip() else "not forecast just now"
-        log(f"[Today] Dawn viability:      {viable}  |  SOC at dawn: {_dawn_txt}")
+        log(f"[Today] Dawn viability:      {_dawn_viable_words(viable)}  |  SOC at dawn: {_dawn_txt}")
         log(f"[Today] Tariff:              {t_name}{rate_str}{tmrw_str}")
         log(f"[Today] Tomorrow forecast:   {fcst_tmrw} kWh solar expected")
         log(f"[Today] Live:                PV {pv_now} W  |  Grid {grid_now} W")

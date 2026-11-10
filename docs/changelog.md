@@ -7,6 +7,16 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.145.2 - 10 November 2026
+
+The **Dawn SOC Viable** state is now blank while the plugin cannot work out whether the battery will last until the sun comes up. That is the case while it is driving an Axle or Saving Session export, filling in a free hour, or standing down. Until now the state said True at those times. Nothing had worked that answer out: it was the value the plugin starts from, shown beside a forecast that 5.145.1 had already made blank.
+
+When there is a forecast, the state says True or False as before.
+
+The plugin's own page shows a dash for Dawn viable at those times. The status the page reads now sends no answer, where it used to send yes, and a page that took no answer to mean no would have shown a red No. The two status reports in the Event Log say "yes", "no" or "not worked out just now".
+
+If you have a trigger or a script that reads this state, treat blank as "not known", neither yes nor no.
+
 ## 5.145.1 - 10 November 2026
 
 A tidy-up of the plugin's messages, from a check of every notification the house sends.

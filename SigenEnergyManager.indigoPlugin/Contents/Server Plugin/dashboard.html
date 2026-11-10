@@ -852,8 +852,12 @@ function update(d) {
   badge.className   = 'action-badge ' + (ACTION_CLASS[action] || 'action-unknown');
   if (d.decision) {
     const dawnEl = document.getElementById('dec-dawn');
-    dawnEl.textContent  = d.decision.dawn_viable ? 'Yes' : 'No';
-    dawnEl.className    = 'dv ' + (d.decision.dawn_viable ? 'dawn-ok' : 'dawn-warn');
+    // null = the plugin has no dawn forecast to judge (5.145.2). A bare truth
+    // test drew that as a red "No".
+    const dawnYes = d.decision.dawn_viable === true;
+    const dawnNo  = d.decision.dawn_viable === false;
+    dawnEl.textContent  = dawnYes ? 'Yes' : dawnNo ? 'No' : '—';
+    dawnEl.className    = 'dv' + (dawnYes ? ' dawn-ok' : dawnNo ? ' dawn-warn' : '');
     // soc_at_dawn_kwh can arrive null (non-finite -> JSON null via _json_safe);
     // fmtKwh is null-safe, so this no longer throws and aborts the whole render.
     document.getElementById('dec-soc-dawn').textContent = fmtKwh(d.decision.soc_at_dawn_kwh);
