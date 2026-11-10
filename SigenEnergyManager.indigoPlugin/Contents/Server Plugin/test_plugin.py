@@ -5616,23 +5616,29 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
             self.assertIn("could not be measured", body)
             self.assertIn("not as what Axle will settle", body)
 
-    def _long_path_dir(self, td):
-        """The real event-log path is ~170 characters. A temp dir is ~50, and
-        that difference is the whole margin: the first plain-English draft came
-        out at 1062 characters IN PRODUCTION while a short-path fixture sat
-        comfortably inside the cap and saw nothing wrong. A fixture only ever
-        tests the regime it was built in."""
-        deep = os.path.join(td, "Library", "Application Support",
-                            "Perceptive Automation", "Indigo 2025.2",
-                            "Preferences", "Plugins",
-                            "com.clives.indigoplugin.sigenergy-energy-manager",
-                            "vpp_events")
-        os.makedirs(deep, exist_ok=True)
-        return deep
+    NAME = "2026-09-05_1830.jsonl"
 
-    def test_a_real_length_path_still_fits_the_cap(self):
+    def _path_of_length(self, td, length):
+        """A log path of exactly `length` characters, whatever the temp dir.
+
+        The real event-log path is 157 characters and is part of the body. A
+        temp dir is about 50 on a Mac and 12 on CI, and that difference is the
+        whole margin: the first plain-English draft came out at 1062 characters
+        IN PRODUCTION while a short-path fixture sat comfortably inside the cap,
+        and on 10-Nov-2026 a fixture built on the temp dir's own length shed a
+        different number of lines on CI than on the Mac. A fixture only ever
+        tests the regime it was built in, so the length is fixed here."""
+        pad = length - len(td) - len(self.NAME) - 2
+        self.assertGreater(pad, 0, "temp dir too long for this fixture")
+        deep = os.path.join(td, "p" * pad)
+        os.makedirs(deep, exist_ok=True)
+        path = os.path.join(deep, self.NAME)
+        self.assertEqual(len(path), length)
+        return path
+
+    def _body_for_path_length(self, length):
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(self._long_path_dir(td), "2026-09-05_1830.jsonl")
+            path = self._path_of_length(td, length)
             self._write_log(path)
             p = plugin.Plugin.__new__(plugin.Plugin)
             p.logger, p.pluginPrefs = MagicMock(), {"axleVppRatePerKwh": "1.00"}
@@ -5643,14 +5649,23 @@ class TestVppSummaryHeadlinesThePaidHour(unittest.TestCase):
             p._update_vpp_device       = MagicMock()
             p._summarise_vpp_event({"start_time": self.START, "end_time": self.END,
                                     "duration_hrs": 1.0})
-            body = p._send_pushover.call_args.args[1]
-            self.assertGreater(len(body), 900, "fixture no longer near the cap")
-            self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
-            # It only fits because a diagnostic line was shed, and it says so.
-            self.assertIn("more details are in the file below.", body)
-            # And what was shed is never the money or the prompt.
-            self.assertIn("inside the paid hour", body)
-            self.assertIn("_verify_ems_registers", body)
+            return p._send_pushover.call_args.args[1]
+
+    def test_a_real_length_path_still_fits_the_cap(self):
+        body = self._body_for_path_length(157)
+        self.assertGreater(len(body), 900, "fixture no longer near the cap")
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        self.assertIn("inside the paid hour", body)
+        self.assertIn("_verify_ems_registers", body)
+
+    def test_a_longer_path_sheds_a_detail_and_says_so(self):
+        body = self._body_for_path_length(200)
+        self.assertLessEqual(len(body), plugin.PUSHOVER_BODY_CAP)
+        # It only fits because a diagnostic line was shed, and it says so.
+        self.assertRegex(body, r"more details? (is|are) in the file below\.")
+        # And what was shed is never the money or the prompt.
+        self.assertIn("inside the paid hour", body)
+        self.assertIn("_verify_ems_registers", body)
 
     def test_a_trivial_tail_is_not_worth_a_sentence(self):
         """Below a tenth of a unit the tails are rounding. Saying it every time
