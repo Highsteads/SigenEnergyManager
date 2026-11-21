@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.145.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.146.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.146.0 (21 November 2026)** - The data the plugin shares with other plugins on this Mac has a new part, `/api/halfhourly`: every half-hourly record it keeps, with every Axle payment and Octopus free-hour credit. The Dashboards plugin's new Savings page reads it. Nothing the plugin does with the battery has changed.
 
 **5.145.2 (10 November 2026)** - The **Dawn SOC Viable** state is now blank while the plugin cannot work out whether the battery will last until the sun comes up, which is the case while it is driving an export or filling in a free hour, while the manager is paused, and while the inverter is not answering. It used to say True at those times, beside a blank forecast. The plugin's own page shows a dash there, where it would have shown a red No.
 
@@ -186,6 +188,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.146.0 | 21 November 2026 | A new `/api/halfhourly` part of the shared data, for the Dashboards Savings page. |
 | 5.145.2 | 10 November 2026 | Dawn SOC Viable is blank, not True, when there is no dawn forecast to judge. |
 | 5.145.1 | 10 November 2026 | Plainer messages with the pound sign; a blank dawn forecast, not 0, during a driven export. |
 | 5.145.0 | 6 November 2026 | A dull day (under 10 kWh of sun forecast) fills the battery overnight. |

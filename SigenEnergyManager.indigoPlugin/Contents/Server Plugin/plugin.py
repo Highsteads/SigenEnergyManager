@@ -94,8 +94,9 @@
 #              Codex GPT-6 (5.137.0 - verify charging hand-back before blocking peak export)
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
-# Date:        10-11-2026 12:10 GMT
-# Version:     5.145.2
+#              Claude Opus 5.5 (5.146.0 - /api/halfhourly for the Dashboards Savings page)
+# Date:        21-11-2026 18:10 GMT
+# Version:     5.146.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3452,6 +3453,81 @@ class Plugin(indigo.PluginBase):
         except (OSError, ValueError):
             return {"days": days, "records": []}
         return {"days": days, "records": records[-days:]}
+
+    # Columns /api/halfhourly sends, in order (5.146.0).
+    HALFHOURLY_FIELDS = ("start", "end", "pv_kwh", "home_kwh", "import_kwh",
+                         "export_kwh", "soc_start", "soc_end", "import_rate_p",
+                         "battery_charge_kwh", "battery_discharge_kwh")
+
+    def get_dashboard_halfhourly(self, days=30):
+        """Every half-hourly slot from the last N days, plus the free-hour credits.
+
+        5.146.0, for the Dashboards Savings page, which needs months of slots where
+        /api/history stops at a week. Rows are lists in HALFHOURLY_FIELDS order to
+        keep a year of them under a megabyte. `import_rate_p` is the unit price the
+        slot was recorded at (the column is still called tracker_price_p from the
+        Tracker days; on Flux it holds the band). Battery charge and discharge are
+        null before 13-09-2026, when they started being recorded.
+
+        free_hour_credits: [{"date", "pence", "reason"}] from the credit keys the
+        free-hour ledger has matched to an hour, so a credit counts once."""
+        db_path = os.path.join(self.data_dir, "energy_timeseries.db")
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        rows = []
+        if os.path.exists(db_path):
+            con = None
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+                cur = con.execute(
+                    """SELECT slot_start, slot_end, pv_kwh, home_kwh,
+                              grid_import_kwh, grid_export_kwh,
+                              battery_soc_start_pct, battery_soc_end_pct,
+                              tracker_price_p, battery_charge_kwh,
+                              battery_discharge_kwh
+                         FROM halfhourly
+                        WHERE slot_start >= ?
+                     ORDER BY slot_start ASC""",
+                    (cutoff,),
+                )
+                rows = [list(r) for r in cur.fetchall()]
+            except sqlite3.Error as exc:
+                self.logger.debug(f"[Dashboard] half-hourly query failed: {exc}")
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except sqlite3.Error:
+                        pass
+        credits = []
+        try:
+            ledger = self._load_free_hour_ledger()
+            for key in ledger.get("assigned_credit_keys") or []:
+                parts = str(key).split("|")
+                if len(parts) == 3:
+                    try:
+                        credits.append({"date": parts[0], "pence": int(parts[1]),
+                                        "reason": parts[2]})
+                    except ValueError:
+                        continue
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Dashboard] free-hour credits unreadable: {exc!r}")
+        # Every Axle payment on the ledger, not the recent dozen /api/vpp lists:
+        # [{"type", "start", "end", "pence", "kwh"}] as Axle reported them.
+        axle = []
+        try:
+            led = _vpp_ledger.load_ledger(_vpp_ledger.ledger_path(self.data_dir))
+            for t in ((led.get("axle") or {}).get("transactions") or []):
+                try:
+                    pence = int(t.get("credit_pence"))
+                except (TypeError, ValueError):
+                    continue
+                axle.append({"type": str(t.get("transaction_type") or ""),
+                             "start": t.get("start_time"), "end": t.get("end_time"),
+                             "pence": pence, "kwh": t.get("flex_kwh")})
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Dashboard] VPP ledger unreadable: {exc!r}")
+        return {"days": days, "fields": list(self.HALFHOURLY_FIELDS),
+                "rows": rows, "free_hour_credits": credits, "axle_payments": axle}
 
     # ================================================================
     # Export sync check (v5.19) — Sigenergy vs Octopus settled exports

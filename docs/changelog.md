@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.146.0 - 21 November 2026
+
+The data the plugin shares with other plugins on this Mac has a new part, `/api/halfhourly`. It lists every half-hourly record the plugin keeps (solar, house, import, export, battery level and the price each half hour was bought at), every Axle payment on its record, and the Octopus free-hour credits it has matched. The Dashboards plugin's Savings page uses it to work out what the solar and battery have saved. Nothing the plugin does with the battery has changed.
+
 ## 5.145.2 - 10 November 2026
 
 The **Dawn SOC Viable** state is now blank while the plugin cannot work out whether the battery will last until the sun comes up. That is the case while it is driving an Axle or Saving Session export, filling in a free hour, or standing down. Until now the state said True at those times. Nothing had worked that answer out: it was the value the plugin starts from, shown beside a forecast that 5.145.1 had already made blank.

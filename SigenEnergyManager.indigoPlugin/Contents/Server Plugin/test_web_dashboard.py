@@ -223,6 +223,7 @@ class _StubPlugin:
     def get_dashboard_years(self):     return {"years": [2026]}
     def get_dashboard_vpp(self):       return {"events": []}
     def get_dashboard_day_patterns(self): return {"available": True, "groups": []}
+    def get_dashboard_halfhourly(self, days=30): return {"fields": [], "rows": []}
 
 
 class TestApiSurface(unittest.TestCase):
@@ -239,7 +240,8 @@ class TestApiSurface(unittest.TestCase):
 
     # Mirrors Dashboards' _SIGEN_ALLOWED_PATHS.
     REQUIRED = ["/api/status", "/api/history", "/api/daily", "/api/export-sync",
-                "/api/years", "/api/calendar", "/api/vpp", "/api/day-patterns"]
+                "/api/years", "/api/calendar", "/api/vpp", "/api/day-patterns",
+                "/api/halfhourly"]
 
     @classmethod
     def setUpClass(cls):

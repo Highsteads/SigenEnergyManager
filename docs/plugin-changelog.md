@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.146.0 - 21 November 2026
+
+`/api/halfhourly?days=N` (1-800, default 30) for the Dashboards Savings page (Dashboards 3.71.0), which needs months of slots where `/api/history` stops at 168 hours. No control logic changed.
+
+- `get_dashboard_halfhourly(days)`: the `halfhourly` table read-only (`mode=ro` URI), oldest first, rows as lists in `HALFHOURLY_FIELDS` order (start, end, pv, home, import, export, SOC start and end, `tracker_price_p` sent as `import_rate_p`, battery charge and discharge). About 9,400 rows from 2-May-2026; battery charge and discharge are null before 13-Sep-2026.
+- `free_hour_credits`: one `{date, pence, reason}` per key in the free-hour ledger's `assigned_credit_keys`, so each credit counts once. Malformed keys are skipped.
+- `axle_payments`: every transaction on the VPP ledger's Axle side, `{type, start, end, pence, kwh}`, not the recent dozen `/api/vpp` lists. On 21-Nov-2026: 25 flex events, 4 monthly top-ups and 1 referral credit.
+- `test_halfhourly_api.py` (7 tests, a real SQLite store in a temp folder); `test_web_dashboard.py` names the new route in its hardcoded list.
+
 ## v5.145.2 - 10 November 2026
 
 `dawnViable` blank when there is no dawn forecast to judge (CliveS, 10-Nov-2026: blank rather than keep the last answer). No control logic changed.

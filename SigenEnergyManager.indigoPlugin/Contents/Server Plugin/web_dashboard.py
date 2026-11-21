@@ -313,6 +313,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             days = self._int_param("days", 30, 1, 800)
             self._send_api(lambda: self._plugin_ref.get_dashboard_daily(days=days))
 
+        elif path == "/api/halfhourly":
+            # 5.146.0: every half-hourly slot for the Dashboards Savings page,
+            # which needs months of them where /api/history stops at a week.
+            days = self._int_param("days", 30, 1, 800)
+            self._send_api(lambda: self._plugin_ref.get_dashboard_halfhourly(days=days))
+
         elif path == "/api/export-sync":
             self._send_api(lambda: self._plugin_ref.get_dashboard_export_sync())
 

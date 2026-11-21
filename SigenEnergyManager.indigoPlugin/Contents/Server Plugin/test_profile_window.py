@@ -295,21 +295,25 @@ class TestWindowPersistence(unittest.TestCase):
         self.assertAlmostEqual(q.store["consumption_profile"][0], 0.4, places=3)
 
     def test_a_corrupt_day_bucket_is_skipped_not_fatal(self):
+        # Days relative to today: fixed dates age out of the 63-day window and
+        # the load prunes them, which made this fail on 21-11-2026 for a reason
+        # that had nothing to do with corrupt buckets.
+        day = lambda n: (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
         path = os.path.join(self.tmp, "home_load_profile.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({
                 "watts_sum": [800.0 * 10] * 48, "count": [10] * 48,
                 "days": {
-                    "2026-09-13": {"sum": [1.0] * 48, "count": [1] * 48},   # good
-                    "2026-09-12": {"sum": [1.0] * 7,  "count": [1] * 7},    # wrong length
-                    "2026-09-11": {"sum": ["x"] * 48, "count": [1] * 48},   # not numbers
+                    day(1): {"sum": [1.0] * 48, "count": [1] * 48},   # good
+                    day(2): {"sum": [1.0] * 7,  "count": [1] * 7},    # wrong length
+                    day(3): {"sum": ["x"] * 48, "count": [1] * 48},   # not numbers
                 },
             }, fh)
         q = _mk(self.tmp)
         q._is_away = lambda: False
         with patch.object(plugin, "log"):
             q._load_home_profile()
-        self.assertEqual(list(q.store["home_profile_days"]), ["2026-09-13"])
+        self.assertEqual(list(q.store["home_profile_days"]), [day(1)])
 
 
 if __name__ == "__main__":
