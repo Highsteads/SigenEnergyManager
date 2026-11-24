@@ -1659,6 +1659,54 @@ class TestPeakClaimedAtFourNotFive(_FluxCase):
         self.assertEqual(p.store["flux_clear_ticks"], 0)
 
 
+class TestTheCheapWindowIsClaimedAtTwoAfterAWarning(_FluxCase):
+    """24-Nov-2026 live (and 16, 17 Nov): a yellow ice warning stood Flux aside all
+    evening and every one of its ticks restarted the five-minute stand-down. At 2am
+    the warning stopped outranking Flux, but Flux could not claim, so the manager
+    began its own smaller charge (to 71%), Flux then stood aside for that, and took
+    the window back at 4:21am with 37 minutes left."""
+
+    def _call_at(self, p, when, fn):
+        # Defined further down the file, so looked up when called.
+        return TestDayRateImportStopsThePeakExport._call_at(self, p, when, fn)
+
+    def _warning_until_two(self, soc=19.0):
+        p, when = self._at((1, 59), soc=soc, storm_level="yellow",
+                           flux_preempted_at=0.0, flux_clear_ticks=0)
+        for _ in range(plugin.FLUX_RECLAIM_TICKS):   # the warning held it all evening
+            self._run(p, when)
+        self.assertEqual(p.store["flux_owner_reason"], "a storm warning (yellow)")
+        self.assertEqual(p.flux_executor.targets(), [])
+        return p, when
+
+    def test_a_warning_standing_aside_does_not_start_the_stand_down(self):
+        p, _ = self._warning_until_two()
+        self.assertEqual(p.store["flux_preempted_at"], 0.0)
+
+    def test_the_charge_is_claimed_on_the_first_tick_after_two(self):
+        p, when = self._warning_until_two()
+        two = when.replace(hour=2, minute=0, second=5)
+        self._run(p, two, at=two)
+        self.assertEqual(p.store["flux_owner_reason"], "")
+        self.assertEqual(len(p.flux_executor.targets()), 1)
+
+    def test_the_manager_is_told_flux_has_the_window_on_that_tick(self):
+        """The manager runs after the supervisor in the same tick. This is the
+        answer that stops it starting its own charge."""
+        p, when = self._warning_until_two()
+        two = when.replace(hour=2, minute=0, second=5)
+        self._run(p, two, at=two)
+        self.assertTrue(self._call_at(p, two, p._flux_owns_cheap_window))
+
+    def test_a_writing_owner_under_a_warning_still_starts_the_stand_down(self):
+        p, when = self._at((1, 59), soc=19.0, storm_level="yellow",
+                           export_active=True,
+                           flux_preempted_at=0.0, flux_clear_ticks=5)
+        self._run(p, when)
+        self.assertGreater(p.store["flux_preempted_at"], 0.0)
+        self.assertEqual(p.store["flux_clear_ticks"], 0)
+
+
 class TestThePeakSaleResumesAfterAnAxleWindow(_FluxCase):
     """2-Nov-2026 live: the 5pm-6pm window ended at 18:02:39 and the sale stayed off
     for ten minutes, five for the manual flag to lapse and five more of stand-down."""

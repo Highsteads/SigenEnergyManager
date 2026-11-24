@@ -21,6 +21,15 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.146.1 - 24 November 2026
+
+Flux claims the cheap window on the first tick after 02:00 when a weather warning was what stood it aside.
+
+- Found live 24-Nov-2026 (and in the logs of 16 and 17 Nov): `_flux_other_owner` names a storm warning as an owner outside the cheap window, and the supervisor re-stamped `flux_preempted_at` and zeroed `flux_clear_ticks` on every tick it stood. At 02:00 the warning stopped being an owner, but `_flux_may_claim` was False for five minutes, so `_flux_owns_cheap_window` was False and the manager's cheap-window fallback started an import to 69-71% in the same tick. That import then outranked Flux until it reached its level at 04:16; Flux applied at 04:21.
+- `_flux_owner_owes_no_stand_down(owner)`: True for `FLUX_OWNER_PRE_PEAK_OVERFLOW` and for any owner starting `FLUX_OWNER_WARNING_PREFIX`. For those the supervisor counts clear ticks and leaves `flux_preempted_at` alone, as it has for pre-peak overflow since 5.114. A writer under a warning (import, export, VPP) is listed ahead of the warning and still starts the stand-down.
+- Tests: `TestTheCheapWindowIsClaimedAtTwoAfterAWarning` (4), three watched failing first.
+- Measured the same morning and NOT changed: the first twenty minutes of the charge ran at about 640 W because the coldest pack was at 4.4 C. Charge power against coldest pack temperature at 02:02 on five nights: 4.4 C 0.64 kW, 5.7 C 1.85 kW, 6.4 C 6.15 kW, 6.5 C 6.15 kW, 6.9 C 6.97 kW. That cost about 9 points of charge on 24 Nov; the handover cost about 2.
+
 ## v5.146.0 - 21 November 2026
 
 `/api/halfhourly?days=N` (1-800, default 30) for the Dashboards Savings page (Dashboards 3.71.0), which needs months of slots where `/api/history` stops at 168 hours. No control logic changed.

@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.146.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.146.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.146.1 (24 November 2026)** - After a weather warning, the 2am charge now starts under the Flux plan at once. A warning makes the plugin hold back from selling, and until now it also kept the Flux plan waiting for five minutes after 2am. In that gap the plugin's own fallback charge started, aimed at a lower level, and the Flux plan could not take over until that had finished. On 24 November that was 4:21am, and the charge then sat idle for five minutes with 37 minutes of cheap power left. A warning writes nothing to the inverter, so there was never anything to wait for. Most of that morning's shortfall (87% where 98% is usual) had a different cause that this version does not change: the coldest battery pack was at 4.4 degrees at 2am, and the battery would take only about 0.6 kW until it had warmed past 5 degrees, some twenty minutes later.
 
 **5.146.0 (21 November 2026)** - The data the plugin shares with other plugins on this Mac has a new part, `/api/halfhourly`: every half-hourly record it keeps, with every Axle payment and Octopus free-hour credit. The Dashboards plugin's new Savings page reads it. Nothing the plugin does with the battery has changed.
 
@@ -188,6 +190,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.146.1 | 24 November 2026 | After a weather warning, the Flux plan takes the 2am charge at once. |
 | 5.146.0 | 21 November 2026 | A new `/api/halfhourly` part of the shared data, for the Dashboards Savings page. |
 | 5.145.2 | 10 November 2026 | Dawn SOC Viable is blank, not True, when there is no dawn forecast to judge. |
 | 5.145.1 | 10 November 2026 | Plainer messages with the pound sign; a blank dawn forecast, not 0, during a driven export. |

@@ -95,8 +95,9 @@
 #              Claude Opus 5.5 (5.141.0 - fixes from the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.146.0 - /api/halfhourly for the Dashboards Savings page)
-# Date:        21-11-2026 18:10 GMT
-# Version:     5.146.0
+#              Claude Fable 5.2 (5.146.1 - Flux claims the 2am charge at once after a weather warning)
+# Date:        24-11-2026 22:45 GMT
+# Version:     5.146.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -519,6 +520,9 @@ VPP_CARRY_GRACE_S             = 30
 # Stamping the stand-down while it held the inverter cost the first five minutes
 # of every peak (live 17-Sep and 21-Sep-2026: export started ~16:05).
 FLUX_OWNER_PRE_PEAK_OVERFLOW = "solar overflow is running"
+# 5.146.1: a weather warning writes nothing to the inverter. It is a reason for Flux
+# to wait, not a writer Flux must give time to finish, so it owes no stand-down.
+FLUX_OWNER_WARNING_PREFIX    = "a storm warning ("
 # The Remote EMS modes that discharge to the grid: 0x05 PV-first, 0x06 ESS-first.
 # Either means the battery is not charging.
 _VPP_EXPORT_MODES = (0x05, 0x06)
@@ -15022,8 +15026,25 @@ class Plugin(indigo.PluginBase):
         if _storm_level_active(self.store.get("storm_level")) and not _flux_cheap_window_open():
             # 5.133.0: inside the cheap window a warning is the reason to charge, so Flux
             # keeps the inverter there. Outside it a storm still hands the inverter back.
-            return f"a storm warning ({self.store.get('storm_level')})"
+            return f"{FLUX_OWNER_WARNING_PREFIX}{self.store.get('storm_level')})"
         return ""
+
+    @staticmethod
+    def _flux_owner_owes_no_stand_down(owner):
+        """True for an owner that only asks Flux to wait and writes nothing itself.
+
+        The stand-down exists so a writer (an import, an export, a paid window) has
+        finished with the registers before Flux writes its own. Solar overflow before
+        the peak and a weather warning outside the cheap window both end on the clock,
+        at 4pm and 2am, exactly when Flux is wanted. 24-Nov-2026: a yellow ice warning
+        re-stamped the stand-down every tick until 2am, Flux could not claim, the
+        manager began its own charge to 71%, and Flux stood aside for that until
+        4:21am. Anything that does write while a warning stands (an import, an export)
+        is listed ahead of the warning in _flux_other_owner and starts the stand-down
+        in its own name.
+        """
+        return (owner == FLUX_OWNER_PRE_PEAK_OVERFLOW
+                or str(owner).startswith(FLUX_OWNER_WARNING_PREFIX))
 
     # ---- event commitments ------------------------------------------------
 
@@ -16520,10 +16541,11 @@ class Plugin(indigo.PluginBase):
             # failure the ordered pre-emption exists to prevent. So the claim is
             # given up with no writes at all, and the new owner plus the
             # manager's verify pass settle the registers.
-            if owner == FLUX_OWNER_PRE_PEAK_OVERFLOW:
+            if self._flux_owner_owes_no_stand_down(owner):
                 # A stand-aside that ends on the clock is not a pre-emption: no
                 # stand-down, and its ticks count as clear, so the peak is
-                # claimed on the first tick after 16:00 rather than at 16:05.
+                # claimed on the first tick after 16:00 rather than at 16:05, and
+                # the cheap window on the first tick after 02:00 (5.146.1).
                 self.store["flux_clear_ticks"] = int(
                     self.store.get("flux_clear_ticks") or 0) + 1
             else:

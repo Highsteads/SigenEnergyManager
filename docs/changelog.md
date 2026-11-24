@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.146.1 - 24 November 2026
+
+After a weather warning, the 2am charge now starts under the Flux plan at once. A warning makes the plugin hold back from selling, and until now it also kept the Flux plan waiting for five minutes after 2am. In that gap the plugin's own fallback charge started, aimed at a lower level, and the Flux plan could not take over until that had finished. On 24 November that was 4:21am, and the charge then sat idle for five minutes with 37 minutes of cheap power left. A warning writes nothing to the inverter, so there was never anything to wait for. Most of that morning's shortfall (87% where 98% is usual) had a different cause that this version does not change: the coldest battery pack was at 4.4 degrees at 2am, and the battery would take only about 0.6 kW until it had warmed past 5 degrees, some twenty minutes later.
+
 ## 5.146.0 - 21 November 2026
 
 The data the plugin shares with other plugins on this Mac has a new part, `/api/halfhourly`. It lists every half-hourly record the plugin keeps (solar, house, import, export, battery level and the price each half hour was bought at), every Axle payment on its record, and the Octopus free-hour credits it has matched. The Dashboards plugin's Savings page uses it to work out what the solar and battery have saved. Nothing the plugin does with the battery has changed.
