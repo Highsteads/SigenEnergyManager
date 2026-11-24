@@ -21,6 +21,19 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.0 - 24 November 2026
+
+The cold-night warm-up: a 1 kW Charge PV First before the Flux cheap window when the coldest pack is cold.
+
+- Why: 24-Nov-2026, coldest pack 4.4 C at 02:00, battery took 0.64 kW for 13 minutes against a 10 kW command and the charge ended at 86.9%. Charge power at 02:02 against `batteryMinTempC` on five nights is in the 5.146.1 entry below.
+- `_cold_warmup_tick` runs in `_tick` just before `_flux_supervisor_tick`. `_cold_warmup_step` starts when: Flux owns the cheap window (armed, Flux tariff), 0 < minutes to 02:00 <= lead (20, or 30 under 5.0 C), coldest pack < 6.0 C (`COLD_WARMUP_*` constants), SOC < 90%, Modbus connected, and nothing outranks Flux bar a weather warning. No reading is never a cold battery.
+- It goes through `_force_charge(1000, 100.0)` (the one door, pinned by `test_every_import_goes_through_the_one_door`) and sets `cold_warmup_active`. It is NOT `import_active` and NOT in `_flux_other_owner`: either would start the stand-down and delay the 02:00 claim.
+- At 02:00 it ends with no writes; the supervisor, next on the same tick, claims and writes Flux's charge. If Flux cannot plan, the manager's fallback or the verify pass settles the registers.
+- Stopped early: if another writer has the inverter (`_another_writer_has_the_inverter`) it lets go with no writes; otherwise (paused, Flux switched off) it calls `set_self_consumption` and keeps the flag until that succeeds.
+- `_verify_ems_registers` expects Charge PV First and a 1000 W charge limit while it runs. `_cold_warmup_recent` (running, or ended under 120 s ago) exempts it from both `_note_day_rate_import` inferences, so the peak sale is not stood down. `_inverter_in_use` counts it.
+- Cost, not measured: up to 30 minutes of house load plus under 0.5 kWh of charge at the day rate, about 10p a kWh over the cheap rate, so 5 to 9p on the coldest nights. Whether a 1 kW cap warms the packs as fast as the uncapped charge did is not known; the handover log line gives start and end temperature for each night.
+- Tests: `test_cold_warmup.py` (34). Mutation sweep of 18 sabotages, all caught.
+
 ## v5.146.1 - 24 November 2026
 
 Flux claims the cheap window on the first tick after 02:00 when a weather warning was what stood it aside.

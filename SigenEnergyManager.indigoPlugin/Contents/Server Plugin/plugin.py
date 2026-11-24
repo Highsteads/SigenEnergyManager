@@ -96,8 +96,9 @@
 #              Claude Opus 5.5 (5.142.0 - the rest of the 01-11-2026 code review)
 #              Claude Opus 5.5 (5.146.0 - /api/halfhourly for the Dashboards Savings page)
 #              Claude Fable 5.2 (5.146.1 - Flux claims the 2am charge at once after a weather warning)
-# Date:        24-11-2026 22:45 GMT
-# Version:     5.146.1
+#              Claude Fable 5.2 (5.147.0 - a cold battery is warmed with a small charge before the 2am window)
+# Date:        24-11-2026 22:36 GMT
+# Version:     5.147.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -523,6 +524,20 @@ FLUX_OWNER_PRE_PEAK_OVERFLOW = "solar overflow is running"
 # 5.146.1: a weather warning writes nothing to the inverter. It is a reason for Flux
 # to wait, not a writer Flux must give time to finish, so it owes no stand-down.
 FLUX_OWNER_WARNING_PREFIX    = "a storm warning ("
+
+# 5.147.0: the cold-night warm-up. Measured 24-Nov-2026 with the inverter asked for
+# 10 kW at 02:00: coldest pack 4.4 C took 0.64 kW, 5.7 C 1.85 kW, 6.4 C 6.15 kW,
+# 6.9 C 6.97 kW, and about 9 kW from 7.5 C. The packs warmed once charging was asked
+# for (4.4 C to 7.7 C in the first 29 minutes), so a small charge before the cheap
+# window should buy the full rate from 02:00. Five nights only: these figures are a
+# first sketch, and the log line at the handover is there to correct them.
+COLD_WARMUP_BELOW_C       = 6.0      # warm up when the coldest pack is under this
+COLD_WARMUP_VERY_COLD_C   = 5.0      # under this, the longer lead
+COLD_WARMUP_LEAD_MIN      = 20       # minutes before the cheap window
+COLD_WARMUP_LONG_LEAD_MIN = 30
+COLD_WARMUP_W             = 1000     # the cap: about half a kWh at the day rate
+COLD_WARMUP_MAX_SOC_PCT   = 90.0     # nearly full has no long charge to speed up
+COLD_WARMUP_RECENT_S      = 120.0    # the handover, for the day-rate guard
 # The Remote EMS modes that discharge to the grid: 0x05 PV-first, 0x06 ESS-first.
 # Either means the battery is not charging.
 _VPP_EXPORT_MODES = (0x05, 0x06)
@@ -932,6 +947,14 @@ def _zone_name(when_utc):
         return when_utc.astimezone(_london_tz()).tzname() or "UK time"
     except Exception:                                   # noqa: BLE001
         return "UK time"
+
+
+def _spoken_c(value):
+    """"4.4 degrees" for a log line, or "an unknown temperature"."""
+    try:
+        return f"{float(value):.1f} degrees"
+    except (TypeError, ValueError):
+        return "an unknown temperature"
 
 
 def _flux_cheap_window_open(now_utc=None):
@@ -3992,6 +4015,9 @@ class Plugin(indigo.PluginBase):
         #     letting go has to be prompt. Taking control is rate-limited inside
         #     the supervisor's own stand-down rules; giving it up is not.
         # Costs nothing when the feature is off: one preference read and a return.
+        # 5.147.0: BEFORE the supervisor, so that at 02:00 the warm-up has let go
+        # by the time Flux plans and claims on the same tick.
+        self._cold_warmup_tick()
         self._flux_supervisor_tick()
         self._vpp_watch_carried_window()
         self._stop_overnight_charge_at_cutoff()
@@ -8106,7 +8132,8 @@ class Plugin(indigo.PluginBase):
         if (not prev_import
                 and _seen[0] in _IMPORT_EMS_MODES and time.time() - _seen[1] < 120.0
                 and not self.store.get("happy_hour_import_active")
-                and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE):
+                and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE
+                and not self._cold_warmup_recent()):      # 5.147.0: ours, and tiny
             self._note_day_rate_import()
 
         # ── Retract a stale scheduled import (v5.65.0) ──────────────────────
@@ -8683,6 +8710,157 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"[Manager] cheap-window headroom not worked out: {exc!r}")
         return max(0, power)
 
+    # ---- the cold-night warm-up (5.147.0) -----------------------------------
+
+    def _cold_warmup_tick(self):
+        """Self-locking, and never lets a fault here stop the tick."""
+        with self._state_lock:
+            try:
+                self._cold_warmup_step()
+            except Exception:                           # noqa: BLE001
+                self.logger.exception("[Warm-up] The cold-night warm-up raised")
+
+    def _coldest_pack_c(self):
+        """The coldest pack in degrees C, or None when there is no usable reading.
+        No reading is no information: it must never count as a cold battery."""
+        try:
+            value = float((self.latest_inverter_data or {}).get("batteryMinTempC"))
+        except (TypeError, ValueError):
+            return None
+        return value if -40.0 <= value <= 80.0 else None
+
+    def _cold_warmup_blocker(self):
+        """Why the warm-up may not hold the inverter right now, or "".
+
+        Everything that outranks Flux outranks this, bar a weather warning, which
+        writes nothing and is what a cold night usually comes with.
+        """
+        if not FLUX_AVAILABLE or not self._flux_owns_cheap_window():
+            return "Flux is not set to run the cheap window"
+        if self._flux_owns_control():
+            return "Flux holds the inverter"
+        owner = self._flux_other_owner()
+        if owner and not str(owner).startswith(FLUX_OWNER_WARNING_PREFIX):
+            return owner
+        return ""
+
+    def _another_writer_has_the_inverter(self):
+        """True when something other than the warm-up is driving the inverter."""
+        mine = self.store.get("cold_warmup_active")
+        self.store["cold_warmup_active"] = False
+        try:
+            return bool(self._flux_owns_control() or self._inverter_in_use())
+        finally:
+            self.store["cold_warmup_active"] = mine
+
+    def _cold_warmup_recent(self):
+        """True while the warm-up runs and for two minutes after it ends, which is
+        how long its charge mode can still be on the inverter or in a reading."""
+        if self.store.get("cold_warmup_active"):
+            return True
+        ended = float(self.store.get("cold_warmup_ended_at") or 0.0)
+        return 0.0 <= time.time() - ended <= COLD_WARMUP_RECENT_S
+
+    def _cold_warmup_step(self):
+        """Warm a cold battery with a small charge just before the cheap window.
+
+        24-Nov-2026: the coldest pack was at 4.4 C at 02:00, the battery took
+        0.64 kW for 13 minutes whatever was asked of it, and the charge ended at
+        86.9% where 97 to 99% is usual. That is about 3 kWh never bought at the
+        cheap rate, which comes straight off the 4pm sale. Against it: up to half
+        an hour of the house and a 1 kW charge at the day rate, a few pence.
+
+        It is NOT an owner Flux stands aside for and NOT a manager import: either
+        would start the five-minute stand-down and cost the start of the very
+        charge this is for. At 02:00 it lets go with no writes; Flux, which runs
+        next on the same tick, writes its own mode and limits over the top, and if
+        Flux cannot plan, the manager's fallback or the verify pass does.
+
+        It is not recorded as a day-rate import either. That record stands the
+        whole peak sale down, which is right for a real purchase and wrong for
+        half a kWh bought so the cheap charge can run.
+        """
+        now_utc = datetime.now(timezone.utc)
+        active  = bool(self.store.get("cold_warmup_active"))
+        in_cheap = _flux_cheap_window_open(now_utc)
+
+        if active:
+            if in_cheap:
+                temp  = self._coldest_pack_c()
+                start = self.store.get("cold_warmup_start_c")
+                mins  = (time.time() - float(self.store.get("cold_warmup_started_at")
+                                             or time.time())) / 60.0
+                self.store["cold_warmup_active"]   = False
+                self.store["cold_warmup_ended_at"] = time.time()
+                log(f"[Warm-up] The cheap window is open, so the warm-up has ended "
+                    f"and the overnight charge takes over. In {mins:.0f} minutes the "
+                    f"coldest battery pack went from {_spoken_c(start)} to "
+                    f"{_spoken_c(temp)}")
+                return
+            blocker = self._cold_warmup_blocker()
+            if not blocker:
+                return                                  # running, nothing to do
+            if self._another_writer_has_the_inverter():
+                # It has written its own mode and limits already. A hand-back now
+                # would put Self Consumption over the top of a live import or a
+                # paid export, so let go with no writes, as the Flux supervisor does.
+                self.store["cold_warmup_active"]   = False
+                self.store["cold_warmup_ended_at"] = time.time()
+                log(f"[Warm-up] Stopped early: {blocker}")
+                return
+            # Nothing else is driving (a paused manager, Flux switched off), so the
+            # charge mode is still ours to take off.
+            if not (self.modbus and self.modbus.connected
+                    and self.modbus.set_self_consumption()):
+                return                                  # ours until it is handed back
+            self.store["cold_warmup_active"]   = False
+            self.store["cold_warmup_ended_at"] = time.time()
+            log(f"[Warm-up] Stopped early and the inverter handed back: {blocker}")
+            return
+
+        if in_cheap or not FLUX_AVAILABLE:
+            return
+        temp = self._coldest_pack_c()
+        if temp is None or temp >= COLD_WARMUP_BELOW_C:
+            return
+        lead = (COLD_WARMUP_LONG_LEAD_MIN if temp < COLD_WARMUP_VERY_COLD_C
+                else COLD_WARMUP_LEAD_MIN)
+        try:
+            opens = _flux_strategy.next_cheap_start(now_utc, _london_tz())
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Warm-up] next cheap window not worked out: {exc!r}")
+            return
+        minutes = (opens - now_utc).total_seconds() / 60.0
+        if not 0.0 < minutes <= lead:
+            return
+        try:
+            soc = float((self.latest_inverter_data or {}).get("batterySoc"))
+        except (TypeError, ValueError):
+            return
+        if soc >= COLD_WARMUP_MAX_SOC_PCT:
+            return
+        if not (self.modbus and self.modbus.connected):
+            return
+        if self._cold_warmup_blocker():
+            return
+        # Through the one door every charge uses, so the verify pass and the
+        # charge agree on the mode and a running solar overflow is ended.
+        if not self._force_charge(COLD_WARMUP_W, 100.0):
+            if self.store.get("cold_warmup_refused_day") != _local_today_str():
+                self.store["cold_warmup_refused_day"] = _local_today_str()
+                log("[Warm-up] The warm-up charge could not be started (the inverter "
+                    "refused the command or did not answer); trying again each tick "
+                    "until the cheap window opens", level="WARNING")
+            return
+        self.store["cold_warmup_active"]     = True
+        self.store["cold_warmup_started_at"] = time.time()
+        self.store["cold_warmup_start_c"]    = temp
+        log(f"[Warm-up] The coldest battery pack is at {_spoken_c(temp)}, and a cold "
+            f"battery charges slowly, so a small charge of {COLD_WARMUP_W / 1000:.0f} kW "
+            f"is running for the {minutes:.0f} minutes until the cheap window opens "
+            f"at {opens.astimezone(_london_tz()):%H:%M}, to "
+            f"warm it. The house runs on the grid until then")
+
     def _stop_overnight_charge_at_cutoff(self):
         """End the fallback charge on the fast tick, not the minute-long evaluation."""
         with self._state_lock:
@@ -8992,6 +9170,8 @@ class Plugin(indigo.PluginBase):
         # Use the stored cap as the expected value so verify() doesn't fight it.
         if self.store.get("import_active"):
             expected_charge_w = int(self.store.get("import_power_w") or inv_max_w)
+        elif self.store.get("cold_warmup_active"):
+            expected_charge_w = COLD_WARMUP_W          # 5.147.0: the warm-up's cap
         elif self.store.get("solar_overflow_active"):
             expected_charge_w = self.store.get("solar_overflow_charge_cap_w", inv_max_w)
         else:
@@ -9016,6 +9196,8 @@ class Plugin(indigo.PluginBase):
                 expected_mode = 0x06  # Discharge ESS First
             elif self.store.get("import_active"):
                 expected_mode = self._import_ems_mode()   # PV First unless it fell back
+            elif self.store.get("cold_warmup_active"):
+                expected_mode = EMS_CHARGE_PV_FIRST       # 5.147.0: the warm-up
             else:
                 expected_mode = 0x02  # Max Self Consumption
 
@@ -9031,7 +9213,8 @@ class Plugin(indigo.PluginBase):
             if (actual_mode in _IMPORT_EMS_MODES and expected_mode == 0x02
                     and not self.store.get("happy_hour_import_active")
                     and self.store.get("vpp_state", VPP_IDLE) == VPP_IDLE
-                    and not self._recent_flux_cheap_charge()):
+                    and not self._recent_flux_cheap_charge()
+                    and not self._cold_warmup_recent()):
                 # An unknown charge found after a restart may really have bought
                 # day-rate energy. Record it BEFORE stopping it. Only a known,
                 # recent cheap-window handover is exempt from this inference.
@@ -18114,6 +18297,7 @@ class Plugin(indigo.PluginBase):
         return bool(store.get("import_active") or store.get("export_active")
                     or store.get("happy_hour_import_active")
                     or store.get("cheap_window_import_active")
+                    or store.get("cold_warmup_active")
                     or store.get("saving_session_export_active")
                     or store.get("solar_overflow_active")
                     or store.get("flood_prev_target_soc")

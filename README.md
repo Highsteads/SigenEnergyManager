@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.146.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.0 (24 November 2026)** - A cold battery is now warmed before the 2am charge. Below about 5 degrees the battery will take very little power: on 24 November the coldest pack was at 4.4 degrees at 2am and the battery took 0.64 kW for the first 13 minutes, where 6 to 7 kW is usual, so the night's charge ended at 87% instead of 98%. When the Flux strategy is on and the coldest pack is under 6 degrees, the plugin now starts a small 1 kW charge 20 minutes before 2am (30 minutes when it is under 5 degrees) so the battery is warm when the cheap power arrives. The house runs on the grid for those minutes, and the whole thing buys well under 1 kWh at the day rate, a few pence, against roughly 3 kWh of cheap charge that a cold start loses. It never starts when the battery is 90% full or more, when there is no temperature reading, or while anything else (an Axle event, a free hour, a paused manager) has the inverter, and it is not counted as a day-rate purchase, so the 4pm sale goes ahead. The Event Log says when it starts and, at 2am, how far the battery warmed. This is new and its timings come from five nights of readings, so expect them to be adjusted.
 
 **5.146.1 (24 November 2026)** - After a weather warning, the 2am charge now starts under the Flux plan at once. A warning makes the plugin hold back from selling, and until now it also kept the Flux plan waiting for five minutes after 2am. In that gap the plugin's own fallback charge started, aimed at a lower level, and the Flux plan could not take over until that had finished. On 24 November that was 4:21am, and the charge then sat idle for five minutes with 37 minutes of cheap power left. A warning writes nothing to the inverter, so there was never anything to wait for. Most of that morning's shortfall (87% where 98% is usual) had a different cause that this version does not change: the coldest battery pack was at 4.4 degrees at 2am, and the battery would take only about 0.6 kW until it had warmed past 5 degrees, some twenty minutes later.
 
@@ -190,6 +192,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.0 | 24 November 2026 | A cold battery is warmed with a small charge before the 2am window. |
 | 5.146.1 | 24 November 2026 | After a weather warning, the Flux plan takes the 2am charge at once. |
 | 5.146.0 | 21 November 2026 | A new `/api/halfhourly` part of the shared data, for the Dashboards Savings page. |
 | 5.145.2 | 10 November 2026 | Dawn SOC Viable is blank, not True, when there is no dawn forecast to judge. |
