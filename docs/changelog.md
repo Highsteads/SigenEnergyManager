@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.3 - 25 November 2026
+
+The Event Log line "[Flux] solar: outside the Flux windows..." is no longer written. It described the ordinary state, about 19 hours a day, and appeared after every Flux window and every time the plugin started. Every other Flux line is unchanged, and the Flux status state still says it.
+
 ## 5.147.2 - 25 November 2026
 
 The warning that the Axle account could not be read, because Axle's emails no longer carry a sign-in link, is no longer written to the Event Log. It came back every time the plugin started and said nothing new. If a sign-in link is found and the read then fails, the plugin still warns.

@@ -99,8 +99,9 @@
 #              Claude Fable 5.2 (5.147.0 - a cold battery is warmed with a small charge before the 2am window)
 #              Claude Fable 5.2 (5.147.1 - the warm-up is switched off: 1 kW gave no heat on its first night)
 #              Claude Fable 5.2 (5.147.2 - the missing Axle sign-in link is no longer logged at every start)
-# Date:        25-11-2026 08:15 GMT
-# Version:     5.147.2
+#              Claude Fable 5.2 (5.147.3 - the Flux "outside the Flux windows" line is no longer logged)
+# Date:        25-11-2026 08:30 GMT
+# Version:     5.147.3
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -16900,6 +16901,11 @@ class Plugin(indigo.PluginBase):
         if self.store.get("flux_note_logged") == key:
             return
         self.store["flux_note_logged"] = key
+        # The resting state is not news: it was logged after every window and
+        # every start, and CliveS asked for it to go (25-Nov-2026). The key is
+        # still stored, so the next real plan logs as a change.
+        if decision.reason == _flux_strategy.OUTSIDE_WINDOWS_REASON:
+            return
         log(f"[Flux] {_flux_strategy.describe(decision)}")
 
     # ================================================================

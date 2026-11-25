@@ -7625,6 +7625,25 @@ class TestPollAxleAccount(unittest.TestCase):
             p._poll_axle_account()
         vl.assert_not_called()
 
+    def test_the_flux_resting_line_is_not_logged_but_a_real_plan_is(self):
+        """5.147.3: "outside the Flux windows" is the state about 19 hours a
+        day and was logged after every window and every start."""
+        fs = plugin._flux_strategy
+        p = self._plugin()
+        rest = fs.FluxDecision(mode=fs.MODE_SOLAR, owns=False,
+                               decision_at=datetime.now(timezone.utc),
+                               reason=fs.OUTSIDE_WINDOWS_REASON)
+        real = fs.FluxDecision(mode=fs.MODE_SOLAR, owns=False,
+                               decision_at=datetime.now(timezone.utc),
+                               reason="peak window, but the roof is still generating")
+        with patch.object(plugin, "log") as lg:
+            p._flux_log_decision(rest)
+            lg.assert_not_called()
+            p._flux_log_decision(real)
+            self.assertEqual(lg.call_count, 1)
+            p._flux_log_decision(rest)
+            self.assertEqual(lg.call_count, 1)
+
     def test_a_read_that_fails_still_warns(self):
         p = self._plugin()
         with patch.object(plugin._axle_account, "newest_live_token",

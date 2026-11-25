@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.147.2 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.3 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.3 (25 November 2026)** - The Event Log line "[Flux] solar: outside the Flux windows..." is no longer written. It described the ordinary state, about 19 hours a day, and appeared after every Flux window and every time the plugin started. Every other Flux line is unchanged, and the Flux status state still says it.
 
 **5.147.2 (25 November 2026)** - The warning that the Axle account could not be read, because Axle's emails no longer carry a sign-in link, is no longer written to the Event Log. It came back every time the plugin started and said nothing new. If a sign-in link is found and the read then fails, the plugin still warns.
 
@@ -196,6 +198,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.3 | 25 November 2026 | The Flux "outside the Flux windows" line is no longer logged. |
 | 5.147.2 | 25 November 2026 | The Axle sign-in link warning no longer appears at every start. |
 | 5.147.1 | 25 November 2026 | The cold-night warm-up is switched off: 1 kW gave no heat. |
 | 5.147.0 | 24 November 2026 | A cold battery is warmed with a small charge before the 2am window. |

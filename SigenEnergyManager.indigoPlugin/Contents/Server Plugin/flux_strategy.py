@@ -216,6 +216,13 @@ MODE_HOLD         = "hold"
 MODE_SUPPLY_HOUSE = "supply_house"
 MODE_EXPORT       = "export"
 MODE_SOLAR        = "solar"          # hand back to the existing manager
+
+# The resting state, about 19 hours a day. Still the decision's reason (the
+# status state and the dashboard show it); the plugin does not log it.
+OUTSIDE_WINDOWS_REASON = (
+    "outside the Flux windows — the battery runs the house, and self "
+    "consumption and solar overflow are the existing manager's job, "
+    "so Flux is not holding the inverter")
 MODE_DEFER        = "defer"          # something is missing — touch nothing
 
 MAX_DECISION_MINUTES   = 25          # executor allows 30
@@ -2129,9 +2136,7 @@ def _plan(inputs):
             mode=MODE_SOLAR, owns=False, decision_at=inputs.now,
             protect_soc_pct=house_floor, household_floor_pct=house_floor,
             committed_kwh=committed,
-            reason=("outside the Flux windows — the battery runs the house, and self "
-                    "consumption and solar overflow are the existing manager's job, "
-                    "so Flux is not holding the inverter"))
+            reason=OUTSIDE_WINDOWS_REASON)
 
     except FluxDeferred as exc:
         return FluxDecision(mode=MODE_DEFER, owns=False, decision_at=inputs.now,

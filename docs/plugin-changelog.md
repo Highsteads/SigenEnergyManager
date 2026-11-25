@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.3 - 25 November 2026
+
+`_flux_log_decision` no longer logs the resting decision (CliveS, 25-Nov-2026). Its reason is now the constant `flux_strategy.OUTSIDE_WINDOWS_REASON`; the logger stores the note key as before and returns without a line when the reason is that constant, so the next real plan still logs as a change. The peak-window `MODE_SOLAR` line ("the existing manager keeps the inverter and banks the solar") is a different reason and still logs. One test in `test_plugin.py`.
+
 ## v5.147.2 - 25 November 2026
 
 The "Axle account could not be read - no live Axle sign-in link was found" warning is no longer logged (CliveS, 25-Nov-2026: it repeats what he already knows). `_note_account_problem` takes `quiet=True` for that one cause: the problem is still recorded in `store["axle_account_problem"]`, so "readable again" still logs if Axle bring the link back. It was latched in memory only, so it came back at every plugin start. A read that is attempted and fails (the events feed, the filing) still warns. Two tests in `test_plugin.py`.
