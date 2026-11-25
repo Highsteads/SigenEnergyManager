@@ -98,8 +98,9 @@
 #              Claude Fable 5.2 (5.146.1 - Flux claims the 2am charge at once after a weather warning)
 #              Claude Fable 5.2 (5.147.0 - a cold battery is warmed with a small charge before the 2am window)
 #              Claude Fable 5.2 (5.147.1 - the warm-up is switched off: 1 kW gave no heat on its first night)
-# Date:        25-11-2026 07:45 GMT
-# Version:     5.147.1
+#              Claude Fable 5.2 (5.147.2 - the missing Axle sign-in link is no longer logged at every start)
+# Date:        25-11-2026 08:15 GMT
+# Version:     5.147.2
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -10617,11 +10618,15 @@ class Plugin(indigo.PluginBase):
 
         found = _axle_account.newest_live_token()
         if not found:
+            # Known and permanent unless Axle bring the link back, so it is
+            # recorded, not logged: the warning came back at every plugin
+            # start and CliveS asked for it to go (25-Nov-2026). A read that
+            # is attempted and fails still warns, below.
             self._note_account_problem(
                 "no live Axle sign-in link was found in Apple Mail on this Mac - "
                 "Axle's emails stopped carrying one in late October 2026. Each event's "
                 "earnings still arrive from their results email, so only the balance "
-                "shown can fall behind")
+                "shown can fall behind", quiet=True)
             return
         token, expires, site_id = found
 
@@ -10660,12 +10665,16 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[VPP] Unsettled-money check skipped: {exc}")
 
-    def _note_account_problem(self, problem):
-        """Report a failing account read, once and then on change only."""
+    def _note_account_problem(self, problem, quiet=False):
+        """Report a failing account read, once and then on change only.
+
+        `quiet` records the problem without a log line, for the one cause
+        that is already known and that nobody can act on.
+        """
         prev = self.store.get("axle_account_problem") or ""
         self.store["axle_account_problem"] = problem or ""
         if problem:
-            if problem != prev:
+            if problem != prev and not quiet:
                 vpp_log(f"[VPP] Axle account could not be read - {problem}.", "WARNING")
         elif prev:
             vpp_log("[VPP] Axle account is readable again.", event=True)

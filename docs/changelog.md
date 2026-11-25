@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.2 - 25 November 2026
+
+The warning that the Axle account could not be read, because Axle's emails no longer carry a sign-in link, is no longer written to the Event Log. It came back every time the plugin started and said nothing new. If a sign-in link is found and the read then fails, the plugin still warns.
+
 ## 5.147.1 - 25 November 2026
 
 The cold-night warm-up added in 5.147.0 is switched off. On its first night, 25 November, it ran as designed: with the coldest pack at 5.4 degrees it held a 1 kW charge for the 20 minutes before 2am, and the Flux plan took the charge over at 2am with no delay. But the battery did not warm: the coldest pack read 5.3 degrees at 2am. The readings show the battery warms only once it is taking a real charge of about 2.5 kW or more, so a warm-up that worked would have to buy roughly one unit at the day rate for every extra unit it let the battery take at the cheap rate, and that breaks even at best. The 1 kW charge cost about 6p and gained nothing that could be measured. The plugin no longer starts it. A cold battery still charges slowly for the first 25 minutes or so after 2am; on 25 November the charge reached 94% by 5am.

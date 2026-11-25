@@ -7616,6 +7616,26 @@ class TestPollAxleAccount(unittest.TestCase):
         p._merge_axle_payload.assert_not_called()
         self.assertIn("sign-in link", p.store["axle_account_problem"])
 
+    def test_a_missing_sign_in_link_is_recorded_but_not_logged(self):
+        """Axle's emails have carried no link since October 2026, so this is
+        known and permanent; it warned at every plugin start until 5.147.2."""
+        p = self._plugin()
+        with patch.object(plugin._axle_account, "newest_live_token", return_value=None), \
+             patch.object(plugin, "vpp_log") as vl:
+            p._poll_axle_account()
+        vl.assert_not_called()
+
+    def test_a_read_that_fails_still_warns(self):
+        p = self._plugin()
+        with patch.object(plugin._axle_account, "newest_live_token",
+                          return_value=("tok", datetime.now(timezone.utc), "site")), \
+             patch.object(plugin._axle_account, "fetch_events",
+                          return_value={"events": None, "note": "HTTP 403"}), \
+             patch.object(plugin, "vpp_log") as vl:
+            p._poll_axle_account()
+        self.assertEqual(vl.call_count, 1)
+        self.assertIn("403", vl.call_args[0][0])
+
     def test_a_failing_events_feed_stops_before_the_money(self):
         p = self._plugin()
         with patch.object(plugin._axle_account, "newest_live_token",

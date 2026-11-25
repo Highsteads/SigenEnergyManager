@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.2 - 25 November 2026
+
+The "Axle account could not be read - no live Axle sign-in link was found" warning is no longer logged (CliveS, 25-Nov-2026: it repeats what he already knows). `_note_account_problem` takes `quiet=True` for that one cause: the problem is still recorded in `store["axle_account_problem"]`, so "readable again" still logs if Axle bring the link back. It was latched in memory only, so it came back at every plugin start. A read that is attempted and fails (the events feed, the filing) still warns. Two tests in `test_plugin.py`.
+
 ## v5.147.1 - 25 November 2026
 
 The cold-night warm-up is switched off: `COLD_WARMUP_ENABLED = False` gates the start branch of `_cold_warmup_step` (CliveS, 25-Nov-2026: "Yes, switch it off"). A warm-up already running still ends through the same code. The code and its tests stay; `test_cold_warmup.py` switches the flag on for the 34 existing cases and adds `TestItIsSwitchedOff` (3 tests).
