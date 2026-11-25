@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.147.7 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.8 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.8 (25 November 2026)** - Saving Sessions that are not open to this house are now recognised from Octopus's own region list. The plugin had Octopus's number for region F (the North East) as 6; it is 4. So a session listing 6 but not 4 was tried, refused by Octopus, and logged as a warning telling you to check the region setting (12 November and 25 November). Such a session is now left alone in silence. No session was missed: every session open to region 4 so far also listed 6. Other regions are not numbered yet, so for them nothing is hidden and Octopus's refusal is still the check.
 
 **5.147.7 (25 November 2026)** - Three more lines no longer appear each time the plugin starts: "[SavingSessions] Automatic opt-in is ON", "[HappyHour] Automatic booking is ON" and "[VPP] Reading the Axle account directly is ON". Each is still written when you save the plugin's settings. The warnings are unchanged: a forced tariff, and Happy Hour booking ticked without Happy Hour charging, still speak at every start.
 
@@ -206,6 +208,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.8 | 25 November 2026 | Octopus's Saving Sessions number for region F is 4, not 6. |
 | 5.147.7 | 25 November 2026 | Three "is ON" setting lines are no longer logged at every start. |
 | 5.147.6 | 25 November 2026 | The bank-first setting is no longer logged at every start. |
 | 5.147.5 | 25 November 2026 | No "no Flux decision" lines at start-up before the first price read. |

@@ -7275,11 +7275,11 @@ class TestSessionsForOtherRegionsStaySilent(unittest.TestCase):
     """CliveS, 17-Sep-2026: "if it does not concern us then we don't need to be told."
 
     EVENT_77 (6pm, regions 8-12) produced a push, a warning and an amber Dashboards
-    chip for an account in region F (6) that Octopus refused to let join.
+    chip for an account in region F (4) that Octopus refused to let join.
     """
     NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
 
-    def _stub(self, store=None, region_id=6):
+    def _stub(self, store=None, region_id=4):
         stub = TestCheckSavingSessions._Stub({}, store=store,
                                              prefs={"savingSessionAutoJoin": True})
         stub.octopus.saving_session_region_id = region_id
@@ -7341,7 +7341,7 @@ class TestSessionsForOtherRegionsStaySilent(unittest.TestCase):
         # so nothing is refused and this test failed of its own accord
         # (28-10-2026). The announcement half runs on the real clock, because
         # _check_saving_sessions drops a session whose start has passed.
-        ev = self._event("EVENT_90", [6, 7])       # list says ours; Octopus says not
+        ev = self._event("EVENT_90", [4, 5])       # list says ours; Octopus says not
         pinned = dict(ev, start_at=self.NOW + timedelta(hours=5),
                       end_at=self.NOW + timedelta(hours=6))
         plugin.Plugin._auto_join_saving_sessions(stub, {"events": [pinned]}, self.NOW)
@@ -7351,13 +7351,35 @@ class TestSessionsForOtherRegionsStaySilent(unittest.TestCase):
         self.assertEqual(stub.sent, [])
         self.assertEqual(stub.store["saving_sessions_upcoming"], [])
 
-    def test_region_ids_parse_and_region_f_is_six(self):
+    def test_region_ids_parse_and_region_f_is_four(self):
         import octopus_api
         self.assertEqual(octopus_api._region_ids([{"regionId": 9}, {"regionId": 8}]), [8, 9])
         self.assertEqual(octopus_api._region_ids([]), [])
         self.assertIsNone(octopus_api._region_ids(None))
-        self.assertEqual(octopus_api.GSP_REGION_IDS["F"], 6)
-        self.assertEqual(octopus_api.GSP_REGION_IDS["P"], 14)
+        self.assertEqual(octopus_api.GSP_REGION_IDS["F"], 4)
+        # A letter never measured is unknown, never a guess from its place in
+        # the alphabet: that guess (F = 6) hid nothing by luck and was wrong.
+        self.assertNotIn("P", octopus_api.GSP_REGION_IDS)
+
+    def test_the_real_refused_sessions_are_not_ours_and_the_joined_ones_are(self):
+        """Region lists as Octopus sent them, 25-Nov-2026."""
+        import octopus_api
+        client = octopus_api.OctopusAPI.__new__(octopus_api.OctopusAPI)
+        client.region = "F"
+        ours = client.saving_session_region_id
+        refused = {"EVENT_77": [8, 9, 10, 11, 12], "EVENT_86": [6, 7, 8, 9, 10, 12],
+                   "EVENT_106": [6, 7, 8, 9, 10, 11, 12],
+                   "EVENT_137": [5, 6, 7, 8, 9, 10, 11, 12],
+                   "EVENT_152": [5, 6, 8, 9, 10, 12]}
+        joined = {"EVENT_135": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+                  "EVENT_144": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                  "EVENT_151": [4, 5, 6, 7, 8, 9, 10, 11, 12]}
+        for code, regions in refused.items():
+            self.assertNotIn(ours, regions, code)
+        for code, regions in joined.items():
+            self.assertIn(ours, regions, code)
+        client.region = "P"
+        self.assertIsNone(client.saving_session_region_id)
 
 
 class TestAutoJoinSavingSessions(unittest.TestCase):

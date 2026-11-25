@@ -351,12 +351,16 @@ def _rate_in_force(rates, when_utc):
     return None
 
 
-# Octopus's numeric region ids, in GSP-group letter order skipping I and O.
-# Not published anywhere we can read; confirmed against this account 17-Sep-2026:
-# all 13 region-listed sessions it had joined included 6, and the one Octopus
+# Octopus's numeric Saving Sessions region id for each GSP-group letter. Octopus
+# publish no table, so a letter is listed only once measured, and an unlisted
+# letter gives None: region unknown, and no session is ever hidden.
+# Region F = 4, measured 25-Nov-2026 over 28 events on this account: all 23
+# region-listed sessions it had joined include 4, and all five that Octopus
 # refused with "Account's region is outside of the target regions" (EVENT_77,
-# regions 8-12) did not. Region F = 6.
-GSP_REGION_IDS = {letter: n for n, letter in enumerate("ABCDEFGHJKLMNP", start=1)}
+# 86, 106, 137 and 152) leave 4 out. No other number fits both. The old table
+# took the letters in order (F = 6, set 17-Sep-2026 on 13 joins and one refusal,
+# which 4 and 6 fitted equally); four refusals of sessions listing 6 disproved it.
+GSP_REGION_IDS = {"F": 4}
 
 
 def _points(raw):

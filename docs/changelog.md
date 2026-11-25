@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.8 - 25 November 2026
+
+Saving Sessions that are not open to this house are now recognised from Octopus's own region list. The plugin had Octopus's number for region F (the North East) as 6; it is 4. So a session listing 6 but not 4 was tried, refused by Octopus, and logged as a warning telling you to check the region setting (12 November and 25 November). Such a session is now left alone in silence. No session was missed: every session open to region 4 so far also listed 6. Other regions are not numbered yet, so for them nothing is hidden and Octopus's refusal is still the check.
+
 ## 5.147.7 - 25 November 2026
 
 Three more lines no longer appear each time the plugin starts: "[SavingSessions] Automatic opt-in is ON", "[HappyHour] Automatic booking is ON" and "[VPP] Reading the Axle account directly is ON". Each is still written when you save the plugin's settings. The warnings are unchanged: a forced tariff, and Happy Hour booking ticked without Happy Hour charging, still speak at every start.

@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.8 - 25 November 2026
+
+`octopus_api.GSP_REGION_IDS` is `{"F": 4}`, where it was the fourteen letters numbered in order (F = 6). Measured 25-Nov-2026 from the `savingSessions` feed on this account: all 23 region-listed events it had joined list 4 (their intersection is 4, 6, 9), and the five refused with OE-1308 "Account's region is outside of the target regions" (EVENT_77, 86, 106, 137, 152) together cover 5 to 12. Only 4 fits both. The 17-Sep table rested on 13 joins and one refusal, which 4 and 6 fitted equally. A letter not in the table gives `saving_session_region_id` None, so `_saving_session_for_us` hides nothing and the join refusal stays the check. No session was missed: no TURN_DOWN event listed 4 without 6. The four codes already in `saving_sessions_not_our_region` are correct and stay. Tests: `test_region_ids_parse_and_region_f_is_four`, `test_the_real_refused_sessions_are_not_ours_and_the_joined_ones_are`; 2948 bundle tests. Not seen live: the next session that lists 6 without 4 passing with no join attempt and no warning.
+
 ## v5.147.7 - 25 November 2026
 
 `startup()` no longer calls `_log_axle_account_setting()` and calls `_log_saving_session_auto_join_setting(at_startup=True)`, which skips the Saving Sessions and Happy Hour "is ON" lines and keeps the Happy Hour mismatch warning (CliveS, 25-Nov-2026). `closedPrefsConfigUi` still announces all three on a save, and `_log_tariff_override_setting` still warns at a start. One test in `test_plugin.py`.

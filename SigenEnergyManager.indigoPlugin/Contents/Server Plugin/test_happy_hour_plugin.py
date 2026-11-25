@@ -213,7 +213,7 @@ class TestAutoBooking(unittest.TestCase):
 
     def test_another_regions_slots_are_left_alone(self):
         p = _mk(pv_kwh=8.0)
-        p.octopus.saving_session_region_id = 6
+        p.octopus.saving_session_region_id = 4
         events = _slot_events()
         for e in events:
             e["target_regions"] = [8, 9]

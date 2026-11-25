@@ -104,8 +104,9 @@
 #              Claude Fable 5.2 (5.147.5 - the start-up "no Flux decision" lines are not logged before the first price read)
 #              Claude Fable 5.2 (5.147.6 - the bank-first setting is no longer logged at start-up)
 #              Claude Fable 5.2 (5.147.7 - the three "is ON" setting lines are no longer logged at start-up)
-# Date:        25-11-2026 09:10 GMT
-# Version:     5.147.7
+#              Claude Fable 5.2 (5.147.8 - Octopus's Saving Sessions number for region F is 4, not 6)
+# Date:        25-11-2026 13:40 GMT
+# Version:     5.147.8
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
