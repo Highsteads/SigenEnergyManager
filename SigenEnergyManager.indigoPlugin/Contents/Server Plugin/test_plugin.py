@@ -7644,6 +7644,21 @@ class TestPollAxleAccount(unittest.TestCase):
             p._flux_log_decision(rest)
             self.assertEqual(lg.call_count, 1)
 
+    def test_the_decision_audit_is_logged_only_with_debug_on(self):
+        """5.147.4: the audit was eleven Event Log lines at every change of
+        action; the one-line reason stays."""
+        from types import SimpleNamespace
+        d = SimpleNamespace(action="self_consumption", reason="24h sufficient",
+                            audit_trail=[("CONTEXT", "SOC 86%"), ("DEFAULT", "matched")])
+        snap = SimpleNamespace(pv_watts=0)
+        for debug, lines in ((False, 1), (True, 5)):
+            p = self._plugin()
+            p.debug = debug
+            with patch.object(plugin, "log") as lg:
+                p._log_manager_decision(d, snap, 86.0)
+            self.assertEqual(lg.call_count, lines, f"debug={debug}")
+            self.assertIn("24h sufficient", lg.call_args_list[0][0][0])
+
     def test_a_read_that_fails_still_warns(self):
         p = self._plugin()
         with patch.object(plugin._axle_account, "newest_live_token",

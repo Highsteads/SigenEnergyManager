@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.4 - 25 November 2026
+
+`_log_manager_decision` logs the `=== DECISION AUDIT ===` block only when `self.debug` is on (CliveS, 25-Nov-2026). `decision.audit_trail` is still built on every evaluation, so the tests that read it are unaffected, and the one-line `[Manager] SOC=... Action=... reason` on a change of action still logs. One test in `test_plugin.py`.
+
 ## v5.147.3 - 25 November 2026
 
 `_flux_log_decision` no longer logs the resting decision (CliveS, 25-Nov-2026). Its reason is now the constant `flux_strategy.OUTSIDE_WINDOWS_REASON`; the logger stores the note key as before and returns without a line when the reason is that constant, so the next real plan still logs as a change. The peak-window `MODE_SOLAR` line ("the existing manager keeps the inverter and banks the solar") is a different reason and still logs. One test in `test_plugin.py`.

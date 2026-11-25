@@ -100,8 +100,9 @@
 #              Claude Fable 5.2 (5.147.1 - the warm-up is switched off: 1 kW gave no heat on its first night)
 #              Claude Fable 5.2 (5.147.2 - the missing Axle sign-in link is no longer logged at every start)
 #              Claude Fable 5.2 (5.147.3 - the Flux "outside the Flux windows" line is no longer logged)
-# Date:        25-11-2026 08:30 GMT
-# Version:     5.147.3
+#              Claude Fable 5.2 (5.147.4 - the decision audit is logged only with debug on)
+# Date:        25-11-2026 08:40 GMT
+# Version:     5.147.4
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -6010,8 +6011,11 @@ class Plugin(indigo.PluginBase):
         # new action is visible without re-running with debug on.  Silently
         # skipped when audit_trail is empty (e.g. unit-test Decisions
         # constructed directly without going through evaluate()).
+        # 5.147.4: debug only. Eleven lines at every change of action and
+        # every start, and the one-line reason above already says why
+        # (CliveS, 25-Nov-2026).
         audit_trail = getattr(decision, "audit_trail", None) or []
-        if audit_trail:
+        if audit_trail and getattr(self, "debug", False):
             log("[Manager] === DECISION AUDIT ===")
             tag_width = max((len(t) for t, _ in audit_trail), default=10)
             for tag, msg in audit_trail:
