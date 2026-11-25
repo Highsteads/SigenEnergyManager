@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.7 - 25 November 2026
+
+Three more lines no longer appear each time the plugin starts: "[SavingSessions] Automatic opt-in is ON", "[HappyHour] Automatic booking is ON" and "[VPP] Reading the Axle account directly is ON". Each is still written when you save the plugin's settings. The warnings are unchanged: a forced tariff, and Happy Hour booking ticked without Happy Hour charging, still speak at every start.
+
 ## 5.147.6 - 25 November 2026
 
 The "[Manager] Bank-first export hold: ON" line is no longer written each time the plugin starts. It is still written when you save the plugin's settings, and a threshold set above the limit still warns at a start.

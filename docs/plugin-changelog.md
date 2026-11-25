@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.7 - 25 November 2026
+
+`startup()` no longer calls `_log_axle_account_setting()` and calls `_log_saving_session_auto_join_setting(at_startup=True)`, which skips the Saving Sessions and Happy Hour "is ON" lines and keeps the Happy Hour mismatch warning (CliveS, 25-Nov-2026). `closedPrefsConfigUi` still announces all three on a save, and `_log_tariff_override_setting` still warns at a start. One test in `test_plugin.py`.
+
 ## v5.147.6 - 25 November 2026
 
 `_log_bank_first_setting(at_startup=False)`: `startup()` passes `at_startup=True`, which skips the ON and OFF lines and keeps the warning for a threshold above the clamp (CliveS, 25-Nov-2026). `closedPrefsConfigUi` still announces the setting on a save. The 5.79.0 reason for the start-up line, a behaviour change arriving silently on upgrade, is fifteen weeks old. One test in `test_plugin.py`.

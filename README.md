@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.147.6 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.7 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.7 (25 November 2026)** - Three more lines no longer appear each time the plugin starts: "[SavingSessions] Automatic opt-in is ON", "[HappyHour] Automatic booking is ON" and "[VPP] Reading the Axle account directly is ON". Each is still written when you save the plugin's settings. The warnings are unchanged: a forced tariff, and Happy Hour booking ticked without Happy Hour charging, still speak at every start.
 
 **5.147.6 (25 November 2026)** - The "[Manager] Bank-first export hold: ON" line is no longer written each time the plugin starts. It is still written when you save the plugin's settings, and a threshold set above the limit still warns at a start.
 
@@ -204,6 +206,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.7 | 25 November 2026 | Three "is ON" setting lines are no longer logged at every start. |
 | 5.147.6 | 25 November 2026 | The bank-first setting is no longer logged at every start. |
 | 5.147.5 | 25 November 2026 | No "no Flux decision" lines at start-up before the first price read. |
 | 5.147.4 | 25 November 2026 | The decision audit block is logged only with debug logging on. |

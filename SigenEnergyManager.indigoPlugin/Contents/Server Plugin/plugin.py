@@ -103,8 +103,9 @@
 #              Claude Fable 5.2 (5.147.4 - the decision audit is logged only with debug on)
 #              Claude Fable 5.2 (5.147.5 - the start-up "no Flux decision" lines are not logged before the first price read)
 #              Claude Fable 5.2 (5.147.6 - the bank-first setting is no longer logged at start-up)
-# Date:        25-11-2026 09:00 GMT
-# Version:     5.147.6
+#              Claude Fable 5.2 (5.147.7 - the three "is ON" setting lines are no longer logged at start-up)
+# Date:        25-11-2026 09:10 GMT
+# Version:     5.147.7
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2386,8 +2387,10 @@ class Plugin(indigo.PluginBase):
         # warning for a threshold above the clamp can speak here.
         self._log_bank_first_setting(at_startup=True)
         self._log_tariff_override_setting()
-        self._log_saving_session_auto_join_setting()
-        self._log_axle_account_setting()
+        # 5.147.7: the Saving Sessions, Happy Hour and Axle account "is ON"
+        # lines are logged on a settings save only (CliveS, 25-Nov-2026). The
+        # warnings stay: a forced tariff above, a Happy Hour mismatch here.
+        self._log_saving_session_auto_join_setting(at_startup=True)
 
         # Auto-update check (best-effort, daily-cached, fully silent on failure).
         try:
@@ -18011,7 +18014,7 @@ class Plugin(indigo.PluginBase):
     def _log_axle_account_setting(self):
         """Say whether the plugin is reading the Axle account directly.
 
-        At every start and every save, for the same reason the tariff override and
+        At every save (and, until 5.147.7, every start), for the same reason the tariff override and
         the saving-session auto-join announce themselves: this one reaches OUTSIDE
         the house and reads the owner's mail to find its sign-in link. A capability
         like that being on should never be something you have to open a dialog to
@@ -18032,8 +18035,10 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[VPP] Axle account setting log skipped: {exc}")
 
-    def _log_saving_session_auto_join_setting(self):
-        """Say whether the plugin will opt in on the owner's behalf. Start and every save.
+    def _log_saving_session_auto_join_setting(self, at_startup=False):
+        """Say whether the plugin will opt in on the owner's behalf, on every save.
+
+        At start-up only the Happy Hour mismatch warning is logged (5.147.7).
 
         Auto-join commits his account to something, and it is one-way. An armed
         state that reaches outside the house has to be visible in the log without
@@ -18042,16 +18047,18 @@ class Plugin(indigo.PluginBase):
         from "I must have tapped it in the app and forgotten".
         """
         try:
-            if _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False):
+            if (not at_startup
+                    and _as_bool(self.pluginPrefs.get("savingSessionAutoJoin"), False)):
                 log("[SavingSessions] Automatic opt-in is ON — announced Power Down "
                     "sessions will be joined for you. Power Ups are never joined "
                     "automatically.")
             # v5.112.0: booking spends tokens, so it announces itself the same way.
             if _as_bool(self.pluginPrefs.get("happyHourAutoBook"), False):
                 if _as_bool(self.pluginPrefs.get("happyHourImport"), False):
-                    log("[HappyHour] Automatic booking is ON — Weekend Happy Hour "
-                        "slots will be booked for you when the battery can use them, "
-                        "and every token spent before the offer ends.")
+                    if not at_startup:
+                        log("[HappyHour] Automatic booking is ON — Weekend Happy Hour "
+                            "slots will be booked for you when the battery can use "
+                            "them, and every token spent before the offer ends.")
                 else:
                     log("[HappyHour] Automatic booking is ticked but charging during a "
                         "Happy Hour is not, so nothing will be booked.", level="WARNING")

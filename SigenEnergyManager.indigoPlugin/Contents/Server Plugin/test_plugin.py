@@ -5200,6 +5200,23 @@ class TestBankFirstLogging(unittest.TestCase):
                 self._stub(prefs={"solarOverflowBankFirstMaxKwh": "500"}), at_startup=True)
         self.assertEqual([c.kwargs.get("level") for c in logged.call_args_list], ["WARNING"])
 
+    def test_at_startup_the_armed_settings_are_not_announced(self):
+        """5.147.7: Saving Sessions and Happy Hour "is ON" came back at every
+        start; a Happy Hour mismatch is a fault and still warns."""
+        on = {"savingSessionAutoJoin": True, "happyHourAutoBook": True,
+              "happyHourImport": True}
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_saving_session_auto_join_setting(
+                self._stub(prefs=on), at_startup=True)
+        logged.assert_not_called()
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_saving_session_auto_join_setting(self._stub(prefs=on))
+        self.assertEqual(logged.call_count, 2)
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_saving_session_auto_join_setting(
+                self._stub(prefs=dict(on, happyHourImport=False)), at_startup=True)
+        self.assertEqual([c.kwargs.get("level") for c in logged.call_args_list], ["WARNING"])
+
     def test_an_absurd_threshold_warns(self):
         st = self._stub(prefs={"solarOverflowBankFirstMaxKwh": "500"})
         with patch.object(plugin, "log") as logged:
