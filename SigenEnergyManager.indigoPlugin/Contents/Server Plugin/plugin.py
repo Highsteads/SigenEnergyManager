@@ -97,8 +97,9 @@
 #              Claude Opus 5.5 (5.146.0 - /api/halfhourly for the Dashboards Savings page)
 #              Claude Fable 5.2 (5.146.1 - Flux claims the 2am charge at once after a weather warning)
 #              Claude Fable 5.2 (5.147.0 - a cold battery is warmed with a small charge before the 2am window)
-# Date:        24-11-2026 22:36 GMT
-# Version:     5.147.0
+#              Claude Fable 5.2 (5.147.1 - the warm-up is switched off: 1 kW gave no heat on its first night)
+# Date:        25-11-2026 07:45 GMT
+# Version:     5.147.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -531,6 +532,15 @@ FLUX_OWNER_WARNING_PREFIX    = "a storm warning ("
 # for (4.4 C to 7.7 C in the first 29 minutes), so a small charge before the cheap
 # window should buy the full rate from 02:00. Five nights only: these figures are a
 # first sketch, and the log line at the handover is there to correct them.
+#
+# 5.147.1: switched off (CliveS, 25-Nov-2026) after its first live night. Measured
+# 25-Nov-2026, one night: 20 minutes at 0.99 kW took the coldest pack from 5.4 C to
+# 5.3 C, so 1 kW gives no heat. The packs warm only once the charge itself is about
+# 2.5 kW or more (0.3 C a minute from 02:10), so a warm-up that works buys about a
+# kWh at the day rate for each kWh it gains at the cheap rate: break-even at best.
+# The code and its tests stay, behind this switch, in case a full-demand trial is
+# ever wanted.
+COLD_WARMUP_ENABLED       = False
 COLD_WARMUP_BELOW_C       = 6.0      # warm up when the coldest pack is under this
 COLD_WARMUP_VERY_COLD_C   = 5.0      # under this, the longer lead
 COLD_WARMUP_LEAD_MIN      = 20       # minutes before the cheap window
@@ -8818,7 +8828,7 @@ class Plugin(indigo.PluginBase):
             log(f"[Warm-up] Stopped early and the inverter handed back: {blocker}")
             return
 
-        if in_cheap or not FLUX_AVAILABLE:
+        if in_cheap or not FLUX_AVAILABLE or not COLD_WARMUP_ENABLED:
             return
         temp = self._coldest_pack_c()
         if temp is None or temp >= COLD_WARMUP_BELOW_C:

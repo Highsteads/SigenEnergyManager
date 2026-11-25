@@ -4,8 +4,8 @@
 # Description: The cold-night warm-up: a small capped charge before the Flux cheap
 #              window, so the battery can take the full rate from 02:00.
 # Author:      CliveS & Claude Fable 5.2
-# Date:        24-11-2026 23:10 GMT
-# Version:     1.0
+# Date:        25-11-2026 07:45 GMT
+# Version:     1.1
 #
 # Measured 24-Nov-2026: with the coldest pack at 4.4 C the battery took 0.64 kW for
 # the first 13 minutes of the cheap window however much was asked for, and the charge
@@ -23,7 +23,15 @@ WARMUP_WRITE = ("force_charge", plugin.COLD_WARMUP_W, 100.0)
 
 
 class _WarmupCase(_FluxCase):
+    """The warm-up is switched off in the plugin (5.147.1). These cases switch it
+    on, so the code behind the switch stays proven."""
     _call_at = _DayRateCases._call_at
+
+    def setUp(self):
+        super().setUp()
+        was = plugin.COLD_WARMUP_ENABLED
+        plugin.COLD_WARMUP_ENABLED = True
+        self.addCleanup(setattr, plugin, "COLD_WARMUP_ENABLED", was)
 
     def _cold(self, hhmm, temp=4.4, soc=20.0, **store):
         p, when = self._at(hhmm, soc=soc, **store)
@@ -36,6 +44,28 @@ class _WarmupCase(_FluxCase):
 
     def _started(self, p):
         return WARMUP_WRITE in p.modbus.writes
+
+
+class TestItIsSwitchedOff(_FluxCase):
+    """25-Nov-2026: 20 minutes at 1 kW moved the coldest pack from 5.4 to 5.3 C."""
+    _call_at = _DayRateCases._call_at
+
+    def test_the_plugin_ships_with_it_off(self):
+        self.assertIs(plugin.COLD_WARMUP_ENABLED, False)
+
+    def test_a_cold_battery_before_two_starts_nothing(self):
+        for hhmm, temp in (((1, 31), 4.4), ((1, 45), 5.4), ((1, 59), 2.0)):
+            p, when = self._at(hhmm, soc=20.0)
+            p.latest_inverter_data["batteryMinTempC"] = temp
+            self._call_at(p, when, p._cold_warmup_step)
+            self.assertEqual(p.modbus.writes, [], (hhmm, temp))
+            self.assertFalse(p.store.get("cold_warmup_active"))
+
+    def test_one_already_running_still_ends_cleanly_at_two(self):
+        p, when = self._at((2, 0), soc=21.0, cold_warmup_active=True)
+        self._call_at(p, when, p._cold_warmup_step)
+        self.assertFalse(p.store["cold_warmup_active"])
+        self.assertEqual(p.modbus.writes, [])
 
 
 class TestWhenTheWarmupStarts(_WarmupCase):

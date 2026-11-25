@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.147.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.1 (25 November 2026)** - The cold-night warm-up added in 5.147.0 is switched off. On its first night, 25 November, it ran as designed: with the coldest pack at 5.4 degrees it held a 1 kW charge for the 20 minutes before 2am, and the Flux plan took the charge over at 2am with no delay. But the battery did not warm: the coldest pack read 5.3 degrees at 2am. The readings show the battery warms only once it is taking a real charge of about 2.5 kW or more, so a warm-up that worked would have to buy roughly one unit at the day rate for every extra unit it let the battery take at the cheap rate, and that breaks even at best. The 1 kW charge cost about 6p and gained nothing that could be measured. The plugin no longer starts it. A cold battery still charges slowly for the first 25 minutes or so after 2am; on 25 November the charge reached 94% by 5am.
 
 **5.147.0 (24 November 2026)** - A cold battery is now warmed before the 2am charge. Below about 5 degrees the battery will take very little power: on 24 November the coldest pack was at 4.4 degrees at 2am and the battery took 0.64 kW for the first 13 minutes, where 6 to 7 kW is usual, so the night's charge ended at 87% instead of 98%. When the Flux strategy is on and the coldest pack is under 6 degrees, the plugin now starts a small 1 kW charge 20 minutes before 2am (30 minutes when it is under 5 degrees) so the battery is warm when the cheap power arrives. The house runs on the grid for those minutes, and the whole thing buys well under 1 kWh at the day rate, a few pence, against roughly 3 kWh of cheap charge that a cold start loses. It never starts when the battery is 90% full or more, when there is no temperature reading, or while anything else (an Axle event, a free hour, a paused manager) has the inverter, and it is not counted as a day-rate purchase, so the 4pm sale goes ahead. The Event Log says when it starts and, at 2am, how far the battery warmed. This is new and its timings come from five nights of readings, so expect them to be adjusted.
 
@@ -192,6 +194,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.1 | 25 November 2026 | The cold-night warm-up is switched off: 1 kW gave no heat. |
 | 5.147.0 | 24 November 2026 | A cold battery is warmed with a small charge before the 2am window. |
 | 5.146.1 | 24 November 2026 | After a weather warning, the Flux plan takes the 2am charge at once. |
 | 5.146.0 | 21 November 2026 | A new `/api/halfhourly` part of the shared data, for the Dashboards Savings page. |

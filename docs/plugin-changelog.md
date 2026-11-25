@@ -21,6 +21,23 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.1 - 25 November 2026
+
+The cold-night warm-up is switched off: `COLD_WARMUP_ENABLED = False` gates the start branch of `_cold_warmup_step` (CliveS, 25-Nov-2026: "Yes, switch it off"). A warm-up already running still ends through the same code. The code and its tests stay; `test_cold_warmup.py` switches the flag on for the 34 existing cases and adds `TestItIsSwitchedOff` (3 tests).
+
+Measured on the first live night, 25-Nov-2026 (one night):
+
+| Time | Battery | Coldest pack |
+|---|---|---|
+| 01:40 to 01:59, warm-up | 0.99 kW | 5.4 C, 5.3 C at 01:59 |
+| 02:00 to 02:10 | 2.5 to 2.8 kW | 5.3 C |
+| 02:15 | 4.0 kW | 5.9 C |
+| 02:20 | 5.9 kW | 6.5 C |
+| 02:26 | 9.0 kW | 7.9 C |
+| 02:35 | 10 kW | 11.3 C |
+
+Flux claimed at 02:00:02 with no stand-down; `dayRateImportDate` was not set; 94.4% at 04:58. The warm-up drew 0.61 kWh at 25.6p. For comparison with no warm-up: 17-Nov at 5.7 C started at 1.85 kW and reached 9 kW at 02:39; 24-Nov at 4.4 C started at 0.64 kW and reached 9 kW at 02:31. So the start may have been a little quicker, but one night cannot separate that from the temperature. The packs warm only under a charge of about 2.5 kW or more, so a working warm-up buys about a kWh at the day rate (25.6p) for each kWh it gains at the cheap rate (15.5p) to sell at about 26p: break-even at best. A full-demand warm-up was not tried.
+
 ## v5.147.0 - 24 November 2026
 
 The cold-night warm-up: a 1 kW Charge PV First before the Flux cheap window when the coldest pack is cold.
