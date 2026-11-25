@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.147.5 - 25 November 2026
+
+After a restart the Flux supervisor steps about 30 seconds before the first Octopus read, so every start logged `[Flux] no Flux decision — Octopus has published no Flux import prices at all` and a `Control handed back` line saying the same (CliveS, 25-Nov-2026). New `_flux_waiting_for_first_prices(decision)`: true for a `MODE_DEFER` decision while `flux_rates_at` and `flux_rates_problem` are both empty and less than `FLUX_STARTUP_QUIET_S` (120 s) has passed since the first step (`store["flux_first_step_at"]`). While true, `_flux_log_decision` returns without storing the note key, and the step passes `quiet=True` to `_flux_release`, which skips only the confirmed hand-back line; an unconfirmed hand-back still warns. A failed read, or the wait running out, ends it. One test in `test_plugin.py`.
+
 ## v5.147.4 - 25 November 2026
 
 `_log_manager_decision` logs the `=== DECISION AUDIT ===` block only when `self.debug` is on (CliveS, 25-Nov-2026). `decision.audit_trail` is still built on every evaluation, so the tests that read it are unaffected, and the one-line `[Manager] SOC=... Action=... reason` on a change of action still logs. One test in `test_plugin.py`.

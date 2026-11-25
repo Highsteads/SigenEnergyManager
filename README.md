@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.147.4 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.147.5 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.147.5 (25 November 2026)** - The two "[Flux] no Flux decision — Octopus has published no Flux import prices at all" lines no longer appear each time the plugin starts. They were written in the half minute before the plugin had first read the prices from Octopus, so they looked like a fault and were not one. If the prices are still missing two minutes after a start, or the read fails, the plugin says so as before.
 
 **5.147.4 (25 November 2026)** - The "DECISION AUDIT" block is no longer written to the Event Log. It was eleven lines each time the plugin changed what it was doing, and at every start. The single line above it, which gives the battery level, the action and the reason, is still logged. To see the full block again, tick **Enable debug logging** in Configure.
 
@@ -200,6 +202,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.147.5 | 25 November 2026 | No "no Flux decision" lines at start-up before the first price read. |
 | 5.147.4 | 25 November 2026 | The decision audit block is logged only with debug logging on. |
 | 5.147.3 | 25 November 2026 | The Flux "outside the Flux windows" line is no longer logged. |
 | 5.147.2 | 25 November 2026 | The Axle sign-in link warning no longer appears at every start. |

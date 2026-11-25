@@ -7659,6 +7659,30 @@ class TestPollAxleAccount(unittest.TestCase):
             self.assertEqual(lg.call_count, lines, f"debug={debug}")
             self.assertIn("24h sufficient", lg.call_args_list[0][0][0])
 
+    def test_a_flux_deferral_before_the_first_price_read_is_not_logged(self):
+        """5.147.5: the supervisor steps about 30 s before the first Octopus
+        read after a restart and said "no Flux import prices at all"."""
+        fs = plugin._flux_strategy
+        d = fs.FluxDecision(mode=fs.MODE_DEFER, owns=False,
+                            decision_at=datetime.now(timezone.utc),
+                            reason="no Flux decision — no prices")
+        p = self._plugin()
+        with patch.object(plugin, "log") as lg:
+            p._flux_log_decision(d)
+            lg.assert_not_called()
+            self.assertTrue(p._flux_waiting_for_first_prices(d))
+            # It outlasts the wait: it speaks.
+            p.store["flux_first_step_at"] -= plugin.FLUX_STARTUP_QUIET_S + 1
+            p._flux_log_decision(d)
+            self.assertEqual(lg.call_count, 1)
+        # A read that failed, or one that worked, ends the wait at once.
+        for key, val in (("flux_rates_problem", "HTTP 500"), ("flux_rates_at", 1.0)):
+            p = self._plugin()
+            p.store[key] = val
+            with patch.object(plugin, "log") as lg:
+                p._flux_log_decision(d)
+            self.assertEqual(lg.call_count, 1, key)
+
     def test_a_read_that_fails_still_warns(self):
         p = self._plugin()
         with patch.object(plugin._axle_account, "newest_live_token",

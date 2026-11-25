@@ -101,8 +101,9 @@
 #              Claude Fable 5.2 (5.147.2 - the missing Axle sign-in link is no longer logged at every start)
 #              Claude Fable 5.2 (5.147.3 - the Flux "outside the Flux windows" line is no longer logged)
 #              Claude Fable 5.2 (5.147.4 - the decision audit is logged only with debug on)
-# Date:        25-11-2026 08:40 GMT
-# Version:     5.147.4
+#              Claude Fable 5.2 (5.147.5 - the start-up "no Flux decision" lines are not logged before the first price read)
+# Date:        25-11-2026 08:50 GMT
+# Version:     5.147.5
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -1798,6 +1799,9 @@ def _count_words(n):
 # a plan made with the tariff UNKNOWN (v5.109.1; the fallback was Tracker until
 # 5.124.0). An unknown tariff runs self consumption and buys nothing.
 TARIFF_WAIT_S = 300
+# 5.147.5: how long after the first Flux step a "no Flux decision" is put down
+# to the first price read not having happened yet, and so not logged.
+FLUX_STARTUP_QUIET_S = 120
 
 
 class _FluxRawDriver:
@@ -16533,7 +16537,7 @@ class Plugin(indigo.PluginBase):
 
     # ---- release and pre-emption ------------------------------------------
 
-    def _flux_release(self, reason, preempted=False):
+    def _flux_release(self, reason, preempted=False, quiet=False):
         """Hand the inverter back to the baseline and stop owning it.
 
         `preempted` starts the stand-down period AND changes what an unconfirmed
@@ -16556,9 +16560,12 @@ class Plugin(indigo.PluginBase):
                 result = ex.step(None, datetime.now(timezone.utc),
                                  communications_ok=bool(self.modbus and self.modbus.connected))
                 if result == "released":
-                    log(f"[Flux] Control handed back — {reason}. The inverter is on the "
-                        f"baseline the manager expects, with the discharge floor at "
-                        f"{self._policy_discharge_floor_pct():.0f}%.")
+                    # `quiet` covers only the confirmed hand-back at start-up;
+                    # an unconfirmed one always warns, below.
+                    if not quiet:
+                        log(f"[Flux] Control handed back — {reason}. The inverter is on the "
+                            f"baseline the manager expects, with the discharge floor at "
+                            f"{self._policy_discharge_floor_pct():.0f}%.")
                 elif preempted:
                     yielded = ex.step(None, datetime.now(timezone.utc),
                                       supervisor_owns=True,
@@ -16801,7 +16808,9 @@ class Plugin(indigo.PluginBase):
 
         if not decision.owns:
             if ex.owns_control:
-                self._flux_release(decision.reason)
+                self._flux_release(
+                    decision.reason,
+                    quiet=self._flux_waiting_for_first_prices(decision))
             return
 
         if not ex.owns_control and not self._flux_may_claim():
@@ -16894,6 +16903,24 @@ class Plugin(indigo.PluginBase):
             f"Switch the Flux strategy off in the plugin configuration to force a "
             f"reconciled hand-back.", level="ERROR")
 
+    def _flux_waiting_for_first_prices(self, decision):
+        """True for a deferral made before this run's first Flux price read.
+
+        After a restart the supervisor steps about 30 seconds before the first
+        Octopus read, so it logged "no Flux decision - Octopus has published no
+        Flux import prices at all" and a hand-back saying the same, at every
+        start (CliveS, 25-Nov-2026). Bounded in time, and ended by a read that
+        fails, so a real absence of prices still speaks.
+        """
+        if decision is None or decision.mode != _flux_strategy.MODE_DEFER:
+            return False
+        if self.store.get("flux_rates_at") or self.store.get("flux_rates_problem"):
+            return False
+        first = self.store.get("flux_first_step_at")
+        if not first:
+            self.store["flux_first_step_at"] = first = time.time()
+        return time.time() - first < FLUX_STARTUP_QUIET_S
+
     def _flux_log_decision(self, decision):
         """One line when the plan changes, and never the same line twice.
 
@@ -16901,6 +16928,9 @@ class Plugin(indigo.PluginBase):
         reason text carries a figure that moves every tick, so keying on the
         prose meant the guard never fired. See note_key() for the detail.
         """
+        # Not stored as logged, so it speaks if it outlasts the start-up wait.
+        if self._flux_waiting_for_first_prices(decision):
+            return
         key = _flux_strategy.note_key(decision)
         if self.store.get("flux_note_logged") == key:
             return

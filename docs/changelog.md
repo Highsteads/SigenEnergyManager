@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.5 - 25 November 2026
+
+The two "[Flux] no Flux decision — Octopus has published no Flux import prices at all" lines no longer appear each time the plugin starts. They were written in the half minute before the plugin had first read the prices from Octopus, so they looked like a fault and were not one. If the prices are still missing two minutes after a start, or the read fails, the plugin says so as before.
+
 ## 5.147.4 - 25 November 2026
 
 The "DECISION AUDIT" block is no longer written to the Event Log. It was eleven lines each time the plugin changed what it was doing, and at every start. The single line above it, which gives the battery level, the action and the reason, is still logged. To see the full block again, tick **Enable debug logging** in Configure.
