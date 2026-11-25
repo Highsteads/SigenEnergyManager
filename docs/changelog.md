@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.147.6 - 25 November 2026
+
+The "[Manager] Bank-first export hold: ON" line is no longer written each time the plugin starts. It is still written when you save the plugin's settings, and a threshold set above the limit still warns at a start.
+
 ## 5.147.5 - 25 November 2026
 
 The two "[Flux] no Flux decision — Octopus has published no Flux import prices at all" lines no longer appear each time the plugin starts. They were written in the half minute before the plugin had first read the prices from Octopus, so they looked like a fault and were not one. If the prices are still missing two minutes after a start, or the read fails, the plugin says so as before.

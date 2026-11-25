@@ -102,8 +102,9 @@
 #              Claude Fable 5.2 (5.147.3 - the Flux "outside the Flux windows" line is no longer logged)
 #              Claude Fable 5.2 (5.147.4 - the decision audit is logged only with debug on)
 #              Claude Fable 5.2 (5.147.5 - the start-up "no Flux decision" lines are not logged before the first price read)
-# Date:        25-11-2026 08:50 GMT
-# Version:     5.147.5
+#              Claude Fable 5.2 (5.147.6 - the bank-first setting is no longer logged at start-up)
+# Date:        25-11-2026 09:00 GMT
+# Version:     5.147.6
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -2380,10 +2381,10 @@ class Plugin(indigo.PluginBase):
         # always uses the same numbers as the plugin (no constant drift).
         self._write_site_config()
 
-        # One line naming the bank-first setting. A deliberate exception to the
-        # quiet-boot convention: v5.79.0 changes when the system exports, and a
-        # behaviour change that arrives silently on upgrade is not acceptable.
-        self._log_bank_first_setting()
+        # 5.147.6: the bank-first ON/OFF line is no longer logged at start-up
+        # (CliveS, 25-Nov-2026); it still is on a settings save. Only the
+        # warning for a threshold above the clamp can speak here.
+        self._log_bank_first_setting(at_startup=True)
         self._log_tariff_override_setting()
         self._log_saving_session_auto_join_setting()
         self._log_axle_account_setting()
@@ -18077,8 +18078,10 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"[Octopus] override announcement skipped: {exc!r}")
 
-    def _log_bank_first_setting(self):
-        """Say what the export hold is set to, at startup and on every prefs save.
+    def _log_bank_first_setting(self, at_startup=False):
+        """Say what the export hold is set to, on every prefs save.
+
+        At start-up only the over-the-clamp warning is logged (5.147.6).
 
         A behaviour change that arrives silently on upgrade is not acceptable; an
         announced one is. It also puts the kill switch in the same line the owner
@@ -18088,16 +18091,18 @@ class Plugin(indigo.PluginBase):
             max_kwh = _as_float(self.pluginPrefs.get("solarOverflowBankFirstMaxKwh"),
                                 SOLAR_OVERFLOW_BANK_FIRST_MAX_KWH)
             if max_kwh <= 0.0:
-                log("[Manager] Bank-first export hold: OFF (threshold 0) — daytime export "
-                    "follows the forecast gate alone.")
+                if not at_startup:
+                    log("[Manager] Bank-first export hold: OFF (threshold 0) — daytime "
+                        "export follows the forecast gate alone.")
                 return
             gate = min(SOLAR_OVERFLOW_BANK_FIRST_SOC_MAX,
                        max(0.0, _as_float(self.pluginPrefs.get("solarOverflowBankFirstSoc"),
                                           SOLAR_OVERFLOW_BANK_FIRST_SOC_PCT)))
             clamped = min(max_kwh, SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX)
-            log(f"[Manager] Bank-first export hold: ON — daytime export waits for "
-                f"{gate:.0f}% SOC on days forecast below {clamped:.1f} kWh "
-                f"(set the threshold to 0 to disable).")
+            if not at_startup:
+                log(f"[Manager] Bank-first export hold: ON — daytime export waits for "
+                    f"{gate:.0f}% SOC on days forecast below {clamped:.1f} kWh "
+                    f"(set the threshold to 0 to disable).")
             if max_kwh > SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX:
                 log(f"[Manager] Bank-first threshold {max_kwh:.1f} kWh is above the "
                     f"{SOLAR_OVERFLOW_BANK_FIRST_KWH_MAX:.0f} kWh clamp and has been "

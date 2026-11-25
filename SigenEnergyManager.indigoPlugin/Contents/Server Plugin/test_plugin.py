@@ -5187,6 +5187,19 @@ class TestBankFirstLogging(unittest.TestCase):
             plugin.Plugin._log_bank_first_setting(st)
         self.assertIn("OFF", logged.call_args_list[0].args[0])
 
+    def test_at_startup_the_setting_is_not_announced_but_a_bad_one_warns(self):
+        """5.147.6: the ON/OFF line came back at every start."""
+        for prefs in ({"solarOverflowBankFirstMaxKwh": "40"},
+                      {"solarOverflowBankFirstMaxKwh": "0"}):
+            with patch.object(plugin, "log") as logged:
+                plugin.Plugin._log_bank_first_setting(self._stub(prefs=prefs),
+                                                      at_startup=True)
+            logged.assert_not_called()
+        with patch.object(plugin, "log") as logged:
+            plugin.Plugin._log_bank_first_setting(
+                self._stub(prefs={"solarOverflowBankFirstMaxKwh": "500"}), at_startup=True)
+        self.assertEqual([c.kwargs.get("level") for c in logged.call_args_list], ["WARNING"])
+
     def test_an_absurd_threshold_warns(self):
         st = self._stub(prefs={"solarOverflowBankFirstMaxKwh": "500"})
         with patch.object(plugin, "log") as logged:
