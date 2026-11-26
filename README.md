@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.148.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.148.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.148.1 (26 November 2026)** - Past days are now given their grid-only price too. 5.148.0 could only re-price a day its stored prices still reached, which is yesterday. The plugin now asks Octopus for the prices it published for each older day, ten days at each price refresh, newest first, so the week, month and year tables come right over the next few hours. A day from before the tariff began, or with no half-hour record, keeps the figure it had.
 
 **5.148.0 (26 November 2026)** - The day's saving is now worked out against a grid-only day priced half hour by half hour, at the price in force when the house used the energy. Until now it was priced at the average rate of what was bought, and on Flux nearly all of that is bought in the cheap three hours for the battery, so "Grid-only would have cost" came out at about the cheap rate and "Saved today" at roughly half what the Dashboards Savings page showed for the same day. Past days are re-priced the same way where the half-hour record and Octopus's published prices still cover them; a day that cannot be re-priced keeps its old figure. On a tariff with one price all day nothing changes. The status the dashboards read also says what the Flux controller is doing while it holds the inverter, so a page no longer has to quote the manager's own decision, which reads "self consumption" through a 2am grid charge.
 
@@ -210,6 +212,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.148.1 | 26 November 2026 | Older days get their grid-only price from the prices Octopus published for them. |
 | 5.148.0 | 26 November 2026 | A grid-only day is priced half hour by half hour, and the dashboards are told what Flux is doing. |
 | 5.147.8 | 25 November 2026 | Octopus's Saving Sessions number for region F is 4, not 6. |
 | 5.147.7 | 25 November 2026 | Three "is ON" setting lines are no longer logged at every start. |

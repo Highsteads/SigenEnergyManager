@@ -3620,6 +3620,62 @@ class TestGridOnlyDayAtItsOwnRate(unittest.TestCase):
         self.assertEqual(p._backfill_grid_only_rates(), 0)
         self.assertEqual(asked, [], "a day that could not be weighed is not asked about again this run")
 
+    def test_a_past_day_the_stored_prices_do_not_reach_is_priced_at_its_own(self):
+        """The stored schedule reaches back to yesterday. An older day is priced
+        at what Octopus published for THAT day, asked for once, a few days per
+        refresh, and a fetch that fails is tried again."""
+        p = self._plugin()
+        want = self._flux_day(p)
+        kept = p.store["flux_import_slots"]
+        p.store["flux_import_slots"] = [{"valid_from": "2026-11-25T02:00:00Z",          # nowhere near the day
+                                         "valid_to": "2026-11-25T05:00:00Z", "value_inc_vat": 16.8}]
+        p.store["flux_account_evidence"]["import"].update(
+            {"product_code": "FLUX-IMPORT-23-02-14", "tariff_code": "E-1R-FLUX-IMPORT-23-02-14-F"})
+        path = os.path.join(p.data_dir, "daily_history.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump([{"date": self.DAY, "home_kwh": 12.0, "rate_today_p": 16.8}], fh)
+        asked = []
+
+        class _Octo:
+            answer = None
+
+            def _fetch_rate_schedule(self, code, tariff, day, failed_as_none=False):
+                asked.append((code, tariff, day.isoformat()))
+                return self.answer
+        p.octopus = _Octo()
+        self.assertEqual(p._backfill_grid_only_rates(), 0)                 # Octopus could not be asked
+        self.assertEqual(asked, [("FLUX-IMPORT-23-02-14", "E-1R-FLUX-IMPORT-23-02-14-F", self.DAY)])
+        _Octo.answer = kept                                                # now it answers
+        self.assertEqual(p._backfill_grid_only_rates(), 1, "a failed fetch is tried again")
+        with open(path, encoding="utf-8") as fh:
+            row = json.load(fh)[0]
+        self.assertAlmostEqual(row["grid_only_rate_p"], want, places=3)
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(p._backfill_grid_only_rates(), 0)
+        self.assertEqual(len(asked), 2, "a day that has its price is not asked about again")
+
+    def test_only_a_few_past_days_are_fetched_per_refresh(self):
+        p = self._plugin()
+        p.store["flux_import_slots"] = []
+        p.store["flux_account_evidence"]["import"].update({"product_code": "P", "tariff_code": "T"})
+        self._flux_day(p)
+        days = [f"2026-10-{d:02d}" for d in range(1, 31)]
+        with open(os.path.join(p.data_dir, "daily_history.json"), "w", encoding="utf-8") as fh:
+            json.dump([{"date": d, "home_kwh": 10.0, "rate_today_p": 16.8} for d in days], fh)
+        asked = []
+
+        class _Octo:
+            def _fetch_rate_schedule(self, code, tariff, day, failed_as_none=False):
+                asked.append(day.isoformat())
+                return []                                                  # nothing published
+        p.octopus = _Octo()
+        p._backfill_grid_only_rates()
+        self.assertEqual(len(asked), plugin.Plugin.GRID_ONLY_BACKFILL_FETCHES)
+        self.assertEqual(asked[0], "2026-10-30", "newest first")
+        p._backfill_grid_only_rates()
+        self.assertEqual(len(asked), 2 * plugin.Plugin.GRID_ONLY_BACKFILL_FETCHES)
+        self.assertEqual(len(set(asked)), len(asked), "no day is asked about twice")
+
     def test_the_flux_status_block(self):
         p = self._plugin()
         p.store["flux_status"] = "charge: buying the cheap three hours"

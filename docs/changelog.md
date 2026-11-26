@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.148.1 - 26 November 2026
+
+Past days are now given their grid-only price too. 5.148.0 could only re-price a day its stored prices still reached, which is yesterday. The plugin now asks Octopus for the prices it published for each older day, ten days at each price refresh, newest first, so the week, month and year tables come right over the next few hours. A day from before the tariff began, or with no half-hour record, keeps the figure it had.
+
 ## 5.148.0 - 26 November 2026
 
 The day's saving is now worked out against a grid-only day priced half hour by half hour, at the price in force when the house used the energy. Until now it was priced at the average rate of what was bought, and on Flux nearly all of that is bought in the cheap three hours for the battery, so "Grid-only would have cost" came out at about the cheap rate and "Saved today" at roughly half what the Dashboards Savings page showed for the same day. Past days are re-priced the same way where the half-hour record and Octopus's published prices still cover them; a day that cannot be re-priced keeps its old figure. On a tariff with one price all day nothing changes. The status the dashboards read also says what the Flux controller is doing while it holds the inverter, so a page no longer has to quote the manager's own decision, which reads "self consumption" through a 2am grid charge.

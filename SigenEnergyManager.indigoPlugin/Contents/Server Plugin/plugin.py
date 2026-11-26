@@ -106,8 +106,9 @@
 #              Claude Fable 5.2 (5.147.7 - the three "is ON" setting lines are no longer logged at start-up)
 #              Claude Fable 5.2 (5.147.8 - Octopus's Saving Sessions number for region F is 4, not 6)
 #              Claude Fable 5.2 (5.148.0 - a grid-only day priced half hour by half hour; /api/status flux block)
-# Date:        26-11-2026 13:05 GMT
-# Version:     5.148.0
+#              Claude Fable 5.2 (5.148.1 - older days priced from the prices Octopus published for them)
+# Date:        26-11-2026 13:20 GMT
+# Version:     5.148.1
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -15601,14 +15602,43 @@ class Plugin(indigo.PluginBase):
             return weighted, "weighted"
         return import_rate_p, ("import-rate" if self._tariff_is_banded("home") else "flat")
 
-    def _backfill_grid_only_rates(self, max_days=120):
+    # Past days priced per price refresh: each needs one request to Octopus
+    # for that day's published prices, so they are done a few at a time.
+    GRID_ONLY_BACKFILL_FETCHES = 10
+
+    def _past_day_import_spans(self, date_str):
+        """The import prices Octopus published for a past day, as spans.
+
+        ([], True) when Octopus answered with none; (None, False) when it could
+        not be asked, so the day is tried again. The stored schedule only
+        reaches back to yesterday, and a past day is priced at what was
+        published for THAT day, never at today's prices."""
+        agreement = (self.store.get("flux_account_evidence") or {}).get("import") or {}
+        code, tariff = agreement.get("product_code"), agreement.get("tariff_code")
+        if not (self.octopus and code and tariff):
+            return None, False
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            slots = self.octopus._fetch_rate_schedule(code, tariff, day, failed_as_none=True)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Economics] past prices for {date_str}: {exc!r}")
+            return None, False
+        if slots is None:
+            return None, False
+        return self._spans_from_slots(slots), True
+
+    def _backfill_grid_only_rates(self, max_days=400):
         """Give past days their grid-only rate, where it can be measured (5.148.0).
 
         Days recorded before this version carry no grid_only_rate_p, so the
         period tables priced a grid-only day at the import rate. Each such day
-        the published prices and the half-hour record still cover is weighed
-        once and the figure kept. A day that cannot be weighed is left as it
-        is, and not asked about again in this run. Returns how many were set."""
+        is weighed once, from the half-hour record and the prices Octopus
+        published for that day: the stored schedule where it reaches, else that
+        day's own schedule asked of Octopus, a few days per price refresh. A
+        day that cannot be weighed (before the agreement, no half-hour record,
+        nothing published) is left as it is and not asked about again in this
+        run; one whose prices could not be fetched is tried again next time.
+        Returns how many were set."""
         path = os.path.join(self.data_dir, "daily_history.json")
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -15620,19 +15650,29 @@ class Plugin(indigo.PluginBase):
         tried = getattr(self, "_grid_only_tried", None)
         if tried is None:
             tried = self._grid_only_tried = set()
-        changed = 0
-        for rec in records[-max_days:]:
+        changed = fetches = 0
+        for rec in reversed(records[-max_days:]):       # newest first: the pages show those
             if not isinstance(rec, dict) or rec.get("grid_only_rate_p") is not None:
                 continue
             date_str = str(rec.get("date") or "")
             if not date_str or date_str in tried:
                 continue
-            tried.add(date_str)
             try:
-                weighted, _why = self._banded_rate_for_day("home", date_str)
+                weighted, why = self._banded_rate_for_day("home", date_str)
+                if weighted is None and why in ("gap", "no bands"):
+                    # The stored prices do not reach this day: ask for its own.
+                    if fetches >= self.GRID_ONLY_BACKFILL_FETCHES:
+                        continue                        # next refresh
+                    fetches += 1
+                    spans, answered = self._past_day_import_spans(date_str)
+                    if not answered:
+                        continue                        # could not ask: try again
+                    if spans:
+                        weighted, why = self._banded_rate_for_day("home", date_str, spans=spans)
             except Exception as exc:                    # noqa: BLE001
                 self.logger.debug(f"[Economics] grid-only backfill {date_str}: {exc!r}")
                 continue
+            tried.add(date_str)
             if weighted is None:
                 continue
             rec["grid_only_rate_p"]     = round(float(weighted), 4)
@@ -16088,8 +16128,14 @@ class Plugin(indigo.PluginBase):
         that dict wholesale every cycle and a Flux fetch that failed on a good
         cycle would silently drop the last known schedule.
         """
+        return self._spans_from_slots(self.store.get(key) or [])
+
+    @staticmethod
+    def _spans_from_slots(slots):
+        """Octopus rate slots as spans. One reader for the stored schedule and
+        for a past day's schedule fetched to price it (5.148.0)."""
         spans = []
-        for slot in (self.store.get(key) or []):
+        for slot in (slots or []):
             try:
                 start = datetime.fromisoformat(str(slot["valid_from"]).replace("Z", "+00:00"))
                 raw_to = slot.get("valid_to")
