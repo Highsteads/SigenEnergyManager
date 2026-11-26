@@ -105,8 +105,9 @@
 #              Claude Fable 5.2 (5.147.6 - the bank-first setting is no longer logged at start-up)
 #              Claude Fable 5.2 (5.147.7 - the three "is ON" setting lines are no longer logged at start-up)
 #              Claude Fable 5.2 (5.147.8 - Octopus's Saving Sessions number for region F is 4, not 6)
-# Date:        25-11-2026 13:40 GMT
-# Version:     5.147.8
+#              Claude Fable 5.2 (5.148.0 - a grid-only day priced half hour by half hour; /api/status flux block)
+# Date:        26-11-2026 13:05 GMT
+# Version:     5.148.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -3022,12 +3023,17 @@ class Plugin(indigo.PluginBase):
             # day's kWh by.
             import_rate_p, today_export_rate_p = self._live_rates_today_p(
                 import_rate_p, export_rate_p)
+            # 5.148.0: and the grid-only day at the price of each half hour the
+            # house used its energy in, not at the rate the battery bought at.
+            grid_only_rate_p, _ = self._grid_only_rate_and_basis(
+                _local_today_str(), import_rate_p)
             today_econ = self._compute_daily_economics(
                 home_kwh      = home_kwh,
                 import_kwh    = import_kwh,
                 export_kwh    = float(store.get("grid_export_daily_kwh", 0.0)),
                 import_rate_p = import_rate_p,
                 export_rate_p = today_export_rate_p,
+                grid_only_rate_p = grid_only_rate_p,
             )
             yesterday_econ, yesterday_date = self._yesterday_economics(
                 export_rate_p          = export_rate_p,
@@ -3171,6 +3177,9 @@ class Plugin(indigo.PluginBase):
                     "soc_at_dawn_kwh": (_finite_or_none(dawn_dec.soc_at_dawn_kwh, 1)
                                         if dawn_dec else None),
                 },
+                # 5.148.0: the Flux controller's own account of itself, so a
+                # page does not have to read the manager's decision for it.
+                "flux": self._flux_status_payload(),
                 "tariff": {
                     "name":         tariff_info.get("display_name", "Unknown"),
                     "product_code": tariff_info.get("product_code", ""),
@@ -3305,10 +3314,12 @@ class Plugin(indigo.PluginBase):
 
     @staticmethod
     def _compute_daily_economics(home_kwh, import_kwh, export_kwh,
-                                 import_rate_p, export_rate_p):
+                                 import_rate_p, export_rate_p,
+                                 grid_only_rate_p=None):
         """Delegates to economics.Economics — see that module."""
         return Economics._compute_daily_economics(
-            home_kwh, import_kwh, export_kwh, import_rate_p, export_rate_p)
+            home_kwh, import_kwh, export_kwh, import_rate_p, export_rate_p,
+            grid_only_rate_p=grid_only_rate_p)
 
     def _settle_whole_house_costs(self):
         """Delegates to economics.Economics — see that module."""
@@ -12975,6 +12986,10 @@ class Plugin(indigo.PluginBase):
             date_str, export_rate_p)
         import_rate_p, import_rate_basis = self._import_rate_and_basis(
             date_str, (self.latest_rates_data or {}).get("tracker", {}).get("today_p"))
+        # 5.148.0: what this day's own use would have cost a kWh from the grid
+        # alone, kept with the day like the other two rates.
+        grid_only_rate_p, grid_only_rate_basis = self._grid_only_rate_and_basis(
+            date_str, import_rate_p)
 
         # Capture the standing charges + gas unit rate in force on this day, so
         # the whole-house settle values each frozen day at its OWN rates rather
@@ -13033,6 +13048,8 @@ class Plugin(indigo.PluginBase):
             # the day's single published rate, exactly as before.
             "rate_today_p":   import_rate_p,
             "import_rate_basis": import_rate_basis,
+            "grid_only_rate_p":     grid_only_rate_p,
+            "grid_only_rate_basis": grid_only_rate_basis,
             "export_rate_p":  round(export_rate_p, 4),
             # How that figure was arrived at: "weighted" means the day's own
             # half-hourly exports were priced against the published bands,
@@ -15550,13 +15567,107 @@ class Plugin(indigo.PluginBase):
     _BAND_SIDES = {
         "import": ("flux_import_slots", "grid_import_kwh", "import_valid_from"),
         "export": ("flux_export_slots", "grid_export_kwh", "export_valid_from"),
+        # 5.148.0: the house's own use, weighed by the IMPORT prices. Not a
+        # third agreement: it answers "what would this day have cost with no
+        # solar and no battery", where every kWh is bought when it is used.
+        "home":   ("flux_import_slots", "home_kwh",        "import_valid_from"),
     }
+    # Which agreement each of those is billed under.
+    _BAND_AGREEMENT = {"import": "import", "export": "export", "home": "import"}
 
     def _tariff_is_banded(self, side):
         """True when the account's agreement on `side` charges more than one price."""
         evidence = self.store.get("flux_account_evidence") or {}
+        side = self._BAND_AGREEMENT.get(side, side)
         key = str((evidence.get(side) or {}).get("tariff_key") or "")
         return key in (TARIFF_FLUX, "iflux")
+
+    def _grid_only_rate_and_basis(self, date_str, import_rate_p):
+        """(pence a kWh, basis) for a day with no solar and no battery (5.148.0).
+
+        "weighted" when the day's own half-hourly home use was priced at the
+        import price in force in each half hour. Otherwise the day's import
+        rate, as every day was valued before: basis "flat" on a tariff with one
+        price, where that IS the answer, and "import-rate" on a banded tariff
+        whose day could not be weighed (no half-hour record, a gap in the
+        published prices, a day before the agreement began). The second is an
+        approximation and is labelled as one."""
+        try:
+            weighted, _reason = self._banded_rate_for_day("home", date_str)
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Economics] grid-only weighting skipped: {exc!r}")
+            weighted = None
+        if weighted is not None:
+            return weighted, "weighted"
+        return import_rate_p, ("import-rate" if self._tariff_is_banded("home") else "flat")
+
+    def _backfill_grid_only_rates(self, max_days=120):
+        """Give past days their grid-only rate, where it can be measured (5.148.0).
+
+        Days recorded before this version carry no grid_only_rate_p, so the
+        period tables priced a grid-only day at the import rate. Each such day
+        the published prices and the half-hour record still cover is weighed
+        once and the figure kept. A day that cannot be weighed is left as it
+        is, and not asked about again in this run. Returns how many were set."""
+        path = os.path.join(self.data_dir, "daily_history.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                records = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(records, list):
+            return 0
+        tried = getattr(self, "_grid_only_tried", None)
+        if tried is None:
+            tried = self._grid_only_tried = set()
+        changed = 0
+        for rec in records[-max_days:]:
+            if not isinstance(rec, dict) or rec.get("grid_only_rate_p") is not None:
+                continue
+            date_str = str(rec.get("date") or "")
+            if not date_str or date_str in tried:
+                continue
+            tried.add(date_str)
+            try:
+                weighted, _why = self._banded_rate_for_day("home", date_str)
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[Economics] grid-only backfill {date_str}: {exc!r}")
+                continue
+            if weighted is None:
+                continue
+            rec["grid_only_rate_p"]     = round(float(weighted), 4)
+            rec["grid_only_rate_basis"] = "weighted"
+            changed += 1
+        if changed:
+            try:
+                _atomic_write_json(path, records)
+            except Exception as exc:                    # noqa: BLE001
+                log(f"[Economics] Could not save the grid-only rates: {exc}", level="WARNING")
+                return 0
+            self.logger.info(
+                f"[Economics] {changed} past {'day' if changed == 1 else 'days'} now "
+                f"{'has' if changed == 1 else 'have'} a grid-only price worked out half hour by half hour.")
+        return changed
+
+    def _flux_status_payload(self):
+        """What the Flux controller is doing, for the dashboards (5.148.0).
+
+        The manager's own decision reads "self consumption" while Flux holds
+        the inverter, so a page that quoted it called a 2am grid charge solar
+        charging. owns is whether Flux controls the inverter now; mode is its
+        current instruction (charge, export, hold, supply_house) and is only
+        given while it owns; status is the controller's own sentence."""
+        out = {"owns": False, "mode": "", "status": str(self.store.get("flux_status") or ""),
+               "standing_aside": str(self.store.get("flux_owner_reason") or "")}
+        try:
+            ex = getattr(self, "flux_executor", None)
+            out["owns"] = bool(ex is not None and ex.owns_control)
+            dec = self.store.get("flux_decision")
+            if out["owns"] and dec is not None and getattr(dec, "owns", False):
+                out["mode"] = str(getattr(dec, "mode", "") or "")
+        except Exception as exc:                        # noqa: BLE001
+            self.logger.debug(f"[Flux] status payload: {exc!r}")
+        return out
 
     def _import_tariff_is_banded(self):
         """True when the account's import agreement charges more than one price."""
@@ -16085,6 +16196,10 @@ class Plugin(indigo.PluginBase):
                 self._reprice_provisional_days()
             except Exception as exc:                    # noqa: BLE001
                 self.logger.debug(f"[Economics] provisional re-pricing failed: {exc!r}")
+            try:
+                self._backfill_grid_only_rates()
+            except Exception as exc:                    # noqa: BLE001
+                self.logger.debug(f"[Economics] grid-only backfill failed: {exc!r}")
         except Exception as exc:                        # noqa: BLE001
             self.store["flux_rates_problem"] = f"{type(exc).__name__}: {exc}"
             self.logger.debug(f"[Flux] rate refresh failed: {exc!r}")

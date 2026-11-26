@@ -11,6 +11,7 @@
 import ast
 import collections
 import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -50,6 +51,7 @@ sys.modules.setdefault("pymodbus.exceptions", _pm.exceptions)
 sys.modules.setdefault("requests", MagicMock())
 
 import plugin              # noqa: E402
+import economics           # noqa: E402
 import flux_strategy as fs  # noqa: E402
 
 LONDON = ZoneInfo("Europe/London")
@@ -3517,6 +3519,128 @@ class TestNextHappyHourToday(unittest.TestCase):
         p = self._plugin([self._w(start)], inv_kw="30")
         self.assertEqual(p._next_happy_hour_today(self.NOW)[1],
                          plugin.HAPPY_HOUR_FAIR_USE_KWH)
+
+
+class TestGridOnlyDayAtItsOwnRate(unittest.TestCase):
+    """v5.148.0: a day with no solar and no battery buys each kWh when it is used.
+
+    The day's saving was worked out against the house's use priced at the
+    IMPORT rate, which is weighed by when the battery bought: on Flux nearly
+    all in the cheap three hours. So the grid-only day was priced at about the
+    cheap rate and the saving came out at roughly half.
+    """
+
+    DAY = "2026-09-17"
+
+    def _plugin(self, import_key="flux", valid_from="2026-09-16T23:00:00Z"):
+        p = _mk_plugin()
+        _seed_flux_day(p, datetime(2026, 9, 17, 17, 0, tzinfo=LONDON))
+        ev = _evidence(import_key=import_key)
+        ev["import_valid_from"] = valid_from
+        ev["export_valid_from"] = valid_from
+        p.store["flux_account_evidence"] = ev
+        return p
+
+    def _series(self, p, rows):
+        con = sqlite3.connect(os.path.join(p.data_dir, "energy_timeseries.db"))
+        con.execute("""CREATE TABLE halfhourly (slot_start TEXT, slot_end TEXT,
+                         grid_import_kwh REAL, grid_export_kwh REAL, home_kwh REAL)""")
+        con.executemany("INSERT INTO halfhourly VALUES (?, ?, ?, ?, ?)", rows)
+        con.commit()
+        con.close()
+
+    def _flux_day(self, p):
+        # The battery buys 20 kWh at 3am. The house uses 2 then, 6 at noon, 4 at 5pm.
+        self._series(p, [(f"{self.DAY}T03:00:00", f"{self.DAY}T03:30:00", 20.0, 0.0, 2.0),
+                         (f"{self.DAY}T12:00:00", f"{self.DAY}T12:30:00", 0.0, 0.0, 6.0),
+                         (f"{self.DAY}T17:00:00", f"{self.DAY}T17:30:00", 0.0, 0.0, 4.0)])
+        return (2 * 16.8 + 6 * 31.4 + 4 * 44.9) / 12.0
+
+    def test_home_use_is_weighed_by_when_it_was_used(self):
+        p = self._plugin()
+        want = self._flux_day(p)
+        self.assertAlmostEqual(p._import_rate_for_day_p(self.DAY), 16.8, places=3)
+        rate, basis = p._grid_only_rate_and_basis(self.DAY, 16.8)
+        self.assertEqual(basis, "weighted")
+        self.assertAlmostEqual(rate, want, places=3)
+        self.assertGreater(rate, 30.0, "about twice the rate the battery bought at")
+
+    def test_a_flat_tariff_keeps_its_one_price(self):
+        p = self._plugin(import_key="tracker")
+        self._flux_day(p)
+        self.assertEqual(p._grid_only_rate_and_basis(self.DAY, 26.21), (26.21, "flat"))
+
+    def test_a_banded_day_that_cannot_be_weighed_says_it_is_the_import_rate(self):
+        p = self._plugin()                          # no half-hour record at all
+        self.assertEqual(p._grid_only_rate_and_basis(self.DAY, 16.8), (16.8, "import-rate"))
+
+    def test_the_days_saving_uses_it(self):
+        econ = plugin.Plugin._compute_daily_economics
+        old = econ(12.0, 20.0, 0.0, 16.8, 28.0)
+        self.assertEqual(old["no_solar_cost_gbp"], round(12.0 * 16.8 / 100, 2))
+        self.assertEqual(old["grid_only_rate_p"], 16.8)
+        new = econ(12.0, 20.0, 0.0, 16.8, 28.0, grid_only_rate_p=33.47)
+        self.assertEqual(new["no_solar_cost_gbp"], round(12.0 * 33.47 / 100, 2))
+        self.assertEqual(new["import_cost_gbp"], old["import_cost_gbp"], "what was paid does not move")
+        self.assertEqual(new["solar_benefit_gbp"],
+                         round((12.0 * 33.47 - 20.0 * 16.8) / 100, 2))
+        self.assertEqual(new["grid_only_rate_p"], 33.47)
+        for bad in (None, 0, -3, "x"):
+            self.assertEqual(econ(12.0, 20.0, 0.0, 16.8, 28.0, grid_only_rate_p=bad)["no_solar_cost_gbp"],
+                             old["no_solar_cost_gbp"], bad)
+        self.assertIsNone(econ(12.0, 20.0, 0.0, None, 28.0, grid_only_rate_p=33.47)["no_solar_cost_gbp"])
+
+    def test_a_history_row_uses_its_own_grid_only_rate_or_falls_back(self):
+        f = economics.Economics._row_grid_only_rate_p
+        self.assertEqual(f({"grid_only_rate_p": 33.47}, 16.8), 33.47)
+        self.assertEqual(f({}, 16.8), 16.8)
+        self.assertEqual(f({"grid_only_rate_p": None}, 16.8), 16.8)
+        self.assertEqual(f({"grid_only_rate_p": "junk"}, 16.8), 16.8)
+        self.assertEqual(f({"grid_only_rate_p": 0}, 16.8), 16.8)
+
+    def test_past_days_are_given_one_where_it_can_be_measured(self):
+        p = self._plugin()
+        want = self._flux_day(p)
+        path = os.path.join(p.data_dir, "daily_history.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump([{"date": "2026-09-10", "home_kwh": 11.0, "rate_today_p": 26.2},   # before Flux
+                       {"date": self.DAY, "home_kwh": 12.0, "rate_today_p": 16.8},
+                       {"date": "2026-09-18", "home_kwh": 9.0, "rate_today_p": 17.0,
+                        "grid_only_rate_p": 31.0}], fh)                                  # already has one
+        self.assertEqual(p._backfill_grid_only_rates(), 1)
+        with open(path, encoding="utf-8") as fh:
+            rows = {r["date"]: r for r in json.load(fh)}
+        self.assertAlmostEqual(rows[self.DAY]["grid_only_rate_p"], want, places=3)
+        self.assertEqual(rows[self.DAY]["grid_only_rate_basis"], "weighted")
+        self.assertNotIn("grid_only_rate_p", rows["2026-09-10"], "a Tracker day is not given a Flux price")
+        self.assertEqual(rows["2026-09-18"]["grid_only_rate_p"], 31.0)
+        asked = []
+        real = p._banded_rate_for_day
+        p._banded_rate_for_day = lambda side, day, spans=None: asked.append(day) or real(side, day, spans)
+        self.assertEqual(p._backfill_grid_only_rates(), 0)
+        self.assertEqual(asked, [], "a day that could not be weighed is not asked about again this run")
+
+    def test_the_flux_status_block(self):
+        p = self._plugin()
+        p.store["flux_status"] = "charge: buying the cheap three hours"
+        p.store["flux_owner_reason"] = ""
+        p.flux_executor = None
+        self.assertEqual(p._flux_status_payload(),
+                         {"owns": False, "mode": "", "status": "charge: buying the cheap three hours",
+                          "standing_aside": ""})
+
+        class _Ex:
+            owns_control = True
+
+        class _Dec:
+            owns = True
+            mode = "charge"
+        p.flux_executor = _Ex()
+        p.store["flux_decision"] = _Dec()
+        self.assertEqual(p._flux_status_payload()["mode"], "charge")
+        self.assertTrue(p._flux_status_payload()["owns"])
+        _Ex.owns_control = False                    # handed back: the old instruction is not quoted
+        self.assertEqual(p._flux_status_payload()["mode"], "")
 
 
 if __name__ == "__main__":

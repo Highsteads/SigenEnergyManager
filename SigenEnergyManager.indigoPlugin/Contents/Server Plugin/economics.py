@@ -101,27 +101,56 @@ class Economics:
     # ---- moved verbatim from plugin.Plugin --------------------------------
 
     @staticmethod
+    def _row_grid_only_rate_p(rec, import_rate_p):
+        """What a kWh would have cost on a day with no solar or battery, for one
+        history row: the row's own grid_only_rate_p where the day recorded one
+        (5.148.0), else the day's import rate, which is what every day used
+        before."""
+        try:
+            g = float(rec.get("grid_only_rate_p") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            g = 0.0
+        return g if g > 0 else import_rate_p
+
+    @staticmethod
     def _compute_daily_economics(home_kwh, import_kwh, export_kwh,
-                                 import_rate_p, export_rate_p):
+                                 import_rate_p, export_rate_p,
+                                 grid_only_rate_p=None):
         """Return the economics dict for a single day's energy figures.
 
         All four kWh values are non-negative floats.  import_rate_p and
         export_rate_p are pence per kWh (positive).  Either rate being None
         produces a None-result dict so the caller can render "—".
+
+        grid_only_rate_p (5.148.0): what the house's own use would have cost a
+        kWh with no solar and no battery, the day's home use weighed by the
+        price in force in each half hour. On a banded tariff this is not the
+        import rate: the import rate is weighed by when the BATTERY bought,
+        which on Flux is nearly all in the cheap three hours, so pricing the
+        whole house at it said a grid-only day would have cost about half
+        what it would. None means there is no such figure (a flat tariff, or
+        a day that could not be weighed) and the import rate is used, as before.
         """
         if import_rate_p is None or export_rate_p is None:
             return {
                 "import_rate_p":      import_rate_p,
                 "export_rate_p":      export_rate_p,
+                "grid_only_rate_p":   None,
                 "import_cost_gbp":    None,
                 "export_revenue_gbp": None,
                 "no_solar_cost_gbp":  None,
                 "net_today_gbp":      None,
                 "solar_benefit_gbp":  None,
             }
+        try:
+            grid_only_p = float(grid_only_rate_p) if grid_only_rate_p is not None else 0.0
+        except (TypeError, ValueError):
+            grid_only_p = 0.0
+        if not grid_only_p > 0:
+            grid_only_p = float(import_rate_p)
         import_cost_p   = import_kwh * import_rate_p
         export_rev_p    = export_kwh * export_rate_p
-        no_solar_cost_p = home_kwh   * import_rate_p
+        no_solar_cost_p = home_kwh   * grid_only_p
         net_p           = export_rev_p - import_cost_p
         benefit_p       = no_solar_cost_p - import_cost_p + export_rev_p
         def _gbp(p):
@@ -129,6 +158,7 @@ class Economics:
         return {
             "import_rate_p":      round(float(import_rate_p), 2),
             "export_rate_p":      round(float(export_rate_p), 2),
+            "grid_only_rate_p":   round(float(grid_only_p), 2),
             "import_cost_gbp":    _gbp(import_cost_p),
             "export_revenue_gbp": _gbp(export_rev_p),
             "no_solar_cost_gbp":  _gbp(no_solar_cost_p),
@@ -325,6 +355,8 @@ class Economics:
                 export_kwh    = float(yest.get("grid_export_kwh", 0.0) or 0.0),
                 import_rate_p = rate_p,
                 export_rate_p = yest_export_p,
+                grid_only_rate_p = (self._row_grid_only_rate_p(yest, rate_p)
+                                    if rate_p is not None else None),
             ),
             date_str,
         )
@@ -560,7 +592,7 @@ class Economics:
 
                 imp_p       = imp_k * ir
                 exp_p       = exp_k * er
-                no_sol_unit = home  * ir
+                no_sol_unit = home  * self._row_grid_only_rate_p(r, ir)
                 net         = exp_p - imp_p
                 # Standing cancels out of the benefit — (no_sol + st) - (imp + st)
                 # + exp — so it is computed from the unit-only figures and does
@@ -708,7 +740,7 @@ class Economics:
 
                 imp_p       = imp_k * ir
                 exp_p       = exp_k * er
-                no_sol_unit = home  * ir
+                no_sol_unit = home  * self._row_grid_only_rate_p(r, ir)
                 net         = exp_p - imp_p
                 benefit     = no_sol_unit - imp_p + exp_p
                 total_imp_p      += imp_p

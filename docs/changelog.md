@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.148.0 - 26 November 2026
+
+The day's saving is now worked out against a grid-only day priced half hour by half hour, at the price in force when the house used the energy. Until now it was priced at the average rate of what was bought, and on Flux nearly all of that is bought in the cheap three hours for the battery, so "Grid-only would have cost" came out at about the cheap rate and "Saved today" at roughly half what the Dashboards Savings page showed for the same day. Past days are re-priced the same way where the half-hour record and Octopus's published prices still cover them; a day that cannot be re-priced keeps its old figure. On a tariff with one price all day nothing changes. The status the dashboards read also says what the Flux controller is doing while it holds the inverter, so a page no longer has to quote the manager's own decision, which reads "self consumption" through a 2am grid charge.
+
 ## 5.147.8 - 25 November 2026
 
 Saving Sessions that are not open to this house are now recognised from Octopus's own region list. The plugin had Octopus's number for region F (the North East) as 6; it is 4. So a session listing 6 but not 4 was tried, refused by Octopus, and logged as a warning telling you to check the region setting (12 November and 25 November). Such a session is now left alone in silence. No session was missed: every session open to region 4 so far also listed 6. Other regions are not numbered yet, so for them nothing is hidden and Octopus's refusal is still the check.
