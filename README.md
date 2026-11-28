@@ -2,7 +2,7 @@
 
 **Runs a Sigenergy solar battery from Indigo, so the house buys as little from the grid as it can.**
 
-**Version:** 5.148.1 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
+**Version:** 5.149.0 | **Author:** CliveS & Claude | **Needs:** Indigo 2025.2 or later and a Sigenergy inverter
 
 **[Read the full guide](https://highsteads.github.io/SigenEnergyManager/)** — setting up, how it decides what the battery does, and what to do when something goes wrong.
 
@@ -53,6 +53,8 @@ My [Dashboards plugin](https://github.com/Highsteads/Dashboards) reads this plug
 The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through each step, explains every setting, and covers what to do if something does not work.
 
 ## What's new
+
+**5.149.0 (28 November 2026)** - The plugin now keeps a running record of what the house's own energy cost: grid energy at the price in force when it was used, battery energy at what charging the battery cost, and solar at nothing. It publishes two running totals in the Sigenergy variable folder, `house_energy_kwh_total` and `house_energy_cost_gbp_total`, and `battery_energy_cost_p`, what a kWh now in the battery cost. Appliance Monitor 1.13.0 uses the two totals to price a washing machine or dryer cycle at what its energy really cost, where it used to use the grid price at the end of the cycle. The record starts the first time this version runs, and the battery's contents at that moment are priced at the cheap rate of a time-of-use tariff, or the price in force on any other.
 
 **5.148.1 (26 November 2026)** - Past days are now given their grid-only price too. 5.148.0 could only re-price a day its stored prices still reached, which is yesterday. The plugin now asks Octopus for the prices it published for each older day, ten days at each price refresh, newest first, so the week, month and year tables come right over the next few hours. A day from before the tariff began, or with no half-hour record, keeps the figure it had.
 
@@ -212,6 +214,7 @@ The [full guide](https://highsteads.github.io/SigenEnergyManager/) goes through 
 
 | Version | Released | In short |
 |---|---|---|
+| 5.149.0 | 28 November 2026 | A running record of what the house's energy cost, for Appliance Monitor. |
 | 5.148.1 | 26 November 2026 | Older days get their grid-only price from the prices Octopus published for them. |
 | 5.148.0 | 26 November 2026 | A grid-only day is priced half hour by half hour, and the dashboards are told what Flux is doing. |
 | 5.147.8 | 25 November 2026 | Octopus's Saving Sessions number for region F is 4, not 6. |

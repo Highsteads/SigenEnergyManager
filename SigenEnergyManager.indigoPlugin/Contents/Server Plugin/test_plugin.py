@@ -6791,9 +6791,10 @@ class TestRatesFollowActiveTariff(unittest.TestCase):
         # _update_tariff_device and get_dashboard_data (which read the Tracker
         # bucket on Flux until the post-deployment fix). Deliberately exact — it
         # went 2 -> 3 -> 4 and the guard caught each, which is the point of it.
-        self.assertEqual(src.count("self._rates_for_tariff("), 4,
-                         "_build_tariff_data, the status line, the tariff device "
-                         "and the dashboard must all use the helper")
+        # FIVE from 5.149.0: _house_cost_prices prices the house energy ledger.
+        self.assertEqual(src.count("self._rates_for_tariff("), 5,
+                         "_build_tariff_data, the status line, the tariff device, "
+                         "the dashboard and the house cost ledger must all use the helper")
         self.assertNotIn('tracker    = monitored.get("tracker", {})', src,
                          "the status line must not read the Tracker bucket directly")
 

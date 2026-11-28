@@ -109,6 +109,8 @@ The plugin also keeps a set of Indigo variables in a folder called **Sigenergy**
 |---|---|
 | **sigen_manager_paused** | Set it to `true` from anything in Indigo to pause the plugin, and back to `false` to let it carry on. [Actions and triggers](actions-and-triggers.md) explains pausing. |
 | **sigen_today_pv_kwh**, **sigen_today_import_kwh**, **sigen_today_export_kwh**, **sigen_today_home_kwh** | Today's running totals, written every 30 minutes. |
+| **house_energy_kwh_total**, **house_energy_cost_gbp_total** | Running totals, from 5.149.0, of the energy the house has used and what it cost: grid energy at the price in force, battery energy at what charging the battery cost, solar at nothing. They only rise, so the cost of anything that ran between two moments is the change in pounds over the change in kWh. Appliance Monitor uses them. Written every minute. |
+| **battery_energy_cost_p** | What a kWh now in the battery cost, in pence. Blank until known. |
 | **sigen_today_self_suff_pct** | Today's self-sufficiency — the share of what the house used that did not come from the grid. |
 | **sigen_decision_action** and **sigen_decision_reason** | The plugin's latest decision. |
 | **elec_**, **gas_** and **export_** variables | Today's and this month's costs, units and export earnings, your unit rates and standing charges, and your Octopus account balance. |

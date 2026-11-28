@@ -107,8 +107,9 @@
 #              Claude Fable 5.2 (5.147.8 - Octopus's Saving Sessions number for region F is 4, not 6)
 #              Claude Fable 5.2 (5.148.0 - a grid-only day priced half hour by half hour; /api/status flux block)
 #              Claude Fable 5.2 (5.148.1 - older days priced from the prices Octopus published for them)
-# Date:        26-11-2026 13:20 GMT
-# Version:     5.148.1
+#              Claude Opus 5.5 (5.149.0 - a running record of what the house's energy cost)
+# Date:        28-11-2026 13:35 GMT
+# Version:     5.149.0
 #
 # CHANGELOG: docs/plugin-changelog.md
 #   The full technical history used to live here and had reached 2,002 lines - 17.4% of
@@ -365,6 +366,7 @@ from web_dashboard import (WebDashboard, DASHBOARD_BIND_ALL,
 import vpp_ledger as _vpp_ledger
 import axle_email as _axle_email
 import axle_account as _axle_account
+from house_energy_cost import HouseCostLedger
 
 # ── Octopus Flux (draft, off by default) ─────────────────────────────────────
 # Two modules, imported together and guarded together. flux_strategy decides;
@@ -492,6 +494,11 @@ FORECAST_FETCH_INTERVAL   = 1800  # 30 minutes (Open-Meteo: 10,000 calls/day fre
 OCTOPUS_RATES_INTERVAL    = 1800  # 30 minutes
 OCTOPUS_PROFILE_INTERVAL  = 86400 # 24 hours
 COST_SETTLE_INTERVAL      = 21600 # 6 hours - backfill settled whole-house costs into daily_history
+HOUSE_COST_PUBLISH_INTERVAL = 60   # house_energy_*_total variables (5.149.0)
+HOUSE_COST_SAVE_INTERVAL    = 300  # house_energy_cost.json
+HOUSE_COST_FILE             = "house_energy_cost.json"
+HOUSE_COST_VARIABLES        = ("house_energy_kwh_total", "house_energy_cost_gbp_total",
+                               "battery_energy_cost_p")
 VPP_POLL_NORMAL_INTERVAL  = 600   # 10 minutes
 VPP_POLL_ACTIVE_INTERVAL  = 60    # 1 minute (near/during event)
 
@@ -1932,6 +1939,9 @@ class Plugin(indigo.PluginBase):
 
         # Data directory for cache files
         self.data_dir = self._get_data_dir()
+        # 5.149.0: what the house's own energy cost, for Appliance Monitor and
+        # anything else that wants to price a stretch of time.
+        self.house_cost = self._load_house_cost()
 
         # Initialise module instances (configured properly in startup())
         self.modbus   = None
@@ -2677,6 +2687,7 @@ class Plugin(indigo.PluginBase):
             self._save_accumulators()
         except Exception as exc:
             log(f"Accumulator save on shutdown failed: {exc!r}", level="WARNING")
+        self._save_house_cost()
         # Give the inverter up BEFORE anything else stops. The executor's journal
         # survives this process, so a claim left standing is a claim the next
         # start has to reconcile against hardware it cannot see the history of —
@@ -4091,6 +4102,15 @@ class Plugin(indigo.PluginBase):
             self._save_accumulators()
             self.store["last_acc_save"] = now
 
+        # 7b. House energy cost totals (5.149.0): published every minute, saved
+        # every five.
+        if now - self.store.get("last_house_cost_pub", 0.0) >= HOUSE_COST_PUBLISH_INTERVAL:
+            self.store["last_house_cost_pub"] = now
+            self._publish_house_cost()
+        if now - self.store.get("last_house_cost_save", 0.0) >= HOUSE_COST_SAVE_INTERVAL:
+            self.store["last_house_cost_save"] = now
+            self._save_house_cost()
+
         # 8. Daily midnight tasks
         self._check_midnight()
 
@@ -4256,6 +4276,7 @@ class Plugin(indigo.PluginBase):
         self.store["modbus_consecutive_failures"] = 0
         data["_read_at"] = time.time()   # staleness stamp for _evaluate_manager
         self.latest_inverter_data = data
+        self._house_cost_step(data)
 
         # Detect grid-status transitions in either direction so the power-cut
         # log captures both the start and end of every outage.  Key the edges on a
@@ -13994,6 +14015,93 @@ class Plugin(indigo.PluginBase):
         self.store["hh_anchor_lifetime"] = dict(snap)
         self.store["hh_anchor_soc_pct"]  = cur_soc
         self.store["hh_anchor_at"]       = slot_end
+
+    # ------------------------------------------------------------------
+    # House energy cost (5.149.0)
+    # ------------------------------------------------------------------
+    def _load_house_cost(self):
+        """The ledger as last saved, or a fresh one. Never raises."""
+        try:
+            path = os.path.join(self.data_dir, HOUSE_COST_FILE)
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    return HouseCostLedger(json.load(fh))
+        except Exception as exc:
+            log(f"[HouseCost] Could not read {HOUSE_COST_FILE} ({exc!r}), "
+                f"starting the totals again", level="WARNING")
+        return HouseCostLedger()
+
+    def _save_house_cost(self):
+        ledger = getattr(self, "house_cost", None)
+        if ledger is None:
+            return
+        try:
+            _atomic_write_json(os.path.join(self.data_dir, HOUSE_COST_FILE),
+                               ledger.to_state())
+        except Exception as exc:
+            log(f"[HouseCost] Save failed: {exc!r}", level="WARNING")
+
+    def _house_cost_prices(self):
+        """(import price in force, price for the battery's first contents), pence.
+
+        Either may be None. The first contents are priced at the cheap band of a
+        time-of-use tariff, because that is when this house fills the battery;
+        on any other tariff at the price in force.
+        """
+        rates = self.latest_rates_data or {}
+        key   = (rates.get("tariff_info") or {}).get("tariff_key", TARIFF_UNKNOWN)
+        try:
+            now_p, _tomorrow = self._rates_for_tariff(key, rates)
+        except Exception:
+            now_p = None
+        seed_p = (rates.get(key) or {}).get("cheap_p") if isinstance(rates.get(key), dict) else None
+        return _as_float(now_p, None), _as_float(seed_p, None)
+
+    def _house_cost_step(self, data):
+        """Feed one fresh inverter reading to the ledger. Caller holds the lock."""
+        ledger = getattr(self, "house_cost", None)
+        if ledger is None:
+            return
+        try:
+            rate_p, seed_p = self._house_cost_prices()
+            ledger.step(
+                data.get("_read_at", time.time()),
+                data.get("gridPowerWatts"), data.get("batteryPowerWatts"),
+                data.get("homePowerWatts"), data.get("batterySoc"),
+                _as_float(self.pluginPrefs.get("batteryCapacityKwh"), BATTERY_CAPACITY_KWH),
+                rate_p, seed_price_p=seed_p)
+        except Exception as exc:
+            log(f"[HouseCost] Step failed: {exc!r}", level="WARNING")
+
+    def _publish_house_cost(self):
+        """Write the totals to Indigo variables in the Sigenergy folder.
+
+        house_energy_kwh_total and house_energy_cost_gbp_total only ever rise, so
+        another plugin prices a stretch of time as the change in pounds over the
+        change in kWh. battery_energy_cost_p is blank until it is known.
+        """
+        ledger = getattr(self, "house_cost", None)
+        if ledger is None:
+            return
+        with self._state_lock:
+            kwh   = ledger.house_kwh
+            gbp   = ledger.house_cost_p / 100.0
+            batt  = ledger.battery_price_p()
+        values = (f"{kwh:.4f}", f"{gbp:.5f}", "" if batt is None else f"{batt:.2f}")
+        try:
+            folder_id = self._sigenergy_folder_id()
+        except Exception as exc:
+            log(f"[HouseCost] No Sigenergy variable folder: {exc!r}", level="WARNING")
+            return
+        for name, value in zip(HOUSE_COST_VARIABLES, values):
+            var_id = self._ensure_var(name, folder_id)
+            if not var_id:
+                continue
+            try:
+                if indigo.variables[var_id].value != value:
+                    indigo.variable.updateValue(var_id, value)
+            except Exception as exc:
+                log(f"[HouseCost] Update failed '{name}': {exc!r}", level="WARNING")
 
     def _write_energy_summary_variables(self):
         """

@@ -21,6 +21,10 @@ New entries go at the top, as they were kept in the file.
 
 ---
 
+## v5.149.0 - 28 November 2026
+
+New module `house_energy_cost.py` (`HouseCostLedger`, pure): each fresh Modbus reading (`_apply_modbus_result` -> `_house_cost_step`) splits the step's grid import into grid-to-battery (first) and grid-to-house, then battery discharge into the house (the rest went to the grid and is not a house cost) and solar for the remainder. Grid energy is priced at `_house_cost_prices()`'s rate in force (`_rates_for_tariff`, the fifth call site, test count updated), the battery as a pool at its average price; after each step the pool's kWh is set from SOC x `batteryCapacityKwh`, keeping the price, so drift does not build and charging losses sit in the price. First contents are seeded at the active TOU tariff's `cheap_p`, else the rate in force. Steps over 300 s are not integrated; with no price ever known nothing is counted. State in `house_energy_cost.json` in the data folder (saved every 5 min and first thing in `shutdown()`); `house_energy_kwh_total`, `house_energy_cost_gbp_total` and `battery_energy_cost_p` published every 60 s (written only when changed). 17 tests in `test_house_energy_cost.py`. Asked for by CliveS on 28-Nov-2026: a 1.098 kWh wash run on battery energy bought at 15.47p was priced at the 25.63p grid rate.
+
 ## v5.148.1 - 26 November 2026
 
 `_backfill_grid_only_rates` (now over the last 400 rows, newest first): where the stored spans do not reach a day (`gap` or `no bands`) it fetches that day's own import schedule with `octopus._fetch_rate_schedule(product, tariff, day, failed_as_none=True)` through `_past_day_import_spans`, and weighs the day with `_banded_rate_for_day("home", day, spans=...)`. At most `GRID_ONLY_BACKFILL_FETCHES` (10) requests per price refresh; a fetch that fails leaves the day to be tried again, any other answer marks it tried for this run. `_spans_from_slots` is the one slot reader, shared with `_flux_rate_spans`. Two more tests in `TestGridOnlyDayAtItsOwnRate`. Found on the first live run of 5.148.0, which could set only one past day.

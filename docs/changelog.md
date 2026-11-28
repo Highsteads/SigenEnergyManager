@@ -7,6 +7,10 @@ nav_order: 9
 
 The newest version is at the top. A fuller, technical record of the recent versions is in the [developer changelog](plugin-changelog.md).
 
+## 5.149.0 - 28 November 2026
+
+The plugin now keeps a running record of what the house's own energy cost: grid energy at the price in force when it was used, battery energy at what charging the battery cost, and solar at nothing. It publishes two running totals in the Sigenergy variable folder, `house_energy_kwh_total` and `house_energy_cost_gbp_total`, and `battery_energy_cost_p`, what a kWh now in the battery cost. Appliance Monitor 1.13.0 uses the two totals to price a washing machine or dryer cycle at what its energy really cost, where it used to use the grid price at the end of the cycle. The record starts the first time this version runs, and the battery's contents at that moment are priced at the cheap rate of a time-of-use tariff, or the price in force on any other.
+
 ## 5.148.1 - 26 November 2026
 
 Past days are now given their grid-only price too. 5.148.0 could only re-price a day its stored prices still reached, which is yesterday. The plugin now asks Octopus for the prices it published for each older day, ten days at each price refresh, newest first, so the week, month and year tables come right over the next few hours. A day from before the tariff began, or with no half-hour record, keeps the figure it had.
